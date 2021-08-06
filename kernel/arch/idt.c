@@ -43,7 +43,9 @@ void idt_free_idt_gate(uint8_t gate)
     idt_set_gate(gate, 0, KERNEL_CODE_SEGMENT, 0);
     idt_sets[gate] = false;
 }
-
+/*
+    This function allocates gate.
+*/
 uint8_t idt_allocate_gate()
 {
     for(uint32_t i = 0; i < MAX_IDT_DESCRIPTORS; i++)

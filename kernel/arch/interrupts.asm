@@ -54,12 +54,6 @@ isr_stub_table:
 %assign i i+1
 %endrep
 
-global idt_flush
-idt_flush:
-    mov eax, [esp+4]
-    lidt[eax]
-    ret
-
 extern exception_handler
 isr_common_stub:
     pusha  ; pushes edi,esi,ebp, esp, ebx, ecx, eax;
@@ -72,7 +66,7 @@ isr_common_stub:
     mov gs, ax
     call exception_handler
     pop eax ; reload the original data segment descriptior;
-    mov ds, ax
+    mov ds, bx
     mov es, ax
     mov fs, ax
     mov gs, ax
@@ -81,3 +75,54 @@ isr_common_stub:
     add esp, 8 ; cleans up the pushed error code and pushed ISR number;
     sti 
     iret ; pops CS, EIP, EFLAGS, SS and EIP;
+%macro irq_stub 2
+global irq_stub_%1
+irq_stub_%1:
+    cli
+    push byte 0
+    push byte %2
+    jmp irq_common_stub
+irq_stub 0, 32
+irq_stub 1, 33
+irq_stub 2, 34
+irq_stub 3, 35
+irq_stub 4, 36
+irq_stub 5, 37
+irq_stub 6, 38
+irq_stub 7, 39
+irq_stub 8, 40
+irq_stub 9, 41
+irq_stub 10, 42
+irq_stub 11, 43
+irq_stub 12, 44
+irq_stub 13, 45
+irq_stub 14, 46
+irq_stub 15, 47
+
+global irq_stub_table:
+irq_stub_table:
+%assign i 0
+%rep 32
+    dd irq_stub_%+1
+%assign i i+1
+%endrep
+
+extern irq_handler
+irq_common_stub:
+    pusha ; Pushes edi, esi, ebp, esp, ebx, edx, ecx, eax
+    mov ax, ds ; Lower 16 bits of eax = ds
+    push eax ; save the data segment descriptor
+    
+    mov ax, 0x10 ; load the kernel data segment descriptor
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    call irq_handler
+
+    pop ebx ; reload the orginal data segment descriptor
+    mov ds, bx
+    mov es, bx
+    mov fs, bx
+    mov gs, bx
