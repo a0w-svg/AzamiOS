@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include "./include/gdt.h"
+#include "../klibc/include/string.h"
 
 #define LOW_GDT(value) (value & 0xFFFF)
 #define HIGH_GDT(value) ((value >> 24) & 0xFF)
@@ -45,7 +46,7 @@ void set_gdt_gate(int32_t num, uint32_t base, uint32_t limit, uint8_t access, ui
     gdt_table[num].base_middle = (base >> 16) & 0xFF; // Sets the next  8 bits  of the GDT base;
     gdt_table[num].base_high = HIGH_GDT(base);        // Sets the last 8 bits of the GDT base;
     gdt_table[num].limit_low = LOW_GDT(limit);        // Sets the lower 16 bits of the GDT limit;
-    gdt_table[num].granularity = GRAN(limit);
+    gdt_table[num].granularity = (limit >> 16) & 0x0F;
     gdt_table[num].granularity |= granularity_segment & 0xF0; // Sets granularity;
     gdt_table[num].access = access; // sets access flags;
 }
@@ -54,11 +55,11 @@ void gdt_init()
 {
     gdt_pointer.limit = (sizeof(gdt_entry_t) * 5) - 1;
     gdt_pointer.base = &gdt_table[0];
-
     set_gdt_gate(0, 0, 0, 0, 0);                // Null segment;
     set_gdt_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xCF); // Code segment;
     set_gdt_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF); // Data segment;
     set_gdt_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF); // User-mode code segment;
     set_gdt_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF); // User-mode data segment;
+  
     gdt_flush();
 }

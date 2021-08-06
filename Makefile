@@ -1,11 +1,11 @@
 #Sources files compile
-C_SOURCES = $(wildcard  kernel/arch/*.c kernel/klibc/*.c)
+C_SOURCES = $(wildcard  kernel/arch/*.c kernel/klibc/*.c kernel/drivers/*.c)
 #Headers files list
-HEADERS = $(wildcard kernel/arch/include/*h kernel/klibc/include/*.h)
+HEADERS = $(wildcard kernel/arch/include/*h kernel/klibc/include/*.h kernel/drivers/include/*.h)
 #compiled files .o
 OBJ = ${C_SOURCES:.c=.o kernel/arch/cpu.o kernel/arch/interrupts.o} 
 #add macro to the cross compiler;
-CC =i686-elf-gcc
+CC = i686-elf-gcc
 #add macro to the debugger;
 GDB = i686-elf-gdb
 #GCC flags
@@ -21,11 +21,10 @@ kernel.elf: kernel/boot/boot.o ${OBJ}
 #run compiled image;
 run: kernel.bin
 	qemu-system-i386 -kernel kernel.bin -soundhw pcspk -serial stdio -hda diskimage.dd
-run-debug:
-	qemu-system-i386 -kernel kernel.bin -soundhw pcspk -serial stdio -hda diskimage.dd -d int
 #debug compiled image;
-run-iso: 
-		qemu-system-i386 -cdrom IrisOS.iso -soundhw pcspk -serial stdio -hda diskimage.dd
+run-debug: kernel.bin
+	qemu-system-i386 -kernel kernel.bin -soundhw pcspk -serial stdio -hda diskimage.dd -d int
+
 build-iso: kernel.bin menu.lst
 	mkdir -p iso/boot/grub              # create the folder structure
 	cp stage2_eltorito iso/boot/grub/   # copy the bootloader
@@ -39,8 +38,11 @@ build-iso: kernel.bin menu.lst
 	  -input-charset utf8             \
 	  -quiet                          \
 	 -boot-info-table                \
-	  -o IrisOS.iso                       \
+	  -o AzamiOS.iso                       \
 	  iso
+#run Azami's iso file;
+run-iso: AzamiOS.iso
+		qemu-system-i386 -cdrom AzamiOS.iso -soundhw pcspk -serial stdio -hda diskimage.dd
 #compile c files;
 %.o: %.c ${HEADERS}
 	${CC} ${CFLAGS} -ffreestanding -c $< -o $@
@@ -50,6 +52,7 @@ build-iso: kernel.bin menu.lst
 #compiles nasm files to bin;
 %.bin: %.asm
 	nasm $< -f bin -o $@
-#clean compiled files;
-clean:
-	
+#clean binary files;
+clean: 
+	rm -rf *.bin *.dis *.o AzamiOS.iso  
+	rm -rf kernel/arch/*.o boot/*.o kernel/klibc/*.o kernel/mem/*.o
