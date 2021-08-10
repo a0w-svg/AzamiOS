@@ -139,9 +139,10 @@ void printk_at(const char* txt, int col, int row, char attrib)
 /*
     Writes the string on the screen;
 */
-void terminal_write(const char* txt)
+int terminal_write(const char* txt)
 {
     printk_at(txt, -1, -1, 0);
+    return -1;
 }
 
 /*
@@ -157,6 +158,15 @@ void terminal_clean()
         term[i*2+1] = WHITE_ON_BLACK; // font color
     }
     set_cursor_offset(get_offset(0, 0)); // set cursor offset to 0, 0
+}
+
+/*
+    Puts character on the screen and return -1 if function finished successfully.
+*/
+int put_char(char ch)
+{
+    print_char(ch, -1, -1, 0);
+    return -1;
 }
 
 int get_offset(int col, int row)

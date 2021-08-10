@@ -13,3 +13,10 @@ gdt_flush:
 
 flush:
     ret
+
+global tss_flush ; allows our C code to call tss_flush()
+tss_flush:
+    mov ax, 0x2B ; Load the index of our TSS structure - The index is
+                 ; 0x28, as it is the 5 selector and each is 8 bytes long
+    ltr ax ; load 0x2B into task state register.
+    ret ; return to the code segment.

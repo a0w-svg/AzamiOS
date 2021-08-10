@@ -5,11 +5,14 @@
     Sets the first num bytes of the block of memory pointed by ptr to the specified value
     (interpreted as an unsigned char)
 */
-void memset(void* ptr, int value, size_t num)
+void* memset(void* ptr, int value, size_t num)
 {
-    char* pptr  = (char*)ptr;
-    for(size_t i = 0; i < num; i++)
-        pptr[i] = (char)value;
+    unsigned char* p = ptr;
+    while(num--)
+    {
+        *p++ = (unsigned char)value;
+    }
+    return ptr;
 }
 
 /*
@@ -17,13 +20,30 @@ void memset(void* ptr, int value, size_t num)
     Copies the values of num bytes from the location pointed to by source directly
     to the memory block pointed to by destination.
 */
-void memcpy(void* destination, const void* source, size_t num)
+void* memcpy(void* destination, const void* source, size_t num)
 {
-    char* src_char = (char*)source;
-    char* dest_char = (char*)destination;
-    for(size_t i = 0; i < num; i++)
-        dest_char[i] = src_char[i]; // copy contents byte by byte.
+    char* ptr_dest = (char*)destination;
+    const char* ptr_source = (const char*)source;
+    if((ptr_dest != NULL) && (ptr_source != NULL))
+    {
+        while(num)
+        {
+            *(ptr_dest++) = *(ptr_source++);
+            --num;
+        }
+    }
+    return destination;
 }
+
+/*
+    Move block of memory
+    Copies the values of num bytes from the location pointed by source
+    to the memory block pointed by destination. Copying takes place
+    as if an intermediate buffer were used, allowing the destination and source to overlap;
+    The underlying type of the objects pointed by both the source and destination pointers are irrelevant for this function;
+     The result is a binary copy of the data;
+*/
+void* memmove(void* destination, const void* source, size_t num);
 
 /*
     convert int type to ascii
@@ -120,4 +140,38 @@ int strcmp(char* str1, char* str2)
     if((str1[i] == '\0' && str2[i] != '\0') || (str1[i] != '\0' && str2[i] == '\0'))
         fault = 1;
     return fault;
+}
+
+/*
+    Copy string
+    Copies the C string pointed by source into the array pointed by destination,
+     including the terminating null character (and stopping at that point);
+*/
+char* strcpy(char* destination, const char* source);
+/*
+    Copy characters from string
+    Copies the first num characters of source to destination. 
+    If the end of the source C string (which is signaled by a null-character) 
+    is found before num characters have been copied, destination is
+    padded with zeros until a total of num characters have been written to it;
+*/
+char* strncpy(char* destination, const char* source, size_t num)
+{
+    // Return if destination and source is NULL;
+    if((destination == NULL) && (source == NULL)) return NULL;
+    // Take a pointer pointing to the beggining of destination string;
+    char* begin = destination;
+    /*
+        Copy first num characters of C-string pointed by source
+        into the array pointed by destination;
+    */
+   while(*source && num--)
+   {
+       *destination = *source;
+       destination++;
+       source++;
+   }
+   // null terminate destination string;
+   *destination = '\0';
+   return begin;
 }

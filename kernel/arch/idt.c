@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include "./include/idt.h"
 #include "../klibc/include/string.h"
+#include "./include/pic.h"
 #define KERNEL_CODE_SEGMENT 0x08 // The offset  your kernel code selector is in your GDT.
 #define MAX_IDT_DESCRIPTORS 256 // Max number of IDT descriptors.
 
@@ -20,16 +21,24 @@ void idt_set_gate(uint8_t num, void* interrupt_handler, uint16_t selector, uint8
 }
 
 extern void* isr_stub_table[];
+extern void* irq_stub_table[];
 /*
+    Initialize IDT;
 */
 void idt_init()
 {
     idtr.base = (uintptr_t)&idt;
     idtr.limit = (uint16_t)sizeof(idt_entry_t) * MAX_IDT_DESCRIPTORS - 1;
     memset(&idt, 0, sizeof(idt_entry_t)*256);
+    init_PIC();
     for(uint8_t i = 0; i < 32; i++)
     {
         idt_set_gate(i, isr_stub_table[i], KERNEL_CODE_SEGMENT, 0x8E);
+        idt_sets[i] = true;
+    }
+    for(uint8_t i = 0; i < 16; i++)
+    {
+        idt_set_gate(i, irq_stub_table[i], KERNEL_CODE_SEGMENT, 0x8E);
         idt_sets[i] = true;
     }
     __asm__ volatile ("lidt %0" : : "memory"(idtr)); // load the new IDT

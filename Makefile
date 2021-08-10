@@ -1,5 +1,5 @@
 #Sources files compile
-C_SOURCES = $(wildcard  kernel/arch/*.c kernel/klibc/*.c kernel/drivers/*.c)
+C_SOURCES = $(wildcard  kernel/arch/*.c kernel/klibc/*.c kernel/drivers/*.c kernel/klibc/stdio/*.c)
 #Headers files list
 HEADERS = $(wildcard kernel/arch/include/*h kernel/klibc/include/*.h kernel/drivers/include/*.h)
 #compiled files .o
