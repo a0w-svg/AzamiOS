@@ -8,8 +8,6 @@ void x86_arch_init()
     gdt_init();
     idt_init();
     terminal_clean();
-    printf("%s", "HEllo\n");
-    printf("%d", 234);
-    printf("%s", "\na\n");
-    printf("%x", 0x1A);
+    printf("dffd %d < %s >\n", 234, "Ssdfdgkfgd vvv");
+    asm volatile("INT $0x3");
 }

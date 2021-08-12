@@ -1,8 +1,46 @@
 #include "./include/isr.h"
-#include "../drivers/include/terminal.h"
+#include "../klibc/include/stdio.h"
 #include "./include/pic.h"
 
 isr_t interrupt_handlers[256];
+const char* exception_messages[] =
+{
+    "Division By Zero",
+    "Debug",
+    "Non Maskable Interrupt",
+    "Breakpoint",
+    "Into Detected Overflow",
+    "Out of Bounds",
+    "Invalid Opcode",
+    "No Coprocessor",
+
+    "Double Fault",
+    "Coprocessor Segment Overrun",
+    "Bad TSS",
+    "Segment Not Present",
+    "Stack Fault",
+    "General Protection Fault",
+    "Page Fault",
+    "Unknown Interrupt",
+
+    "Coprocessor Fault",
+    "Alignment Check",
+    "Machine Check",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved"
+};
 /*
     Interrupt handler; Gets called from asm interrupt handler stub;
 */
@@ -15,7 +53,8 @@ void exception_handler(registers_t *r)
     }
     else
     {
-
+        printf("unhandled interrupt: %d \n", r->int_no);
+        while(1);
     }
 }
 

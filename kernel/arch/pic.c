@@ -47,10 +47,10 @@
 */
 void PIC_remap(uint8_t offset1, uint8_t offset2)
 {
-    uint8_t p_mask, s_mask;
+    uint8_t p_mask = 0xFF, s_mask = 0xFF;
 
-    p_mask = inb(PIC1_DATA);
-    s_mask = inb(PIC2_DATA);
+    //p_mask = inb(PIC1_DATA);
+    //s_mask = inb(PIC2_DATA);
     outb(PIC1_COMMAND, ICW1_INIT | ICW1_ICW4); // starts the initialization sequence
     io_wait();
     outb(PIC2_COMMAND, ICW1_INIT | ICW1_ICW4);

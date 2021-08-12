@@ -1,14 +1,14 @@
 %macro isr_err_stub 1
-isr_stub_%+%1:
-    cli
-    push byte 0
-    push byte %1
+global isr_%1
+isr_%1:
+    push %1
     jmp  isr_common_stub
 %endmacro
 
 %macro isr_no_err_stub 1
-isr_stub_%+%1:
-    push byte 0
+global isr_%1
+isr_%1:
+    push  0
     push %1
     jmp isr_common_stub
 %endmacro
@@ -46,37 +46,16 @@ isr_no_err_stub 29
 isr_err_stub    30
 isr_no_err_stub 31
 
-global isr_stub_table
-isr_stub_table:
-%assign i 0
-%rep 32
-    dd isr_stub_%+i
-%assign i i+1
-%endrep
-
 extern exception_handler
 isr_common_stub:
-    pusha  ; pushes edi,esi,ebp, esp, ebx, ecx, eax;
-    mov ax, ds ; lower 16 bits of eax = ds;
-    push eax ; save the data segment descriptior;
-    mov ax, 0x10 ; load the kernel data segment descriptior;
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
+    pushad  ; pushes edi,esi,ebp, esp, ebx, ecx, eax;
     call exception_handler
-    pop eax ; reload the original data segment descriptior;
-    mov ds, bx
-    mov es, bx
-    mov fs, bx
-    mov gs, bx
-
-    popa ; pops edi, esi, ebp, esp, ecx, eax;
-    add esp, 8 ; cleans up the pushed error code and pushed ISR number;
-    iret ; pops CS, EIP, EFLAGS, SS and EIP;
+    popad
+    add esp, 8
+    iret
 %macro irq_stub 2
-global irq_stub_%1
-irq_stub_%1:
+global irq_%1
+irq_%1:
     cli
     push byte 0
     push byte %2
@@ -99,33 +78,13 @@ irq_stub 13, 45
 irq_stub 14, 46
 irq_stub 15, 47
 
-global irq_stub_table:
-irq_stub_table:
-%assign i 0
-%rep 16
-    dd irq_stub_%+i
-%assign i i+1
-%endrep
 
 extern irq_handler
 irq_common_stub:
-    pusha ; Pushes edi, esi, ebp, esp, ebx, edx, ecx, eax
-    mov ax, ds ; Lower 16 bits of eax = ds
-    push eax ; save the data segment descriptor
-    
-    mov ax, 0x10 ; load the kernel data segment descriptor
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-
+    pushad
+    push esp
     call irq_handler
-
-    pop ebx ; reload the orginal data segment descriptor
-    mov ds, bx
-    mov es, bx
-    mov fs, bx
-    mov gs, bx
-    popa ; pops edi, esi, ebp, esp, ecx, eax;
-    add esp, 8 ; cleans up the pushed error code and pushed ISR number;
-    iret ; pops CS, EIP, EFLAGS, SS and EIP;
+    pop esp
+    popad
+    add esp, 8
+    iret
