@@ -9,7 +9,7 @@ CC = i686-elf-gcc
 #add macro to the debugger;
 GDB = i686-elf-gdb
 #GCC flags
-CFLAGS = -g -ffreestanding -Wall -Wextra -fno-exceptions -m32
+CFLAGS = -g -ffreestanding -Wall -Wextra -fno-exceptions -m32 
 #create bootable file;
 kernel.bin: kernel/boot/boot.o ${OBJ}
 	i686-elf-ld  $^ -T Link.ld -o kernel.bin

@@ -47,30 +47,16 @@
 */
 void PIC_remap(uint8_t offset1, uint8_t offset2)
 {
-    uint8_t p_mask = 0xFF, s_mask = 0xFF;
-
-    //p_mask = inb(PIC1_DATA);
-    //s_mask = inb(PIC2_DATA);
-    outb(PIC1_COMMAND, ICW1_INIT | ICW1_ICW4); // starts the initialization sequence
-    io_wait();
+    outb(PIC1_COMMAND, ICW1_INIT | ICW1_ICW4); // starts the initialization sequence;
     outb(PIC2_COMMAND, ICW1_INIT | ICW1_ICW4);
-    io_wait();
     outb(PIC1_DATA, offset1); // ICW2: Primary PIC vector offset;
-    io_wait();
     outb(PIC2_DATA, offset2); // ICW2: Secondary PIC vector offset;
-    io_wait();
-    outb(PIC1_DATA, 4); // ICW3: tell primary PIC that there is a secondary PIC at IRQ2;
-    io_wait();
-    outb(PIC2_DATA, 2); // ICW3: tell  secondary PIC its cascade identity;
-    io_wait();
-
+    outb(PIC1_DATA, 0x04); // ICW3: tell primary PIC that there is a secondary PIC at IRQ2;
+    outb(PIC2_DATA, 0x02); // ICW3: tell  secondary PIC its cascade identity;
     outb(PIC1_DATA, ICW4_8086);
-    io_wait();
     outb(PIC2_DATA, ICW4_8086);
-    io_wait();
-
-    outb(PIC1_DATA, p_mask); // Restore saved masks;
-    outb(PIC2_DATA, s_mask);
+    outb(0x21, 0x0);
+    outb(0xA1, 0x0);
 }
 
 /*

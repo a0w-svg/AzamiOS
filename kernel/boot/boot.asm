@@ -20,11 +20,10 @@ global boot
 extern x86_arch_init
 boot:
     mov esp, stack_top
-    
-    call x86_arch_init
     cli 
-    hlt
+    call x86_arch_init
     jmp $
+    hlt
 
 section .bss
 align 16
