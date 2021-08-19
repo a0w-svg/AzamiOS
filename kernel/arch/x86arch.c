@@ -4,6 +4,7 @@
 #include "../drivers/include/terminal.h"
 #include "../klibc/include/stdio.h"
 #include "../drivers/include/pit.h"
+#include "../drivers/include/keyboard.h"
 void x86_arch_init()
 {
     gdt_init();
@@ -14,4 +15,5 @@ void x86_arch_init()
    __asm__ volatile("sti");
    init_pit();
    set_pit_phase(50);
+   init_keyboard();
 }
