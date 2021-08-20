@@ -36,37 +36,26 @@ void kb_ignore_resend();
 */
 bool kb_check_resend();
 /*
+    return diagnostics test result
+*/
+bool kb_get_diagnostic_res();
+/*
     return BAT test result
 */
 bool kb_get_bat_res();
 /*
+    returs true if keyboard is disabled;
+*/
+bool kb_is_disabled();
+/*
+    return last char;
+*/
+uint8_t kb_getchar();
+/*
     Read status from keyboard controller;
 */
-uint8_t kbc_read_status();
-/*
-    Send command byte to keyboard controller;
-*/
-void kbc_send_cmd(uint8_t cmd);
-/*
-    read keyboard encoder buffer;
-*/
-uint8_t kb_encoder_read_buffer();
-/*
-    Send command byte to keyboard encoder;
-*/
-void kb_encoder_send_cmd(uint8_t cmd);
-/*
-    Sets leds
-*/
 void kb_set_leds(bool num_led, bool caps_led, bool scroll_led);
-/*
-    run self test
-*/
-bool kb_self_test();
-/*
-    Set alternatate scan code set (PS/2 only);
-*/
-void kb_set_alt_scancode_set(uint8_t scancode_set);
+
 /*
     disable keyboard
 */
@@ -75,10 +64,6 @@ void kb_disable_keyboard();
     enables the keyboard;
 */
 void kb_enable_keyboard();
-/*
-    Restart the system;
-*/
-void kb_reset_system();
 /*  
     Initialize the keyboard;
 */

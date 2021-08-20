@@ -5,6 +5,7 @@
 #include "../klibc/include/stdio.h"
 #include "../drivers/include/pit.h"
 #include "../drivers/include/keyboard.h"
+#include "../drivers/include/kbc.h"
 void x86_arch_init()
 {
     gdt_init();
@@ -16,4 +17,5 @@ void x86_arch_init()
    init_pit();
    set_pit_phase(50);
    init_keyboard();
+   printf("\n%x", kb_device_check_type());
 }
