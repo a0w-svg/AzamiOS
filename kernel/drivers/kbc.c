@@ -97,11 +97,14 @@ uint8_t kb_interface_test()
 */
 uint8_t kb_device_check_type()
 {
+    uint8_t code;
     // send the disable scannig command;
     kb_encoder_send_cmd(KBE_RESET_POWER_ON_CONDITION_WAIT_TO_ENABLE_CMD);
     kb_encoder_send_cmd(KBE_SEND_2_BYTE_KB_ID);
     while(1)
         if((kbc_read_status() & KBC_STATS_MASK_OUT_BUFFER) == 0)
             break;
-    return kb_encoder_read_buffer();
+    code = kb_encoder_read_buffer();
+    kb_encoder_send_cmd(0xF4);
+    return code;
 }

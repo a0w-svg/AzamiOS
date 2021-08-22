@@ -19,7 +19,9 @@ mboot:
 global boot
 extern x86_arch_init
 boot:
-    mov esp, stack_top
+    mov esp, kstack
+    push ebx
+    push eax
     cli 
     call x86_arch_init
     jmp $
@@ -27,6 +29,10 @@ boot:
 
 section .bss
 align 16
-stack_bottom:
-resb 32768
-stack_top:
+    resb 32768
+kstack:
+    resb 32768
+    align 4096
+    global heap
+heap:
+    resb 1 << 23

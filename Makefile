@@ -1,15 +1,15 @@
 #Sources files compile
-C_SOURCES = $(wildcard  kernel/arch/*.c kernel/klibc/*.c kernel/drivers/*.c kernel/klibc/stdio/*.c)
+C_SOURCES = $(wildcard  kernel/arch/*.c kernel/klibc/*.c kernel/drivers/*.c kernel/klibc/stdio/*.c kernel/mem/*.c)
 #Headers files list
-HEADERS = $(wildcard kernel/arch/include/*h kernel/klibc/include/*.h kernel/drivers/include/*.h)
+HEADERS = $(wildcard kernel/arch/include/*h kernel/klibc/include/*.h kernel/drivers/include/*.h kernel/mem/include/*.h)
 #compiled files .o
-OBJ = ${C_SOURCES:.c=.o kernel/arch/cpu.o kernel/arch/interrupts.o} 
+OBJ = ${C_SOURCES:.c=.o kernel/arch/cpu.o kernel/arch/interrupts.o kernel/mem/paging.o} 
 #add macro to the cross compiler;
 CC = i686-elf-gcc
 #add macro to the debugger;
 GDB = i686-elf-gdb
 #GCC flags
-CFLAGS = -g -ffreestanding -Wall -Wextra -fno-exceptions -m32 
+CFLAGS = -g -ffreestanding -Wall -Wextra -fno-exceptions -m32 -fno-stack-protector
 #create bootable file;
 kernel.bin: kernel/boot/boot.o ${OBJ}
 	i686-elf-ld  $^ -T Link.ld -o kernel.bin
