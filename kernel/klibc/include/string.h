@@ -14,15 +14,7 @@ void* memset(void* ptr, int value, size_t num);
     to the memory block pointed to by destination;
 */
 void* memcpy(void* destination, const void* source, size_t num);
-/*
-    Move block of memory
-    Copies the values of num bytes from the location pointed by source
-    to the memory block pointed by destination. Copying takes place
-    as if an intermediate buffer were used, allowing the destination and source to overlap;
-    The underlying type of the objects pointed by both the source and destination pointers are irrelevant for this function;
-     The result is a binary copy of the data;
-*/
-void* memmove(void* destination, const void* source, size_t num);
+
 /*
     convert int type to ascii
     int base atrributes:
