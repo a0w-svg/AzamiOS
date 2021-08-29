@@ -2,7 +2,7 @@
 #define ISR_H
 
 #include <stdint.h>
-
+#define UNUSED(x) (void)(x) 
 typedef struct 
 {
     uint32_t ds;  // Data segment selector;

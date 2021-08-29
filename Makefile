@@ -20,7 +20,7 @@ kernel.elf: kernel/boot/boot.o ${OBJ}
 
 #run compiled image;
 run: kernel.bin
-	qemu-system-i386 -kernel kernel.bin -soundhw pcspk -serial stdio -hda diskimage.dd
+	qemu-system-i386 -kernel kernel.bin -soundhw pcspk -serial stdio #-hda diskimage.dd
 #debug compiled image;
 run-debug: kernel.bin
 	qemu-system-i386 -kernel kernel.bin -soundhw pcspk -serial stdio -hda diskimage.dd -d int

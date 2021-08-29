@@ -3,14 +3,13 @@
 #include "../klibc/include/port.h"
 #define PIT_CHANNEL0 0x40
 #define PIT_CHANNEL1 0x41
-#define PIT_CHANNEL2 0x42
 #define PIT_CMD_REG  0x43
 uint32_t pit_ticks = 0;
 
 void pit_handler(registers_t *r)
 {
     pit_ticks++; // increment the pit_ticks value after receiving an PIT interrupt;
-    
+    UNUSED(r);
 }
 
 /*

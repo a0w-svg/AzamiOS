@@ -8,6 +8,7 @@
 #include "../drivers/include/kbc.h"
 #include "../mem/include/mmp.h"
 #include "../../thirdparty/multiboot.h"
+#include "../drivers/include/rtc.h"
 void x86_arch_init(unsigned long magic, unsigned long addr)
 {
     gdt_init();
@@ -29,5 +30,12 @@ void x86_arch_init(unsigned long magic, unsigned long addr)
     for(int i = 0; i < 5; i++)
         printf("%d ", a[i]);
     init_keyboard();
+    rtc_init();
     printf("\n%x", kb_device_check_type());
+    time_t *time = kmalloc(sizeof(time_t));
+    while(true)
+    {
+        rtc_get_time(time);
+        printf("%d:%d:%d\n", time->hour, time->minute, time->second);
+    }
 }

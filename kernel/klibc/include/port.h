@@ -32,4 +32,18 @@ static inline void io_wait()
 {
     __asm__ volatile("jmp 1f\n\t" "1:jmp 2f\n\t" "2:");
 }
+/*
+    Enable the interrupts;
+*/
+static inline void en_interrrupts()
+{
+    __asm__ volatile("sti");
+}
+/*
+    Disable the interrupts;
+*/
+static inline void dis_interrupts()
+{
+    __asm__ volatile("cli");
+}
 #endif

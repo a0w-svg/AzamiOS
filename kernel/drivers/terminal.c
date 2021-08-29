@@ -99,7 +99,6 @@ int print_char(char ch, int col, int row, char attrib)
         vga_addr[offset+1] = attrib;
         offset += 2;
     }
-
     if(offset >= MAX_ROWS * MAX_COLS * 2)
     {
         for(int i = 1; i < MAX_ROWS; i++)
