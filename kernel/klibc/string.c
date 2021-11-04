@@ -20,19 +20,12 @@ void* memset(void* ptr, int value, size_t num)
     Copies the values of num bytes from the location pointed to by source directly
     to the memory block pointed to by destination.
 */
-void* memcpy(void* destination, const void* source, size_t num)
-{
-    char* ptr_dest = (char*)destination;
-    const char* ptr_source = (const char*)source;
-    if((ptr_dest != NULL) && (ptr_source != NULL))
-    {
-        while(num)
-        {
-            *(ptr_dest++) = *(ptr_source++);
-            --num;
-        }
-    }
-    return destination;
+void* memcpy(void* restrict dstptr, const void* restrict srcptr, size_t size) {
+	unsigned char* dst = (unsigned char*) dstptr;
+	const unsigned char* src = (const unsigned char*) srcptr;
+	for (size_t i = 0; i < size; i++)
+		dst[i] = src[i];
+	return dstptr;
 }
 
 /*
@@ -175,3 +168,4 @@ char* strncpy(char* destination, const char* source, size_t num)
    *destination = '\0';
    return begin;
 }
+

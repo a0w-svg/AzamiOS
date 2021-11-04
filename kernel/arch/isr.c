@@ -159,6 +159,7 @@ void init_isr()
     idt_set_gate(46, (uint32_t)irq_14, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
     idt_set_gate(47, (uint32_t)irq_15, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
     idt_init();
+    asm volatile("sti");
 }
 
 /*

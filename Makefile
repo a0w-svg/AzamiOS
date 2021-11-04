@@ -20,10 +20,10 @@ kernel.elf: kernel/boot/boot.o ${OBJ}
 
 #run compiled image;
 run: kernel.bin
-	qemu-system-i386 -kernel kernel.bin -soundhw pcspk -serial stdio #-hda diskimage.dd
+	qemu-system-i386 -kernel kernel.bin -soundhw pcspk -serial stdio
 #debug compiled image;
 run-debug: kernel.bin
-	qemu-system-i386 -kernel kernel.bin -soundhw pcspk -serial stdio -hda diskimage.dd -d int
+	qemu-system-i386 -kernel kernel.bin -soundhw pcspk -serial stdio -S
 
 build-iso: kernel.bin menu.lst
 	mkdir -p iso/boot/grub              # create the folder structure
@@ -42,7 +42,7 @@ build-iso: kernel.bin menu.lst
 	  iso
 #run Azami's iso file;
 run-iso: AzamiOS.iso
-		qemu-system-i386 -cdrom AzamiOS.iso -soundhw pcspk -serial stdio -hda diskimage.dd
+		qemu-system-i386 -cdrom AzamiOS.iso -soundhw pcspk -serial stdio
 #compile c files;
 %.o: %.c ${HEADERS}
 	${CC} ${CFLAGS} -ffreestanding -c $< -o $@

@@ -13,7 +13,7 @@ void* memset(void* ptr, int value, size_t num);
     Copies the values of num bytes from the location pointed to by source directly
     to the memory block pointed to by destination;
 */
-void* memcpy(void* destination, const void* source, size_t num);
+void* memcpy(void* restrict dstptr, const void* restrict srcptr, size_t size);
 /*
     Move block of memory
     Copies the values of num bytes from the location pointed by source

@@ -12,14 +12,12 @@ typedef struct
     uint8_t day;
     uint8_t month;
     uint32_t year;
-}time_t;
+}__attribute((packed)) time_t;
 /*
     Get the current time from RTC;
 */
+
 void rtc_get_time(time_t* time);
-/*
-    Initialize Real Time Clock;
-*/
 void rtc_init();
 /*
     Send value to RTC reg;
