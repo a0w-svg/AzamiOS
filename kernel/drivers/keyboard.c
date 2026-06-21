@@ -268,7 +268,7 @@ void key_handler(int32_t keycode)
 /*
     Keyboard handler;
 */
-static void keyboard_handler()
+static void keyboard_handler(registers_t* regs)
 {
     uint8_t status;
     int8_t scan_code;

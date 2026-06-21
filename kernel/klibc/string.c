@@ -1,18 +1,18 @@
 #include "./include/string.h"
 #include <limits.h>
+#include <stdint.h>
 /*
     Fill block of memory
     Sets the first num bytes of the block of memory pointed by ptr to the specified value
     (interpreted as an unsigned char)
 */
-void* memset(void* ptr, int value, size_t num)
+void* memset(void* s, int c, size_t n)
 {
-    unsigned char* p = ptr;
-    while(num--)
-    {
-        *p++ = (unsigned char)value;
+    uint8_t* p  = (uint8_t*)s;
+    while(n--){
+        *p++ = (uint8_t)c;
     }
-    return ptr;
+    return s;
 }
 
 /*
@@ -20,12 +20,25 @@ void* memset(void* ptr, int value, size_t num)
     Copies the values of num bytes from the location pointed to by source directly
     to the memory block pointed to by destination.
 */
-void* memcpy(void* restrict dstptr, const void* restrict srcptr, size_t size) {
-	unsigned char* dst = (unsigned char*) dstptr;
-	const unsigned char* src = (const unsigned char*) srcptr;
-	for (size_t i = 0; i < size; i++)
-		dst[i] = src[i];
-	return dstptr;
+void* memcpy(void* dest, const void* src, size_t n) {
+	uint8_t* d = (uint8_t*)dest;
+    const uint8_t* s = (const uint8_t*)src;
+    // try copying whole words (4 bytes) if addresses are aligned.
+    uint32_t* d32 = (uint32_t*)d;
+    const uint32_t* s32 = (const uint32_t*)s;
+    
+    while(n >= 4){
+        *d32++ = *s32++;
+        n -= 4;
+    }
+
+    // finish remain part (when n < 4)
+    d = (uint8_t*)d32;
+    s = (const uint8_t*)s32;
+    while(n--){
+        *d++ = *s++;
+    }
+    return dest;
 }
 
 /*
@@ -36,7 +49,23 @@ void* memcpy(void* restrict dstptr, const void* restrict srcptr, size_t size) {
     The underlying type of the objects pointed by both the source and destination pointers are irrelevant for this function;
      The result is a binary copy of the data;
 */
-void* memmove(void* destination, const void* source, size_t num);
+void* memmove(void* dest, const void* src, size_t n){
+    uint8_t* d = (uint8_t*)dest;
+    const uint8_t* s = (const uint8_t*)src;
+
+    // if regions doesn't collide with each other then use fast memcpy
+    if(d <=  s || d >= (s + n)){
+        return memcpy(dest,src,n);
+    }
+    // if regions collide with each other (d > s), we have to copy from end,
+    // in order to not override data that we haven't copied yet.
+    d += n;
+    s += n;
+    while(n--){
+        *--d = *--s;
+    }
+    return dest;
+}
 
 /*
     convert int type to ascii
@@ -46,37 +75,47 @@ void* memmove(void* destination, const void* source, size_t num);
     int d - source int type
     char* buffer - destination product
 */
-void itoa(char* buf, int base, int d)
+char* itoa(int value, char* str, int base)
 {
-    char* p = buf;
-    char* p1, *p2;
-    unsigned long src = d;
-    int divisor = 10; // decimal
-    if(base == 'd' && d < 0)
-    {
-        *p++ = '-';
-        buf++;
-        src = -d;
-    }
-    else if(base == 'x')
-        divisor = 16;
-    do{
-        int remainer = src % divisor;
-        *p++ = (remainer < 10) ? remainer + '0' : remainer + 'A' - 10;
-    }while(src /= divisor);
-    *p = 0;
-    p1 = buf;
-    p2 = p - 1;
-    while(p1 < p2)
-    {
-        char tmp = *p1;
-        *p1 = *p2;
-        *p2 = tmp;
-        p1++;
-        p2--;
-    }
-}
+    char* ptr = str;
+    char* ptr1 = str;
+    char tmp_char;
+    int is_negative = 0;
 
+    // zero handler
+    if(value == 0){
+        *ptr++ = '0';
+        *ptr = '\0';
+        return str;
+    }
+
+    // negative numbers for decimal system support
+    if(value < 0 && base == 10){
+        is_negative = 1;
+        value = -value;
+    }
+    
+    // digit generator
+    while(value != 0){
+        int rem = value % base;
+        *ptr++ = (rem > 9) ? (rem - 10) + 'A' : rem + '0';
+    }
+    // add negative sign 
+    if(is_negative){
+        *ptr++ = '-';
+    }
+
+    *ptr = '\0';
+
+    // reverse string
+    ptr--;
+    while(ptr1 < ptr){
+        tmp_char = *ptr;
+        *ptr-- = *ptr1;
+        *ptr1++ = tmp_char;
+    }
+    return str;
+}
 /*
     converts ascii to int type;
 */
@@ -107,32 +146,25 @@ int atoi(char *str)
 /*
     Return the string length
 */
-int strlen(const char* str)
+int strlen(const char* s)
 {
-    int i = 0;
-    while(str[i] != '\0')
-        ++i;
-    return i;
+   size_t len = 0;
+   while(s[len]){
+    len++;
+   }
+   return len;
 }
 
 /*
     Compare two string and return 1 if them are identical or 0 if them are not identical;
 */
-int strcmp(char* str1, char* str2)
+int strcmp(const char* s1, const char* s2)
 {
-    int i = 0, fault = 0;
-    while(str1[i] != '\0' && str2[i] != '\0')
-    {
-        if(str1[i] != str2[i])
-        {
-            fault = 1;
-            break;
-        }
-        i++;
+    while(*s1 && (*s1 == *s2)){
+        s1++;
+        s2++;
     }
-    if((str1[i] == '\0' && str2[i] != '\0') || (str1[i] != '\0' && str2[i] == '\0'))
-        fault = 1;
-    return fault;
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
 /*
@@ -140,7 +172,11 @@ int strcmp(char* str1, char* str2)
     Copies the C string pointed by source into the array pointed by destination,
      including the terminating null character (and stopping at that point);
 */
-char* strcpy(char* destination, const char* source);
+char* strcpy(char* dest, const char* src){
+    char* d = dest;
+    while((*d++ = *src++));
+    return dest;
+}
 /*
     Copy characters from string
     Copies the first num characters of source to destination. 
@@ -167,5 +203,14 @@ char* strncpy(char* destination, const char* source, size_t num)
    // null terminate destination string;
    *destination = '\0';
    return begin;
+}
+
+int strncmp(const char* s1, const char* s2, size_t n){
+    while(n && *s1 && (*s1 == *s2)){
+        s1++;
+        s2++;
+        n--;
+    }
+    return (n == 0) ? 0 : (*(const unsigned char*)s1 - *(const unsigned char*)s2);
 }
 

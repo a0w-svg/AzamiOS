@@ -61,5 +61,7 @@ typedef union
     
 }page_directory_entry_t;
 
-void switch_page_dir(void *page);
+void paging_map_page(uint32_t phys_addr, uint32_t virt_addr, uint8_t is_kernel, uint8_t is_writable);
+void paging_init();
+
 #endif

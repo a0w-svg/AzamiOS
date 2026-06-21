@@ -7,13 +7,15 @@
     Sets the first num bytes of the block of memory pointed by ptr to the specified value
     (interpreted as an unsigned char);
 */
-void* memset(void* ptr, int value, size_t num);
+void* memset(void* s, int c, size_t n);
 /*
     Copy block of memory;
     Copies the values of num bytes from the location pointed to by source directly
     to the memory block pointed to by destination;
 */
-void* memcpy(void* restrict dstptr, const void* restrict srcptr, size_t size);
+void* memcpy(void* dest, const void* src, size_t n);
+
+int memcmp(const void* s1, const void* s2, size_t n);
 /*
     Move block of memory
     Copies the values of num bytes from the location pointed by source
@@ -31,7 +33,7 @@ void* memmove(void* destination, const void* source, size_t num);
     int d - source int type
     char* buffer - destination product
 */
-void itoa(char* buf, int base, int d);
+char* itoa(int value, char* str, int base);
 /*
     converts ascii to int type;
 */
@@ -39,17 +41,17 @@ int atoi(char *str);
 /*
     Return the string length
 */
-int strlen(const char* str);
+int strlen(const char* s);
 /*
     Compare two string and return 1 if them are identical or 0 if them are not identical;
 */
-int strcmp(char* str1, char* str2);
+int strcmp(const char* s1, const char* s2);
 /*
     Copy string
     Copies the C string pointed by source into the array pointed by destination,
      including the terminating null character (and stopping at that point);
 */
-char* strcpy(char* destination, const char* source);
+char* strcpy(char* dest, const char* src);
 /*
     Copy characters from string
     Copies the first num characters of source to destination. 
@@ -58,4 +60,7 @@ char* strcpy(char* destination, const char* source);
     padded with zeros until a total of num characters have been written to it;
 */
 char* strncpy(char* destination, const char* source, size_t num);
+
+int strncmp(const char* s1, const char* s2, size_t n);
+
 #endif 
