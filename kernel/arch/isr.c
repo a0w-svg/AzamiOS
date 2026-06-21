@@ -178,8 +178,12 @@ void exception_handler(registers_t *r)
     }
     else
     {
-        printf("Received unhandled interrupt: %d %s\n", r->int_no, exception_messages[r->int_no]);
-        // halt cpu in critical error state
+        if(r->int_no < 32){
+            printf("Receive unhandled exception: %d %s\n", r->int_no, exception_messages[r->int_no]);
+        }
+        else{
+            printf("Receive unhandled interrupt: %d\n", r->int_no);
+        }
         for(;;);
     }
 }
