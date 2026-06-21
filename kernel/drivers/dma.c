@@ -130,7 +130,7 @@ void dma_set_mode(uint8_t channel, uint8_t mode)
     dma_mask_channel(channel);
     uint16_t port_chan = (channel < 4) ? (DMA0_MODE_REG) : DMA1_MODE_REG;
     outb(port_chan, dma_channel | (mode));
-    dma_unmask_all(dma);
+    dma_unmask_channel(channel);
 }
 
 /*
@@ -154,7 +154,7 @@ void dma_set_write(uint8_t channel)
 */
 void dma_reset_flipflop(int dma)
 {
-    if(dma < 2) return;
+    if(dma > 1) return;
     uint16_t port = (dma == 0) ? DMA0_CLEARBYTE_FLIPFLOP_REG : DMA1_CLEARBYTE_FLIPFLOP_REG;
     // it doesn't matter what is written to this register;
     outb(port, 0xFF);
@@ -165,8 +165,12 @@ void dma_reset_flipflop(int dma)
 */
 void dma_reset(int dma)
 {
-    // it doesn't matter what is written to this register;
-    outb(DMA0_TEMP_REG, 0xFF);
+    if(dma == 0){
+        outb(DMA0_PRIMARY_CLEAR_REG, 0xFF);
+    }
+    else if(dma == 1){
+        outb(DMA1_PRIMARY_CLEAR_REG, 0xFF);
+    }
 }
 
 /*
@@ -250,11 +254,11 @@ void dma_set_count(uint8_t channel, uint8_t low, uint8_t high)
 */
 void dma_mask_channel(uint8_t channel)
 {
-    if(channel <= 4)
-        outb(DMA0_CHAN_MASK_REG, (1 << (channel - 1)));
-    else
-    {
-        outb(DMA1_CHAN_MASK_REG, (1 << (channel - 5)));
+    if(channel < 4){ // DMA0
+        outb(DMA0_CHAN_MASK_REG,  0x4 | channel); // BIT 2 (0x04) disable mask
+    }
+    else if(channel < 8){ // DMA1
+        outb(DMA1_CHAN_MASK_REG, 0x04 | (channel - 4));
     }
 }
 
@@ -263,11 +267,11 @@ void dma_mask_channel(uint8_t channel)
 */
 void dma_unmask_channel(uint8_t channel)
 {
-    if(channel <= 4)
-        outb(DMA0_CHAN_MASK_REG, channel);
+    if(channel <= 4) // DMA0
+        outb(DMA0_CHAN_MASK_REG, channel); // Bit 2 is set to zero = disable mask
     else
-    {
-        outb(DMA1_CHAN_MASK_REG, channel);
+    { // DMA1
+        outb(DMA1_CHAN_MASK_REG, channel - 4);
     }
 }
 

@@ -12,6 +12,7 @@
 #include "../drivers/include/rtc.h"
 #include "../drivers/include/serial.h"
 #include "../klibc/include/string.h"
+#include "../syscall/include/syscall.h"
 
 extern uint32_t __end;
 void x86_arch_init(unsigned long magic, unsigned long addr)
@@ -29,7 +30,7 @@ void x86_arch_init(unsigned long magic, unsigned long addr)
     // 3. initialize CPU tables (GDT and interrupts)
     gdt_init();
     init_isr();
-    
+    init_syscalls();
     // 4. Initialize memory management (PMM and VMM)
     multiboot_info_t* bootinfo = (multiboot_info_t*)addr;
 

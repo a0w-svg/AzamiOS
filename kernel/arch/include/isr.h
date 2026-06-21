@@ -6,7 +6,7 @@
 typedef struct 
 {
     uint32_t ds;  // Data segment selector;
-    uint32_t edi, esi, ebp, euseless, ebx, ecx, eax; // Pushed by pusha;
+    uint32_t edi, esi, ebp, euseless, ebx, edx, ecx, eax; // Pushed by pusha;
     uint32_t err_code, int_no; // Interrupt number and error code (if applicable);
     uint32_t eip, cs, eflags, esp, ss; // Pushed by the procesor automatically;
 }registers_t;
