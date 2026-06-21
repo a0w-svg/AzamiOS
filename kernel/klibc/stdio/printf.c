@@ -10,6 +10,7 @@
     %d - displaying the decimal number from the argument of the int type;
     %s - displaying the string from the argument of the  const char* type;
     %x - displaying the hexadecimal number from the argument of the int type;
+    %o - displaying the octal number from the argument of the int type;
  */
 void printf(char* format, ...)
 {

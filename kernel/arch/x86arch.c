@@ -13,7 +13,8 @@
 #include "../drivers/include/serial.h"
 #include "../klibc/include/string.h"
 #include "../syscall/include/syscall.h"
-
+#include "../filesystem/include/tarfs.h"
+#include "../filesystem/include/vfs.h"
 extern uint32_t __end;
 void x86_arch_init(unsigned long magic, unsigned long addr)
 {
@@ -42,4 +43,13 @@ void x86_arch_init(unsigned long magic, unsigned long addr)
     pmm_init(mem_size_kb, (uint32_t)&__end);
     // initialize Paging (Identity Mapping on boot)
     paging_init();
+    printf("test initrd: \n");
+    if(bootinfo->flags & MULTIBOOT_INFO_MODS){
+        if(bootinfo->mods_count > 0){
+            multiboot_module_t *mod = (multiboot_module_t*)bootinfo->mods_addr;
+            uint32_t initrd_location = mod->mod_start;
+            tarfs_init(initrd_location);
+            printf("found directory: %s" find)
+        }
+    }
 }
