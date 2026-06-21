@@ -11,10 +11,21 @@
 #define FS_SYMLINK      0x06
 #define FS_MOUNTPOINT   0x08
 
+typedef struct block_device {
+    char name[32];
+    uint32_t block_size; 
+    uint32_t (*read)(struct block_device *dev, uint32_t lba, uint32_t count, void *buffer);
+    uint32_t (*write)(struct block_device *dev, uint32_t lba, uint32_t count, void *buffer);
+    void *impl_data;
+} block_device_t;
+
+// register device in system
+void vfs_register_device(block_device_t *dev);
+
 struct fs_node;
 // pointers to specific functions for specified filesystem
-typedef uint32_t (*read_type_t)(struct fs_node*, uint32_t offset, uint32_t size, uint8_t *buffer);
-typedef uint32_t (*write_type_t)(struct fs_node*, uint32_t offset, uint32_t size, uint8_t *buffer);
+typedef uint32_t (*read_type_t)(block_device_t *dev, struct fs_node*, uint32_t offset, uint32_t size, uint8_t *buffer);
+typedef uint32_t (*write_type_t)(block_device_t *dev, struct fs_node*, uint32_t offset, uint32_t size, uint8_t *buffer);
 typedef int (*open_type_t)(struct fs_node*);
 typedef int (*close_type_t)(struct fs_node*);
 typedef struct directory_entry * (*readdir_type_t)(struct fs_node*, uint32_t index);
