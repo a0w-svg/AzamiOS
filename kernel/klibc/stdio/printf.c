@@ -40,9 +40,13 @@ void printf(char* format, ...)
             case 'o': // Fetch Octal representation;
                 i = va_arg(arg, int);
                 itoa(i, buf, 8);
+                puts(buf);
                 break;
             case 's': // Fetch string;
                 string = va_arg(arg, char*);
+                if(string == NULL){
+                    string = "(null)";
+                }
                 puts(string);
                 break;
             case 'x': // Fetch Hexadecimal representation

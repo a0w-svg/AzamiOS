@@ -49,7 +49,7 @@ void x86_arch_init(unsigned long magic, unsigned long addr)
             multiboot_module_t *mod = (multiboot_module_t*)bootinfo->mods_addr;
             uint32_t initrd_location = mod->mod_start;
             tarfs_init(initrd_location);
-            printf("found directory: %s" find)
+            printf("found directory: %s", fs_root->finddir(fs_root, "test")->name);
         }
     }
 }

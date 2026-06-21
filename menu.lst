@@ -2,3 +2,4 @@ default=0
 timeout=0
 title AzamiOS
 kernel /boot/kernel.bin
+module /boot/initrd.tar

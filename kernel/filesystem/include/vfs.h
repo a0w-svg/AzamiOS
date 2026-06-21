@@ -15,8 +15,8 @@ struct fs_node;
 // pointers to specific functions for specified filesystem
 typedef uint32_t (*read_type_t)(struct fs_node*, uint32_t offset, uint32_t size, uint8_t *buffer);
 typedef uint32_t (*write_type_t)(struct fs_node*, uint32_t offset, uint32_t size, uint8_t *buffer);
-typedef void (*open_type_t)(struct fs_node*);
-typedef void (*close_type_t)(struct fs_node*);
+typedef int (*open_type_t)(struct fs_node*);
+typedef int (*close_type_t)(struct fs_node*);
 typedef struct directory_entry * (*readdir_type_t)(struct fs_node*, uint32_t index);
 typedef struct fs_node * (*finddir_type_t)(struct fs_node*, char* name);
 

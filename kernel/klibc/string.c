@@ -21,20 +21,8 @@ void* memset(void* s, int c, size_t n)
     to the memory block pointed to by destination.
 */
 void* memcpy(void* dest, const void* src, size_t n) {
-	uint8_t* d = (uint8_t*)dest;
+		uint8_t* d = (uint8_t*)dest;
     const uint8_t* s = (const uint8_t*)src;
-    // try copying whole words (4 bytes) if addresses are aligned.
-    uint32_t* d32 = (uint32_t*)d;
-    const uint32_t* s32 = (const uint32_t*)s;
-    
-    while(n >= 4){
-        *d32++ = *s32++;
-        n -= 4;
-    }
-
-    // finish remain part (when n < 4)
-    d = (uint8_t*)d32;
-    s = (const uint8_t*)s32;
     while(n--){
         *d++ = *s++;
     }
@@ -118,14 +106,15 @@ char* strncpy(char* destination, const char* source, size_t num)
         Copy first num characters of C-string pointed by source
         into the array pointed by destination;
     */
-   while(*source && num--)
-   {
-       *destination = *source;
-       destination++;
-       source++;
-   }
-   // null terminate destination string;
-   *destination = '\0';
+   while (num > 0 && *source != '\0') {
+        *destination++ = *source++;
+        num--;
+    }
+    
+    while (num > 0) {
+        *destination++ = '\0';
+        num--;
+    }
    return begin;
 }
 
