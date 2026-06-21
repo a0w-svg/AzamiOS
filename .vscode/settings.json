@@ -1,8 +1,0 @@
-{
-    "files.associations": {
-        "isr.h": "c",
-        "string.h": "c",
-        "terminal.h": "c",
-        "gdt.h": "c"
-    }
-}
