@@ -33,14 +33,6 @@ void* memmove(void* destination, const void* source, size_t num);
     int d - source int type
     char* buffer - destination product
 */
-char* itoa(int value, char* str, int base);
-/*
-    converts ascii to int type;
-*/
-int atoi(char *str);
-/*
-    Return the string length
-*/
 int strlen(const char* s);
 /*
     Compare two string and return 1 if them are identical or 0 if them are not identical;

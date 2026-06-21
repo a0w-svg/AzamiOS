@@ -78,6 +78,11 @@ extern void isr_28();
 extern void isr_29();
 extern void isr_30();
 extern void isr_31();
+
+// syscall
+extern void isr_128();
+
+// IRQ
 extern void irq_0();
 extern void irq_1();
 extern void irq_2();
@@ -131,17 +136,14 @@ void init_isr()
     idt_set_gate(29, (uint32_t)isr_29, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
     idt_set_gate(30, (uint32_t)isr_30, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
     idt_set_gate(31, (uint32_t)isr_31, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
-    // irqs
-    outb(0x20, 0x11);
-    outb(0xA0, 0x11);
-    outb(0x21, 0x20);
-    outb(0xA1, 0x28);
-    outb(0x21, 0x04);
-    outb(0xA1, 0x02);
-    outb(0x21, 0x01);
-    outb(0xA1, 0x01);
-    outb(0x21, 0x0);
-    outb(0xA1, 0x0);
+    
+    // register syscall for userspace (DPL = 3)
+    idt_set_gate(128, (uint32_t)isr_128, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE_USER);
+    
+    // initialize and remap PIC 
+    init_PIC();
+    
+    // registrate hardware interrupts IRQ
     idt_set_gate(32, (uint32_t)irq_0, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
     idt_set_gate(33, (uint32_t)irq_1, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
     idt_set_gate(34, (uint32_t)irq_2, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
@@ -158,6 +160,8 @@ void init_isr()
     idt_set_gate(45, (uint32_t)irq_13, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
     idt_set_gate(46, (uint32_t)irq_14, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
     idt_set_gate(47, (uint32_t)irq_15, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
+    
+    // load IDT table and enable interrupts
     idt_init();
     asm volatile("sti");
 }
@@ -174,7 +178,9 @@ void exception_handler(registers_t *r)
     }
     else
     {
-        printf("received unhandled interrupt: %d %s", r->int_no, exception_messages[r->int_no]);
+        printf("Received unhandled interrupt: %d %s\n", r->int_no, exception_messages[r->int_no]);
+        // halt cpu in critical error state
+        for(;;);
     }
 }
 
@@ -190,13 +196,11 @@ IRQ handler
 */
 void irq_handler(registers_t *r)
 {
-    if(r->int_no >= 40)
-        outb(0xA0, 0x20); // secondary mode
-    // primary mode
-    outb(0x20, 0x20);
-    if(interrupt_handlers[r->int_no] != 0)
-    {
+    // check if interrupt comes from dedicated handler (for example: keyboard)
+    if(interrupt_handlers[r->int_no] != 0){
         isr_t handler = interrupt_handlers[r->int_no];
         handler(r);
     }
+    // send EOI signal to PIC
+    PIC_send_EOI(r->int_no - 32);
 }

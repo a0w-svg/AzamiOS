@@ -1,5 +1,6 @@
 #include "../include/stdio.h"
 #include "../include/string.h"
+#include "../include/stdlib.h"
 #include <stddef.h>
 #include <stdarg.h>
 #include <limits.h>
@@ -32,11 +33,12 @@ void printf(char* format, ...)
                 break;
             case 'd': // Fetch Decimal/Integer argument;
                 i = va_arg(arg, int);
-                itoa(buf, 'd', i);
+                itoa(i, buf, 10);
                 puts(buf);
                 break;
             case 'o': // Fetch Octal representation;
                 i = va_arg(arg, int);
+                itoa(i, buf, 8);
                 break;
             case 's': // Fetch string;
                 string = va_arg(arg, char*);
@@ -44,7 +46,7 @@ void printf(char* format, ...)
                 break;
             case 'x': // Fetch Hexadecimal representation
                 i = va_arg(arg, int);
-                itoa(buf, 'x', i);
+                itoa(i, buf, 16);
                 puts("0x");
                 puts(buf);
                 break;

@@ -1,7 +1,7 @@
 global gdt_flush ; Allows  the C code to call gdt_flush().
-extern gdt_pointer
 gdt_flush:
-    lgdt [gdt_pointer]         ; load the new GDT pointer.
+    mov eax, [esp+4]
+    lgdt [eax]         ; load the new GDT pointer.
 
     mov ax, 0x10       ; 0x10 is the offset in the GDT to our data segment.
     mov ds, ax         ; loads all data segment selectors.

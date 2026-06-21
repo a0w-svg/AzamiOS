@@ -2,6 +2,7 @@
 #define IDT_H
 #include <stdint.h>
 #define BITS_32_INTERRUPT_GATE 0x8E
+#define BITS_32_INTERRUPT_GATE_USER 0xEE
 #define KERNEL_CODE_SEGMENT 0x08 // The offset  your kernel code selector is in your GDT.
 typedef struct 
 {

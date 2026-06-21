@@ -26,7 +26,7 @@ typedef struct
     gdt_entry_t *base;  // The address of the first gdt_entry_t struct.
 } __attribute__((packed)) gdt_ptr_t;
 
-gdt_entry_t gdt_table[5]; // GDT entries table.
+gdt_entry_t gdt_table[6]; // GDT entries table.
 gdt_ptr_t gdt_pointer;    // The pointer to the Global Descriptor Table.
 
 /*
@@ -38,7 +38,7 @@ gdt_ptr_t gdt_pointer;    // The pointer to the Global Descriptor Table.
     the granularity_segment variable determines the scaling of the segment limit field.  
 */
 
-extern void gdt_flush(); // enables access to our asm function from our C code.
+extern void gdt_flush(uint32_t pointer); // enables access to our asm function from our C code.
 
 void set_gdt_gate(int32_t num, uint32_t base, uint32_t limit, uint8_t access, uint8_t granularity_segment)
 {
@@ -54,13 +54,13 @@ void set_gdt_gate(int32_t num, uint32_t base, uint32_t limit, uint8_t access, ui
 
 void gdt_init()
 {
-    gdt_pointer.limit = (sizeof(gdt_entry_t) * 5) - 1;
+    gdt_pointer.limit = (sizeof(gdt_entry_t) * 6) - 1;
     gdt_pointer.base = &gdt_table[0];
     set_gdt_gate(0, 0, 0, 0, 0);                // Null segment;
     set_gdt_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xCF); // Code segment;
     set_gdt_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF); // Data segment;
     set_gdt_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF); // User-mode code segment;
     set_gdt_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF); // User-mode data segment;
-  
-    gdt_flush();
+    set_gdt_gate(5, 0, 0, 0, 0); // TSS
+    gdt_flush((uint32_t)&gdt_pointer);
 }
