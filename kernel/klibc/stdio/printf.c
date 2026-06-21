@@ -12,7 +12,7 @@
     %x - displaying the hexadecimal number from the argument of the int type;
     %o - displaying the octal number from the argument of the int type;
  */
-void printf(char* format, ...)
+void kprintf(char* format, ...)
 {
     char *string; // Pointer to char* argument;
     char buf[50]; // Buffer used to converts numbers to strings;
@@ -52,7 +52,6 @@ void printf(char* format, ...)
             case 'x': // Fetch Hexadecimal representation
                 i = va_arg(arg, int);
                 itoa(i, buf, 16);
-                puts("0x");
                 puts(buf);
                 break;
             }

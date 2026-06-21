@@ -122,6 +122,7 @@ irq_common_stub:
     mov gs, ax
     push esp ; registers_t *r
     cld ; cleans DF flag
+    call irq_handler;
     pop ebx ; restore saved cpu state
     pop ebx
     mov ds, bx

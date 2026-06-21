@@ -99,6 +99,9 @@ extern void irq_12();
 extern void irq_13();
 extern void irq_14();
 extern void irq_15();
+
+void page_fault_handler(registers_t *r);
+
 /*
     Initialize Iterrupt Service Routine;
 */
@@ -160,7 +163,7 @@ void init_isr()
     idt_set_gate(45, (uint32_t)irq_13, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
     idt_set_gate(46, (uint32_t)irq_14, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
     idt_set_gate(47, (uint32_t)irq_15, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
-    
+    register_interrupt_handler(14, page_fault_handler);
     // load IDT table and enable interrupts
     idt_init();
     asm volatile("sti");
@@ -179,10 +182,10 @@ void exception_handler(registers_t *r)
     else
     {
         if(r->int_no < 32){
-            printf("Receive unhandled exception: %d %s\n", r->int_no, exception_messages[r->int_no]);
+            kprintf("Receive unhandled exception: %d %s\n", r->int_no, exception_messages[r->int_no]);
         }
         else{
-            printf("Receive unhandled interrupt: %d\n", r->int_no);
+            kprintf("Receive unhandled interrupt: %d\n", r->int_no);
         }
         for(;;);
     }
@@ -207,4 +210,19 @@ void irq_handler(registers_t *r)
     }
     // send EOI signal to PIC
     PIC_send_EOI(r->int_no - 32);
+}
+
+void page_fault_handler(registers_t *r) {
+    uint32_t faulting_address;
+    asm volatile("mov %%cr2, %0" : "=r"(faulting_address));
+    
+    int present = !(r->err_code & 0x1); // 0 = Page not found, 1 = security error
+    int rw = r->err_code & 0x2;  // 0 = read error, 2 = write error
+    int us = r->err_code & 0x4; // 0 = kernel fault, 4 = usermode fault
+    uint32_t cr2;
+    asm volatile("mov %%cr2, %0" : "=r"(cr2));
+    kprintf("\n[PAGE FAULT] Adres: 0x%x\n");
+    kprintf("Page not found: %d, Write: %d, Ring3: %d\n", present, rw, us);
+    kprintf("\nCritical Error: Page Fault at address: 0x%x\n", cr2);
+    for(;;);
 }

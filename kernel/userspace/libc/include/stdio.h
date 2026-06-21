@@ -13,10 +13,12 @@ void printf(char* format, ...);
     Function places a char;
     char ch - character to print;
 */
+/*
 int putchar(char ch);
 /*
     Function places a string on the screen;
     const char* string - the string you want to display;
-*/
+
 int puts(const char* string);
+*/
 #endif

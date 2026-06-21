@@ -6,11 +6,11 @@ fs_node_t *fs_root;
 uint32_t read_fs(block_device_t *dev, fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer){
     // check if pointer to read function is not empty
     if(dev == NULL){
-        printf("VFS Error: Read attempt from NULL Device\n");
+        kprintf("VFS Error: Read attempt from NULL Device\n");
         return 0;
     }
     if(node->read == NULL){
-        printf("VFS Error: Driver %s doesn't have read function!\n", dev->name);
+        kprintf("VFS Error: Driver %s doesn't have read function!\n", dev->name);
         return 0; 
     }
    
@@ -19,11 +19,11 @@ uint32_t read_fs(block_device_t *dev, fs_node_t *node, uint32_t offset, uint32_t
 
 uint32_t write_fs(block_device_t *dev, fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer){
     if(dev == NULL){
-        printf("VFS Error: Write attempt from NULL Device\n");
+        kprintf("VFS Error: Write attempt from NULL Device\n");
         return 0;
     }
     if(node->write == NULL){
-        printf("VFS Error: Driver %s doesn't have write function!\n", dev->name);
+        kprintf("VFS Error: Driver %s doesn't have write function!\n", dev->name);
         return 0; 
     }
 
@@ -65,6 +65,6 @@ static int device_count = 0;
 void vfs_register_device(block_device_t *dev){
     if(device_count < MAX_DEVICES){
         device_list[device_count++] = dev;
-        printf("Device [%s] has been registred successfully\n", dev->name);
+        kprintf("Device [%s] has been registred successfully\n", dev->name);
     }
 }

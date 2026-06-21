@@ -44,7 +44,7 @@ void paging_init(){
     // identity mapping for first 4MB of memory (Kernel runtime protection)
     for(int j = 0; j < 4; j++){
         for(uint32_t i = 0; i < 1024; i++){
-            page_tables[j].pages[i].frame_addr = i;
+            page_tables[j].pages[i].frame_addr = (j * 1024) + i;
             page_tables[j].pages[i].present = 1;
             page_tables[j].pages[i].writable = 1;
             page_tables[j].pages[i].user = 0; 

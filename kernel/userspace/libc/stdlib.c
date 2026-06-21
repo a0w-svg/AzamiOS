@@ -1,4 +1,4 @@
-#include <stdint.h>
+/*#include <stdint.h>
 #include <stdbool.h>
 #include <limits.h>
 static void reverse(char* str, int length) {
@@ -53,7 +53,7 @@ char* itoa(int value, char* str, int base) {
 }
 /*
     converts ascii to int type;
-*/
+
 int atoi(char *str)
 {
     int sign = 1, result = 0, i = 0;
@@ -80,3 +80,4 @@ int atoi(char *str)
     }
     return result * sign;
 } 
+*/

@@ -4,7 +4,7 @@
 
 // kernel function declaration that will be shared to user
 static void syscall_print_string(char *str){
-    printf("%s", str);
+    kprintf("%s", str);
 }
 
 static void syscall_print_char(char c){
@@ -24,7 +24,7 @@ void syscall_handler(registers_t *r){
             syscall_print_char((char)r->ebx);
             break;
         default:
-            printf("Unknown syscall: %d\n", syscall_number);
+            kprintf("Unknown syscall: %d\n", syscall_number);
     }
 }
 

@@ -1,7 +1,8 @@
 #Sources files compile
-C_SOURCES = $(wildcard kernel/arch/*.c kernel/klibc/*.c kernel/drivers/*.c kernel/klibc/stdio/*.c kernel/mem/*.c kernel/syscall/*.c kernel/filesystem/*.c)
+C_SOURCES = $(wildcard kernel/arch/*.c kernel/klibc/*.c kernel/drivers/*.c kernel/klibc/stdio/*.c kernel/mem/*.c kernel/syscall/*.c kernel/filesystem/*.c kernel/userspace/libc/*.c)
 #Headers files list
-HEADERS = $(wildcard kernel/arch/include/*.h kernel/klibc/include/*.h kernel/drivers/include/*.h kernel/mem/include/*.h kernel/syscall/include/*.h kernel/filesystem/include/*.h)
+HEADERS = $(wildcard kernel/arch/include/*.h kernel/klibc/include/*.h kernel/drivers/include/*.h kernel/mem/include/*.h kernel/syscall/include/*.h kernel/filesystem/include/*.h kernel/userspace/libc/include/*.h)
+#Headers files list
 #compiled files .o
 OBJ = ${C_SOURCES:.c=.o} kernel/arch/cpu.o kernel/arch/interrupts.o kernel/mem/paging_ext.o 
 

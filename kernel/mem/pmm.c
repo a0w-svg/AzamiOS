@@ -16,7 +16,7 @@ static inline void bitmap_set(uint32_t bit){
 }
 
 static inline void bitmap_unset(uint32_t bit){
-    pmm_bitmap[bit / 32] &= (1 << (bit % 32));
+    pmm_bitmap[bit / 32] &= ~(1 << (bit % 32));
 }
 
 
@@ -77,7 +77,12 @@ void* pmm_alloc_block(){
     if(frame == -1){
         return 0;
     }
-
+    
+    if(frame == 0){
+        bitmap_set(frame);
+        pmm_used_blocks++;
+        frame = bitmap_find_first_tree();
+    }
     bitmap_set(frame);
     pmm_used_blocks++;
     

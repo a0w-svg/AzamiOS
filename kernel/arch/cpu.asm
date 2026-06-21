@@ -14,9 +14,30 @@ gdt_flush:
 flush:
     ret
 
-global tss_flush ; allows our C code to call tss_flush()
-tss_flush:
-    mov ax, 0x2B ; Load the index of our TSS structure - The index is
-                 ; 0x28, as it is the 5 selector and each is 8 bytes long
-    ltr ax ; load 0x2B into task state register.
-    ret ; return to the code segment.
+global enter_usermode
+
+enter_usermode:
+    cli ; disable interrupts
+    ; user data segment vector is 4 * 8 = 0x20. Add 3 for Ring 3 = 0x23
+    mov ecx, [esp+4]
+    mov edx, [esp+8]
+    mov ax, 0x23
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    ; stack configuration for iret
+    mov eax, esp
+    push 0x23 ; SS - Stack Segment Ring 3
+    push eax  ; ESP - Using the same stack
+
+    pushf
+    pop eax
+    or eax, 0x200 ; set bit 9 (IF) to enable interrupts in jmp_usermode
+    push eax ; return modified flags onto stack
+
+    push 0x1B
+    push ecx
+    iret
+

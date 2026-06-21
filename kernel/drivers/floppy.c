@@ -101,7 +101,7 @@ void init_floppy(){
 
     // set speed to 500 Kbps (standard 1.44MB)
     outb(FDC_CCR, 0x00);
-    printf("FDC (Floppy) Driver has been initiated succesfully.\n");
+    kprintf("FDC (Floppy) Driver has been initiated succesfully.\n");
 }
 
 /*
