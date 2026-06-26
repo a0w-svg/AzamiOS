@@ -8,25 +8,31 @@
 */
 void* memset(void* s, int c, size_t n)
 {
-    uint8_t* p  = (uint8_t*)s;
-    while(n--){
-        *p++ = (uint8_t)c;
-    }
-    return s;
+    void *orig = s;
+    asm volatile("rep stosb" : "+D"(s), "+c"(n) : "a"(c) : "memory");
+    return orig;
 }
 
 /*
     Copy block of memory
-    Copies the values of num bytes from the location pointed to by source directly
-    to the memory block pointed to by destination.
 */
 void* memcpy(void* dest, const void* src, size_t n) {
-		uint8_t* d = (uint8_t*)dest;
-    const uint8_t* s = (const uint8_t*)src;
-    while(n--){
-        *d++ = *s++;
+    void *orig = dest;
+    asm volatile("rep movsb" : "+D"(dest), "+S"(src), "+c"(n) : : "memory");
+    return orig;
+}
+
+int memcmp(const void* s1, const void* s2, size_t n) {
+    const unsigned char* p1 = (const unsigned char*)s1;
+    const unsigned char* p2 = (const unsigned char*)s2;
+    while(n--) {
+        if(*p1 != *p2) {
+            return *p1 - *p2;
+        }
+        p1++;
+        p2++;
     }
-    return dest;
+    return 0;
 }
 
 /*

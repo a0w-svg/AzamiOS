@@ -10,46 +10,20 @@
 #include "../mem/include/paging.h"
 #include "../../thirdparty/multiboot.h"
 #include "../drivers/include/rtc.h"
+#include "../drivers/include/mouse.h"
 #include "../drivers/include/serial.h"
 #include "../klibc/include/string.h"
 #include "../syscall/include/syscall.h"
+#include "../syscall/include/exec.h"
 #include "../filesystem/include/tarfs.h"
 #include "../filesystem/include/vfs.h"
-#include "../userspace/libc/include/stdio.h"
+#include "../drivers/include/ata.h"
+#include "../filesystem/include/fat32.h"
+#include "../proc/include/process.h"
+#include "../proc/include/scheduler.h"
+#include "./include/smp.h"
 extern uint32_t __end;
 uint32_t start_addr = (uint32_t)&__end;
-extern void enter_usermode(uint32_t user_function, uint32_t user_stack_top);
-void isolated_user_proccess(){
-    while(1){
-        asm volatile(
-            "int $128\n"
-            :
-            : "a"(1), "b"('Z')
-        );
-    }
-}
-void setup_isolated_userspace(){
-    // 1. Alloc free physical frames for usercode and user stack
-    uint32_t user_code_phys = (uint32_t)pmm_alloc_block();
-    uint32_t user_stack_phys = (uint32_t)pmm_alloc_block();
-    kprintf("PMM Code: 0x%x, PMM Stack: 0x%x\n", user_code_phys, user_stack_phys);
-    // map as high, virtual addresses Ring 3
-    // is_kernel = 0, is_writable = 1;
-    paging_map_page(user_code_phys, 0x40000000, 0, 1);
-    paging_map_page(user_stack_phys, 0xBFFF000, 0, 1);
-    //copy code from kernel to new isolated place
-    uint8_t payload[] = {
-        0xB8, 0x01, 0x00, 0x00, 0x00,
-        0xBB, 0x5A, 0x00, 0x00, 0x00,
-        0xCD, 0x80,
-        0xEB, 0xFE
-    };
-    extern page_directory_entry_t page_directory[];
-    extern void switch_page_dir(void *page);
-    switch_page_dir(page_directory);
-    memcpy((void*)0x40000000, payload, sizeof(payload));
-    enter_usermode(0x40000000, 0xC000000);
-}
 
 void x86_arch_init(unsigned long magic, unsigned long addr)
 {
@@ -67,6 +41,11 @@ void x86_arch_init(unsigned long magic, unsigned long addr)
     gdt_init();
     init_isr();
     init_syscalls();
+    rtc_init();
+    init_mouse();
+    time_t now;
+    rtc_get_time(&now);
+    kprintf("RTC Time: %d:%d:%d %d/%d/%d\n", now.hour, now.minute, now.second, now.day, now.month, now.year);
     // 4. Initialize memory management (PMM and VMM)
     multiboot_info_t* bootinfo = (multiboot_info_t*)addr;
 
@@ -74,10 +53,24 @@ void x86_arch_init(unsigned long magic, unsigned long addr)
     uint32_t mem_size_kb = bootinfo->mem_lower + bootinfo->mem_upper + 1024;
     kprintf("Found RAM: %d KB\n", mem_size_kb);
 
-    // initialize Physical Memory Manager (bitmap right after kernel)
-    pmm_init(mem_size_kb, (uint32_t)&__end);
-    start_addr = (start_addr + 4096) & ~4096;
-    pmm_deinit_region(start_addr, 8 * 1024 * 1024);
+    uint32_t free_mem_start = (uint32_t)&__end;
+    if (bootinfo->flags & MULTIBOOT_INFO_MODS) {
+        if (bootinfo->mods_count > 0) {
+            multiboot_module_t *mods = (multiboot_module_t*)bootinfo->mods_addr;
+            for (uint32_t m = 0; m < bootinfo->mods_count; m++) {
+                if (mods[m].mod_end > free_mem_start) {
+                    free_mem_start = mods[m].mod_end;
+                }
+            }
+        }
+    }
+    free_mem_start = (free_mem_start + 4095) & ~4095;
+    uint32_t bitmap_addr = free_mem_start;
+    uint32_t bitmap_size_bytes = ((mem_size_kb * 1024 / 4096) + 7) / 8;
+    free_mem_start = (bitmap_addr + bitmap_size_bytes + 4095) & ~4095;
+
+    pmm_init(mem_size_kb, bitmap_addr);
+    pmm_deinit_region(free_mem_start, 16 * 1024 * 1024);
     // initialize Paging (Identity Mapping on boot)
     paging_init();
     kprintf("test initrd: \n");
@@ -95,5 +88,30 @@ void x86_arch_init(unsigned long magic, unsigned long addr)
             }
         }
     }
-    setup_isolated_userspace();
+
+    /* ── 5. Detect ATA primary master and mount FAT32 ──────────────────── */
+    kprintf("\nATA init:\n");
+    if (ata_init() == 0) {
+        block_device_t *ata_dev = ata_get_device();
+        fs_node_t *froot = fat32_init(ata_dev);
+        if (froot) {
+            kprintf("FAT32 mounted. Root directory:\n");
+            uint32_t fi = 0;
+            directory_entry_t *fe;
+            while ((fe = froot->readdir(froot, fi)) != 0) {
+                kprintf("  [FAT32] %s\n", fe->name);
+                fi++;
+            }
+        } else {
+            kprintf("fat32: mount failed\n");
+        }
+    }
+
+    /* ── 6. Initialize Multi-process Scheduler & SMP Cores ───────────────── */
+    process_init();
+    scheduler_init();
+    smp_init();
+
+    /* ── 7. Launch the Window Manager user-space program from initrd ──────── */
+    //execute_program("wm");
 }

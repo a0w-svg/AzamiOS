@@ -5,14 +5,18 @@
 directory_entry_t directory_entry_cache;
 fs_node_t initrd_root_node;
 
+/* ustar numeric fields are terminated by a space or NUL — stop on anything
+   that is not a valid octal digit ('0'–'7'). */
 uint32_t octal_to_int(const char *str){
     uint32_t size = 0;
-    while(*str){
+    while(*str == ' ' || *str == '0') str++;
+    while(*str >= '0' && *str <= '7'){
         size = size * 8 + (*str - '0');
         str++;
     }
-    return 0;
+    return size;
 }
+
 
 uint32_t tarfs_read(block_device_t *dev, fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer){
     // address in RAM memory at which starts raw data of file
@@ -35,10 +39,17 @@ fs_node_t tar_nodes[32];
 int tar_node_count = 0;
 
 void tarfs_init(uint32_t tar_address){
+    if (tar_address == 0) return;
     tar_header_t *header = (tar_header_t*)tar_address;
 
     // archive TAR ends when name of file is NULL
     while(header->filename[0] != '\0'){
+        /* Guard against non-ustar data or pointer corruption */
+        if (memcmp(header->padding + 100, "ustar", 5) != 0) {
+            break;
+        }
+        if (tar_node_count >= 32) break;
+
         // omit empty files and special blocks
         uint32_t file_size = octal_to_int(header->size);
 

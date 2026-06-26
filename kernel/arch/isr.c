@@ -3,6 +3,7 @@
 #include "./include/pic.h"
 #include "./include/idt.h"
 #include "../klibc/include/port.h"
+#include "../klibc/include/kpanic.h"
 #include <stdint.h>
 
 isr_t interrupt_handlers[256];
@@ -182,12 +183,11 @@ void exception_handler(registers_t *r)
     else
     {
         if(r->int_no < 32){
-            kprintf("Receive unhandled exception: %d %s\n", r->int_no, exception_messages[r->int_no]);
+            PANIC(exception_messages[r->int_no]);
         }
         else{
-            kprintf("Receive unhandled interrupt: %d\n", r->int_no);
+            PANIC("Unhandled Hardware Interrupt");
         }
-        for(;;);
     }
 }
 
@@ -213,16 +213,13 @@ void irq_handler(registers_t *r)
 }
 
 void page_fault_handler(registers_t *r) {
-    uint32_t faulting_address;
-    asm volatile("mov %%cr2, %0" : "=r"(faulting_address));
+    uint32_t cr2;
+    asm volatile("mov %%cr2, %0" : "=r"(cr2));
     
     int present = !(r->err_code & 0x1); // 0 = Page not found, 1 = security error
     int rw = r->err_code & 0x2;  // 0 = read error, 2 = write error
     int us = r->err_code & 0x4; // 0 = kernel fault, 4 = usermode fault
-    uint32_t cr2;
-    asm volatile("mov %%cr2, %0" : "=r"(cr2));
-    kprintf("\n[PAGE FAULT] Adres: 0x%x\n");
-    kprintf("Page not found: %d, Write: %d, Ring3: %d\n", present, rw, us);
-    kprintf("\nCritical Error: Page Fault at address: 0x%x\n", cr2);
-    for(;;);
+
+    kprintf("\n[PAGE FAULT] CR2=0x%x at EIP=0x%x (present=%d, rw=%d, user=%d)\n", cr2, r->eip, !present, !rw, !us);
+    PANIC("Memory Access Violation (Page Fault)");
 }

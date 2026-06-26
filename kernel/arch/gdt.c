@@ -83,6 +83,11 @@ void write_tss(int32_t num, uint16_t ss0, uint32_t esp0){
     // set IOPB flag to block unauthorized access for user
     tss_entry.iomap_base = sizeof(tss_entry_t);
 }
+
+void set_kernel_stack(uint32_t esp0) {
+    tss_entry.esp0 = esp0;
+}
+
 uint8_t kernel_tss_stack[4096]__attribute__((aligned(4096)));
 void gdt_init()
 {

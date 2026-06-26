@@ -12,7 +12,7 @@ typedef struct
     uint8_t day;
     uint8_t month;
     uint32_t year;
-}__attribute((packed)) time_t;
+} __attribute__((packed)) time_t;
 /*
     Get the current time from RTC;
 */

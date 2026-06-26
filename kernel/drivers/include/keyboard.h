@@ -51,6 +51,7 @@ bool kb_is_disabled();
     return last char;
 */
 uint8_t kb_getchar();
+bool kb_has_char();
 /*
     Read status from keyboard controller;
 */

@@ -65,8 +65,8 @@ void PIC_remap(uint8_t offset1, uint8_t offset2)
 void PIC_send_EOI(uint8_t irq)
 {
     if(irq >= 8)
-        outb(PIC2_COMMAND, PIC_EOI); // If irq is greater than eight or equal, send the EOI signal to secondary PIC.
-    else outb(PIC1_COMMAND, PIC_EOI); // Send the EOI signal to primary PIC;
+        outb(PIC2_COMMAND, PIC_EOI);
+    outb(PIC1_COMMAND, PIC_EOI);
 }
 /*
     Sets the ignore bit on the specifed IRQline;

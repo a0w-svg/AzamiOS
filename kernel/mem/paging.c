@@ -6,7 +6,7 @@ extern void switch_page_dir(void *page);
 
 // memory for catalogue and first page table must be aligned to 4KB
 page_directory_entry_t page_directory[1024] __attribute__((aligned(4096)));
-page_table_t page_tables[4] __attribute__((aligned(4096)));
+page_table_t page_tables[32] __attribute__((aligned(4096)));
 
 void paging_map_page(uint32_t phys_addr, uint32_t virt_addr, uint8_t is_kernel, uint8_t is_writable){
     uint32_t pd_index = virt_addr >> 22;
@@ -15,8 +15,14 @@ void paging_map_page(uint32_t phys_addr, uint32_t virt_addr, uint8_t is_kernel, 
     page_table_t* page_table;
     // check if page table exists
     if(page_directory[pd_index].present == 1){
-        //extract table address and shift 12 bits to left.
+        // Extract page table virtual address (identity-mapped, so phys == virt here)
         page_table = (page_table_t*)(page_directory[pd_index].table << 12);
+        // x86 requires BOTH the PDE and PTE to have U/S=1 for ring-3 access.
+        // If we are mapping a user page into an existing kernel-only page table,
+        // we must promote the PDE's user bit so ring-3 can reach the entry.
+        if(!is_kernel){
+            page_directory[pd_index].user = 1;
+        }
     }
     else{
         page_table = (page_table_t*)pmm_alloc_block();
@@ -32,6 +38,8 @@ void paging_map_page(uint32_t phys_addr, uint32_t virt_addr, uint8_t is_kernel, 
     page_table->pages[pt_index].present = 1;
     page_table->pages[pt_index].writable = is_writable ? 1 : 0;
     page_table->pages[pt_index].user = is_kernel ? 0 : 1;
+
+    asm volatile("invlpg (%0)" : : "r"(virt_addr) : "memory");
 }
 
 void paging_init(){
@@ -41,8 +49,8 @@ void paging_init(){
         page_directory[i].writable = 1;
     }
 
-    // identity mapping for first 4MB of memory (Kernel runtime protection)
-    for(int j = 0; j < 4; j++){
+    // identity mapping for first 128MB of memory (Kernel runtime protection)
+    for(int j = 0; j < 32; j++){
         for(uint32_t i = 0; i < 1024; i++){
             page_tables[j].pages[i].frame_addr = (j * 1024) + i;
             page_tables[j].pages[i].present = 1;

@@ -1,6 +1,7 @@
 ; extern C functions
 extern  exception_handler
 extern irq_handler
+extern g_active_context
 
 ; -----------------------------------------
 ; NASM PREPROCESSORS MACROS
@@ -120,11 +121,17 @@ irq_common_stub:
     mov es, ax
     mov fs, ax
     mov gs, ax
+    mov [g_active_context], esp ; save current stack context
     push esp ; registers_t *r
     cld ; cleans DF flag
-    call irq_handler;
-    pop ebx ; restore saved cpu state
-    pop ebx
+    call irq_handler
+    add esp, 4 ; pop pushed argument
+    mov eax, [g_active_context]
+    test eax, eax
+    jz .no_switch
+    mov esp, eax ; switch stack pointer!
+.no_switch:
+    pop ebx ; restore data segment
     mov ds, bx
     mov es, bx
     mov fs, bx

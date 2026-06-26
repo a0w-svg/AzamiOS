@@ -5,7 +5,9 @@
 #include <stdarg.h>
 #include <limits.h>
 
-void syscall_putchar(char c){
+/* ─── raw syscall wrappers ──────────────────────────────────────────────── */
+
+static void syscall_putchar(char c) {
     asm volatile(
         "int $128\n"
         :
@@ -13,82 +15,111 @@ void syscall_putchar(char c){
     );
 }
 
-void syscall_print_string(const char* str){
+static void syscall_print_string(const char* str) {
     asm volatile(
         "int $128\n"
         :
         : "a"(0), "b"(str)
     );
 }
-/*
-int putchar(char c){
-    syscall_putchar(c);
-    return c;
+
+static void syscall_exit(int code) {
+    asm volatile(
+        "int $128\n"
+        :
+        : "a"(2), "b"(code)
+    );
 }
 
-int puts(const char *string){
+static int syscall_getchar(void) {
+    int ret;
+    asm volatile(
+        "int $128\n"
+        : "=a"(ret)
+        : "a"(3)
+    );
+    return ret;
+}
+
+/* ─── public libc functions ─────────────────────────────────────────────── */
+
+int getchar(void) {
+    return syscall_getchar();
+}
+
+int putchar(char c) {
+    syscall_putchar(c);
+    return (int)(unsigned char)c;
+}
+
+int puts(const char* string) {
     syscall_print_string(string);
+    syscall_putchar('\n');
     return 0;
 }
-*/
+
+void exit(int code) {
+    syscall_exit(code);
+    for (;;); /* should not be reached */
+}
+
+void exec(const char *filename) {
+    asm volatile(
+        "int $128\n"
+        :
+        : "a"(10), "b"(filename)
+    );
+}
+
 /*
- Print function
-    flags:
-    %d - displaying the decimal number from the argument of the int type;
-    %s - displaying the string from the argument of the  const char* type;
-    %x - displaying the hexadecimal number from the argument of the int type;
-    %o - displaying the octal number from the argument of the int type;
+ * printf — minimal implementation.
+ * Flags: %c %d %s %x %o
  */
-void printf(char* format, ...)
-{
-    char *string; // Pointer to char* argument;
-    char buf[50]; // Buffer used to converts numbers to strings;
-    unsigned int i = 0; // Used to store temporary int variable;
-    // arguments;
+void printf(char* format, ...) {
+    char *string;
+    char buf[50];
+    unsigned int i = 0;
+
     va_list arg;
-    va_start(arg, format); // Create arguments list;
-    while(*format != '\0')
-    {
-        if(*format == '%')
-        {
+    va_start(arg, format);
+
+    while (*format != '\0') {
+        if (*format == '%') {
             format++;
-            // Fetching and executing arguments;
-            switch (*format++)
-            {
-            case 'c': // fetch char argument;
-                i = va_arg(arg, int);
-                syscall_putchar(i);
+            switch (*format++) {
+            case 'c':
+                i = (unsigned int)va_arg(arg, int);
+                syscall_putchar((char)i);
                 break;
-            case 'd': // Fetch Decimal/Integer argument;
-                i = va_arg(arg, int);
-                itoa(i, buf, 10);
+            case 'd':
+                i = (unsigned int)va_arg(arg, int);
+                itoa((int)i, buf, 10);
                 syscall_print_string(buf);
                 break;
-            case 'o': // Fetch Octal representation;
-                i = va_arg(arg, int);
-                itoa(i, buf, 8);
+            case 'o':
+                i = (unsigned int)va_arg(arg, int);
+                itoa((int)i, buf, 8);
                 syscall_print_string(buf);
                 break;
-            case 's': // Fetch string;
+            case 's':
                 string = va_arg(arg, char*);
-                if(string == NULL){
+                if (string == NULL) {
                     string = "(null)";
                 }
                 syscall_print_string(string);
                 break;
-            case 'x': // Fetch Hexadecimal representation
-                i = va_arg(arg, int);
-                itoa(i, buf, 16);
+            case 'x':
+                i = (unsigned int)va_arg(arg, int);
+                itoa((int)i, buf, 16);
                 syscall_print_string("0x");
                 syscall_print_string(buf);
                 break;
+            default:
+                break;
             }
-        }
-        else
-        {
+        } else {
             syscall_putchar(*format);
             format++;
-           
         }
     }
     va_end(arg);

@@ -2,6 +2,7 @@
 #include "../klibc/include/port.h"
 #include "../klibc/include/string.h"
 #include <stdint.h>
+#include "./include/serial.h"
 // defines constans values;
 #define VIDEO_ADDR 0xB8000
 #define MAX_ROWS 25
@@ -140,6 +141,7 @@ void printk_at(const char* txt, int col, int row, char attrib)
 */
 int terminal_write(const char* txt)
 {
+    write_serial_bytes(txt);
     printk_at(txt, -1, -1, 0);
     return -1;
 }
@@ -149,6 +151,7 @@ int terminal_write(const char* txt)
 */
 void terminal_clean()
 {
+    init_serial();
     int term_size = MAX_COLS * MAX_ROWS;
     uint8_t* term = (uint8_t*)VIDEO_ADDR;
     for(int i = 0; i < term_size; i++) 
@@ -164,6 +167,7 @@ void terminal_clean()
 */
 int put_char(char ch)
 {
+    write_serial(ch);
     print_char(ch, -1, -1, 0);
     return -1;
 }

@@ -1,5 +1,6 @@
 #include "./include/keyboard.h"
 #include "../klibc/include/port.h"
+#include "../klibc/include/stdio.h"
 #include "../arch/include/isr.h"
 #include "./include/kbc.h"
 #include <stdbool.h>
@@ -229,39 +230,69 @@ void kb_enable_keyboard()
     kb_disable = false;
 }
 
+#define KB_BUF_SIZE 256
+static volatile char kb_buffer[KB_BUF_SIZE];
+static volatile int kb_head = 0;
+static volatile int kb_tail = 0;
+
+uint8_t kb_getchar() {
+    if (kb_head == kb_tail) {
+        return 0;
+    }
+    char c = kb_buffer[kb_tail];
+    kb_tail = (kb_tail + 1) % KB_BUF_SIZE;
+    return (uint8_t)c;
+}
+
+bool kb_has_char() {
+    return kb_head != kb_tail;
+}
+
 /*
     Key Handler
 */
 void key_handler(int32_t keycode)
 {
-    switch (keycode)
+    uint8_t scan = (uint8_t)(keycode & 0xFF);
+    if (scan & 0x80) {
+        if (scan == (42 | 0x80) || scan == (54 | 0x80)) shift = false;
+        return;
+    }
+
+    switch (scan)
     {
+    case ESCAPE:
+        kprintf("[KB_EVENT] ESC pressed\n");
+        break;
+    case BACKSPACE: {
+        char ch = '\b';
+        int next_head = (kb_head + 1) % KB_BUF_SIZE;
+        if (next_head != kb_tail) {
+            kb_buffer[kb_head] = ch;
+            kb_head = next_head;
+        }
+        kprintf("[KB_EVENT] BACKSPACE pressed (head=%d tail=%d)\n", kb_head, kb_tail);
+        break;
+    }
     case SHIFT:
+    case 54:
         shift = true;
         break;
-    case SHIFT_RELEASE:
-        shift = false;
-        break;
     case CAPSLOCK:
-        if(capslock > 0)
-            capslock = 0;
-        else
-        {
-            capslock = 1;
-        }
+        capslock = (capslock > 0) ? 0 : 1;
         break;
     default:
-        if(keycode < 0) return; // error
-        char ch;
-        if(shift || capslock)
-            ch = upper_ascii[keycode];
-        else 
-        {
-            ch = small_ascii[keycode];
-        }
+        if (scan >= 128) return;
+        char ch = (shift || capslock) ? upper_ascii[scan] : small_ascii[scan];
         scancode = ch;
-        char s[2] = {ch, '\0'};
-        terminal_write(s);
+        if (ch != 0) {
+            int next_head = (kb_head + 1) % KB_BUF_SIZE;
+            if (next_head != kb_tail) {
+                kb_buffer[kb_head] = ch;
+                kb_head = next_head;
+            }
+        }
+        kprintf("[KB_EVENT] scan=0x%x char='%c' (head=%d tail=%d)\n", scan, ch ? ch : '.', kb_head, kb_tail);
         break;
     }
 }
@@ -270,12 +301,9 @@ void key_handler(int32_t keycode)
 */
 static void keyboard_handler(registers_t* regs)
 {
-    uint8_t status;
-    int8_t scan_code;
-    outb(0x20, 0x20); // send the EoI;
-    status = kbc_read_status(); // get kbc status;
-    if(status & KBC_STATS_MASK_OUT_BUFFER) // if status is KBC_STATS_MASK_OUT_BUFFER, get data from 0x60 port;
-        scan_code = inb(0x60);
+    UNUSED(regs);
+    uint8_t scan_code = inb(0x60);
+    kprintf("[KB_IRQ] IRQ1 fired! scancode=0x%x\n", scan_code);
     key_handler(scan_code);
 }
 

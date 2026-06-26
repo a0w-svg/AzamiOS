@@ -3,18 +3,21 @@
 #include <stdint.h>
 
 typedef int KRESULT;
-/*
-    Displays the location of the exception and the type of exception;
-*/
-#define PANIC(msg) kpanic(msg, __FILE__, __LINE__);
-/*
-    This is a macro that performs kernel panic if the value entered into it is other than 0;
-*/
+
+/* Displays kernel panic screen with message, file location, registers, and backtrace */
+#define PANIC(msg) kpanic(msg, __FILE__, __LINE__)
+
+/* Assertion macro triggering panic if condition is false */
 #define ASSERT(b) ((b) ? (void)0 : kpanic_assert(__FILE__, __LINE__, #b))
-/*
-    Do not use these functions instead use the PANIC or ASSERT macros;
-*/
+
+/* Debugging macros */
+#define KDEBUG(msg) kprintf("[DEBUG] %s:%d: %s\n", __FILE__, __LINE__, msg)
+#define KTRACE() kprintf("[TRACE] function %s at %s:%d\n", __func__, __FILE__, __LINE__)
+
 void kpanic(const char* msg, const char* file, uint32_t line);
 void kpanic_assert(const char* file, uint32_t line, const char* descript);
+
+void dump_registers(void);
+void print_backtrace(uint32_t max_frames);
 
 #endif
