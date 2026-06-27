@@ -184,6 +184,14 @@ void gfx_init_bga(void) {
     lfb = (uint32_t*)lfb_phys;
     g_gfx_enabled = true;
 
+    kprintf("gfx: Testing LFB read/write at 0x%x...\n", lfb_phys);
+    uint32_t cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    kprintf("gfx: current cr3=0x%x\n", cr3);
+    volatile uint32_t *test_ptr = (volatile uint32_t *)lfb_phys;
+    *test_ptr = 0x12345678;
+    kprintf("gfx: successfully wrote to LFB, read back: 0x%x\n", *test_ptr);
+
     gfx_clear(0x000F172A);
     gfx_flip();
     kprintf("gfx: Bochs VBE True Color Mode Active\n");

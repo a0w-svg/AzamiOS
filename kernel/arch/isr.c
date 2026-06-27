@@ -5,6 +5,8 @@
 #include "../klibc/include/port.h"
 #include "../klibc/include/kpanic.h"
 #include <stdint.h>
+#include "../mem/include/paging.h"
+extern page_directory_entry_t page_directory[];
 
 isr_t interrupt_handlers[256];
 
@@ -220,6 +222,21 @@ void page_fault_handler(registers_t *r) {
     int rw = r->err_code & 0x2;  // 0 = read error, 2 = write error
     int us = r->err_code & 0x4; // 0 = kernel fault, 4 = usermode fault
 
+    uint32_t pd_index = cr2 >> 22;
+    uint32_t pt_index = (cr2 >> 12) & 0x3FF;
+    uint32_t pde_val = page_directory[pd_index].value;
+    uint32_t pte_val = 0;
+    if (page_directory[pd_index].present) {
+        page_table_t *pt = (page_table_t*)(page_directory[pd_index].table << 12);
+        pte_val = pt->pages[pt_index].value;
+    }
+
+    uint32_t cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint32_t hw_pde = ((uint32_t*)cr3)[pd_index];
+
     kprintf("\n[PAGE FAULT] CR2=0x%x at EIP=0x%x (present=%d, rw=%d, user=%d)\n", cr2, r->eip, !present, !rw, !us);
+    kprintf("DEBUG: cr3=0x%x, page_dir=0x%x, hw_pde=0x%x\n", cr3, (uint32_t)page_directory, hw_pde);
+    kprintf("DEBUG: pd_index=%d, pde=0x%x, pt_index=%d, pte=0x%x\n", pd_index, pde_val, pt_index, pte_val);
     PANIC("Memory Access Violation (Page Fault)");
 }

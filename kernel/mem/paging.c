@@ -13,7 +13,7 @@ void paging_map_page(uint32_t phys_addr, uint32_t virt_addr, uint8_t is_kernel, 
     uint32_t pd_index = virt_addr >> 22;
     uint32_t pt_index = (virt_addr >> 12) & 0x3FF;
 
-    page_table_t* page_table;
+    page_table_t* page_table = 0;
     // check if page table exists
     if(page_directory[pd_index].present == 1){
         // Extract page table virtual address (identity-mapped, so phys == virt here)
@@ -26,10 +26,15 @@ void paging_map_page(uint32_t phys_addr, uint32_t virt_addr, uint8_t is_kernel, 
         }
     }
     else{
-        page_table = (page_table_t*)pmm_alloc_block();
+        uint32_t new_table_phys = (uint32_t)pmm_alloc_block();
+        if(!new_table_phys){
+            kprintf("PANIC: Out of physical memory!\n");
+            return;
+        }
+        page_table = (page_table_t*)new_table_phys;
         memset(page_table, 0, 4096);
-
-        page_directory[pd_index].table = ((uint32_t)page_table) >> 12;
+            
+        page_directory[pd_index].table = new_table_phys >> 12;
         page_directory[pd_index].present = 1;
         page_directory[pd_index].writable = 1;
         page_directory[pd_index].user = is_kernel ? 0 : 1;
@@ -40,12 +45,14 @@ void paging_map_page(uint32_t phys_addr, uint32_t virt_addr, uint8_t is_kernel, 
     page_table->pages[pt_index].writable = is_writable ? 1 : 0;
     page_table->pages[pt_index].user = is_kernel ? 0 : 1;
 
-    uint32_t cr3;
-    asm volatile("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) : : "memory");
-    if (virt_addr == 0xfd000000 || virt_addr == 0xBFF80000) {
-        kprintf("map: virt=0x%x, pde=0x%x, pte.val=0x%x, sizeof=0x%x\n",
-                virt_addr, page_directory[pd_index].value, page_table->pages[pt_index].value, sizeof(page_t));
+    if(phys_addr >= 0xF0000000){
+        page_table->pages[pt_index].pcd = 1;
+        page_table->pages[pt_index].pwt = 1;
     }
+    asm volatile("invlpg (%0)" : : "b"(virt_addr) : "memory");
+
+    uint32_t cr3;
+    asm volatile("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) : "r"(cr3) : "memory");
 }
 
 void paging_init(){
@@ -69,5 +76,10 @@ void paging_init(){
         page_directory[j].writable = 1;
         page_directory[j].user = 0;
     }
+
+    page_directory[1023].table = ((uint32_t)page_directory) >> 12;
+    page_directory[1023].present = 1;
+    page_directory[1023].writable = 1;
+    page_directory[1023].user = 0;
     switch_page_dir(page_directory);
 }
