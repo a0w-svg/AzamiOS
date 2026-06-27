@@ -1,6 +1,7 @@
 #include "include/paging.h"
 #include "include/pmm.h"
 #include "../klibc/include/string.h"
+#include "../klibc/include/stdio.h"
 
 extern void switch_page_dir(void *page);
 
@@ -39,7 +40,12 @@ void paging_map_page(uint32_t phys_addr, uint32_t virt_addr, uint8_t is_kernel, 
     page_table->pages[pt_index].writable = is_writable ? 1 : 0;
     page_table->pages[pt_index].user = is_kernel ? 0 : 1;
 
-    asm volatile("invlpg (%0)" : : "r"(virt_addr) : "memory");
+    uint32_t cr3;
+    asm volatile("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) : : "memory");
+    if (virt_addr == 0xfd000000 || virt_addr == 0xBFF80000) {
+        kprintf("map: virt=0x%x, pde=0x%x, pte.val=0x%x, sizeof=0x%x\n",
+                virt_addr, page_directory[pd_index].value, page_table->pages[pt_index].value, sizeof(page_t));
+    }
 }
 
 void paging_init(){

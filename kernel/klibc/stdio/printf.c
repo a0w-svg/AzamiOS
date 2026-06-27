@@ -1,6 +1,7 @@
 #include "../include/stdio.h"
 #include "../include/string.h"
 #include "../include/stdlib.h"
+#include "../../arch/include/spinlock.h"
 #include <stddef.h>
 #include <stdarg.h>
 #include <limits.h>
@@ -12,8 +13,10 @@
     %x - displaying the hexadecimal number from the argument of the int type;
     %o - displaying the octal number from the argument of the int type;
  */
-void kprintf(char* format, ...)
+ static volatile int kprintf_lock = 0;
+void kprintf(const char* format, ...)
 {
+    spinlock_acquire(&kprintf_lock);
     char *string; // Pointer to char* argument;
     char buf[50]; // Buffer used to converts numbers to strings;
     unsigned int i = 0; // Used to store temporary int variable;
@@ -64,4 +67,5 @@ void kprintf(char* format, ...)
         }
     }
     va_end(arg);
+    spinlock_release(&kprintf_lock);
 }

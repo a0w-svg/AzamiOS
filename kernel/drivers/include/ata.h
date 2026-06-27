@@ -16,6 +16,19 @@
 #define ATA_PRI_CMD         0x1F7   /* command (write)               */
 #define ATA_PRI_CTRL        0x3F6   /* alternate status / device ctrl */
 
+/* ─── Secondary ATA channel I/O ports ────────────────────────────────────── */
+#define ATA_SEC_DATA        0x170
+#define ATA_SEC_ERROR       0x171
+#define ATA_SEC_SECCOUNT    0x172
+#define ATA_SEC_LBA_LO      0x173
+#define ATA_SEC_LBA_MID     0x174
+#define ATA_SEC_LBA_HI      0x175
+#define ATA_SEC_DRIVE       0x176
+#define ATA_SEC_STATUS      0x177
+#define ATA_SEC_CMD         0x177
+#define ATA_SEC_CTRL        0x376
+
+
 /* ─── Status register bits ───────────────────────────────────────────────── */
 #define ATA_SR_BSY          0x80    /* controller busy               */
 #define ATA_SR_DRDY         0x40    /* drive ready                   */
@@ -28,7 +41,9 @@
 #define ATA_CMD_IDENTIFY    0xEC    /* identify device               */
 
 /* ─── Drive select nibble (LBA mode) ─────────────────────────────────────── */
-#define ATA_DRIVE_MASTER    0xE0    /* primary master, LBA           */
+#define ATA_DRIVE_MASTER    0xE0    /* master, LBA                   */
+#define ATA_DRIVE_SLAVE     0xF0    /* slave, LBA                    */
+
 
 /* ─── Public API ──────────────────────────────────────────────────────────── */
 

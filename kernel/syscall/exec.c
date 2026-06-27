@@ -24,7 +24,7 @@
  * We push esp = USER_STACK_TOP - 4 so the stack pointer is valid on entry.
  */
 #define USER_STACK_TOP    0xC0000000u   /* 3 GB mark – top of user address space */
-#define USER_STACK_PAGES  4             /* 4 × 4 KB = 16 KB user stack */
+#define USER_STACK_PAGES  128           /* 128 × 4 KB = 512 KB user stack */
 
 /* Defined in cpu.asm */
 extern void enter_usermode(uint32_t user_entry, uint32_t user_stack_top);

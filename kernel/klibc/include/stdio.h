@@ -9,7 +9,7 @@
     %s - displaying the string from the argument of the  const char* type;
     %x - displaying the hexadecimal number from the argument of the int type;
 */
-void kprintf(char* format, ...);
+void kprintf(const char* format, ...);
 /*
     Function places a char;
     char ch - character to print;

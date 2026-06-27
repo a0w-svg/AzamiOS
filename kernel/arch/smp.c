@@ -6,6 +6,7 @@
 #include "../mem/include/pmm.h"
 #include "../klibc/include/string.h"
 #include "../klibc/include/stdio.h"
+#include "include/spinlock.h"
 
 extern char smp_boot_start[];
 extern char smp_boot_end[];
@@ -21,7 +22,8 @@ static volatile uint32_t g_ap_count = 1;
 void ap_entry(void) {
     uint32_t id = apic_get_id();
     apic_init();
-    g_ap_count++;
+
+    atomic_inc(&g_ap_count);
     kprintf("smp: AP core #%d awakened and entering idle scheduler loop\n", id);
 
     for (;;) {

@@ -1,0 +1,78 @@
+/**
+ * lib/stdlib/stdlib.c  –  AzamiOS portable integer/string conversion
+ *
+ * Pure arithmetic — no hardware, no port I/O, no kernel headers.
+ * Compiles with: i686-elf-gcc -ffreestanding  OR  host gcc for testing.
+ */
+#include "stdlib.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <limits.h>
+
+static void reverse(char* str, int length) {
+    int start = 0, end = length - 1;
+    while (start < end) {
+        char temp  = str[start];
+        str[start] = str[end];
+        str[end]   = temp;
+        start++;
+        end--;
+    }
+}
+
+/**
+ * itoa – convert integer value to a NUL-terminated string in the given base.
+ * Supports bases 2–36. Returns str.
+ */
+char* itoa(int value, char* str, int base) {
+    int i = 0;
+    bool isNegative = false;
+
+    if (base < 2 || base > 36) {
+        str[0] = '\0';
+        return str;
+    }
+    if (value == 0) {
+        str[i++] = '0';
+        str[i]   = '\0';
+        return str;
+    }
+
+    unsigned int unum = (unsigned int)value;
+    if (value < 0 && base == 10) {
+        isNegative = true;
+        unum = (unsigned int)(-value);
+    }
+
+    while (unum != 0) {
+        int rem = unum % base;
+        str[i++] = (rem > 9) ? (rem - 10) + 'a' : rem + '0';
+        unum /= base;
+    }
+    if (isNegative)
+        str[i++] = '-';
+
+    str[i] = '\0';
+    reverse(str, i);
+    return str;
+}
+
+/**
+ * atoi – convert ASCII decimal string to int.
+ * Handles leading whitespace, optional sign, and INT_MAX/INT_MIN overflow.
+ */
+int atoi(char *str)
+{
+    int sign = 1, result = 0, i = 0;
+    while (str[i] == ' ')
+        i++;
+    if (str[i] == '-' || str[i] == '+')
+        sign = 1 - 2 * (str[i++] == '-');
+    while (str[i] >= '0' && str[i] <= '9') {
+        if ((result > INT_MAX / 10) ||
+            (result == INT_MAX / 10 && str[i] - '0' > 7))
+            return (sign == 1) ? INT_MAX : INT_MIN;
+        result = 10 * result + (str[i++] - '0');
+    }
+    return result * sign;
+}
