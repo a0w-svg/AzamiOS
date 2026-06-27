@@ -24,9 +24,13 @@ static uint32_t octal_to_int(const char *str) {
     return size;
 }
 
-/* Node pool — supports up to 32 files per archive */
-static fs_node_t tar_nodes[32];
+/* Node pool — supports up to 64 files per archive */
+static fs_node_t tar_nodes[64];
 static int       tar_node_count = 0;
+
+static uint8_t dynamic_file_data[32][4096];
+static int dynamic_file_allocated[64];
+static int dynamic_buf_count = 0;
 
 /**
  * tarfs_read – copy file data from the in-RAM archive into buffer.
@@ -42,6 +46,35 @@ uint32_t tarfs_read(block_device_t *dev, fs_node_t *node,
         size = node->length - offset;
 
     memcpy(buffer, (uint8_t*)(uintptr_t)(file_data_address + offset), size);
+    return size;
+}
+
+uint32_t tarfs_write(block_device_t *dev, fs_node_t *node,
+                     uint32_t offset, uint32_t size, uint8_t *buffer) {
+    (void)dev;
+    int node_idx = (int)(node - tar_nodes);
+    if (node_idx < 0 || node_idx >= 64) return 0;
+
+    if (dynamic_file_allocated[node_idx] == 0) {
+        if (dynamic_buf_count >= 32) return 0;
+        int buf_idx = dynamic_buf_count++;
+        if (node->length > 0) {
+            uint32_t copy_len = node->length > 4096 ? 4096 : node->length;
+            memcpy(dynamic_file_data[buf_idx], (uint8_t*)(uintptr_t)node->impl, copy_len);
+        }
+        node->impl = (uint32_t)(uintptr_t)dynamic_file_data[buf_idx];
+        dynamic_file_allocated[node_idx] = buf_idx + 1;
+    }
+
+    if (offset >= 4096) return 0;
+    if (offset + size > 4096) size = 4096 - offset;
+
+    memcpy((uint8_t*)(uintptr_t)node->impl + offset, buffer, size);
+    if (offset == 0) {
+        node->length = size;
+    } else if (offset + size > node->length) {
+        node->length = offset + size;
+    }
     return size;
 }
 
@@ -70,6 +103,7 @@ void tarfs_init(uint32_t tar_address) {
         node->flags   = FS_FILE;
         node->impl    = (uint32_t)(uintptr_t)header + 512;  /* data follows header */
         node->read    = tarfs_read;
+        node->write   = tarfs_write;
         tar_node_count++;
 
         uint32_t blocks    = (file_size + 511) / 512;
@@ -103,4 +137,21 @@ fs_node_t *initrd_finddir(fs_node_t *node, char *name) {
             return &tar_nodes[i];
     }
     return (void*)0;
+}
+
+fs_node_t *initrd_create_file(char *name) {
+    for (int i = 0; i < tar_node_count; i++) {
+        if (strcmp(name, tar_nodes[i].name) == 0) return &tar_nodes[i];
+    }
+    if (tar_node_count >= 64) return (void*)0;
+    fs_node_t *node = &tar_nodes[tar_node_count];
+    strncpy(node->name, name, sizeof(node->name) - 1);
+    node->name[sizeof(node->name) - 1] = '\0';
+    node->length = 0;
+    node->flags = FS_FILE;
+    node->read = tarfs_read;
+    node->write = tarfs_write;
+    dynamic_file_allocated[tar_node_count] = 0;
+    tar_node_count++;
+    return node;
 }

@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/cpu.h>
+#include <fcntl.h>
 
 #define COLS 78
 #define ROWS 54
@@ -21,6 +22,13 @@
 #define COL_TEXT_GOLD  0x00F59E0B
 #define COL_TEXT_CYAN  0x0038BDF8
 #define COL_TEXT_RED   0x00EF4444
+
+typedef struct {
+    char buf[ROWS][COLS];
+    uint32_t color[ROWS][COLS];
+    int r;
+    int c;
+} shell_state_t;
 
 static char term_buf[ROWS][COLS];
 static uint32_t term_color[ROWS][COLS];
@@ -108,12 +116,51 @@ static void render_tui(void) {
 
 void _start(void) {
     init_graphics();
-    tui_clear();
 
-    tui_print("+------------------------------------------------------+\n", COL_TEXT_CYAN);
-    tui_print("|           AzamiOS Standalone Shell v2.0              |\n", COL_TEXT_GOLD);
-    tui_print("+------------------------------------------------------+\n", COL_TEXT_CYAN);
-    tui_print("Type 'help' for built-in commands, 'wm' for Desktop GUI.\n\n", COL_TEXT_WHITE);
+    int s_fd = open(".shell_state", 0);
+    if (s_fd >= 0) {
+        shell_state_t st;
+        int n = read(s_fd, &st, sizeof(st));
+        close(s_fd);
+        int d_fd = open(".shell_state", O_WRONLY | O_CREAT, 0);
+        if (d_fd >= 0) { close(d_fd); }
+
+        if (n == sizeof(st)) {
+            memcpy(term_buf, st.buf, sizeof(term_buf));
+            memcpy(term_color, st.color, sizeof(term_color));
+            term_r = st.r;
+            term_c = st.c;
+        } else {
+            tui_clear();
+        }
+
+        int o_fd = open("cmd_out", 0);
+        if (o_fd >= 0) {
+            char out_buf[1024];
+            int rn = read(o_fd, out_buf, sizeof(out_buf) - 1);
+            close(o_fd);
+            int tr_fd = open("cmd_out", O_WRONLY | O_CREAT, 0);
+            if (tr_fd >= 0) { close(tr_fd); }
+
+            if (rn > 0) {
+                out_buf[rn] = '\0';
+                if (strcmp(out_buf, "__CLEAR__") == 0 || strncmp(out_buf, "__CLEAR__", 9) == 0) {
+                    tui_clear();
+                } else if (strncmp(out_buf, "\033WIN_", 5) == 0) {
+                    tui_print("Opening application window in GUI...\n", COL_TEXT_CYAN);
+                } else {
+                    tui_print(out_buf, COL_TEXT_WHITE);
+                    if (out_buf[rn - 1] != '\n') tui_print("\n", COL_TEXT_WHITE);
+                }
+            }
+        }
+    } else {
+        tui_clear();
+        tui_print("+------------------------------------------------------+\n", COL_TEXT_CYAN);
+        tui_print("|           AzamiOS Standalone Shell v2.0              |\n", COL_TEXT_GOLD);
+        tui_print("+------------------------------------------------------+\n", COL_TEXT_CYAN);
+        tui_print("Type 'help' for built-in commands, 'wm' for Desktop GUI.\n\n", COL_TEXT_WHITE);
+    }
 
     char cmd[64];
     int p = 0;
@@ -142,79 +189,50 @@ void _start(void) {
                 tui_putc('\n', COL_TEXT_WHITE);
                 cmd[p] = 0;
 
-                if (strcmp(cmd, "help") == 0) {
-                    tui_print("Built-in TUI commands:\n", COL_TEXT_GOLD);
-                    tui_print("  help  - show this help menu\n", COL_TEXT_WHITE);
-                    tui_print("  time  - display live RTC time\n", COL_TEXT_WHITE);
-                    tui_print("  clear - clear terminal screen\n", COL_TEXT_WHITE);
-                    tui_print("  wm    - return to Desktop GUI\n", COL_TEXT_CYAN);
-                    tui_print("  cc    - run AzamiCC Ring 3 C compiler\n", COL_TEXT_GREEN);
-                    tui_print("  cpu   - inspect x86 CPU topology & features\n", COL_TEXT_CYAN);
-                    tui_print("  lsmod - list loaded Ring 0 kernel modules\n", COL_TEXT_CYAN);
-                    tui_print("  exit  - shutdown terminal\n", COL_TEXT_RED);
-                } else if (strcmp(cmd, "time") == 0) {
-                    rtc_time_t t;
-                    rtc_get_time(&t);
-                    char time_str[32];
-                    itoa(t.hour, time_str, 10);
-                    tui_print("Hardware RTC Time: ", COL_TEXT_CYAN);
-                    if (t.hour < 10) tui_print("0", COL_TEXT_WHITE);
-                    tui_print(time_str, COL_TEXT_WHITE);
-                    tui_print(":", COL_TEXT_WHITE);
-                    itoa(t.minute, time_str, 10);
-                    if (t.minute < 10) tui_print("0", COL_TEXT_WHITE);
-                    tui_print(time_str, COL_TEXT_WHITE);
-                    tui_print(":", COL_TEXT_WHITE);
-                    itoa(t.second, time_str, 10);
-                    if (t.second < 10) tui_print("0", COL_TEXT_WHITE);
-                    tui_print(time_str, COL_TEXT_WHITE);
-                    tui_print("\n", COL_TEXT_WHITE);
-                } else if (strcmp(cmd, "clear") == 0) {
-                    tui_clear();
-                } else if (strcmp(cmd, "wm") == 0 || strcmp(cmd, "gui") == 0) {
-                    tui_print("Launching Window Manager...\n", COL_TEXT_GOLD);
-                    exec("wm");
-                } else if (strncmp(cmd, "cc", 2) == 0) {
-                    tui_print("AzamiCC v1.0 - Ring 3 Embedded C Compiler Engine\n", COL_TEXT_GOLD);
-                    tui_print("Compiling C AST symbols from disk...\n", COL_TEXT_CYAN);
-                    tui_print("Executing emitted virtual bytecode natively...\n", COL_TEXT_WHITE);
-                    tui_print("Result: fib(10) = 55\n", COL_TEXT_GREEN);
-                } else if (strcmp(cmd, "lsmod") == 0 || strcmp(cmd, "modules") == 0) {
-                    char mod_buf[1024];
-                    sys_lsmod(mod_buf, sizeof(mod_buf));
-                    tui_print(mod_buf, COL_TEXT_CYAN);
-                } else if (strcmp(cmd, "cpu") == 0 || strcmp(cmd, "sysinfo") == 0) {
-                    cpu_info_t cpu;
-                    get_cpu_info(&cpu);
-                    char buf[64];
-                    tui_print("x86 Processor Topology & Capability Report:\n", COL_TEXT_GOLD);
-                    tui_print("  Vendor ID : ", COL_TEXT_CYAN);
-                    tui_print(cpu.vendor, COL_TEXT_WHITE);
-                    tui_print("\n  Family    : ", COL_TEXT_CYAN);
-                    itoa(cpu.family, buf, 10);
-                    tui_print(buf, COL_TEXT_WHITE);
-                    tui_print(" | Model: ", COL_TEXT_CYAN);
-                    itoa(cpu.model, buf, 10);
-                    tui_print(buf, COL_TEXT_WHITE);
-                    tui_print(" | Stepping: ", COL_TEXT_CYAN);
-                    itoa(cpu.stepping, buf, 10);
-                    tui_print(buf, COL_TEXT_WHITE);
-                    tui_print("\n  Features  : ", COL_TEXT_CYAN);
-                    if (cpu.has_fpu)  tui_print("[FPU] ", COL_TEXT_GREEN);
-                    if (cpu.has_tsc)  tui_print("[TSC] ", COL_TEXT_GREEN);
-                    if (cpu.has_msr)  tui_print("[MSR] ", COL_TEXT_GREEN);
-                    if (cpu.has_pae)  tui_print("[PAE] ", COL_TEXT_GREEN);
-                    if (cpu.has_apic) tui_print("[APIC] ", COL_TEXT_GREEN);
-                    if (cpu.has_sse)  tui_print("[SSE] ", COL_TEXT_GREEN);
-                    if (cpu.has_sse2) tui_print("[SSE2] ", COL_TEXT_GREEN);
-                    tui_print("\n", COL_TEXT_WHITE);
-                } else if (strcmp(cmd, "exit") == 0) {
-                    exit(0);
-                } else if (cmd[0] != 0) {
-                    tui_print("bash: command not found: ", COL_TEXT_RED);
-                    tui_print(cmd, COL_TEXT_WHITE);
-                    tui_print("\n", COL_TEXT_WHITE);
+                if (cmd[0] == '\0') {
+                    tui_print("azami@os:~$ ", COL_TEXT_GREEN);
+                    continue;
                 }
+                if (strcmp(cmd, "exit") == 0) {
+                    exit(0);
+                }
+
+                char cmd_word[32];
+                int i = 0;
+                char *ptr = cmd;
+                while (*ptr && *ptr != ' ' && i < 31) {
+                    cmd_word[i++] = *ptr++;
+                }
+                cmd_word[i] = '\0';
+                while (*ptr == ' ') ptr++;
+
+                int arg_fd = open("cmd_args", O_WRONLY | O_CREAT, 0);
+                if (arg_fd >= 0) {
+                    write(arg_fd, ptr, strlen(ptr));
+                    close(arg_fd);
+                }
+                int out_fd = open("cmd_out", O_WRONLY | O_CREAT, 0);
+                if (out_fd >= 0) { close(out_fd); }
+
+                int st_fd = open(".shell_state", O_WRONLY | O_CREAT, 0);
+                if (st_fd >= 0) {
+                    shell_state_t st;
+                    memcpy(st.buf, term_buf, sizeof(term_buf));
+                    memcpy(st.color, term_color, sizeof(term_color));
+                    st.r = term_r;
+                    st.c = term_c;
+                    write(st_fd, &st, sizeof(st));
+                    close(st_fd);
+                }
+
+                exec(cmd_word);
+
+                int d_fd = open(".shell_state", O_WRONLY | O_CREAT, 0);
+                if (d_fd >= 0) { close(d_fd); }
+
+                tui_print("bash: command not found: ", COL_TEXT_RED);
+                tui_print(cmd_word, COL_TEXT_WHITE);
+                tui_print("\n", COL_TEXT_WHITE);
 
                 p = 0;
                 cmd[0] = 0;

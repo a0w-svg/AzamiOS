@@ -10,6 +10,7 @@
 #include "../drivers/include/rtl8139.h"
 #include "../drivers/include/net_stack.h"
 #include "../filesystem/include/vfs.h"
+#include "../filesystem/include/tarfs.h"
 #include "../module/include/module.h"
 #include "include/exec.h"
 
@@ -33,7 +34,12 @@ static void syscall_print_char(char c) {
  * added this will become a yield / task-destroy call.
  */
 static void syscall_exit(int code) {
-    kprintf("\nexec: process exited with code %d\n", code);
+    kprintf("\nexec: process '%s' exited with code %d\n", g_current_program, code);
+    if (strcmp(g_current_program, g_return_program) != 0 && g_return_program[0] != '\0') {
+        kprintf("exec: returning control to parent shell '%s'...\n", g_return_program);
+        execute_program(g_return_program);
+        return;
+    }
     acpi_poweroff();
 }
 
@@ -149,6 +155,13 @@ void syscall_handler(registers_t *r) {
                 const char *b = (const char*)r->ecx;
                 for (uint32_t i = 0; i < r->edx; i++) syscall_print_char(b[i]);
                 r->eax = r->edx;
+            } else if (r->ebx >= 3 && r->ebx < 16 && g_file_table[r->ebx]) {
+                fs_node_t *fn = g_file_table[r->ebx];
+                if (fn->write && r->ecx && r->edx > 0) {
+                    uint32_t nwritten = fn->write(NULL, fn, g_file_offsets[r->ebx], r->edx, (uint8_t*)r->ecx);
+                    g_file_offsets[r->ebx] += nwritten;
+                    r->eax = nwritten;
+                } else { r->eax = 0; }
             } else { r->eax = 0; }
             break;
 
@@ -157,6 +170,9 @@ void syscall_handler(registers_t *r) {
                 const char *path = (const char*)r->ebx;
                 if (path && fs_root && fs_root->finddir) {
                     fs_node_t *fn = fs_root->finddir(fs_root, (char*)path);
+                    if (!fn) {
+                        fn = initrd_create_file((char*)path);
+                    }
                     if (fn) {
                         for (int fd = 3; fd < 16; fd++) {
                             if (g_file_table[fd] == NULL) {
@@ -204,6 +220,16 @@ void syscall_handler(registers_t *r) {
 
         case 28: /* fill circle: ebx=xc, ecx=yc, edx=r, esi=color */
             gfx_fill_circle((int)r->ebx, (int)r->ecx, (int)r->edx, (uint32_t)r->esi);
+            break;
+
+        case 29: /* sys_modreload: name=ebx */
+            if (r->ebx) {
+                r->eax = module_reload((const char*)r->ebx);
+            } else { r->eax = -1; }
+            break;
+
+        case 30: /* sys_poweroff */
+            acpi_poweroff();
             break;
 
         default:

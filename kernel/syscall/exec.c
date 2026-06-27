@@ -29,7 +29,17 @@
 /* Defined in cpu.asm */
 extern void enter_usermode(uint32_t user_entry, uint32_t user_stack_top);
 
+char g_return_program[64] = "wm";
+char g_current_program[64] = "wm";
+
 void execute_program(char *filename) {
+    if (strcmp(filename, "wm") == 0 || strcmp(filename, "shell") == 0) {
+        strncpy(g_return_program, filename, 63);
+        g_return_program[63] = '\0';
+    }
+    strncpy(g_current_program, filename, 63);
+    g_current_program[63] = '\0';
+
     /* ── 1. Locate file in VFS ───────────────────────────────────────── */
     fs_node_t *file_node = fs_root->finddir(fs_root, filename);
 

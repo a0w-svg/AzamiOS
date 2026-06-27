@@ -38,6 +38,10 @@ void sys_reboot(void) {
     asm volatile("int $128" : : "a"(14) : "memory");
 }
 
+void sys_poweroff(void) {
+    asm volatile("int $128" : : "a"(30) : "memory");
+}
+
 void sys_net_status(void) {
     asm volatile("int $128" : : "a"(15) : "memory");
 }
@@ -57,6 +61,12 @@ void sys_net_arp(void) {
 int sys_lsmod(char *buf, int max_len) {
     int ret;
     asm volatile("int $128" : "=a"(ret) : "a"(25), "b"(buf), "c"(max_len) : "memory");
+    return ret;
+}
+
+int sys_modreload(const char *name) {
+    int ret;
+    asm volatile("int $128" : "=a"(ret) : "a"(29), "b"(name) : "memory");
     return ret;
 }
 

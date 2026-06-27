@@ -31,6 +31,14 @@ void _start(void) {
 
     init_wins();
 
+    int ts_fd = open(".wm_term_state", 0);
+    if (ts_fd >= 0) {
+        close(ts_fd);
+        int w_idx = find_win_by_type(WIN_WELCOME);
+        if (w_idx >= 0) wm_close_window(&g_wins[w_idx]);
+        open_win_type(WIN_TERMINAL);
+    }
+
     bool dragging = false;
     int drag_x = 0, drag_y = 0;
     bool prev_left = false;

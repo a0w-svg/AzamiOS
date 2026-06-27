@@ -28,6 +28,10 @@ uint32_t          tarfs_read(block_device_t *dev, fs_node_t *node,
 directory_entry_t *initrd_readdir(fs_node_t *node, uint32_t index);
 fs_node_t         *initrd_finddir(fs_node_t *node, char *name);
 
+uint32_t          tarfs_write(block_device_t *dev, fs_node_t *node,
+                               uint32_t offset, uint32_t size, uint8_t *buffer);
+fs_node_t         *initrd_create_file(char *name);
+
 /**
  * tarfs_init – parse a ustar archive that has been loaded into RAM.
  * @param tar_address  physical/virtual start address of the archive.

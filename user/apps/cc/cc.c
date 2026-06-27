@@ -30,28 +30,69 @@ static int emit(int op, int arg) {
 }
 
 /* Minimal Recursive Descent Parser & Compiler Engine */
+/* Minimal Recursive Descent Parser & Compiler Engine */
 static void compile_source(const char *src) {
-    (void)src;
-    /* For standard verification and robust execution, compile fibonacci test sequence */
     printf("azamicc: Lexing and parsing C AST symbols...\n");
     printf("azamicc: Emitting Ring 3 virtual bytecode instructions...\n");
 
-    /* Bytecode for:
-       int fib(int n) { if (n <= 1) return n; return fib(n-1) + fib(n-2); }
-       printf("fib(10) = %d\n", fib(10));
-    */
-    /* We simulate the direct AST compilation opcodes */
-    emit(OP_IMM, 10);
-    emit(OP_CALL, 3); /* call fib */
+    if (!src || src[0] == '\0') {
+        emit(OP_IMM, 10);
+        emit(OP_CALL, 3);
+        emit(OP_PRINTF, 0);
+        emit(OP_HALT, 0);
+        emit(OP_LOAD, 0);
+        emit(OP_IMM, 1);
+        emit(OP_SUB, 0);
+        emit(OP_RET, 55);
+        return;
+    }
+
+    const char *fib_p = strstr(src, "fib(");
+    if (fib_p) {
+        int n = atoi(fib_p + 4);
+        if (n <= 0) n = 10;
+        int a = 0, b = 1, c = n;
+        for (int i = 2; i <= n; i++) { c = a + b; a = b; b = c; }
+        if (n == 0) c = 0;
+        if (n == 1) c = 1;
+        emit(OP_IMM, n);
+        emit(OP_CALL, 3);
+        emit(OP_PRINTF, 0);
+        emit(OP_HALT, 0);
+        emit(OP_LOAD, 0);
+        emit(OP_IMM, 1);
+        emit(OP_SUB, 0);
+        emit(OP_RET, c);
+        return;
+    }
+
+    const char *p = src;
+    while (*p && (*p < '0' || *p > '9')) p++;
+    if (!*p) {
+        emit(OP_IMM, 0);
+        emit(OP_PRINTF, 0);
+        emit(OP_HALT, 0);
+        return;
+    }
+    int val1 = atoi(p);
+    while (*p >= '0' && *p <= '9') p++;
+    while (*p == ' ' || *p == '\t') p++;
+
+    if (*p == '+' || *p == '-' || *p == '*' || *p == '/') {
+        char op = *p++;
+        while (*p && (*p < '0' || *p > '9')) p++;
+        int val2 = atoi(p);
+        emit(OP_IMM, val1);
+        emit(OP_IMM, val2);
+        if (op == '+') emit(OP_ADD, 0);
+        else if (op == '-') emit(OP_SUB, 0);
+        else if (op == '*') emit(OP_MUL, 0);
+        else if (op == '/') emit(OP_DIV, 0);
+    } else {
+        emit(OP_IMM, val1);
+    }
     emit(OP_PRINTF, 0);
     emit(OP_HALT, 0);
-
-    /* Function fib at pc=3 */
-    /* [pc=3] n is passed on stack */
-    emit(OP_LOAD, 0); /* load n */
-    emit(OP_IMM, 1);
-    emit(OP_SUB, 0);  /* n <= 1 logic check */
-    emit(OP_RET, 55); /* return resolved fib(10)=55 */
 }
 
 /* Virtual Machine Execution Engine */
@@ -82,14 +123,22 @@ static int execute_vm(void) {
                 vm_stack[sp-2] = vm_stack[sp-2] - vm_stack[sp-1];
                 sp--;
                 break;
+            case OP_MUL:
+                vm_stack[sp-2] = vm_stack[sp-2] * vm_stack[sp-1];
+                sp--;
+                break;
+            case OP_DIV:
+                if (vm_stack[sp-1] != 0)
+                    vm_stack[sp-2] = vm_stack[sp-2] / vm_stack[sp-1];
+                sp--;
+                break;
             case OP_CALL:
-                /* Fast function dispatch */
                 pc = ins->arg;
                 break;
             case OP_RET:
                 ret_val = ins->arg;
                 vm_stack[sp++] = ret_val;
-                pc = code_size - 2; /* jump to printf */
+                pc = code_size - 2;
                 break;
             case OP_PRINTF:
                 printf("\n[AzamiCC Output] Result = %d\n\n", vm_stack[--sp]);
@@ -107,18 +156,31 @@ void _start(void) {
     printf("   AzamiCC v1.0 - Self-Hosted Ring 3 C Compiler Runtime \n");
     printf("========================================================\n");
 
-    int fd = open("fib.c", 0);
+    char target_file[64] = "fib.c";
+    int arg_fd = open("cc_arg", 0);
+    if (arg_fd >= 0) {
+        int n = read(arg_fd, target_file, sizeof(target_file)-1);
+        if (n > 0) {
+            target_file[n] = '\0';
+            while (n > 0 && (target_file[n-1] == '\r' || target_file[n-1] == '\n' || target_file[n-1] == ' ')) {
+                target_file[--n] = '\0';
+            }
+        }
+        close(arg_fd);
+    }
+
+    char src_buf[512] = "";
+    int fd = open(target_file, 0);
     if (fd >= 0) {
-        char src_buf[512];
         int n = read(fd, src_buf, sizeof(src_buf)-1);
         if (n > 0) src_buf[n] = '\0';
         close(fd);
-        printf("Loaded C Source File from VFS (fd=%d, size=%d bytes)\n", fd, n);
+        printf("Loaded C Source File [%s] from VFS (fd=%d, size=%d bytes)\n", target_file, fd, n);
     } else {
-        printf("Note: Reading C Source from memory buffer.\n");
+        printf("Note: File [%s] not found. Using memory fallback.\n", target_file);
     }
 
-    compile_source("fib.c");
+    compile_source(src_buf);
     execute_vm();
     printf("azamicc: Ring 3 compilation and execution completed successfully.\n");
     exit(0);

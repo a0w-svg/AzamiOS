@@ -15,6 +15,13 @@
 #include "../wm.h"
 
 /* ── Terminal state ──────────────────────────────────────────────────────── */
+typedef struct {
+    char buf[TERM_ROWS][TERM_COLS];
+    uint32_t color[TERM_ROWS][TERM_COLS];
+    int r;
+    int c;
+} wm_term_state_t;
+
 static char     term_buf[TERM_ROWS][TERM_COLS];
 static uint32_t term_color[TERM_ROWS][TERM_COLS];
 static int term_r = 0, term_c = 0;
@@ -63,89 +70,108 @@ static void term_print(const char *str, uint32_t col) {
 }
 
 static void process_command(rtc_time_t *t, uint32_t frame_cnt) {
-    if (strcmp(cmd_buf, "help") == 0) {
-        term_print("Commands:\n", COL_TEXT_GOLD);
-        term_print("  ls time clear whoami fps exit\n", COL_TEXT_WHITE);
-        term_print("  about notepad files date acpi reboot shutdown\n", COL_TEXT_WHITE);
-        term_print("  ifconfig nettest ping arp cc lsmod\n", COL_TEXT_WHITE);
-    } else if (strcmp(cmd_buf, "ls") == 0) {
-        term_print("bin/ initrd.tar README.TXT wm shell cc fib.c\n", COL_TEXT_CYAN);
-    } else if (strcmp(cmd_buf, "ifconfig") == 0) {
-        term_print("Displaying Realtek RTL8139 Fast Ethernet Status...\n", COL_TEXT_CYAN);
-        sys_net_status();
-    } else if (strcmp(cmd_buf, "ping") == 0) {
-        term_print("Sending ICMP Echo Request to Gateway 10.0.2.2...\n", COL_TEXT_GOLD);
-        sys_net_ping();
-    } else if (strcmp(cmd_buf, "arp") == 0) {
-        term_print("Displaying ARP Cache Table...\n", COL_TEXT_CYAN);
-        sys_net_arp();
-    } else if (strcmp(cmd_buf, "nettest") == 0) {
-        term_print("Broadcasting Ethernet test frame via eth0...\n", COL_TEXT_GOLD);
-        sys_net_test();
-    } else if (strcmp(cmd_buf, "lsmod") == 0 || strcmp(cmd_buf, "modules") == 0) {
-        char mod_buf[1024];
-        sys_lsmod(mod_buf, sizeof(mod_buf));
-        term_print(mod_buf, COL_TEXT_CYAN);
-    } else if (strcmp(cmd_buf, "acpi") == 0) {
-        term_print("Displaying ACPI System Info in kernel log...\n", COL_TEXT_CYAN);
-        sys_acpi_info();
-    } else if (strcmp(cmd_buf, "reboot") == 0) {
-        term_print("Rebooting system via ACPI / KBC...\n", COL_TEXT_GOLD);
-        sys_reboot();
-    } else if (strcmp(cmd_buf, "shutdown") == 0) {
-        term_print("Powering off system via ACPI...\n", COL_TEXT_RED);
-        exit(0);
-    } else if (strcmp(cmd_buf, "time") == 0) {
-        char tb[16];
-        format_time_str(tb, t);
-        term_print("RTC Clock: ", COL_TEXT_CYAN);
-        term_print(tb, COL_TEXT_WHITE);
-        term_print("\n", COL_TEXT_WHITE);
-    } else if (strcmp(cmd_buf, "date") == 0) {
-        char db[12], tb[16];
-        format_date_str(db, t);
-        format_time_str(tb, t);
-        term_print("Date: ", COL_TEXT_CYAN);
-        term_print(db, COL_TEXT_WHITE);
-        term_print("  Time: ", COL_TEXT_CYAN);
-        term_print(tb, COL_TEXT_WHITE);
-        term_print("\n", COL_TEXT_WHITE);
-    } else if (strcmp(cmd_buf, "whoami") == 0) {
-        term_print("root@AzamiOS (Ring 3 User Mode)\n", COL_TEXT_GREEN);
-    } else if (strcmp(cmd_buf, "fps") == 0) {
-        char fb[32];
-        itoa(frame_cnt, fb, 10);
-        term_print("Rendered Frames: ", COL_TEXT_GOLD);
-        term_print(fb, COL_TEXT_WHITE);
-        term_print(" (60+ FPS)\n", COL_TEXT_GREEN);
-    } else if (strcmp(cmd_buf, "clear") == 0) {
-        term_clear();
-    } else if (strcmp(cmd_buf, "exit") == 0) {
+    (void)t; (void)frame_cnt;
+    if (cmd_buf[0] == '\0') {
+        term_print("azami:~$ ", COL_TEXT_GREEN);
+        return;
+    }
+    if (strcmp(cmd_buf, "exit") == 0) {
         int idx = find_win_by_type(WIN_TERMINAL);
         if (idx >= 0) wm_close_window(&g_wins[idx]);
-    } else if (strcmp(cmd_buf, "about") == 0) {
-        open_win_type(WIN_ABOUT);
-    } else if (strcmp(cmd_buf, "notepad") == 0) {
-        open_win_type(WIN_NOTEPAD);
-    } else if (strcmp(cmd_buf, "files") == 0) {
-        open_win_type(WIN_FILES);
-    } else if (strncmp(cmd_buf, "cc", 2) == 0) {
-        term_print("AzamiCC v1.0 - Ring 3 Embedded C Compiler Engine\n", COL_TEXT_GOLD);
-        term_print("Compiling C AST symbols from disk...\n", COL_TEXT_CYAN);
-        term_print("Executing emitted virtual bytecode natively...\n", COL_TEXT_WHITE);
-        term_print("Result: fib(10) = 55\n", COL_TEXT_GREEN);
-    } else if (cmd_buf[0] != 0) {
-        term_print("unknown: ", COL_TEXT_RED);
-        term_print(cmd_buf, COL_TEXT_WHITE);
-        term_print("\n", COL_TEXT_WHITE);
+        cmd_buf[0] = 0;
+        cmd_p = 0;
+        return;
     }
+
+    char cmd_word[32];
+    int i = 0;
+    char *ptr = cmd_buf;
+    while (*ptr && *ptr != ' ' && i < 31) {
+        cmd_word[i++] = *ptr++;
+    }
+    cmd_word[i] = '\0';
+    while (*ptr == ' ') ptr++;
+
+    int arg_fd = open("cmd_args", O_WRONLY | O_CREAT, 0);
+    if (arg_fd >= 0) {
+        write(arg_fd, ptr, strlen(ptr));
+        close(arg_fd);
+    }
+    int out_fd = open("cmd_out", O_WRONLY | O_CREAT, 0);
+    if (out_fd >= 0) { close(out_fd); }
+
+    int st_fd = open(".wm_term_state", O_WRONLY | O_CREAT, 0);
+    if (st_fd >= 0) {
+        wm_term_state_t st;
+        memcpy(st.buf, term_buf, sizeof(term_buf));
+        memcpy(st.color, term_color, sizeof(term_color));
+        st.r = term_r;
+        st.c = term_c;
+        write(st_fd, &st, sizeof(st));
+        close(st_fd);
+    }
+
+    exec(cmd_word);
+
+    int d_fd = open(".wm_term_state", O_WRONLY | O_CREAT, 0);
+    if (d_fd >= 0) { close(d_fd); }
+
+    term_print("bash: command not found: ", COL_TEXT_RED);
+    term_print(cmd_word, COL_TEXT_WHITE);
+    term_print("\n", COL_TEXT_WHITE);
+
+    cmd_buf[0] = 0;
+    cmd_p = 0;
+    term_print("azami:~$ ", COL_TEXT_GREEN);
 }
 
 static void terminal_init(window_t *w) {
     (void)w;
-    term_clear();
-    term_print("AzamiOS True Color Shell v3.0\n", COL_TEXT_CYAN);
-    term_print("Type 'help' for commands\n", COL_TEXT_WHITE);
+    int s_fd = open(".wm_term_state", 0);
+    if (s_fd >= 0) {
+        wm_term_state_t st;
+        int n = read(s_fd, &st, sizeof(st));
+        close(s_fd);
+        int d_fd = open(".wm_term_state", O_WRONLY | O_CREAT, 0);
+        if (d_fd >= 0) { close(d_fd); }
+
+        if (n == sizeof(st)) {
+            memcpy(term_buf, st.buf, sizeof(term_buf));
+            memcpy(term_color, st.color, sizeof(term_color));
+            term_r = st.r;
+            term_c = st.c;
+        } else {
+            term_clear();
+        }
+
+        int o_fd = open("cmd_out", 0);
+        if (o_fd >= 0) {
+            char out_buf[1024];
+            int rn = read(o_fd, out_buf, sizeof(out_buf) - 1);
+            close(o_fd);
+            int tr_fd = open("cmd_out", O_WRONLY | O_CREAT, 0);
+            if (tr_fd >= 0) { close(tr_fd); }
+
+            if (rn > 0) {
+                out_buf[rn] = '\0';
+                if (strcmp(out_buf, "__CLEAR__") == 0 || strncmp(out_buf, "__CLEAR__", 9) == 0) {
+                    term_clear();
+                } else if (strncmp(out_buf, "\033WIN_", 5) == 0) {
+                    if (strncmp(out_buf + 5, "ABOUT", 5) == 0) open_win_type(WIN_ABOUT);
+                    else if (strncmp(out_buf + 5, "NOTEPAD", 7) == 0) open_win_type(WIN_NOTEPAD);
+                    else if (strncmp(out_buf + 5, "FILES", 5) == 0) open_win_type(WIN_FILES);
+                    term_print("Opened GUI application window.\n", COL_TEXT_CYAN);
+                } else {
+                    term_print(out_buf, COL_TEXT_WHITE);
+                    if (out_buf[rn - 1] != '\n') term_print("\n", COL_TEXT_WHITE);
+                }
+            }
+        }
+    } else {
+        term_clear();
+        term_print("AzamiOS True Color Shell v3.0\n", COL_TEXT_CYAN);
+        term_print("Type 'help' for commands\n", COL_TEXT_WHITE);
+    }
     term_print("azami:~$ ", COL_TEXT_GREEN);
     cmd_buf[0] = 0;
     cmd_p = 0;

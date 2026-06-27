@@ -33,5 +33,6 @@ int  module_init_all(void);
 int  module_get_count(void);
 const kernel_module_t *module_get_registry(void);
 int  module_get_summary_table(char *buf, int max_len);
+int  module_reload(const char *name);
 
 #endif /* _KERNEL_MODULE_H */

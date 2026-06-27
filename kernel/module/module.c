@@ -109,3 +109,34 @@ int module_get_summary_table(char *buf, int max_len) {
     }
     return strlen(buf);
 }
+
+int module_reload(const char *name) {
+    if (!name) return -1;
+    kernel_module_t *curr = g_mod_registry;
+    while (curr) {
+        if (strcmp(curr->name, name) == 0) {
+            kprintf("[mod] Live reload requested for [%s] : %s\n", curr->name, curr->desc);
+            if (curr->active && curr->exit) {
+                curr->exit();
+            }
+            curr->active = 0;
+            if (curr->probe && !curr->probe()) {
+                kprintf("[mod] Reload probe failed for [%s]\n", curr->name);
+                return -2;
+            }
+            int res = 0;
+            if (curr->init) res = curr->init();
+            if (res == 0) {
+                curr->active = 1;
+                kprintf("[mod] Reloaded [%s] successfully without reboot.\n", curr->name);
+                return 0;
+            } else {
+                kprintf("[mod] Reload init failed (%d)\n", res);
+                return res;
+            }
+        }
+        curr = curr->next;
+    }
+    kprintf("[mod] Module '%s' not found in registry\n", name);
+    return -1;
+}

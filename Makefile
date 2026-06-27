@@ -65,8 +65,11 @@ HOST_CFLAGS = -Wall -Wextra -O2 -I. -Ilib
 # ──────────────────────────────────────────────────────────────────────────────
 # Primary aliases / phony targets
 # ──────────────────────────────────────────────────────────────────────────────
+UTIL_LIST = ls help cat write time clear ifconfig ping arp lsmod reload cpu whoami fps acpi reboot shutdown about notepad files
+UTIL_TARGETS = $(foreach u,$(UTIL_LIST),user/apps/$(u)/$(u))
+
 .PHONY: all run run-iso run-debug build-iso kernel.bin kernel.elf initrd.tar fat32.img clean test-lib
-.PHONY: user/apps/wm/wm user/apps/shell/shell user/apps/cc/cc user/apps/glcube/glcube
+.PHONY: user/apps/wm/wm user/apps/shell/shell user/apps/cc/cc user/apps/glcube/glcube $(UTIL_TARGETS)
 
 all: $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/initrd.tar
 
@@ -96,14 +99,15 @@ $(BUILD_DIR)/fat32.img:
 	mcopy -i $@ readme.txt ::README.TXT
 	rm -f readme.txt
 
-$(BUILD_DIR)/initrd.tar: user/apps/wm/wm user/apps/shell/shell user/apps/cc/cc user/apps/glcube/glcube user/apps/cc/fib.c
+$(BUILD_DIR)/initrd.tar: user/apps/wm/wm user/apps/shell/shell user/apps/cc/cc user/apps/glcube/glcube user/apps/cc/fib.c $(UTIL_TARGETS)
 	@mkdir -p $(BUILD_DIR)/user_bin
 	cp user/apps/wm/wm    $(BUILD_DIR)/user_bin/wm
 	cp user/apps/shell/shell $(BUILD_DIR)/user_bin/shell
 	cp user/apps/cc/cc    $(BUILD_DIR)/user_bin/cc
 	cp user/apps/glcube/glcube $(BUILD_DIR)/user_bin/glcube
 	cp user/apps/cc/fib.c $(BUILD_DIR)/user_bin/fib.c
-	cd $(BUILD_DIR)/user_bin && tar --format=ustar -cf ../initrd.tar wm shell cc glcube fib.c
+	for u in $(UTIL_LIST); do cp user/apps/$$u/$$u $(BUILD_DIR)/user_bin/$$u; done
+	cd $(BUILD_DIR)/user_bin && tar --format=ustar -cf ../initrd.tar wm shell cc glcube fib.c $(UTIL_LIST)
 
 $(BUILD_DIR)/AzamiOS.iso: $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/initrd.tar boot/grub/menu.lst
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
@@ -131,6 +135,8 @@ user/apps/cc/cc:
 	$(MAKE) -C user/apps/cc
 user/apps/glcube/glcube:
 	$(MAKE) -C user/apps/glcube
+$(UTIL_TARGETS):
+	$(MAKE) -C $(dir $@)
 
 # ── Execution targets ─────────────────────────────────────────────────────────
 run: $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/initrd.tar $(BUILD_DIR)/fat32.img
