@@ -1,7 +1,9 @@
 #ifndef STDIO_H
 #define STDIO_H
 #define EOF (-1)
+#ifndef NULL
 #define NULL ((void*)0)
+#endif
 /*
  Print function
     flags:

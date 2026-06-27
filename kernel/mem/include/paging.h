@@ -62,6 +62,7 @@ typedef union
 }page_directory_entry_t;
 
 void paging_map_page(uint32_t phys_addr, uint32_t virt_addr, uint8_t is_kernel, uint8_t is_writable);
+void paging_map_framebuffer(uint32_t lfb_phys, uint32_t size_bytes);
 void paging_init();
 
 #endif

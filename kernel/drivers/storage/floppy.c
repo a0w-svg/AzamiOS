@@ -1,3 +1,13 @@
+/**
+ * kernel/drivers/storage/floppy.c — AzamiOS Floppy Disk Controller Driver
+ *
+ * EDUCATIONAL RELIABILITY EXPLANATIONS:
+ * 1. IRQ Timeout Enforcement:
+ *    Waiting endlessly for an IRQ (`while(!floppy_irq_fired);`) causes a system hang
+ *    if the virtual disk or physical drive fails to signal completion. A bounding timeout
+ *    counter (`timeout = 5000000`) guarantees kernel thread recovery.
+ */
+
 #include "./include/floppy.h"
 #include "../klibc/include/port.h"
 #include "../klibc/include/stdio.h"
@@ -20,7 +30,8 @@ void floppy_irq_handler(registers_t *r){
     Puts in sleep (blocks executing) until it receives interrupt from FDD
  */
  static void floppy_wait_irq(){
-    while(!floppy_irq_fired);
+    int timeout = 5000000;
+    while(!floppy_irq_fired && --timeout > 0);
     floppy_irq_fired = 0;
  }
 

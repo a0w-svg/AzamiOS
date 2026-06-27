@@ -280,6 +280,7 @@ void dma_unmask_channel(uint8_t channel)
 */
 void dma_unmask_all(int dma)
 {
+    (void)dma;
     // it doesn't matter what is written to this register;
     outb(DMA1_UNMASK_ALL_REG, 0xFF);
 }

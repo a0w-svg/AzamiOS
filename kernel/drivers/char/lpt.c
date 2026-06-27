@@ -7,5 +7,5 @@
 
 void lpt_write_byte(uint8_t lpt_data)
 {
-
+    (void)lpt_data;
 }

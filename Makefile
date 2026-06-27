@@ -82,11 +82,11 @@ build-iso:  $(BUILD_DIR)/AzamiOS.iso
 
 $(BUILD_DIR)/kernel.bin: $(BUILD_DIR)/obj/kernel/boot/boot.o ${OBJ}
 	@mkdir -p $(dir $@)
-	i686-elf-ld $^ -T Link.ld -o $@
+	i686-elf-ld $^ -T Link.ld --no-warn-rwx-segments -o $@
 
 $(BUILD_DIR)/kernel.elf: $(BUILD_DIR)/obj/kernel/boot/boot.o ${OBJ}
 	@mkdir -p $(dir $@)
-	i686-elf-ld -T Link.ld $^ -o $@
+	i686-elf-ld -T Link.ld --no-warn-rwx-segments $^ -o $@
 
 $(BUILD_DIR)/fat32.img:
 	@mkdir -p $(BUILD_DIR)

@@ -1,6 +1,20 @@
+/**
+ * kernel/drivers/input/kbc.c — AzamiOS PS/2 Keyboard Controller Driver
+ *
+ * EDUCATIONAL RELIABILITY & DEADLOCK PREVENTION EXPLANATIONS:
+ * 1. Bounded Hardware Polling (Timeout Enforcements):
+ *    Unbounded `while(1)` spin loops waiting on status registers can hang the entire
+ *    operating system kernel if hardware fails or slows down. All polling loops now use
+ *    a timeout counter (`timeout = 100000`) to guarantee progress and prevent ring 0 deadlocks.
+ * 2. Correct Status Bit Polling:
+ *    When waiting for the input buffer to clear before sending data, we wait while bit 1 is 1.
+ *    When waiting for data from the output buffer, we wait while bit 0 is 0 (`OUT_BUFFER == 0`).
+ */
+
 #include "./include/kbc.h"
 #include "../klibc/include/port.h"
 #include <stdbool.h>
+
 /*
     Read status from keyboard controller;
 */
@@ -14,11 +28,12 @@ uint8_t kbc_read_status()
 */
 void kbc_send_cmd(uint8_t cmd)
 {
-    // wait for keyboard controller input buffer to be clear;
-    while(1)
-        if((kbc_read_status() & KBC_STATS_MASK_IN_BUFFER) == 0)
+    int timeout = 100000;
+    while (--timeout > 0) {
+        if ((kbc_read_status() & KBC_STATS_MASK_IN_BUFFER) == 0)
             break;
-    outb(KBC_CMD_REGISTER, cmd); //  send commmand to port 0x64;
+    }
+    outb(KBC_CMD_REGISTER, cmd); // send command to port 0x64;
 }
 
 /*
@@ -34,11 +49,11 @@ uint8_t kb_encoder_read_buffer()
 */
 void kb_encoder_send_cmd(uint8_t cmd)
 {
-    // wait for Keyboard Controller input buffer to be clear;
-    while(1)
-        if((kbc_read_status() & KBC_STATS_MASK_IN_BUFFER) == 0)
+    int timeout = 100000;
+    while (--timeout > 0) {
+        if ((kbc_read_status() & KBC_STATS_MASK_IN_BUFFER) == 0)
             break;
-    // send command byte to keyboard encoder;
+    }
     outb(KB_ENDCODER_CMD_REGISTER, cmd);
 }
 
@@ -47,7 +62,6 @@ void kb_encoder_send_cmd(uint8_t cmd)
 */
 void kb_reset_system()
 {
-    // writes 11111110 to the output port (sets reset system line low);
     kbc_send_cmd(KBC_WRITE_OUTPUT_PORT);
     kb_encoder_send_cmd(0xFE);
 }
@@ -57,54 +71,46 @@ void kb_reset_system()
 */
 uint8_t kb_self_test()
 {
-    // send the self test command;
     kbc_send_cmd(KBC_SELF_TEST);
-    // wait for output buffer to be full
-    while(1)
-        if((kbc_read_status() & KBC_STATS_MASK_OUT_BUFFER) == 0)
+    int timeout = 100000;
+    while (--timeout > 0) {
+        if ((kbc_read_status() & KBC_STATS_MASK_OUT_BUFFER) != 0)
             break;
-    // if output buffer == 0x55, test passed;
+    }
+    if (timeout == 0) return false;
     return (kb_encoder_read_buffer() == 0x55) ? true : false;
 }
 
 /*
     run interface test;
+    Returns 0x00 on success, or error code / 0xFF on timeout.
 */
 uint8_t kb_interface_test()
 {
-    // send the interface test command;
     kbc_send_cmd(KBC_INTERFACE_TEST);
-    // wait for output buffer to be full
-    while(1)
-        if((kbc_read_status() & KBC_STATS_MASK_OUT_BUFFER) == 0)
+    int timeout = 100000;
+    while (--timeout > 0) {
+        if ((kbc_read_status() & KBC_STATS_MASK_OUT_BUFFER) != 0)
             break;
-    // if output buffer == 
-    // TODO LATER
-    return 0;
+    }
+    if (timeout == 0) return 0xFF; // timeout error
+    return kb_encoder_read_buffer();
 }
 
 /*
     Check the type of PS/2 device;
-    returns:
-        None - Ancient AT keyboard with translation enabled in the PS/Controller
-         (not possible for the second PS/2 port)
-        0x00 - Standard PS/2 mouse
-        0x03 - Mouse with scroll wheel
-        0x04 - 5-button mouse
-        0xAB, 0x41 or 0xAB, 0xC1 -MF2 keyboard with translation enabled in the PS/Controller 
-        (not possible for the second PS/2 port)
-        0xAB, 0x83 - MF2 keyboard
 */
 uint8_t kb_device_check_type()
 {
-    uint8_t code;
-    // send the disable scannig command;
+    uint8_t code = 0xFF;
     kb_encoder_send_cmd(KBE_RESET_POWER_ON_CONDITION_WAIT_TO_ENABLE_CMD);
     kb_encoder_send_cmd(KBE_SEND_2_BYTE_KB_ID);
-    while(1)
-        if((kbc_read_status() & KBC_STATS_MASK_OUT_BUFFER) == 0)
+    int timeout = 100000;
+    while (--timeout > 0) {
+        if ((kbc_read_status() & KBC_STATS_MASK_OUT_BUFFER) != 0)
             break;
-    code = kb_encoder_read_buffer();
+    }
+    if (timeout > 0) code = kb_encoder_read_buffer();
     kb_encoder_send_cmd(0xF4);
     return code;
 }

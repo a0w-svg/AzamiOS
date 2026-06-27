@@ -17,7 +17,7 @@ void* memmove(void* destination, const void* source, size_t num);
 int   memcmp(const void* s1, const void* s2, size_t n);
 
 /* ── String operations ───────────────────────────────────────────────── */
-int   strlen(const char* s);
+size_t strlen(const char* s);
 int   strcmp(const char* s1, const char* s2);
 int   strncmp(const char* s1, const char* s2, size_t n);
 char* strcpy(char* dest, const char* src);

@@ -70,12 +70,12 @@ void* memmove(void* dest, const void* src, size_t n) {
 /**
  * strlen – return the number of bytes in s (not counting the NUL).
  */
-int strlen(const char* s)
+size_t strlen(const char* s)
 {
     size_t len = 0;
     while (s[len])
         len++;
-    return (int)len;
+    return len;
 }
 
 /**
@@ -106,7 +106,6 @@ char* strcpy(char* dest, const char* src) {
  */
 char* strncpy(char* destination, const char* source, size_t num)
 {
-    if (!destination && !source) return NULL;
     char* begin = destination;
     while (num > 0 && *source != '\0') {
         *destination++ = *source++;

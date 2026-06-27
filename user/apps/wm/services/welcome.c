@@ -1,7 +1,21 @@
+/**
+ * welcome.c — AzamiOS Welcome & About Window Services
+ *
+ * EDUCATIONAL ARCHITECTURE & MODULARITY EXPLANATIONS:
+ * 1. Static Service Encapsulation:
+ *    The Welcome and About dialogs operate as passive, static display services.
+ *    They declare `WM_SRV_FLAG_NONE` because they do not require continuous CPU cycles
+ *    or frame rendering animations when idle, preserving system battery and CPU time.
+ * 2. Safe Window Rendering Boundaries:
+ *    Render coordinates derive strictly from clamped parent window dimensions (`w->w`, `w->h`),
+ *    preventing UI overflow regardless of user dragging or resizing actions.
+ */
+
 #include "../wm.h"
 
 static void welcome_render(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int blink) {
     (void)t; (void)frame_cnt; (void)blink;
+    if (!w) return;
     int bx = w->x + 1;
     int by = w->y + TITLEBAR_H;
     int bw = w->w - 2;
@@ -34,6 +48,7 @@ static void welcome_render(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int b
 
 static void about_render(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int blink) {
     (void)t; (void)frame_cnt; (void)blink;
+    if (!w) return;
     int bx = w->x + 1;
     int by = w->y + TITLEBAR_H;
     int bw = w->w - 2;
@@ -69,6 +84,8 @@ void welcome_service_init(void) {
     static const wm_service_t welcome_srv = {
         WIN_WELCOME,
         "Welcome",
+        WM_SRV_FLAG_NONE,
+        NULL,
         NULL,
         NULL,
         welcome_render,
@@ -77,6 +94,8 @@ void welcome_service_init(void) {
     static const wm_service_t about_srv = {
         WIN_ABOUT,
         "About",
+        WM_SRV_FLAG_NONE,
+        NULL,
         NULL,
         NULL,
         about_render,

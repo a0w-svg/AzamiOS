@@ -1,7 +1,20 @@
+/**
+ * files.c — AzamiOS File Manager Service
+ *
+ * EDUCATIONAL ARCHITECTURE & SECURITY EXPLANATIONS:
+ * 1. Read-Only Display Isolation:
+ *    The graphical file browser displays volume mappings without direct mutator callbacks.
+ *    By separating browsing rendering from low-level filesystem drivers (`sys_open`, etc.),
+ *    the service prevents UI exploits from arbitrarily modifying root storage sectors.
+ * 2. Static Compositing:
+ *    Registers with `WM_SRV_FLAG_NONE`, rendering UI components only when brought into focus.
+ */
+
 #include "../wm.h"
 
 static void files_render(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int blink) {
     (void)t; (void)frame_cnt; (void)blink;
+    if (!w) return;
     int bx = w->x + 1;
     int by = w->y + TITLEBAR_H;
     int bw = w->w - 2;
@@ -42,6 +55,8 @@ void files_service_init(void) {
     static const wm_service_t files_srv = {
         WIN_FILES,
         "File Manager",
+        WM_SRV_FLAG_NONE,
+        NULL,
         NULL,
         NULL,
         files_render,

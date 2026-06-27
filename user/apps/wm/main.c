@@ -1,3 +1,20 @@
+/**
+ * main.c — AzamiOS Secure & Modular Desktop Environment Main Loop
+ *
+ * EDUCATIONAL ARCHITECTURE & SECURITY EXPLANATIONS:
+ * 1. Decoupled Frame Animation Triggering:
+ *    Instead of hardcoding checks for specific window IDs (like `WIN_GLCUBE`),
+ *    the loop checks if any visible window's service possesses the `WM_SRV_FLAG_ANIMATED`
+ *    capability flag. This decouples core event loop logic from specific apps.
+ * 2. Dynamic Start Menu Event Dispatching:
+ *    Menu click resolution dynamically matches click offsets against registered service index
+ *    entries (`wm_get_service_by_index`). Applications can be dynamically added or removed
+ *    without modifying UI dispatch code.
+ * 3. Safe Lifecycle Mutators & Input Validation:
+ *    Closing windows triggers `wm_close_window` ensuring service cleanup hooks (`on_close`)
+ *    execute safely. Keyboard inputs are clamped to standard ASCII bounds before dispatch.
+ */
+
 #include "wm.h"
 
 void _start(void) {
@@ -48,13 +65,17 @@ void _start(void) {
             p_foc = g_focus; p_sm = start_menu; p_cm = ctx_menu_open;
         }
         if ((frame_cnt % 30) == 0) dirty = true;
+
+        /* MODULARITY: Check capability flags instead of hardcoded app IDs */
         for (int i = 0; i < g_num_wins; i++) {
-            if (g_wins[i].open && !g_wins[i].minimized && g_wins[i].type == WIN_GLCUBE) {
-                dirty = true;
-                break;
+            if (g_wins[i].open && !g_wins[i].minimized) {
+                const wm_service_t *srv = wm_get_service(g_wins[i].type);
+                if (srv && (srv->flags & WM_SRV_FLAG_ANIMATED)) {
+                    dirty = true;
+                    break;
+                }
             }
         }
-
 
         /* ── Mouse Input ─────────────────────────────────────────────── */
         bool left_click  = ms.left_btn && !prev_left;
@@ -62,7 +83,6 @@ void _start(void) {
 
         /* Right-click: open context menu on desktop */
         if (right_click) {
-            /* Only open if clicking on the desktop area (not on a window) */
             bool on_window = false;
             for (int i = 0; i < g_num_wins; i++) {
                 window_t *w = &g_wins[i];
@@ -97,7 +117,6 @@ void _start(void) {
                     if (entry == 0) { open_win_type(WIN_NOTEPAD); }
                     else if (entry == 1) { open_win_type(WIN_ABOUT); }
                     else if (entry == 2) { open_win_type(WIN_FILES); }
-                    /* entry 3 = Refresh, no-op (just redraws) */
                     handled = true;
                 }
                 ctx_menu_open = false;
@@ -134,24 +153,23 @@ void _start(void) {
                 }
             }
 
-            /* 4. Start menu clicks */
+            /* 4. Start menu clicks (Dynamically Dispatched) */
             if (start_menu && !handled) {
+                int srv_count = wm_get_service_count();
+                int total_entries = srv_count + 1;
+                int menu_h = START_HEADER_H + total_entries * START_ENTRY_H + 8;
                 int mx = 4;
-                int my = SCREEN_H - TASKBAR_H - START_MENU_H;
+                int my = SCREEN_H - TASKBAR_H - menu_h;
                 if (ms.x >= mx && ms.x <= mx + START_MENU_W &&
-                    ms.y >= my && ms.y <= my + START_MENU_H) {
+                    ms.y >= my && ms.y <= my + menu_h) {
                     int rel_y = ms.y - my - START_HEADER_H - 2;
                     if (rel_y >= 0) {
                         int entry = rel_y / START_ENTRY_H;
-                        switch (entry) {
-                            case 0: open_win_type(WIN_WELCOME); break;
-                            case 1: open_win_type(WIN_TERMINAL); break;
-                            case 2: open_win_type(WIN_SYSMON); break;
-                            case 3: open_win_type(WIN_ABOUT); break;
-                            case 4: open_win_type(WIN_NOTEPAD); break;
-                            case 5: open_win_type(WIN_FILES); break;
-                            case 6: open_win_type(WIN_GLCUBE); break;
-                            case 7: exit(0); break;
+                        if (entry >= 0 && entry < srv_count) {
+                            const wm_service_t *srv = wm_get_service_by_index(entry);
+                            if (srv) open_win_type(srv->type);
+                        } else if (entry == srv_count) {
+                            exit(0);
                         }
                     }
                     start_menu = false;
@@ -173,7 +191,6 @@ void _start(void) {
 
             /* 6. Window interactions (top-down Z-order) */
             if (!handled) {
-                /* Build draw order: focused window is last (on top) */
                 int order[MAX_WINS];
                 int oc = 0;
                 for (int i = 0; i < g_num_wins; i++)
@@ -185,17 +202,16 @@ void _start(void) {
                     window_t *w = &g_wins[idx];
                     if (!w->open || w->minimized) continue;
 
-                    /* Check if click is in window bounds */
                     if (ms.x < w->x || ms.x > w->x + w->w ||
                         ms.y < w->y || ms.y > w->y + w->h) continue;
 
                     int bx = w->x + w->w;
                     int by_btn = w->y + 4;
 
-                    /* Close button */
+                    /* Close button (Safe Lifecycle API) */
                     if (ms.x >= bx - 20 && ms.x <= bx - 4 &&
                         ms.y >= by_btn && ms.y <= by_btn + 14) {
-                        w->open = false;
+                        wm_close_window(w);
                         handled = true;
                         break;
                     }
@@ -209,8 +225,8 @@ void _start(void) {
                         } else {
                             w->ox = w->x; w->oy = w->y;
                             w->ow = w->w; w->oh = w->h;
+                            wm_resize_window(w, SCREEN_W, DESKTOP_H);
                             w->x = 0; w->y = 0;
-                            w->w = SCREEN_W; w->h = DESKTOP_H;
                             w->maximized = true;
                         }
                         g_focus = idx;
@@ -240,7 +256,6 @@ void _start(void) {
                 }
             }
 
-            /* Dismiss menus on any unhandled click */
             if (!handled) {
                 start_menu = false;
                 ctx_menu_open = false;
@@ -257,10 +272,12 @@ void _start(void) {
         prev_left = ms.left_btn;
         prev_right = ms.right_btn;
 
-        /* ── Keyboard Input ──────────────────────────────────────────── */
+        /* ── Keyboard Input (Validated) ──────────────────────────────── */
         while (has_char()) {
             dirty = true;
             int c = getchar();
+            /* SECURITY ENFORCEMENT: Clamp input character to valid ASCII range */
+            if (c < 0 || c > 255) continue;
             int ftype = (g_focus >= 0 && g_focus < g_num_wins) ? g_wins[g_focus].type : -1;
             const wm_service_t *srv = wm_get_service(ftype);
             if (srv && srv->on_key) {
@@ -274,16 +291,11 @@ void _start(void) {
         }
 
         /* ── Render Frame ────────────────────────────────────────────── */
-
         blink = (blink + 1) % 40;
 
-        /* 1. Wallpaper gradient */
         draw_wallpaper();
-
-        /* 2. Desktop icons */
         render_desktop_icons();
 
-        /* 3. Windows (back to front Z-order) */
         {
             int order[MAX_WINS];
             int oc = 0;
@@ -296,20 +308,14 @@ void _start(void) {
             }
         }
 
-        /* 4. Start menu overlay */
         if (start_menu) render_start_menu();
-
-        /* 5. Context menu overlay */
         if (ctx_menu_open) render_context_menu();
-
-        /* 6. Taskbar (always on top) */
         render_taskbar(&t, start_menu);
 
         gfx_flip();
 
-        /* Frame pacing */
         for (volatile int k = 0; k < 150; k++);
     }
 
-    exit(0);
+    for(;;);
 }

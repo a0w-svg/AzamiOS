@@ -5,6 +5,9 @@
 #define _STRING_H
 
 #include <stddef.h>
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 
 /* ── Memory operations ─────────────────────────────────────────── */
 void  *memset (void *s, int c, size_t n);

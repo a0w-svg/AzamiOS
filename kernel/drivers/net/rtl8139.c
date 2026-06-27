@@ -1,6 +1,12 @@
 /**
- * rtl8139.c  –  Realtek RTL8139 Fast Ethernet NIC Driver
+ * kernel/drivers/net/rtl8139.c  –  Realtek RTL8139 Fast Ethernet NIC Driver
  * PCI initialization, MMIO/IO ring buffers, interrupts, packet Rx/Tx
+ *
+ * EDUCATIONAL SECURITY & RELIABILITY EXPLANATIONS:
+ * 1. Denial-of-Service Protection (Packet Storm Rate Limiting):
+ *    Unbounded packet processing inside an Interrupt Service Routine (ISR) can starve
+ *    the OS task scheduler during network floods or hardware buffer loops. A rate limit
+ *    (`max_pkts = 64`) ensures ring 0 yields CPU execution back to scheduled processes.
  */
 #include "./include/rtl8139.h"
 #include "./include/pci.h"
@@ -19,8 +25,9 @@ static void rtl8139_irq_handler(registers_t *regs) {
     uint16_t status = inw(g_rtl.io_base + RTL_ISR);
 
     if (status & RTL_INT_ROK) {
-        /* Packet Received */
-        while ((inb(g_rtl.io_base + RTL_CR) & RTL_CR_BUFE) == 0) {
+        /* Packet Received - Bounded by rate limit to prevent ISR livelock */
+        int max_pkts = 64;
+        while (((inb(g_rtl.io_base + RTL_CR) & RTL_CR_BUFE) == 0) && max_pkts-- > 0) {
             uint32_t rx_offset = g_rtl.cur_rx % RTL_RX_BUF_SIZE;
             uint16_t *header = (uint16_t*)(g_rtl.rx_buffer_phys + rx_offset);
             uint16_t pkt_status = header[0];

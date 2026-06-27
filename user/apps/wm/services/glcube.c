@@ -1,16 +1,30 @@
 /**
  * glcube.c — AzamiGL 3D Rotating Cube Service for Window Manager
+ *
+ * EDUCATIONAL ARCHITECTURE & CAPABILITY EXPLANATIONS:
+ * 1. Dynamic Animation Capability Flag (`WM_SRV_FLAG_ANIMATED`):
+ *    Unlike static applications, 3D rendering engines require continuous screen refreshing
+ *    to display fluid motion. By declaring `WM_SRV_FLAG_ANIMATED` during service registration,
+ *    this module instructs the core event loop (`main.c`) to flag redraw frames dynamically
+ *    without hardcoding window IDs into the central compositor.
+ * 2. Viewport Boundary Verification:
+ *    Before executing 3D matrix projections (`glViewport`), the render callback checks that
+ *    window dimensions (`bw`, `bh`) strictly exceed zero, avoiding division-by-zero crashes
+ *    in projection calculations (`gluPerspective`).
  */
+
 #include "../wm.h"
 #include <GL/gl.h>
 
 static void glcube_render(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int blink) {
     (void)blink;
+    if (!w) return;
     int bx = w->x + 1;
     int by = w->y + TITLEBAR_H;
     int bw = w->w - 2;
     int bh = w->h - TITLEBAR_H - 1;
 
+    /* SAFETY CHECK: Prevent division by zero or invalid negative viewport allocation */
     if (bw <= 0 || bh <= 0) return;
 
     /* 1. Set viewport and clear buffers */
@@ -82,6 +96,8 @@ void glcube_service_init(void) {
     static const wm_service_t glcube_srv = {
         WIN_GLCUBE,
         "3D OpenGL Demo",
+        WM_SRV_FLAG_ANIMATED,
+        NULL,
         NULL,
         NULL,
         glcube_render,

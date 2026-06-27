@@ -176,21 +176,12 @@ void gfx_init_bga(void) {
     uint32_t lfb_phys = bga_locate_lfb();
     kprintf("gfx: LFB located at physical address 0x%x\n", lfb_phys);
 
-    /* Map the framebuffer into the page tables (300 × 4 KB pages = 1.2 MB) */
+    /* Map MMIO LFB using a dedicated kernel page table. */
     uint32_t fb_size_bytes = GFX_WIDTH * GFX_HEIGHT * 4;
-    for (uint32_t off = 0; off < fb_size_bytes; off += 4096)
-        paging_map_page(lfb_phys + off, lfb_phys + off, 0, 1);
+    paging_map_framebuffer(lfb_phys, fb_size_bytes);
 
     lfb = (uint32_t*)lfb_phys;
     g_gfx_enabled = true;
-
-    kprintf("gfx: Testing LFB read/write at 0x%x...\n", lfb_phys);
-    uint32_t cr3;
-    asm volatile("mov %%cr3, %0" : "=r"(cr3));
-    kprintf("gfx: current cr3=0x%x\n", cr3);
-    volatile uint32_t *test_ptr = (volatile uint32_t *)lfb_phys;
-    *test_ptr = 0x12345678;
-    kprintf("gfx: successfully wrote to LFB, read back: 0x%x\n", *test_ptr);
 
     gfx_clear(0x000F172A);
     gfx_flip();

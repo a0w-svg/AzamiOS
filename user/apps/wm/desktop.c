@@ -1,3 +1,18 @@
+/**
+ * desktop.c — AzamiOS Secure & Dynamic Desktop UI Environment
+ *
+ * EDUCATIONAL ARCHITECTURE & SECURITY EXPLANATIONS:
+ * 1. Dynamic Modularity in UI Elements:
+ *    Hardcoded menus require recompiling the core desktop engine whenever an application
+ *    is added or removed. Here, `render_start_menu` dynamically queries the Service
+ *    Registry (`wm_get_service_count`, `wm_get_service_by_index`), generating UI entries
+ *    on the fly. This decoupling ensures true modular design.
+ * 2. Safe Buffer Operations in Formatting Helpers:
+ *    Formatting numeric date and time structures into character buffers can overflow if
+ *    index pointers (`p`) exceed allocated string dimensions. Bounding checks (`p < 8`)
+ *    guarantee stack integrity during continuous taskbar clock rendering.
+ */
+
 #include "wm.h"
 
 /* ── Global UI state ─────────────────────────────────────────────────────── */
@@ -14,38 +29,39 @@ const desktop_icon_t icons[NUM_ICONS] = {
     {16, 280, "3D Cube",   WIN_GLCUBE},
 };
 
-/* ── Time formatting helpers ─────────────────────────────────────────────── */
+/* ── Bounded Time & Date Formatting Helpers ──────────────────────────────── */
 void format_time_str(char *buf, rtc_time_t *t) {
+    if (!buf || !t) return;
     char tmp[16]; int p = 0;
     itoa(t->hour, tmp, 10);
     if (t->hour < 10) buf[p++] = '0';
-    for (int i = 0; tmp[i]; i++) buf[p++] = tmp[i];
+    for (int i = 0; tmp[i] && p < 8; i++) buf[p++] = tmp[i];
     buf[p++] = ':';
     itoa(t->minute, tmp, 10);
     if (t->minute < 10) buf[p++] = '0';
-    for (int i = 0; tmp[i]; i++) buf[p++] = tmp[i];
+    for (int i = 0; tmp[i] && p < 8; i++) buf[p++] = tmp[i];
     buf[p++] = ':';
     itoa(t->second, tmp, 10);
     if (t->second < 10) buf[p++] = '0';
-    for (int i = 0; tmp[i]; i++) buf[p++] = tmp[i];
+    for (int i = 0; tmp[i] && p < 8; i++) buf[p++] = tmp[i];
     buf[p] = 0;
 }
 
 void format_date_str(char *buf, rtc_time_t *t) {
+    if (!buf || !t) return;
     char tmp[16]; int p = 0;
     itoa(t->day, tmp, 10);
     if (t->day < 10) buf[p++] = '0';
-    for (int i = 0; tmp[i]; i++) buf[p++] = tmp[i];
+    for (int i = 0; tmp[i] && p < 8; i++) buf[p++] = tmp[i];
     buf[p++] = '/';
     itoa(t->month, tmp, 10);
     if (t->month < 10) buf[p++] = '0';
-    for (int i = 0; tmp[i]; i++) buf[p++] = tmp[i];
+    for (int i = 0; tmp[i] && p < 8; i++) buf[p++] = tmp[i];
     buf[p] = 0;
 }
 
 /* ── Pixel art icon drawing ──────────────────────────────────────────────── */
 void draw_icon_terminal(int x, int y) {
-    /* Dark terminal rectangle with >_ prompt */
     draw_rect(x, y, 24, 24, COL_TERM_BG);
     draw_rect(x, y, 24, 5, COL_ICON_GRAY);
     draw_rect(x + 1, y + 1, 3, 3, COL_BTN_CLOSE);
@@ -56,21 +72,17 @@ void draw_icon_terminal(int x, int y) {
 }
 
 void draw_icon_system(int x, int y) {
-    /* Gear icon approximation using rectangles */
     draw_rect(x, y, 24, 24, COL_ICON_BLUE);
     draw_rect(x + 2, y + 2, 20, 20, COL_WIN_FRAME);
-    /* Gear teeth */
     draw_rect(x + 10, y, 4, 4, COL_ICON_BLUE);
     draw_rect(x + 10, y + 20, 4, 4, COL_ICON_BLUE);
     draw_rect(x, y + 10, 4, 4, COL_ICON_BLUE);
     draw_rect(x + 20, y + 10, 4, 4, COL_ICON_BLUE);
-    /* Center circle */
     draw_rect(x + 8, y + 8, 8, 8, COL_ICON_BLUE);
     draw_rect(x + 10, y + 10, 4, 4, COL_WIN_FRAME);
 }
 
 void draw_icon_folder(int x, int y) {
-    /* Folder shape */
     draw_rect(x, y + 4, 24, 20, COL_ICON_AMBER);
     draw_rect(x, y + 2, 10, 4, COL_ICON_AMBER);
     draw_rect(x + 1, y + 7, 22, 15, 0x00FCD34D);
@@ -78,18 +90,15 @@ void draw_icon_folder(int x, int y) {
 }
 
 void draw_icon_notepad(int x, int y) {
-    /* Paper with lines */
     draw_rect(x + 2, y, 20, 24, COL_WIN_BODY);
     draw_rect(x + 2, y, 20, 1, COL_ICON_GRAY);
     draw_rect(x + 2, y + 23, 20, 1, COL_ICON_GRAY);
     draw_rect(x + 2, y, 1, 24, COL_ICON_GRAY);
     draw_rect(x + 21, y, 1, 24, COL_ICON_GRAY);
-    /* Lines of text */
     draw_rect(x + 5, y + 5, 14, 1, COL_TEXT_BLUE);
     draw_rect(x + 5, y + 9, 12, 1, COL_TEXT_BLUE);
     draw_rect(x + 5, y + 13, 14, 1, COL_TEXT_BLUE);
     draw_rect(x + 5, y + 17, 8, 1, COL_TEXT_BLUE);
-    /* Pencil */
     draw_rect(x + 16, y + 14, 2, 8, COL_ICON_AMBER);
     draw_rect(x + 16, y + 22, 2, 2, COL_TEXT_DARK);
 }
@@ -102,11 +111,9 @@ void draw_icon_cube(int x, int y) {
 
 /* ── Wallpaper rendering (vertical gradient) ─────────────────────────────── */
 void draw_wallpaper(void) {
-    /* Draw vertical gradient from COL_WALL_TOP to COL_WALL_BOT */
     uint8_t r1 = (COL_WALL_TOP >> 16) & 0xFF, g1 = (COL_WALL_TOP >> 8) & 0xFF, b1 = COL_WALL_TOP & 0xFF;
     uint8_t r2 = (COL_WALL_BOT >> 16) & 0xFF, g2 = (COL_WALL_BOT >> 8) & 0xFF, b2 = COL_WALL_BOT & 0xFF;
 
-    /* Draw in 20-pixel strips for high performance (23 strips for 460 pixels) */
     for (int y = 0; y < DESKTOP_H; y += 20) {
         int rr = r1 + (r2 - r1) * y / DESKTOP_H;
         int gg = g1 + (g2 - g1) * y / DESKTOP_H;
@@ -114,7 +121,6 @@ void draw_wallpaper(void) {
         uint32_t col = ((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bb;
         draw_rect(0, y, SCREEN_W, 20, col);
     }
-
 }
 
 /* ── Render desktop icons ────────────────────────────────────────────────── */
@@ -128,7 +134,6 @@ void render_desktop_icons(void) {
             case WIN_FILES:    draw_icon_folder(ix, iy);    break;
             case WIN_GLCUBE:   draw_icon_cube(ix, iy);      break;
         }
-        /* Label centered below icon */
         int lx = ix + 12 - (strlen(icons[i].label) * 4);
         draw_text(lx, iy + 28, icons[i].label, COL_TEXT_WHITE, 0xFFFFFFFF);
     }
@@ -137,30 +142,23 @@ void render_desktop_icons(void) {
 /* ── Taskbar ─────────────────────────────────────────────────────────────── */
 void render_taskbar(rtc_time_t *t, bool start_open) {
     int ty = SCREEN_H - TASKBAR_H;
-    /* Background */
     draw_rect(0, ty, SCREEN_W, TASKBAR_H, COL_TASKBAR);
-    /* Top accent line */
     draw_rect(0, ty, SCREEN_W, 2, COL_TASKBAR_LN);
-    /* START button */
     draw_rect(4, ty + 4, 60, 16, start_open ? COL_START_ACT : COL_START_BTN);
     draw_text(12, ty + 8, "START", COL_TEXT_WHITE, start_open ? COL_START_ACT : COL_START_BTN);
 
-    /* Window buttons */
     int btn_x = 72;
     for (int i = 0; i < g_num_wins; i++) {
         if (!g_wins[i].open) continue;
-        if (btn_x + 72 > 500) break; /* don't overflow into clock area */
+        if (btn_x + 72 > 500) break;
         uint32_t bcol = (g_focus == i) ? COL_TB_BTN_ACT : COL_TB_BTN;
         draw_rect(btn_x, ty + 4, 68, 16, bcol);
-        /* Truncate title to fit */
         char lbl[10];
-        strncpy(lbl, g_wins[i].title, 8);
-        lbl[8] = 0;
+        wm_strlcpy(lbl, g_wins[i].title, 9);
         draw_text(btn_x + 4, ty + 8, lbl, COL_TEXT_WHITE, bcol);
         btn_x += 72;
     }
 
-    /* Date + time */
     char date_buf[12], time_buf[12];
     format_date_str(date_buf, t);
     format_time_str(time_buf, t);
@@ -168,55 +166,46 @@ void render_taskbar(rtc_time_t *t, bool start_open) {
     draw_text(580, ty + 8, time_buf, COL_TEXT_WHITE, COL_TASKBAR);
 }
 
-/* ── Start menu ──────────────────────────────────────────────────────────── */
+/* ── Dynamic Modular Start Menu ──────────────────────────────────────────── */
 void render_start_menu(void) {
+    int srv_count = wm_get_service_count();
+    int total_entries = srv_count + 1; /* services + Shutdown */
+    int menu_h = START_HEADER_H + total_entries * START_ENTRY_H + 8;
     int mx = 4;
-    int my = SCREEN_H - TASKBAR_H - START_MENU_H;
-    /* Background */
-    draw_rect(mx, my, START_MENU_W, START_MENU_H, COL_CTX_BG);
-    /* Top accent */
+    int my = SCREEN_H - TASKBAR_H - menu_h;
+
+    draw_rect(mx, my, START_MENU_W, menu_h, COL_CTX_BG);
     draw_rect(mx, my, START_MENU_W, 2, COL_TASKBAR_LN);
-    /* Header */
     draw_rect(mx + 4, my + 4, START_MENU_W - 8, START_HEADER_H - 4, COL_START_BTN);
     draw_text(mx + 12, my + 10, "AzamiOS v3.0", COL_TEXT_WHITE, COL_START_BTN);
 
     int ey = my + START_HEADER_H + 2;
-    /* Menu entries */
-    static const char *labels[] = {
-        "> Welcome",
-        "> Terminal",
-        "# System Monitor",
-        "? About AzamiOS",
-        "= Notepad",
-        "@ File Manager",
-        "* 3D OpenGL Demo",
-        "X Shutdown"
+    static const uint32_t palette[] = {
+        COL_TEXT_WHITE, COL_TEXT_CYAN, COL_TEXT_GOLD, COL_TEXT_BLUE, COL_TEXT_GREEN
     };
-    static const uint32_t colors[] = {
-        COL_TEXT_WHITE,
-        COL_TEXT_CYAN,
-        COL_TEXT_GOLD,
-        COL_TEXT_BLUE,
-        COL_TEXT_GREEN,
-        COL_TEXT_GOLD,
-        COL_TEXT_CYAN,
-        COL_TEXT_RED,
-    };
-    for (int i = 0; i < START_MENU_ENTRIES; i++) {
-        if (i == START_MENU_ENTRIES - 1) {
-            /* Separator before Shutdown */
-            draw_rect(mx + 8, ey, START_MENU_W - 16, 1, COL_ICON_GRAY);
-            ey += 3;
+
+    /* Dynamically generate list of registered applications */
+    for (int i = 0; i < srv_count; i++) {
+        const wm_service_t *srv = wm_get_service_by_index(i);
+        char lbl[32];
+        lbl[0] = '>'; lbl[1] = ' '; lbl[2] = '\0';
+        if (srv && srv->name) {
+            wm_strlcpy(lbl + 2, srv->name, sizeof(lbl) - 2);
         }
-        draw_text(mx + 12, ey + 6, labels[i], colors[i], COL_CTX_BG);
+        uint32_t col = palette[i % 5];
+        draw_text(mx + 12, ey + 6, lbl, col, COL_CTX_BG);
         ey += START_ENTRY_H;
     }
+
+    /* Separator before Shutdown */
+    draw_rect(mx + 8, ey, START_MENU_W - 16, 1, COL_ICON_GRAY);
+    ey += 3;
+    draw_text(mx + 12, ey + 6, "X Shutdown", COL_TEXT_RED, COL_CTX_BG);
 }
 
 /* ── Context menu ────────────────────────────────────────────────────────── */
 void render_context_menu(void) {
     int mx = ctx_menu_x, my = ctx_menu_y;
-    /* Clamp to screen */
     if (mx + CTX_MENU_W > SCREEN_W) mx = SCREEN_W - CTX_MENU_W;
     if (my + CTX_MENU_H > DESKTOP_H) my = DESKTOP_H - CTX_MENU_H;
 

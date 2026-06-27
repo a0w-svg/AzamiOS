@@ -22,6 +22,7 @@
 #include "../proc/include/process.h"
 #include "../proc/include/scheduler.h"
 #include "./include/smp.h"
+#include "./include/cpu_check.h"
 #include "../drivers/include/ac97.h"
 #include "../drivers/include/acpi.h"
 #include "../drivers/include/rtl8139.h"
@@ -33,10 +34,14 @@
 #include "../drivers/include/ahci.h"
 #include "../drivers/include/es1370.h"
 #include "../drivers/include/uhci.h"
+#include "../drivers/include/dma.h"
+#include "../drivers/include/lpt.h"
+#include "../drivers/include/floppy.h"
+#include "../drivers/include/gfx.h"
+#include "../module/include/module.h"
 #include "../drivers/include/net_stack.h"
 #include "../drivers/include/pci.h"
 #include "../klibc/include/port.h"
-#include "../module/include/module.h"
 
 static uint32_t g_mem_size_kb = 0;
 static uint32_t g_bitmap_addr = 0;
@@ -44,6 +49,7 @@ static uint32_t g_free_mem_start = 0;
 static uint32_t g_initrd_loc = 0;
 static block_device_t *g_ata_dev = (block_device_t*)0;
 
+static int mod_cpu_init(void) { cpu_check_init(); return 0; }
 static int mod_rtc_init(void) { rtc_init(); init_mouse(); init_keyboard(); return 0; }
 static int mod_pmm_init(void) { pmm_init(g_mem_size_kb, g_bitmap_addr); pmm_deinit_region(g_free_mem_start, 16*1024*1024); return 0; }
 static int mod_paging_init(void) { paging_init(); return 0; }
@@ -113,6 +119,7 @@ static bool mod_sb16_probe(void) {
 static bool mod_gameport_probe(void) { return inb(0x201) != 0xFF; }
 
 static kernel_module_t kmods[] = {
+    { "cpu",       "x86 CPU Topology & Feature Checker", MOD_CORE, 0,       mod_cpu_init,      0, 0, 0 },
     { "rtc",       "RTC & Peripherals",         MOD_CORE, 0,               mod_rtc_init,      0, 0, 0 },
     { "pmm",       "Physical Memory Manager",   MOD_MEM,  0,               mod_pmm_init,      0, 0, 0 },
     { "paging",    "Virtual Memory Manager",    MOD_MEM,  0,               mod_paging_init,   0, 0, 0 },

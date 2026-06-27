@@ -235,7 +235,7 @@ void page_fault_handler(registers_t *r) {
     asm volatile("mov %%cr3, %0" : "=r"(cr3));
     uint32_t hw_pde = ((uint32_t*)cr3)[pd_index];
 
-    kprintf("\n[PAGE FAULT] CR2=0x%x at EIP=0x%x (present=%d, rw=%d, user=%d)\n", cr2, r->eip, !present, !rw, !us);
+    kprintf("\n[PAGE FAULT] CR2=0x%x at EIP=0x%x (present=%d, rw=%d, user=%d)\n", cr2, r->eip, present, rw, us);
     kprintf("DEBUG: cr3=0x%x, page_dir=0x%x, hw_pde=0x%x\n", cr3, (uint32_t)page_directory, hw_pde);
     kprintf("DEBUG: pd_index=%d, pde=0x%x, pt_index=%d, pte=0x%x\n", pd_index, pde_val, pt_index, pte_val);
     PANIC("Memory Access Violation (Page Fault)");

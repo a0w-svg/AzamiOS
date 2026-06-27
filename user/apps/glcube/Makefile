@@ -6,7 +6,7 @@ CFLAGS  = -ffreestanding -nostdlib -nostdinc -m32 -O2 -Wall -Wextra \
           -I/home/a0wsvg/opt/cross/lib/gcc/i686-elf/15.2.0/include \
           -I../../libc/include
 
-LDFLAGS = -T link.ld -nostdlib
+LDFLAGS = -T link.ld -nostdlib --no-warn-rwx-segments
 
 SRCS    = glcube.c
 OBJS    = $(SRCS:.c=.o)

@@ -8,6 +8,7 @@
 #include <gui.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/cpu.h>
 
 #define COLS 78
 #define ROWS 54
@@ -148,6 +149,7 @@ void _start(void) {
                     tui_print("  clear - clear terminal screen\n", COL_TEXT_WHITE);
                     tui_print("  wm    - return to Desktop GUI\n", COL_TEXT_CYAN);
                     tui_print("  cc    - run AzamiCC Ring 3 C compiler\n", COL_TEXT_GREEN);
+                    tui_print("  cpu   - inspect x86 CPU topology & features\n", COL_TEXT_CYAN);
                     tui_print("  lsmod - list loaded Ring 0 kernel modules\n", COL_TEXT_CYAN);
                     tui_print("  exit  - shutdown terminal\n", COL_TEXT_RED);
                 } else if (strcmp(cmd, "time") == 0) {
@@ -181,6 +183,31 @@ void _start(void) {
                     char mod_buf[1024];
                     sys_lsmod(mod_buf, sizeof(mod_buf));
                     tui_print(mod_buf, COL_TEXT_CYAN);
+                } else if (strcmp(cmd, "cpu") == 0 || strcmp(cmd, "sysinfo") == 0) {
+                    cpu_info_t cpu;
+                    get_cpu_info(&cpu);
+                    char buf[64];
+                    tui_print("x86 Processor Topology & Capability Report:\n", COL_TEXT_GOLD);
+                    tui_print("  Vendor ID : ", COL_TEXT_CYAN);
+                    tui_print(cpu.vendor, COL_TEXT_WHITE);
+                    tui_print("\n  Family    : ", COL_TEXT_CYAN);
+                    itoa(cpu.family, buf, 10);
+                    tui_print(buf, COL_TEXT_WHITE);
+                    tui_print(" | Model: ", COL_TEXT_CYAN);
+                    itoa(cpu.model, buf, 10);
+                    tui_print(buf, COL_TEXT_WHITE);
+                    tui_print(" | Stepping: ", COL_TEXT_CYAN);
+                    itoa(cpu.stepping, buf, 10);
+                    tui_print(buf, COL_TEXT_WHITE);
+                    tui_print("\n  Features  : ", COL_TEXT_CYAN);
+                    if (cpu.has_fpu)  tui_print("[FPU] ", COL_TEXT_GREEN);
+                    if (cpu.has_tsc)  tui_print("[TSC] ", COL_TEXT_GREEN);
+                    if (cpu.has_msr)  tui_print("[MSR] ", COL_TEXT_GREEN);
+                    if (cpu.has_pae)  tui_print("[PAE] ", COL_TEXT_GREEN);
+                    if (cpu.has_apic) tui_print("[APIC] ", COL_TEXT_GREEN);
+                    if (cpu.has_sse)  tui_print("[SSE] ", COL_TEXT_GREEN);
+                    if (cpu.has_sse2) tui_print("[SSE2] ", COL_TEXT_GREEN);
+                    tui_print("\n", COL_TEXT_WHITE);
                 } else if (strcmp(cmd, "exit") == 0) {
                     exit(0);
                 } else if (cmd[0] != 0) {

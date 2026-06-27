@@ -40,19 +40,30 @@ void paging_map_page(uint32_t phys_addr, uint32_t virt_addr, uint8_t is_kernel, 
         page_directory[pd_index].user = is_kernel ? 0 : 1;
     }
 
-    page_table->pages[pt_index].frame_addr = phys_addr >> 12;
-    page_table->pages[pt_index].present = 1;
-    page_table->pages[pt_index].writable = is_writable ? 1 : 0;
-    page_table->pages[pt_index].user = is_kernel ? 0 : 1;
+    page_table->pages[pt_index].value = (phys_addr & 0xFFFFF000u)
+        | (is_writable ? 0x02u : 0x00u)
+        | 0x01u
+        | (is_kernel ? 0x00u : 0x04u);
 
-    if(phys_addr >= 0xF0000000){
-        page_table->pages[pt_index].pcd = 1;
-        page_table->pages[pt_index].pwt = 1;
-    }
     asm volatile("invlpg (%0)" : : "b"(virt_addr) : "memory");
+    switch_page_dir(page_directory);
+}
 
-    uint32_t cr3;
-    asm volatile("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) : "r"(cr3) : "memory");
+/* Static page table for the MMIO linear framebuffer (avoids PMM-allocated PT issues). */
+static page_table_t g_lfb_pt __attribute__((aligned(4096)));
+
+void paging_map_framebuffer(uint32_t lfb_phys, uint32_t size_bytes) {
+    uint32_t pages = (size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (pages > 1024) pages = 1024;
+
+    memset(&g_lfb_pt, 0, sizeof(g_lfb_pt));
+    for (uint32_t i = 0; i < pages; i++) {
+        g_lfb_pt.pages[i].value = (lfb_phys + (i * PAGE_SIZE)) | 0x03u;
+    }
+
+    uint32_t pd_index = lfb_phys >> 22;
+    page_directory[pd_index].value = ((uint32_t)&g_lfb_pt) | 0x03u;
+    switch_page_dir(page_directory);
 }
 
 void paging_init(){

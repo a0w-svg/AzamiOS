@@ -2,6 +2,9 @@
 #define MEM_H
 
 #include <stddef.h>
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 /*
     Fill block of memory;
     Sets the first num bytes of the block of memory pointed by ptr to the specified value
@@ -33,7 +36,7 @@ void* memmove(void* destination, const void* source, size_t num);
     int d - source int type
     char* buffer - destination product
 */
-int strlen(const char* s);
+size_t strlen(const char* s);
 /*
     Compare two string and return 1 if them are identical or 0 if them are not identical;
 */

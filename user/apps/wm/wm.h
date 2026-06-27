@@ -1,3 +1,17 @@
+/**
+ * wm.h — AzamiOS Secure & Modular Window Manager Header
+ *
+ * ARCHITECTURAL EXPLANATION:
+ * This header defines the core interfaces for the AzamiOS Window Manager.
+ * To achieve high safety and security:
+ * 1. Encapsulation: State changes are routed through validated API endpoints
+ *    (e.g., wm_set_title, wm_resize_window) rather than unchecked struct access.
+ * 2. Modularity: Applications register as decoupled services via `wm_service_t`
+ *    providing capability flags and standardized lifecycle event hooks.
+ * 3. Memory Safety: Explicit buffer lengths and bounded string manipulation
+ *    helpers prevent stack overflow vulnerabilities.
+ */
+
 #ifndef WM_H
 #define WM_H
 
@@ -69,12 +83,21 @@
 #define WIN_FILES    5
 #define WIN_GLCUBE   6
 
+/* Service Capability Flags */
+#define WM_SRV_FLAG_NONE     0x00
+#define WM_SRV_FLAG_ANIMATED 0x01  /* Service requires continuous frame updates (e.g. 3D OpenGL) */
+
 typedef struct window window_t;
 
+/**
+ * struct window — Represents an active UI window instance.
+ * SAFETY NOTE: Fixed character buffers like `title` must always be modified
+ * via safe helper APIs like `wm_set_title()` to avoid buffer overflows.
+ */
 struct window {
     int  id;
     char title[32];
-    int  x, y, w, h;        /* current position and size */
+    int  x, y, w, h;        /* current position and size (clamped to screen bounds) */
     int  ox, oy, ow, oh;    /* saved position for un-maximize */
     bool open;
     bool minimized;
@@ -82,12 +105,19 @@ struct window {
     int  type;
 };
 
-/* Modular service interface */
+/**
+ * wm_service_t — Modular Application Service Descriptor.
+ * MODULARITY NOTE: By decoupling application logic into self-contained callbacks,
+ * the core window manager operates blindly on abstract services without coupling
+ * to specific application internals.
+ */
 typedef struct {
     int type;
     const char *name;
+    uint32_t flags;
     void (*on_init)(window_t *w);
     void (*on_open)(window_t *w);
+    void (*on_close)(window_t *w);
     void (*on_render)(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int blink);
     void (*on_key)(window_t *w, int char_code, rtc_time_t *t, uint32_t frame_cnt);
 } wm_service_t;
@@ -123,15 +153,29 @@ typedef struct {
 #define NUM_ICONS 5
 extern const desktop_icon_t icons[NUM_ICONS];
 
-/* Functions */
+/* ── Safe String Utilities ───────────────────────────────────────────────── */
+/**
+ * Safe string copy that guarantees null-termination within max_len buffer.
+ */
+void wm_strlcpy(char *dst, const char *src, size_t max_len);
+
+/* ── Core Functions & Safe Lifecycle API ─────────────────────────────────── */
 void init_wins(void);
 int find_win_by_type(int type);
 void open_win_type(int type);
 void render_window(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int blink);
 void render_window_body(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int blink);
 
+/* Secure API mutators */
+void wm_close_window(window_t *w);
+void wm_resize_window(window_t *w, int new_w, int new_h);
+void wm_set_title(window_t *w, const char *title);
+
+/* Modularity Service Registry */
 void wm_register_service(const wm_service_t *service);
 const wm_service_t *wm_get_service(int type);
+int wm_get_service_count(void);
+const wm_service_t *wm_get_service_by_index(int idx);
 
 /* Desktop UI */
 void draw_wallpaper(void);

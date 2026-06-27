@@ -1,3 +1,17 @@
+/**
+ * terminal.c — AzamiOS Interactive Terminal Window Service
+ *
+ * EDUCATIONAL SECURITY & BOUNDARY EXPLANATIONS:
+ * 1. Safe Terminal Text Buffering:
+ *    Terminal display grids (`term_buf`) are strictly bounded by `TERM_ROWS` and `TERM_COLS`.
+ *    Character injection loops verify column pointers (`term_c`) before memory assignment,
+ *    triggering clean circular scrolling (`term_scroll`) to prevent out-of-bounds writes.
+ * 2. Secure Command Execution Lifecycle:
+ *    Shell commands execute within User Mode (Ring 3) isolation. Issuing window termination
+ *    commands (`exit`) invokes the secure mutator API `wm_close_window` rather than directly
+ *    flipping global flags, guaranteeing deterministic resource cleanup.
+ */
+
 #include "../wm.h"
 
 /* ── Terminal state ──────────────────────────────────────────────────────── */
@@ -107,7 +121,8 @@ static void process_command(rtc_time_t *t, uint32_t frame_cnt) {
     } else if (strcmp(cmd_buf, "clear") == 0) {
         term_clear();
     } else if (strcmp(cmd_buf, "exit") == 0) {
-        g_wins[find_win_by_type(WIN_TERMINAL)].open = false;
+        int idx = find_win_by_type(WIN_TERMINAL);
+        if (idx >= 0) wm_close_window(&g_wins[idx]);
     } else if (strcmp(cmd_buf, "about") == 0) {
         open_win_type(WIN_ABOUT);
     } else if (strcmp(cmd_buf, "notepad") == 0) {
@@ -138,13 +153,13 @@ static void terminal_init(window_t *w) {
 
 static void terminal_render(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int blink) {
     (void)t; (void)frame_cnt;
+    if (!w) return;
     int bx = w->x + 1;
     int by = w->y + TITLEBAR_H;
     int bw = w->w - 2;
     int bh = w->h - TITLEBAR_H - 1;
 
     draw_rect(bx, by, bw, bh, COL_TERM_BG);
-    /* Render terminal text buffer */
     for (int r = 0; r < TERM_ROWS; r++) {
         char wb[TERM_COLS + 1];
         int wp = 0;
@@ -167,14 +182,13 @@ static void terminal_render(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int 
             draw_text(bx + 6 + st * 8, by + 4 + r * 8, wb, cc, COL_TERM_BG);
         }
     }
-    /* Blinking cursor */
     if (g_focus == w->id && blink < 20) {
         draw_rect(bx + 6 + term_c * 8, by + 10 + term_r * 8, 8, 2, COL_TEXT_GREEN);
     }
 }
 
 static void terminal_on_key(window_t *w, int c, rtc_time_t *t, uint32_t frame_cnt) {
-    if (!w->open || w->minimized) return;
+    if (!w || !w->open || w->minimized) return;
     if (c == '\n' || c == '\r') {
         term_putc('\n', COL_TEXT_WHITE);
         cmd_buf[cmd_p] = 0;
@@ -188,7 +202,7 @@ static void terminal_on_key(window_t *w, int c, rtc_time_t *t, uint32_t frame_cn
             cmd_buf[cmd_p] = 0;
             term_putc('\b', COL_TEXT_WHITE);
         }
-    } else if (c >= 32 && c <= 126 && cmd_p < 50) {
+    } else if (c >= 32 && c <= 126 && cmd_p < (int)sizeof(cmd_buf) - 1) {
         cmd_buf[cmd_p++] = c;
         cmd_buf[cmd_p] = 0;
         term_putc(c, COL_TEXT_WHITE);
@@ -199,7 +213,9 @@ void terminal_service_init(void) {
     static const wm_service_t terminal_srv = {
         WIN_TERMINAL,
         "Terminal",
+        WM_SRV_FLAG_NONE,
         terminal_init,
+        NULL,
         NULL,
         terminal_render,
         terminal_on_key

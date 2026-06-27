@@ -88,9 +88,9 @@ static uint16_t nam_read16(uint16_t reg)            { return inw(nam_base + reg)
 static void nabm_write8 (uint16_t reg, uint8_t  val) { outb(nabm_base + reg, val); }
 static void nabm_write16(uint16_t reg, uint16_t val) { outw(nabm_base + reg, val); }
 static void nabm_write32(uint16_t reg, uint32_t val) { outl(nabm_base + reg, val); }
-static uint8_t  nabm_read8 (uint16_t reg) { return inb(nabm_base + reg); }
+static uint8_t __attribute__((unused)) nabm_read8 (uint16_t reg) { return inb(nabm_base + reg); }
 static uint16_t nabm_read16(uint16_t reg) { return inw(nabm_base + reg); }
-static uint32_t nabm_read32(uint16_t reg) { return inl(nabm_base + reg); }
+static uint32_t __attribute__((unused)) nabm_read32(uint16_t reg) { return inl(nabm_base + reg); }
 
 /* ── IRQ handler ────────────────────────────────────────────────────────── */
 static void ac97_irq_handler(registers_t *r)

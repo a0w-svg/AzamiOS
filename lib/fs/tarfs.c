@@ -8,6 +8,7 @@
  */
 #include "tarfs.h"
 #include "../string/string.h"
+#include <stdint.h>
 
 static directory_entry_t directory_entry_cache;
 static fs_node_t         initrd_root_node;
@@ -40,7 +41,7 @@ uint32_t tarfs_read(block_device_t *dev, fs_node_t *node,
     if (offset + size > node->length)
         size = node->length - offset;
 
-    memcpy(buffer, (uint8_t*)(file_data_address + offset), size);
+    memcpy(buffer, (uint8_t*)(uintptr_t)(file_data_address + offset), size);
     return size;
 }
 
@@ -51,7 +52,7 @@ void tarfs_init(uint32_t tar_address) {
     if (tar_address == 0) return;
 
     tar_node_count = 0;
-    tar_header_t *header = (tar_header_t*)tar_address;
+    tar_header_t *header = (tar_header_t*)(uintptr_t)tar_address;
 
     while (header->filename[0] != '\0') {
         /* Verify ustar magic to guard against corrupt data */
@@ -63,19 +64,21 @@ void tarfs_init(uint32_t tar_address) {
         uint32_t file_size = octal_to_int(header->size);
 
         fs_node_t *node = &tar_nodes[tar_node_count];
-        strcpy(node->name, header->filename);
+        strncpy(node->name, header->filename, sizeof(node->name) - 1);
+        node->name[sizeof(node->name) - 1] = '\0';
         node->length  = file_size;
         node->flags   = FS_FILE;
-        node->impl    = (uint32_t)header + 512;  /* data follows header */
+        node->impl    = (uint32_t)(uintptr_t)header + 512;  /* data follows header */
         node->read    = tarfs_read;
         tar_node_count++;
 
         uint32_t blocks    = (file_size + 511) / 512;
         uint32_t jump_size = 512 + (blocks * 512);
-        header = (tar_header_t*)((uint32_t)header + jump_size);
+        header = (tar_header_t*)((uintptr_t)header + jump_size);
     }
 
-    strcpy(initrd_root_node.name, "initrd");
+    strncpy(initrd_root_node.name, "initrd", sizeof(initrd_root_node.name) - 1);
+    initrd_root_node.name[sizeof(initrd_root_node.name) - 1] = '\0';
     initrd_root_node.flags   = FS_DIRECTORY;
     initrd_root_node.readdir = initrd_readdir;
     initrd_root_node.finddir = initrd_finddir;
@@ -86,7 +89,8 @@ void tarfs_init(uint32_t tar_address) {
 directory_entry_t *initrd_readdir(fs_node_t *node, uint32_t index) {
     (void)node;
     if ((int)index >= tar_node_count) return (void*)0;
-    strcpy(directory_entry_cache.name, tar_nodes[index].name);
+    strncpy(directory_entry_cache.name, tar_nodes[index].name, sizeof(directory_entry_cache.name) - 1);
+    directory_entry_cache.name[sizeof(directory_entry_cache.name) - 1] = '\0';
     directory_entry_cache.inode = index;
     return &directory_entry_cache;
 }

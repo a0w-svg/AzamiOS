@@ -216,6 +216,6 @@ void gfx_blit_flip(gfx_blit_ctx_t *ctx, uint32_t *lfb) {
     uint32_t       *dest = lfb;
     const uint32_t *src  = ctx->backbuffer;
     int             cnt  = ctx->width * ctx->height;
-    asm volatile("rep movsd" : "+D"(dest), "+S"(src), "+c"(cnt) : : "memory");
+    asm volatile("rep movsl" : "+D"(dest), "+S"(src), "+c"(cnt) : : "memory");
 }
 
