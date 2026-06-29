@@ -40,7 +40,7 @@ void pmm_init(uint32_t mem_size_kb, uint32_t bitmap_addr){
     pmm_max_blocks = pmm_memory_size / PMM_FRAME_SIZE;
     pmm_used_blocks = pmm_max_blocks;
 
-    pmm_bitmap = (uint32_t*)bitmap_addr;
+    pmm_bitmap = (uint32_t*)(uintptr_t)bitmap_addr;
     
     memset(pmm_bitmap, 0xFF, pmm_max_blocks / PMM_BLOCKS_PER_BYTE);
 }
@@ -86,11 +86,11 @@ void* pmm_alloc_block(){
     bitmap_set(frame);
     pmm_used_blocks++;
     
-    return (void*)(frame * PMM_FRAME_SIZE);
+    return (void*)(uintptr_t)(frame * PMM_FRAME_SIZE);
 }
 
 void pmm_free_block(void* addr){
-    uint32_t frame = (uint32_t)addr / PMM_FRAME_SIZE;
+    uint32_t frame = (uint32_t)(uintptr_t)addr / PMM_FRAME_SIZE;
     bitmap_unset(frame);
     pmm_used_blocks--;
 }

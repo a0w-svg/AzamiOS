@@ -14,8 +14,7 @@
 #include "../module/include/module.h"
 #include "include/exec.h"
 
-static fs_node_t *g_file_table[16];
-static uint32_t   g_file_offsets[16];
+static vfs_file_t *g_file_table[16];
 
 /* ─── kernel-side syscall implementations ────────────────────────────────── */
 
@@ -141,11 +140,8 @@ void syscall_handler(registers_t *r) {
                 if (c) { b[0] = c; r->eax = 1; }
                 else { r->eax = 0; }
             } else if (r->ebx >= 3 && r->ebx < 16 && g_file_table[r->ebx]) {
-                fs_node_t *fn = g_file_table[r->ebx];
-                if (fn->read && r->ecx && r->edx > 0) {
-                    uint32_t nread = fn->read(NULL, fn, g_file_offsets[r->ebx], r->edx, (uint8_t*)r->ecx);
-                    g_file_offsets[r->ebx] += nread;
-                    r->eax = nread;
+                if (r->ecx && r->edx > 0) {
+                    r->eax = vfs_file_read(g_file_table[r->ebx], r->edx, (uint8_t*)r->ecx);
                 } else { r->eax = 0; }
             } else { r->eax = 0; }
             break;
@@ -156,11 +152,8 @@ void syscall_handler(registers_t *r) {
                 for (uint32_t i = 0; i < r->edx; i++) syscall_print_char(b[i]);
                 r->eax = r->edx;
             } else if (r->ebx >= 3 && r->ebx < 16 && g_file_table[r->ebx]) {
-                fs_node_t *fn = g_file_table[r->ebx];
-                if (fn->write && r->ecx && r->edx > 0) {
-                    uint32_t nwritten = fn->write(NULL, fn, g_file_offsets[r->ebx], r->edx, (uint8_t*)r->ecx);
-                    g_file_offsets[r->ebx] += nwritten;
-                    r->eax = nwritten;
+                if (r->ecx && r->edx > 0) {
+                    r->eax = vfs_file_write(g_file_table[r->ebx], r->edx, (uint8_t*)r->ecx);
                 } else { r->eax = 0; }
             } else { r->eax = 0; }
             break;
@@ -168,20 +161,17 @@ void syscall_handler(registers_t *r) {
         case 21: /* sys_open: path=ebx */
             {
                 const char *path = (const char*)r->ebx;
-                if (path && fs_root && fs_root->finddir) {
-                    fs_node_t *fn = fs_root->finddir(fs_root, (char*)path);
-                    if (!fn) {
-                        fn = initrd_create_file((char*)path);
-                    }
-                    if (fn) {
+                if (path) {
+                    vfs_file_t *f = vfs_open_file(path, 0);
+                    if (f) {
                         for (int fd = 3; fd < 16; fd++) {
                             if (g_file_table[fd] == NULL) {
-                                g_file_table[fd] = fn;
-                                g_file_offsets[fd] = 0;
+                                g_file_table[fd] = f;
                                 r->eax = fd;
                                 goto open_done;
                             }
                         }
+                        vfs_file_close(f);
                     }
                 }
                 r->eax = -1;
@@ -189,9 +179,9 @@ void syscall_handler(registers_t *r) {
             }
 
         case 22: /* sys_close: fd=ebx */
-            if (r->ebx >= 3 && r->ebx < 16) {
+            if (r->ebx >= 3 && r->ebx < 16 && g_file_table[r->ebx]) {
+                vfs_file_close(g_file_table[r->ebx]);
                 g_file_table[r->ebx] = NULL;
-                g_file_offsets[r->ebx] = 0;
                 r->eax = 0;
             } else { r->eax = -1; }
             break;

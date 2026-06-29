@@ -128,5 +128,7 @@ void rtc_init()
     char prev = inb(0x71);
     outb(0x70, 0x8B);
     outb(0x71, prev | 0x40);
+#if !defined(__x86_64__)
     asm volatile("sti");
+#endif
 }

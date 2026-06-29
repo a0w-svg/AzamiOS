@@ -14,7 +14,7 @@
 #define FDC_CMD_SPECIFY     0x03
 #define FDC_CMD_RECALIBRATE 0x07
 
-void init_floppy();
+void floppy_init(void);
 void floppy_read_sector(uint8_t head, uint8_t track, uint8_t sector, uint8_t *buffer);
 
 #endif

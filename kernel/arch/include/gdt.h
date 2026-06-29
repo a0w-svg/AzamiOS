@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
-void gdt_init();
-void set_kernel_stack(uint32_t esp0);
+void gdt_init(void);
+void set_kernel_stack(uintptr_t stack_top);
+
 #endif

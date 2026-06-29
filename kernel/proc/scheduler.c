@@ -7,7 +7,7 @@
 #include "../mem/include/paging.h"
 #include "../klibc/include/stdio.h"
 
-uint32_t g_active_context = 0;
+uintptr_t g_active_context = 0;
 extern void switch_page_dir(void *page);
 
 static process_t *g_head = NULL;
@@ -59,9 +59,9 @@ void scheduler_schedule(void) {
     set_kernel_stack(g_current->kernel_stack + 4096);
 
     /* Switch memory page directory if dirty */
-    uint32_t cur_cr3;
+    uintptr_t cur_cr3;
     asm volatile("mov %%cr3, %0" : "=r"(cur_cr3));
     if (cur_cr3 != g_current->cr3) {
-        switch_page_dir((void*)g_current->cr3);
+        switch_page_dir((void*)(uintptr_t)g_current->cr3);
     }
 }

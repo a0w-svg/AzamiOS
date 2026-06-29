@@ -28,6 +28,21 @@ void kprintf(const char* format, ...)
         if(*format == '%')
         {
             format++;
+            if (*format == '%') {
+                putchar('%');
+                format++;
+                continue;
+            }
+            int pad_zero = 0;
+            int width = 0;
+            if (*format == '0') {
+                pad_zero = 1;
+                format++;
+            }
+            while (*format >= '0' && *format <= '9') {
+                width = width * 10 + (*format - '0');
+                format++;
+            }
             // Fetching and executing arguments;
             switch (*format++)
             {
@@ -36,13 +51,31 @@ void kprintf(const char* format, ...)
                 putchar(i);
                 break;
             case 'd': // Fetch Decimal/Integer argument;
+            case 'i':
                 i = va_arg(arg, int);
                 itoa(i, buf, 10);
+                {
+                    int len = strlen(buf);
+                    while (len < width) { putchar(pad_zero ? '0' : ' '); len++; }
+                }
+                puts(buf);
+                break;
+            case 'u':
+                i = va_arg(arg, unsigned int);
+                itoa(i, buf, 10);
+                {
+                    int len = strlen(buf);
+                    while (len < width) { putchar(pad_zero ? '0' : ' '); len++; }
+                }
                 puts(buf);
                 break;
             case 'o': // Fetch Octal representation;
                 i = va_arg(arg, int);
                 itoa(i, buf, 8);
+                {
+                    int len = strlen(buf);
+                    while (len < width) { putchar(pad_zero ? '0' : ' '); len++; }
+                }
                 puts(buf);
                 break;
             case 's': // Fetch string;
@@ -53,8 +86,14 @@ void kprintf(const char* format, ...)
                 puts(string);
                 break;
             case 'x': // Fetch Hexadecimal representation
+            case 'X':
+            case 'p':
                 i = va_arg(arg, int);
                 itoa(i, buf, 16);
+                {
+                    int len = strlen(buf);
+                    while (len < width) { putchar(pad_zero ? '0' : ' '); len++; }
+                }
                 puts(buf);
                 break;
             }

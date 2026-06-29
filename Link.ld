@@ -5,28 +5,32 @@ SECTIONS
    {
       code = .; _code = .; __code = .;
       *(.multiboot)
-      *(.text)
+      *(.text*)
       . = ALIGN(4096);
    }
    
    .rodata :
    {
      rodata = .; _rodata = .; __rodata = .;
-     *(.rodata)
+     *(.rodata*)
+     *(.lrodata*)
      . = ALIGN(4096);
    }
    
    .data :
    {
      data = .; _data = .; __data = .;
-     *(.data)
+     *(.data*)
+     *(.ldata*)
      . = ALIGN(4096);
    }
    
    .bss :
    {
      bss = .; _bss = .; __bss = .;
-     *(.bss)
+     *(.bss*)
+     *(.lbss*)
+     *(COMMON)
      . = ALIGN(4096);
    }
    

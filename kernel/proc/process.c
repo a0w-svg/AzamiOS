@@ -14,7 +14,7 @@ void process_init(void) {
     kprintf("proc: process manager initialized\n");
 }
 
-process_t *process_create(const char *name, uint32_t entry, uint32_t cr3) {
+process_t *process_create(const char *name, uintptr_t entry, uintptr_t cr3) {
     process_t *p = (process_t*)pmm_alloc_block();
     if (!p) return NULL;
     memset(p, 0, sizeof(process_t));
@@ -26,10 +26,10 @@ process_t *process_create(const char *name, uint32_t entry, uint32_t cr3) {
 
     void *phys_kstack = pmm_alloc_block();
     if (!phys_kstack) return NULL;
-    p->kernel_stack = (uint32_t)phys_kstack;
+    p->kernel_stack = (uintptr_t)phys_kstack;
 
     /* Mock initial hardware stack frame for iret */
-    uint32_t *stack = (uint32_t*)(p->kernel_stack + 4096);
+    uintptr_t *stack = (uintptr_t*)(p->kernel_stack + 4096);
 
     *(--stack) = 0x23;       /* SS (User Data Selector 0x20 | RPL 3) */
     *(--stack) = 0xC0000000; /* ESP (User Stack Top) */
@@ -45,10 +45,10 @@ process_t *process_create(const char *name, uint32_t entry, uint32_t cr3) {
 
     *(--stack) = 0x23;       /* DS (User Data Selector) */
 
-    p->kernel_esp = (uint32_t)stack;
+    p->kernel_esp = (uintptr_t)stack;
     scheduler_add(p);
 
-    kprintf("proc: created process '%s' (PID %d, cr3=0x%x)\n", name, p->pid, cr3);
+    kprintf("proc: created process '%s' (PID %d, cr3=0x%x)\n", name, p->pid, (uint32_t)cr3);
     return p;
 }
 

@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 /* ── Screen constants ────────────────────────────────────────────────────── */
 #define SCREEN_W       640

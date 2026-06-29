@@ -10,7 +10,7 @@ typedef struct block_header{
     struct block_header* prev; // pointer to the previous block in memory
 } block_header_t;
 // Starts with heap in virtual memory, somewhere high, that it will not collide with kernel. 
-static uint32_t heap_start = 0xC0000000;
+static uintptr_t heap_start = 0xC0000000;
 static block_header_t* head = 0;
 
 void* kmalloc(uint32_t size){
@@ -19,7 +19,7 @@ void* kmalloc(uint32_t size){
    while(current){
     if(current->is_free && current->size >= size){
         current->is_free = 0; // set as occupied
-        return (void*)((uint32_t)current + sizeof(block_header_t));
+        return (void*)((uintptr_t)current + sizeof(block_header_t));
     }
     current = current->next;
    }
@@ -31,7 +31,7 @@ void* kmalloc(uint32_t size){
    block_header_t* new_block = (block_header_t*)heap_start;
    for(uint32_t i = 0; i < pages; i++){
         void* phys = pmm_alloc_block();
-        paging_map_page((uint32_t)phys, heap_start, 1, 1);
+        paging_map_page((uint32_t)(uintptr_t)phys, heap_start, 1, 1);
         heap_start += 4096;
    }
    
@@ -44,7 +44,7 @@ void* kmalloc(uint32_t size){
    }
    head = new_block;
    
-   return (void*)((uint32_t)new_block + sizeof(block_header_t));
+   return (void*)((uintptr_t)new_block + sizeof(block_header_t));
 }
 
 void kfree(void* ptr){
@@ -52,7 +52,7 @@ void kfree(void* ptr){
     return;
    }
    
-   block_header_t* block = (block_header_t*)((uint32_t)ptr - sizeof(block_header_t));
+   block_header_t* block = (block_header_t*)((uintptr_t)ptr - sizeof(block_header_t));
    block->is_free = 1;
    // merge with next block
    if(block->next && block->next->is_free){

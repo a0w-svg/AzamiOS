@@ -10,14 +10,26 @@ idt_entry_t idt[MAX_IDT_DESCRIPTORS]; // Create an array of IDT entries; aligned
 idt_register_t idtr;
 static bool idt_sets[MAX_IDT_DESCRIPTORS]; // set of used gates
 
-void idt_set_gate(uint8_t num, uint32_t handler, uint16_t selector, uint8_t flags)
+extern bool g_is_uefi;
+
+void idt_set_gate(uint8_t num, uintptr_t handler, uint16_t selector, uint8_t flags)
 {
     idt_entry_t* idt_gate = &idt[num];
+#if defined(__x86_64__)
+    idt_gate->base_low = (uint16_t)(handler & 0xFFFF);
+    idt_gate->kernel_cs = selector;
+    idt_gate->ist = 0;
+    idt_gate->attributes = flags;
+    idt_gate->base_mid = (uint16_t)((handler >> 16) & 0xFFFF);
+    idt_gate->base_high = (uint32_t)((handler >> 32) & 0xFFFFFFFF);
+    idt_gate->reserved = 0;
+#else
     idt_gate->base_low = (uint16_t)(handler & 0xFFFF); // Sets the lower 16 bits of the ISR address.
     idt_gate->kernel_cs = selector; // Sets offset to your kernel code selector.
     idt_gate->reserved = 0; // This variable always must be zero.
     idt_gate->attributes = flags;  // Sets the flags.
     idt_gate->base_high = (uint16_t)((handler >> 16) & 0xFFFF); // Sets the Higher 16 bits of the ISR address;
+#endif
     // set  gate as used in system
     idt_sets[num] = true;
 }
@@ -25,9 +37,9 @@ void idt_set_gate(uint8_t num, uint32_t handler, uint16_t selector, uint8_t flag
 /*
     Initialize IDT;
 */
-void idt_init()
+void idt_init(void)
 {
-    idtr.base = (uint32_t)&idt;
+    idtr.base = (uintptr_t)&idt;
     idtr.limit = (sizeof(idt_entry_t) * MAX_IDT_DESCRIPTORS) - 1;
     
     // load pointer to IDT with use of memory operate

@@ -117,16 +117,16 @@ static int load_segment(fs_node_t *node, const Elf32_Phdr_t *phdr) {
 
     /* Allocate and map physical pages */
     for (uint32_t i = 0; i < page_count; i++) {
-        uint32_t virt = vaddr_base + i * PAGE_SIZE;
+        uintptr_t virt = vaddr_base + i * PAGE_SIZE;
 
         void *phys = pmm_alloc_block();
         if (!phys) {
-            kprintf("elf: out of physical memory at vaddr=0x%x\n", virt);
+            kprintf("elf: out of physical memory at vaddr=0x%x\n", (uint32_t)virt);
             return ELF_LOAD_ERR_NO_MEM;
         }
 
         /* Map: not kernel (user=1), writable */
-        paging_map_page((uint32_t)phys, virt, 0 /* user */, writable);
+        paging_map_page((uint32_t)(uintptr_t)phys, virt, 0 /* user */, writable);
 
         /* Zero the freshly mapped page so BSS regions are clean */
         memset((void *)virt, 0, PAGE_SIZE);
@@ -135,7 +135,7 @@ static int load_segment(fs_node_t *node, const Elf32_Phdr_t *phdr) {
     /* Copy file image into virtual memory */
     if (phdr->p_filesz > 0) {
         int rc = read_exact(node, phdr->p_offset,
-                            phdr->p_filesz, (uint8_t *)phdr->p_vaddr);
+                            phdr->p_filesz, (uint8_t *)(uintptr_t)phdr->p_vaddr);
         if (rc != ELF_LOAD_OK) {
             kprintf("elf: failed to read segment at offset 0x%x\n",
                     phdr->p_offset);
@@ -149,7 +149,7 @@ static int load_segment(fs_node_t *node, const Elf32_Phdr_t *phdr) {
      * allocator ever returns dirty pages.
      */
     if (phdr->p_memsz > phdr->p_filesz) {
-        uint8_t  *bss   = (uint8_t *)(phdr->p_vaddr + phdr->p_filesz);
+        uint8_t  *bss   = (uint8_t *)(uintptr_t)(phdr->p_vaddr + phdr->p_filesz);
         uint32_t  bsssz = phdr->p_memsz - phdr->p_filesz;
         memset(bss, 0, bsssz);
     }

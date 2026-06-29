@@ -37,7 +37,9 @@ static inline void io_wait()
 */
 static inline void en_interrrupts()
 {
+#if !defined(__x86_64__)
     __asm__ volatile("sti");
+#endif
 }
 /*
     Disable the interrupts;

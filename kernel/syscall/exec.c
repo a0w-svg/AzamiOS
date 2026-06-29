@@ -84,9 +84,9 @@ void execute_program(char *filename) {
             kprintf("exec: out of memory allocating user stack\n");
             return;
         }
-        uint32_t virt = stack_virt + i * PAGE_SIZE;
+        uintptr_t virt = stack_virt + i * PAGE_SIZE;
         /* user=1, writable=1 */
-        paging_map_page((uint32_t)phys, virt, 0, 1);
+        paging_map_page((uint32_t)(uintptr_t)phys, virt, 0, 1);
         memset((void *)virt, 0, PAGE_SIZE);
     }
 
@@ -94,7 +94,7 @@ void execute_program(char *filename) {
             stack_virt, USER_STACK_TOP);
 
     /* Flush entire hardware TLB before jumping to new process */
-    uint32_t cr3;
+    uintptr_t cr3;
     asm volatile("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) : : "memory");
 
     /* ── 6. Enter ring-3 ─────────────────────────────────────────────── */

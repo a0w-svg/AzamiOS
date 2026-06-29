@@ -3,6 +3,7 @@
 */
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "./include/gdt.h"
 #include "../klibc/include/string.h"
 
@@ -26,7 +27,7 @@ typedef struct
     gdt_entry_t *base;  // The address of the first gdt_entry_t struct.
 } __attribute__((packed)) gdt_ptr_t;
 
-gdt_entry_t gdt_table[6]; // GDT entries table.
+gdt_entry_t gdt_table[8]; // GDT entries table.
 gdt_ptr_t gdt_pointer;    // The pointer to the Global Descriptor Table.
 
 typedef struct{
@@ -40,57 +41,86 @@ typedef struct{
     uint32_t trap, iomap_base;
 }__attribute__((packed)) tss_entry_t;
 
-
 tss_entry_t tss_entry;
 
+#if defined(__x86_64__)
+struct tss64 {
+    uint32_t reserved0;
+    uint64_t rsp0;
+    uint64_t rsp1;
+    uint64_t rsp2;
+    uint64_t reserved1;
+    uint64_t ist[7];
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iopb_offset;
+} __attribute__((packed));
 
+struct tss64 tss_entry64;
+#endif
 
-/*
-    This function sets the value of one GDT entry.
-    A num variable determines the segment number.
-    The base variable determines the segment base address.
-    The limit variable determines the size of the segment.
-    The access variable determines access flags.
-    the granularity_segment variable determines the scaling of the segment limit field.  
-*/
+extern void gdt_flush(uintptr_t pointer);
+extern bool g_is_uefi;
 
-extern void gdt_flush(uint32_t pointer); // enables access to our asm function from our C code.
-
-void set_gdt_gate(int32_t num, uint32_t base, uint32_t limit, uint8_t access, uint8_t granularity_segment)
+void set_gdt_gate(int32_t num, uintptr_t base, uint32_t limit, uint8_t access, uint8_t granularity_segment)
 {
     gdt_entry_t* gdt_entry = &gdt_table[num];
-    gdt_entry->base_low = LOW_GDT(base);          // Sets the lower 16 bits of the GDT base;
-    gdt_entry->base_middle = (base >> 16) & 0xFF; // Sets the next  8 bits  of the GDT base;
-    gdt_entry->base_high = HIGH_GDT(base);        // Sets the last 8 bits of the GDT base;
-    gdt_entry->limit_low = LOW_GDT(limit);        // Sets the lower 16 bits of the GDT limit;
+    gdt_entry->base_low = LOW_GDT(base);
+    gdt_entry->base_middle = (base >> 16) & 0xFF;
+    gdt_entry->base_high = HIGH_GDT(base);
+    gdt_entry->limit_low = LOW_GDT(limit);
     gdt_entry->granularity = (limit >> 16) & 0x0F;
-    gdt_entry->granularity |= granularity_segment & 0xF0; // Sets granularity;
-    gdt_entry->access = access; // sets access flags;
+    gdt_entry->granularity |= granularity_segment & 0xF0;
+    gdt_entry->access = access;
 }
 
-void write_tss(int32_t num, uint16_t ss0, uint32_t esp0){
-    uint32_t base = (uint32_t)&tss_entry;
+void write_tss(int32_t num, uint16_t ss0, uintptr_t esp0){
+    uintptr_t base = (uintptr_t)&tss_entry;
     uint32_t limit = sizeof(tss_entry_t) - 1;
-    
-    // access flag 0xE9 means 32 bit available TSS for mode Ring 3
     set_gdt_gate(num, base, limit, 0xE9, 0x00);
-    // zeroing structure 
     memset(&tss_entry, 0, sizeof(tss_entry_t));
-
     tss_entry.ss0 = ss0;
-    tss_entry.esp0 = esp0;
-
-    // set IOPB flag to block unauthorized access for user
+    tss_entry.esp0 = (uint32_t)esp0;
     tss_entry.iomap_base = sizeof(tss_entry_t);
 }
 
-void set_kernel_stack(uint32_t esp0) {
-    tss_entry.esp0 = esp0;
+#if defined(__x86_64__)
+void write_tss64(int32_t num, uintptr_t rsp0) {
+    uintptr_t base = (uintptr_t)&tss_entry64;
+    uint32_t limit = sizeof(struct tss64) - 1;
+    memset(&tss_entry64, 0, sizeof(struct tss64));
+    tss_entry64.rsp0 = rsp0;
+    tss_entry64.iopb_offset = sizeof(struct tss64);
+    set_gdt_gate(num, base & 0xFFFFFFFF, limit, 0x89, 0x00);
+    uint64_t base_high = base >> 32;
+    uint64_t *next_entry = (uint64_t*)&gdt_table[num + 1];
+    *next_entry = base_high;
+}
+#endif
+
+void set_kernel_stack(uintptr_t esp0) {
+#if defined(__x86_64__)
+    tss_entry64.rsp0 = esp0;
+#else
+    tss_entry.esp0 = (uint32_t)esp0;
+#endif
 }
 
 uint8_t kernel_tss_stack[4096]__attribute__((aligned(4096)));
-void gdt_init()
+void gdt_init(void)
 {
+#if defined(__x86_64__)
+    gdt_pointer.limit = (sizeof(gdt_entry_t) * 7) - 1;
+    gdt_pointer.base = &gdt_table[0];
+    set_gdt_gate(0, 0, 0, 0, 0);                // Null segment;
+    set_gdt_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xAF); // 64-bit Kernel Code (L=1, D=0);
+    set_gdt_gate(2, 0, 0xFFFFFFFF, 0x92, 0xAF); // 64-bit Kernel Data;
+    set_gdt_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF); // 32-bit Compatibility User Code (L=0, D=1);
+    set_gdt_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF); // User Data;
+    write_tss64(5, (uintptr_t)kernel_tss_stack + 4096);
+    gdt_flush((uintptr_t)&gdt_pointer);
+    asm volatile("ltr %%ax" : : "a" (0x28));
+#else
     gdt_pointer.limit = (sizeof(gdt_entry_t) * 6) - 1;
     gdt_pointer.base = &gdt_table[0];
     set_gdt_gate(0, 0, 0, 0, 0);                // Null segment;
@@ -98,11 +128,8 @@ void gdt_init()
     set_gdt_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF); // Data segment;
     set_gdt_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF); // User-mode code segment;
     set_gdt_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF); // User-mode data segment;
-    // save current kernel esp
-    uint32_t kernel_stack_top;
-    asm volatile("mov %%esp, %0" : "=r"(kernel_stack_top));
-    write_tss(5,0x10, (uint32_t)kernel_tss_stack + 4096); //0x10 to selector Kernel Data Segment (2 * 8 = 16)
-    gdt_flush((uint32_t)&gdt_pointer);
+    write_tss(5,0x10, (uintptr_t)kernel_tss_stack + 4096); //0x10 to selector Kernel Data Segment (2 * 8 = 16)
+    gdt_flush((uintptr_t)&gdt_pointer);
     asm volatile("ltr %%ax" : : "a" (0x28));
-
+#endif
 }

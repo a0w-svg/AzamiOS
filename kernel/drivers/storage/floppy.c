@@ -14,6 +14,11 @@
 #include "../arch/include/isr.h"
 #include "include/dma.h"
 
+#include "../../filesystem/include/vfs.h"
+#include "../../klibc/include/string.h"
+
+static block_device_t floppy_dev;
+
 // signal variable if controller has finished operation (secured by volatile!)
 static volatile int floppy_irq_fired = 0;
 
@@ -93,10 +98,12 @@ static void floppy_dma_init(uint8_t *buffer, uint32_t length, int is_write){
     dma_unmask_channel(2); // ready to transfer;
 }
 
-/*
-    Initialize FDC
-*/
-void init_floppy(){
+void floppy_register_vfs(void);
+
+void floppy_init(){
+    kprintf("Initiation of FDC (Floppy) Driver...\n");
+    
+    // registration handler IRQ6
     register_interrupt_handler(38, floppy_irq_handler);
     // reset controller
     outb(FDC_DOR, 0x00);
@@ -112,7 +119,7 @@ void init_floppy(){
 
     // set speed to 500 Kbps (standard 1.44MB)
     outb(FDC_CCR, 0x00);
-    kprintf("FDC (Floppy) Driver has been initiated succesfully.\n");
+    floppy_register_vfs();
 }
 
 /*
@@ -139,4 +146,26 @@ void floppy_read_sector(uint8_t head, uint8_t track, uint8_t sector, uint8_t *bu
         floppy_read_data();
     }
     outb(FDC_DOR, 0x0C);
+}
+
+static uint32_t floppy_block_read(block_device_t *dev, uint32_t lba, uint32_t count, void *buffer) {
+    (void)dev;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t cur_lba = lba + i;
+        uint8_t sector = (cur_lba % 18) + 1;
+        uint8_t head = (cur_lba / 18) % 2;
+        uint8_t track = cur_lba / 36;
+        floppy_read_sector(head, track, sector, (uint8_t*)buffer + (i * 512));
+    }
+    return count * 512;
+}
+
+void floppy_register_vfs(void) {
+    memset(&floppy_dev, 0, sizeof(floppy_dev));
+    memcpy(floppy_dev.name, "fd0", 4);
+    floppy_dev.block_size = 512;
+    floppy_dev.read = floppy_block_read;
+    floppy_dev.write = 0;
+    vfs_register_device(&floppy_dev);
+    kprintf("FDC (Floppy) Driver has been initiated succesfully (/dev/fd0 registered).\n");
 }

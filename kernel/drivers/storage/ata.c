@@ -151,10 +151,11 @@ int ata_init(void) {
         kprintf("ata: hard disk detected on %s: %s\n", channels[ch].name, model);
 
         memset(&ata_device, 0, sizeof(ata_device));
-        memcpy(ata_device.name, "ata0", 5);
+        memcpy(ata_device.name, "hda", 4);
         ata_device.block_size = 512;
         ata_device.read  = ata_block_read;
         ata_device.write = 0;
+        vfs_register_device(&ata_device);
         return 0;
     }
 

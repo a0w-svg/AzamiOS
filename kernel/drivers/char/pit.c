@@ -22,7 +22,9 @@ void set_pit_count(uint32_t count)
     __asm__ volatile("cli"); // disable interrupts
     outb(PIT_CHANNEL0, count & 0xFF); // set low byte.
     outb(PIT_CHANNEL0, (count & 0xFF00) >> 8); // set high byte.
+#if !defined(__x86_64__)
     __asm__ volatile("sti"); // enable interrupts;
+#endif
 }
 
 /*

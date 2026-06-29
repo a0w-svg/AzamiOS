@@ -30,9 +30,24 @@ static bool acpi_validate_checksum(acpi_sdt_hdr_t *hdr) {
     return sum == 0;
 }
 
+static void acpi_map_table(uint32_t addr) {
+    if (!addr) return;
+    paging_map_page(addr & ~0xFFFu, addr & ~0xFFFu, 1, 0);
+    paging_map_page((addr & ~0xFFFu) + 4096, (addr & ~0xFFFu) + 4096, 1, 0);
+    acpi_sdt_hdr_t *hdr = (acpi_sdt_hdr_t*)addr;
+    uint32_t len = hdr->length;
+    if (len > 1024 * 1024) len = 4096;
+    uint32_t start_page = addr & ~0xFFFu;
+    uint32_t end_page = (addr + len + 0xFFFu) & ~0xFFFu;
+    for (uint32_t p = start_page; p < end_page; p += 4096) {
+        paging_map_page(p, p, 1, 0);
+    }
+}
+
 /* Parse DSDT table bytecode for _S5_ sleep package */
 static void acpi_parse_dsdt(uint32_t dsdt_addr) {
     if (!dsdt_addr) return;
+    acpi_map_table(dsdt_addr);
     acpi_sdt_hdr_t *hdr = (acpi_sdt_hdr_t*)dsdt_addr;
     if (strncmp(hdr->signature, "DSDT", 4) != 0) return;
 
@@ -94,6 +109,7 @@ void acpi_init(void) {
     kprintf("acpi: found RSDP at 0x%x (OEM: %s, rev %d)\n", g_rsdp, oem, g_rsdp->revision);
 
     /* 2. Parse RSDT */
+    acpi_map_table(g_rsdp->rsdt_address);
     g_rsdt = (acpi_rsdt_t*)g_rsdp->rsdt_address;
     if (!acpi_validate_checksum(&g_rsdt->header)) {
         kprintf("acpi: RSDT checksum invalid\n");
@@ -104,6 +120,7 @@ void acpi_init(void) {
     kprintf("acpi: RSDT at 0x%x contains %d tables\n", g_rsdt, num_tables);
 
     for (uint32_t i = 0; i < num_tables; i++) {
+        acpi_map_table(g_rsdt->table_pointers[i]);
         acpi_sdt_hdr_t *hdr = (acpi_sdt_hdr_t*)g_rsdt->table_pointers[i];
         char sig[5];
         memcpy(sig, hdr->signature, 4);
