@@ -262,7 +262,6 @@ void key_handler(int32_t keycode)
     switch (scan)
     {
     case ESCAPE:
-        kprintf("[KB_EVENT] ESC pressed\n");
         break;
     case BACKSPACE: {
         char ch = '\b';
@@ -271,7 +270,6 @@ void key_handler(int32_t keycode)
             kb_buffer[kb_head] = ch;
             kb_head = next_head;
         }
-        kprintf("[KB_EVENT] BACKSPACE pressed (head=%d tail=%d)\n", kb_head, kb_tail);
         break;
     }
     case SHIFT:
@@ -283,7 +281,7 @@ void key_handler(int32_t keycode)
         break;
     default:
         if (scan >= 128) return;
-        char ch = (shift || capslock) ? upper_ascii[scan] : small_ascii[scan];
+        char ch = (shift != (capslock > 0)) ? upper_ascii[scan] : small_ascii[scan];
         scancode = ch;
         if (ch != 0) {
             int next_head = (kb_head + 1) % KB_BUF_SIZE;
@@ -292,7 +290,6 @@ void key_handler(int32_t keycode)
                 kb_head = next_head;
             }
         }
-        kprintf("[KB_EVENT] scan=0x%x char='%c' (head=%d tail=%d)\n", scan, ch ? ch : '.', kb_head, kb_tail);
         break;
     }
 }
@@ -303,7 +300,6 @@ static void keyboard_handler(registers_t* regs)
 {
     UNUSED(regs);
     uint8_t scan_code = inb(0x60);
-    kprintf("[KB_IRQ] IRQ1 fired! scancode=0x%x\n", scan_code);
     key_handler(scan_code);
 }
 

@@ -29,7 +29,7 @@ static void rtl8139_irq_handler(registers_t *regs) {
         int max_pkts = 64;
         while (((inb(g_rtl.io_base + RTL_CR) & RTL_CR_BUFE) == 0) && max_pkts-- > 0) {
             uint32_t rx_offset = g_rtl.cur_rx % RTL_RX_BUF_SIZE;
-            uint16_t *header = (uint16_t*)(g_rtl.rx_buffer_phys + rx_offset);
+            uint16_t *header = (uint16_t*)(uintptr_t)(g_rtl.rx_buffer_phys + rx_offset);
             uint16_t pkt_status = header[0];
             uint16_t pkt_len    = header[1];
 
@@ -57,11 +57,11 @@ static void rtl8139_irq_handler(registers_t *regs) {
 static uint32_t alloc_phys_pages(uint32_t num_pages) {
     void *first = pmm_alloc_block();
     if (!first) return 0;
-    uint32_t base = (uint32_t)first;
+    uint32_t base = (uint32_t)(uintptr_t)first;
     paging_map_page(base, base, 0, 1);
     for (uint32_t i = 1; i < num_pages; i++) {
         void *page = pmm_alloc_block();
-        uint32_t addr = (uint32_t)page;
+        uint32_t addr = (uint32_t)(uintptr_t)page;
         paging_map_page(addr, addr, 0, 1);
     }
     return base;
@@ -100,7 +100,7 @@ void rtl8139_init(void) {
         kprintf("rtl8139: failed to allocate DMA receive buffer\n");
         return;
     }
-    memset((void*)g_rtl.rx_buffer_phys, 0, 3 * 4096);
+    memset((void*)(uintptr_t)g_rtl.rx_buffer_phys, 0, 3 * 4096);
     outl(g_rtl.io_base + RTL_RBSTART, g_rtl.rx_buffer_phys);
 
     /* Allocate Tx Buffers (4 buffers × 2 KB = 2 pages = 8 KB) */
@@ -141,7 +141,7 @@ void rtl8139_send_packet(const uint8_t *data, uint32_t len) {
     if (len > 1792) len = 1792;
 
     uint32_t tx_addr = g_rtl.tx_buffers_phys[g_rtl.cur_tx];
-    memcpy((void*)tx_addr, data, len);
+    memcpy((void*)(uintptr_t)tx_addr, data, len);
 
     outl(g_rtl.io_base + RTL_TSAD0 + (g_rtl.cur_tx * 4), tx_addr);
     outl(g_rtl.io_base + RTL_TSD0 + (g_rtl.cur_tx * 4), len);

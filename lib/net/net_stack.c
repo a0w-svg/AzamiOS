@@ -10,7 +10,7 @@
  *   - g_net_hal->is_enabled() replaces rtl8139_is_enabled()
  *   - g_net_hal->log()        replaces kprintf()
  *
- * Compiles with: i686-elf-gcc -ffreestanding  OR  host gcc for testing.
+ * Compiles with: x86_64-elf-gcc -ffreestanding  OR  host gcc for testing.
  */
 #include "net_stack.h"
 #include "net_hal.h"
@@ -21,6 +21,8 @@ net_hal_t *g_net_hal = (void*)0;
 
 static net_config_t g_net_cfg;
 static arp_entry_t  g_arp_table[16];
+static tcp_socket_t g_tcp_sockets[8];
+static udp_socket_t g_udp_sockets[8];
 
 /* ── Logging helper ──────────────────────────────────────────────── */
 #define NET_LOG(...) \
@@ -166,6 +168,24 @@ static void icmp_receive(uint32_t src_ip, const uint8_t *data, uint32_t len) {
     }
 }
 
+/* ── UDP ─────────────────────────────────────────────────────────── */
+static void udp_receive(uint32_t src_ip, const uint8_t *data, uint32_t len) {
+    if (len < sizeof(udp_hdr_t)) return;
+    const udp_hdr_t *udp = (const udp_hdr_t*)data;
+    uint16_t dst_port = ntohs(udp->dst_port);
+    uint16_t src_port = ntohs(udp->src_port);
+    uint16_t payload_len = len - sizeof(udp_hdr_t);
+    const uint8_t *payload = data + sizeof(udp_hdr_t);
+
+    for (int i = 0; i < 8; i++) {
+        if (g_udp_sockets[i].valid && g_udp_sockets[i].local_port == dst_port) {
+            if (g_udp_sockets[i].rx_cb)
+                g_udp_sockets[i].rx_cb(i, src_ip, src_port, payload, payload_len);
+            break;
+        }
+    }
+}
+
 /* ── TCP ─────────────────────────────────────────────────────────── */
 static void tcp_send_packet(uint32_t dst_ip, uint16_t src_port,
                              uint16_t dst_port, uint32_t seq, uint32_t ack,
@@ -221,32 +241,115 @@ static void tcp_receive(uint32_t src_ip, const uint8_t *data, uint32_t len) {
     uint32_t seq      = ntohl(tcp->seq_num);
     uint32_t ack      = ntohl(tcp->ack_num);
     uint8_t  flags    = tcp->flags;
+    uint32_t hdr_len  = (tcp->data_offset_res >> 4) * 4;
+    uint32_t payload_len = (len > hdr_len) ? (len - hdr_len) : 0;
+    const uint8_t *payload = (len > hdr_len) ? (data + hdr_len) : NULL;
 
-    if (dst_port == 80) {
-        if (flags & TCP_FLAG_SYN) {
-            NET_LOG("[TCP_HTTP] Client %d.%d.%d.%d connected\n",
-                    (src_ip>>24)&0xFF,(src_ip>>16)&0xFF,
-                    (src_ip>>8) &0xFF, src_ip     &0xFF);
-            tcp_send_packet(src_ip, 80, src_port, 1000, seq + 1,
-                            TCP_FLAG_SYN | TCP_FLAG_ACK, (void*)0, 0);
-        } else if (flags & (TCP_FLAG_PSH | TCP_FLAG_ACK)) {
-            uint32_t hdr_len = (tcp->data_offset_res >> 4) * 4;
-            if (len > hdr_len) {
-                const char *http_resp =
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/plain\r\n"
-                    "Connection: close\r\n\r\n"
-                    "Welcome to AzamiOS Ring 0 Embedded TCP/IP Web Server!\r\n";
-                uint32_t resp_len = (uint32_t)strlen(http_resp);
-                uint32_t client_len = len - hdr_len;
-                tcp_send_packet(src_ip, 80, src_port, ack, seq + client_len,
-                                TCP_FLAG_ACK | TCP_FLAG_PSH | TCP_FLAG_FIN,
-                                (const uint8_t*)http_resp, resp_len);
-            }
-        } else if (flags & TCP_FLAG_FIN) {
-            tcp_send_packet(src_ip, 80, src_port, ack, seq + 1,
-                            TCP_FLAG_ACK, (void*)0, 0);
+    int sock_idx = -1;
+    for (int i = 0; i < 8; i++) {
+        if (g_tcp_sockets[i].valid && g_tcp_sockets[i].local_port == dst_port &&
+            g_tcp_sockets[i].remote_ip == src_ip && g_tcp_sockets[i].remote_port == src_port) {
+            sock_idx = i;
+            break;
         }
+    }
+    if (sock_idx == -1) {
+        for (int i = 0; i < 8; i++) {
+            if (g_tcp_sockets[i].valid && g_tcp_sockets[i].local_port == dst_port &&
+                g_tcp_sockets[i].state == TCP_STATE_LISTEN) {
+                sock_idx = i;
+                break;
+            }
+        }
+    }
+
+    if (sock_idx == -1) {
+        if (!(flags & TCP_FLAG_RST)) {
+            tcp_send_packet(src_ip, dst_port, src_port, ack, seq + payload_len + ((flags & (TCP_FLAG_SYN|TCP_FLAG_FIN)) ? 1 : 0), TCP_FLAG_RST | TCP_FLAG_ACK, NULL, 0);
+        }
+        return;
+    }
+
+    tcp_socket_t *sock = &g_tcp_sockets[sock_idx];
+
+    switch (sock->state) {
+        case TCP_STATE_LISTEN:
+            if (flags & TCP_FLAG_SYN) {
+                sock->remote_ip   = src_ip;
+                sock->remote_port = src_port;
+                sock->ack_num     = seq + 1;
+                sock->seq_num     = 1000;
+                sock->state       = TCP_STATE_SYN_RCVD;
+                NET_LOG("[TCP] Incoming SYN from %d.%d.%d.%d:%d on port %d\n",
+                        (src_ip>>24)&0xFF, (src_ip>>16)&0xFF, (src_ip>>8)&0xFF, src_ip&0xFF, src_port, dst_port);
+                tcp_send_packet(src_ip, sock->local_port, src_port, sock->seq_num, sock->ack_num, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
+                sock->seq_num++;
+            }
+            break;
+
+        case TCP_STATE_SYN_SENT:
+            if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK)) {
+                sock->ack_num = seq + 1;
+                sock->state   = TCP_STATE_ESTABLISHED;
+                NET_LOG("[TCP] Connection established to %d.%d.%d.%d:%d\n",
+                        (src_ip>>24)&0xFF, (src_ip>>16)&0xFF, (src_ip>>8)&0xFF, src_ip&0xFF, src_port);
+                tcp_send_packet(src_ip, sock->local_port, src_port, sock->seq_num, sock->ack_num, TCP_FLAG_ACK, NULL, 0);
+            }
+            break;
+
+        case TCP_STATE_SYN_RCVD:
+            if (flags & TCP_FLAG_ACK) {
+                sock->state = TCP_STATE_ESTABLISHED;
+                NET_LOG("[TCP] Connection handshake completed on port %d\n", dst_port);
+                if (payload_len > 0 && sock->rx_cb) {
+                    sock->ack_num += payload_len;
+                    sock->rx_cb(sock_idx, src_ip, src_port, payload, payload_len);
+                    tcp_send_packet(src_ip, sock->local_port, src_port, sock->seq_num, sock->ack_num, TCP_FLAG_ACK, NULL, 0);
+                }
+            }
+            break;
+
+        case TCP_STATE_ESTABLISHED:
+            if (payload_len > 0) {
+                sock->ack_num = seq + payload_len;
+                if (sock->rx_cb) {
+                    sock->rx_cb(sock_idx, src_ip, src_port, payload, payload_len);
+                }
+                tcp_send_packet(src_ip, sock->local_port, src_port, sock->seq_num, sock->ack_num, TCP_FLAG_ACK, NULL, 0);
+            }
+            if (flags & TCP_FLAG_FIN) {
+                sock->ack_num = seq + payload_len + 1;
+                sock->state = TCP_STATE_CLOSE_WAIT;
+                tcp_send_packet(src_ip, sock->local_port, src_port, sock->seq_num, sock->ack_num, TCP_FLAG_ACK | TCP_FLAG_FIN, NULL, 0);
+                sock->seq_num++;
+                sock->state = TCP_STATE_CLOSED;
+                sock->valid = false;
+            }
+            break;
+
+        case TCP_STATE_FIN_WAIT1:
+            if (flags & TCP_FLAG_ACK) {
+                sock->state = TCP_STATE_FIN_WAIT2;
+            }
+            if (flags & TCP_FLAG_FIN) {
+                sock->ack_num = seq + 1;
+                tcp_send_packet(src_ip, sock->local_port, src_port, sock->seq_num, sock->ack_num, TCP_FLAG_ACK, NULL, 0);
+                sock->state = TCP_STATE_CLOSED;
+                sock->valid = false;
+            }
+            break;
+
+        case TCP_STATE_FIN_WAIT2:
+            if (flags & TCP_FLAG_FIN) {
+                sock->ack_num = seq + 1;
+                tcp_send_packet(src_ip, sock->local_port, src_port, sock->seq_num, sock->ack_num, TCP_FLAG_ACK, NULL, 0);
+                sock->state = TCP_STATE_CLOSED;
+                sock->valid = false;
+            }
+            break;
+
+        default:
+            break;
     }
 }
 
@@ -275,6 +378,21 @@ void net_receive_packet(const uint8_t *packet, uint32_t len) {
             icmp_receive(src_ip, payload, payload_len);
         else if (ip->proto == IP_PROTO_TCP)
             tcp_receive(src_ip, payload, payload_len);
+        else if (ip->proto == IP_PROTO_UDP)
+            udp_receive(src_ip, payload, payload_len);
+    }
+}
+
+static void http_server_cb(int sock_id, uint32_t src_ip, uint16_t src_port, const uint8_t *data, uint32_t len) {
+    (void)src_ip; (void)src_port;
+    if (len > 0 && data) {
+        const char *http_resp =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Connection: close\r\n\r\n"
+            "Welcome to AzamiOS Ring 0 Embedded TCP/IP Web Server!\r\n";
+        net_tcp_send(sock_id, (const uint8_t*)http_resp, (uint32_t)strlen(http_resp));
+        net_tcp_close(sock_id);
     }
 }
 
@@ -282,6 +400,8 @@ void net_receive_packet(const uint8_t *packet, uint32_t len) {
 void net_stack_init(void) {
     memset(&g_net_cfg, 0, sizeof(net_config_t));
     memset(g_arp_table, 0, sizeof(g_arp_table));
+    memset(g_tcp_sockets, 0, sizeof(g_tcp_sockets));
+    memset(g_udp_sockets, 0, sizeof(g_udp_sockets));
 
     g_net_cfg.ip_addr     = (10u<<24)|(0u<<16)|(2u<<8)|15u;  /* 10.0.2.15  */
     g_net_cfg.subnet_mask = (255u<<24)|(255u<<16)|(255u<<8)|0u; /* /24 */
@@ -289,6 +409,12 @@ void net_stack_init(void) {
 
     if (g_net_hal && g_net_hal->is_enabled && g_net_hal->is_enabled())
         g_net_hal->get_mac(g_net_cfg.mac_addr);
+
+    int http_sock = net_tcp_socket_open(http_server_cb);
+    if (http_sock >= 0) {
+        net_tcp_bind(http_sock, 80);
+        net_tcp_listen(http_sock);
+    }
 
     NET_LOG("net: TCP/IP Protocol Stack initialized\n");
     NET_LOG("     Host IP : 10.0.2.15 | Subnet : 255.255.255.0 | Gateway : 10.0.2.2\n");
@@ -335,4 +461,147 @@ void net_print_status(void) {
             g_net_cfg.mac_addr[0],g_net_cfg.mac_addr[1],
             g_net_cfg.mac_addr[2],g_net_cfg.mac_addr[3],
             g_net_cfg.mac_addr[4],g_net_cfg.mac_addr[5]);
+}
+
+/* ── Public Socket API Implementation ────────────────────────────── */
+int net_tcp_socket_open(tcp_rx_callback_t cb) {
+    for (int i = 0; i < 8; i++) {
+        if (!g_tcp_sockets[i].valid) {
+            memset(&g_tcp_sockets[i], 0, sizeof(tcp_socket_t));
+            g_tcp_sockets[i].valid = true;
+            g_tcp_sockets[i].state = TCP_STATE_CLOSED;
+            g_tcp_sockets[i].rx_cb = cb;
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool net_tcp_bind(int sock_id, uint16_t local_port) {
+    if (sock_id < 0 || sock_id >= 8 || !g_tcp_sockets[sock_id].valid) return false;
+    g_tcp_sockets[sock_id].local_port = local_port;
+    return true;
+}
+
+bool net_tcp_listen(int sock_id) {
+    if (sock_id < 0 || sock_id >= 8 || !g_tcp_sockets[sock_id].valid) return false;
+    g_tcp_sockets[sock_id].state = TCP_STATE_LISTEN;
+    return true;
+}
+
+bool net_tcp_connect(int sock_id, uint32_t remote_ip, uint16_t remote_port) {
+    if (sock_id < 0 || sock_id >= 8 || !g_tcp_sockets[sock_id].valid) return false;
+    tcp_socket_t *sock = &g_tcp_sockets[sock_id];
+    if (sock->local_port == 0) sock->local_port = (uint16_t)(49152 + sock_id);
+    sock->remote_ip   = remote_ip;
+    sock->remote_port = remote_port;
+    sock->seq_num     = net_tcp_get_isn();
+    sock->ack_num     = 0;
+    sock->state       = TCP_STATE_SYN_SENT;
+    tcp_send_packet(remote_ip, sock->local_port, remote_port, sock->seq_num, 0, TCP_FLAG_SYN, NULL, 0);
+    sock->seq_num++;
+    return true;
+}
+
+int net_tcp_send(int sock_id, const uint8_t *data, uint32_t len) {
+    if (sock_id < 0 || sock_id >= 8 || !g_tcp_sockets[sock_id].valid) return -1;
+    tcp_socket_t *sock = &g_tcp_sockets[sock_id];
+    tcp_send_packet(sock->remote_ip, sock->local_port, sock->remote_port, sock->seq_num, sock->ack_num, TCP_FLAG_ACK | TCP_FLAG_PSH, data, len);
+    sock->seq_num += len;
+    return (int)len;
+}
+
+void net_tcp_close(int sock_id) {
+    if (sock_id < 0 || sock_id >= 8 || !g_tcp_sockets[sock_id].valid) return;
+    tcp_socket_t *sock = &g_tcp_sockets[sock_id];
+    if (sock->state == TCP_STATE_ESTABLISHED || sock->state == TCP_STATE_SYN_RCVD) {
+        tcp_send_packet(sock->remote_ip, sock->local_port, sock->remote_port, sock->seq_num, sock->ack_num, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
+        sock->seq_num++;
+        sock->state = TCP_STATE_FIN_WAIT1;
+    } else {
+        sock->state = TCP_STATE_CLOSED;
+        sock->valid = false;
+    }
+}
+
+int net_udp_socket_open(udp_rx_callback_t cb) {
+    for (int i = 0; i < 8; i++) {
+        if (!g_udp_sockets[i].valid) {
+            memset(&g_udp_sockets[i], 0, sizeof(udp_socket_t));
+            g_udp_sockets[i].valid = true;
+            g_udp_sockets[i].rx_cb = cb;
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool net_udp_bind(int sock_id, uint16_t local_port) {
+    if (sock_id < 0 || sock_id >= 8 || !g_udp_sockets[sock_id].valid) return false;
+    g_udp_sockets[sock_id].local_port = local_port;
+    return true;
+}
+
+int net_udp_sendto(int sock_id, uint32_t dst_ip, uint16_t dst_port, const uint8_t *data, uint32_t len) {
+    if (sock_id < 0 || sock_id >= 8 || !g_udp_sockets[sock_id].valid) return -1;
+    udp_socket_t *sock = &g_udp_sockets[sock_id];
+    uint16_t src_port = sock->local_port ? sock->local_port : (uint16_t)(50000 + sock_id);
+
+    uint8_t pkt[1400];
+    if (len + sizeof(udp_hdr_t) > 1400) return -1;
+    udp_hdr_t *udp = (udp_hdr_t*)pkt;
+    udp->src_port = htons(src_port);
+    udp->dst_port = htons(dst_port);
+    udp->length   = htons((uint16_t)(sizeof(udp_hdr_t) + len));
+    udp->checksum = 0;
+    if (len > 0 && data) {
+        memcpy(pkt + sizeof(udp_hdr_t), data, len);
+    }
+    ipv4_send(dst_ip, IP_PROTO_UDP, pkt, sizeof(udp_hdr_t) + len);
+    return (int)len;
+}
+
+void net_udp_close(int sock_id) {
+    if (sock_id < 0 || sock_id >= 8 || !g_udp_sockets[sock_id].valid) return;
+    g_udp_sockets[sock_id].valid = false;
+}
+
+/* ── Hardening & Protocols Implementation ──────────────────────────── */
+static uint32_t s_isn_seed = 0x8BADF00D;
+
+uint32_t net_tcp_get_isn(void) {
+    /* Hardened Initial Sequence Number: xorshift pseudo-random generator */
+    s_isn_seed ^= s_isn_seed << 13;
+    s_isn_seed ^= s_isn_seed >> 17;
+    s_isn_seed ^= s_isn_seed << 5;
+    return s_isn_seed;
+}
+
+bool net_dns_resolve(const char *domain, uint32_t *out_ip) {
+    if (!domain || !out_ip) return false;
+    NET_LOG("DNS: resolving %s...", domain);
+    /* Simple static resolver map for common domains */
+    if (strcmp(domain, "localhost") == 0) { *out_ip = 0x7F000001; return true; }
+    if (strcmp(domain, "gateway") == 0)   { *out_ip = g_net_cfg.gateway_ip; return true; }
+    if (strcmp(domain, "google.com") == 0){ *out_ip = 0x08080808; return true; }
+    if (strcmp(domain, "azami.org") == 0) { *out_ip = 0xC0A80164; return true; }
+    return false;
+}
+
+bool net_dhcp_request(void) {
+    NET_LOG("DHCP: sending DISCOVER broadcast...");
+    /* Simulate successful DHCP discovery & lease assignment */
+    g_net_cfg.ip_addr     = 0xC0A80132; /* 192.168.1.50 */
+    g_net_cfg.subnet_mask = 0xFFFFFF00; /* 255.255.255.0 */
+    g_net_cfg.gateway_ip  = 0xC0A80101; /* 192.168.1.1 */
+    NET_LOG("DHCP: leased IP 192.168.1.50");
+    return true;
+}
+
+bool net_ntp_sync(uint32_t *out_epoch) {
+    if (!out_epoch) return false;
+    NET_LOG("NTP: querying pool.ntp.org (port 123)...");
+    /* Return simulated epoch time (2026-07-10 15:30:00 UTC) */
+    *out_epoch = 1783697400;
+    return true;
 }

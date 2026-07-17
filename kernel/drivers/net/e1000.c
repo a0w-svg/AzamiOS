@@ -35,6 +35,12 @@ void e1000_init(void) {
     uint16_t pci_cmd = pci_config_read16(bus, slot, func, 0x04);
     pci_config_write16(bus, slot, func, 0x04, pci_cmd | (1 << 2) | (1 << 1));
 
+    /* Disable all e1000 interrupts and clear pending interrupts */
+    volatile uint32_t *imc = (volatile uint32_t *)(uintptr_t)(g_e1000_mmio_base + 0x00D8);
+    volatile uint32_t *icr = (volatile uint32_t *)(uintptr_t)(g_e1000_mmio_base + 0x00C0);
+    *imc = 0xFFFFFFFF;
+    (void)*icr;
+
     /* Read MAC address from Receive Address Low/High MMIO registers (offset 0x5400) */
     volatile uint32_t *ra_low = (volatile uint32_t *)(uintptr_t)(g_e1000_mmio_base + 0x5400);
     volatile uint32_t *ra_high = (volatile uint32_t *)(uintptr_t)(g_e1000_mmio_base + 0x5404);

@@ -4,13 +4,12 @@ This document provides detailed deep-dives into the kernel internal architecture
 
 ---
 
-## 1. Dual-Architecture Adaptation Strategy
+## 1. 64-Bit Architecture & System Design
 
-AzamiOS achieves compatibility between legacy 32-bit Protected Mode and modern 64-bit Long Mode (UEFI) without maintaining forked kernel repositories. This is accomplished through three primary software engineering pillars:
+AzamiOS is designed specifically for 64-bit (`x86_64`) Long Mode, ensuring a clean and minimalistic architecture without legacy 32-bit code paths or dual-build complexity.
 
-### A. Data Type Polymorphism
+### A. Data Types & Memory Pointers
 All pointers, page frame counts, and virtual memory offsets across the kernel use `uintptr_t` or `size_t` from `<stdint.h>`.
-- In 32-bit compilation (`i686-elf-gcc -m32`), `uintptr_t` resolves to a 4-byte unsigned integer (`uint32_t`).
 - In 64-bit compilation (`x86_64-elf-gcc -m64`), `uintptr_t` resolves to an 8-byte unsigned integer (`uint64_t`).
 
 Example from process management (`process.h`):
@@ -28,19 +27,8 @@ typedef struct process {
 } process_t;
 ```
 
-### B. Hardware Initialization Gating (`g_is_uefi`)
-When booting via UEFI firmware, the system is already placed into 64-bit Long Mode with paging active (4-level PML4 table set up by firmware) and a flat linear framebuffer provided by the UEFI Graphics Output Protocol (GOP). Re-initializing legacy x86 hardware tables (such as 32-bit GDT or 2-level Page Directories) would immediately cause a processor triple-fault crash.
-
-To protect system integrity, the kernel exports a global runtime boolean `bool g_is_uefi`. Hardware initialization routines check this gate before altering CPU registers:
-```c
-void gdt_init(void) {
-    if (g_is_uefi) return; /* Bypass legacy 32-bit GDT loading in UEFI mode */
-    // ... legacy 32-bit GDT & TSS setup ...
-}
-```
-
-### C. Linker Decoupling (`x86_64_stubs.c`)
-Legacy 32-bit assembly routines (`cpu.asm`, `interrupts.asm`, `paging_ext.asm`, `smp_boot.asm`) are written specifically for 32-bit register architectures (`eax`, `esp`, `cr0`). When compiling for 64-bit (`ARCH=x86_64`), the Makefile omits these assembly objects and instead links `kernel/arch/x86_64_stubs.c`. This file provides C-level stubs for symbols referenced during linking, allowing clean executable generation without syntax mismatch.
+### B. Hardware Initialization & Boot
+When booting, the system operates in 64-bit Long Mode with paging active (4-level PML4 table) and linear framebuffer support. All GDT, IDT, and TSS structures are native 64-bit descriptors (`tss_t` 104 bytes, 16-byte IDT gates).
 
 ---
 
@@ -48,8 +36,7 @@ Legacy 32-bit assembly routines (`cpu.asm`, `interrupts.asm`, `paging_ext.asm`, 
 
 ### Physical Memory Manager (PMM)
 The PMM (`kernel/mem/pmm.c`) tracks physical frame allocations using a bitmap allocator. Each bit represents a 4KB physical memory page frame (`PMM_FRAME_SIZE = 4096`).
-- **32-Bit Mode**: Initializes from the GRUB Multiboot memory map passed via `ebx`.
-- **64-Bit Mode**: Initializes from the descriptor array retrieved via `SystemTable->BootServices->GetMemoryMap()`.
+- **64-Bit Mode**: Initializes physical frame allocations (`PMM_FRAME_SIZE = 4096`).
 
 ### Virtual Memory Manager & Paging
 - **Identity Mapping**: The kernel protects runtime code execution by identity-mapping low physical memory (`0x00000000` through `0x08000000`).

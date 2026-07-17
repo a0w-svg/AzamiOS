@@ -67,7 +67,7 @@ static uint8_t floppy_read_data(){
     Use DMA driver to prepare channel 2
 */
 static void floppy_dma_init(uint8_t *buffer, uint32_t length, int is_write){
-    uint32_t addr = (uint32_t)buffer;
+    uint32_t addr = (uint32_t)(uintptr_t)buffer;
 
     // divide address in elements for DMA
     uint8_t page = (addr >> 16) & 0xFF;

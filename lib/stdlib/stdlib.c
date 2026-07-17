@@ -2,7 +2,7 @@
  * lib/stdlib/stdlib.c  –  AzamiOS portable integer/string conversion
  *
  * Pure arithmetic — no hardware, no port I/O, no kernel headers.
- * Compiles with: i686-elf-gcc -ffreestanding  OR  host gcc for testing.
+ * Compiles with: x86_64-elf-gcc -ffreestanding  OR  host gcc for testing.
  */
 #include "stdlib.h"
 #include <stdint.h>

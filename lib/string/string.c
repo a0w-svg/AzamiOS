@@ -3,7 +3,7 @@
  *
  * Pure C / inline-asm (x86 STOS/MOVS) string primitives.
  * No kernel headers, no port I/O, no ring-0 primitives.
- * Compiles with: i686-elf-gcc -ffreestanding  OR  host gcc for unit testing.
+ * Compiles with: x86_64-elf-gcc -ffreestanding  OR  host gcc for unit testing.
  */
 #include "string.h"
 #include <stdint.h>
@@ -17,7 +17,14 @@
 void* memset(void* s, int c, size_t n)
 {
     void *orig = s;
-    asm volatile("rep stosb" : "+D"(s), "+c"(n) : "a"(c) : "memory");
+    uint32_t c32 = (uint8_t)c;
+    c32 |= (c32 << 8);
+    c32 |= (c32 << 16);
+    size_t dwords = n / 4;
+    size_t bytes = n % 4;
+    void *dest = s;
+    asm volatile("cld; rep stosl" : "+D"(dest), "+c"(dwords) : "a"(c32) : "memory");
+    asm volatile("rep stosb" : "+D"(dest), "+c"(bytes) : "a"(c) : "memory");
     return orig;
 }
 
@@ -26,7 +33,12 @@ void* memset(void* s, int c, size_t n)
  */
 void* memcpy(void* dest, const void* src, size_t n) {
     void *orig = dest;
-    asm volatile("rep movsb" : "+D"(dest), "+S"(src), "+c"(n) : : "memory");
+    size_t dwords = n / 4;
+    size_t bytes = n % 4;
+    void *d = dest;
+    const void *s = src;
+    asm volatile("cld; rep movsl" : "+D"(d), "+S"(s), "+c"(dwords) : : "memory");
+    asm volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(bytes) : : "memory");
     return orig;
 }
 

@@ -2,7 +2,7 @@
  * lib/string/string.h  –  AzamiOS portable string & memory utilities
  *
  * This header is kernel-independent: it can be compiled with any C compiler
- * targeting i686-elf or the host toolchain for unit testing.
+ * targeting x86_64-elf or the host toolchain for unit testing.
  * It is the canonical definition; kernel/klibc/include/string.h delegates here.
  */
 #ifndef LIB_STRING_H

@@ -19,11 +19,17 @@ typedef struct process {
     uintptr_t kernel_stack;   // Base of allocated ring 0 stack (4KB)
     uintptr_t user_stack;     // User ring 3 stack
     uintptr_t entry;          // Entry point
+    uint8_t ring;             // Privilege level: 0=kernel, 3=user
+    bool on_cpu;              // True if this task is currently running on a core
+    uint32_t cpu_id;          // Which core this task is pinned to / last ran on
     struct process *next;
 } process_t;
 
+
 void process_init(void);
 process_t *process_create(const char *name, uintptr_t entry, uintptr_t cr3);
+int process_thread_create(uintptr_t entry, uintptr_t arg, uintptr_t user_stack);
+int process_fork(registers_t *regs);
 void process_exit(int exit_code);
 
 #endif

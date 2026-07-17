@@ -12,9 +12,9 @@ void _start(void) {
     snprintf(buf, sizeof(buf),
              "x86 Processor Topology & Capability Report:\n"
              "  Vendor ID : %s\n"
-             "  Family    : %u | Model: %u | Stepping: %u\n"
+             "  Family    : %lu | Model: %lu | Stepping: %lu\n"
              "  Features  : %s%s%s%s%s%s%s\n",
-             cpu.vendor, cpu.family, cpu.model, cpu.stepping,
+             cpu.vendor, (unsigned long)cpu.family, (unsigned long)cpu.model, (unsigned long)cpu.stepping,
              cpu.has_fpu ? "[FPU] " : "",
              cpu.has_tsc ? "[TSC] " : "",
              cpu.has_msr ? "[MSR] " : "",

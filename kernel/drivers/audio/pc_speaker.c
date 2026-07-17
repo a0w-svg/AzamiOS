@@ -9,13 +9,15 @@
 */
 void play_sound(uint32_t nfreq)
 {
-    uint32_t div_freq;
+    if (nfreq == 0) return;
+    uint32_t div_freq = (1193182 + (nfreq / 2)) / nfreq;
+    if (div_freq < 18) div_freq = 18;
+    if (div_freq > 65535) div_freq = 0;
     uint8_t temp;
     // set the PIT to the specified frequency;
-    div_freq = 1193180 / nfreq; 
     outb(PIT_CMD_REG, 0xB6);
-    outb(PIT_CHANNEL2, (uint8_t)(div_freq));
-    outb(PIT_CHANNEL2, (uint8_t)(div_freq >> 8));
+    outb(PIT_CHANNEL2, (uint8_t)(div_freq & 0xFF));
+    outb(PIT_CHANNEL2, (uint8_t)((div_freq >> 8) & 0xFF));
     // play the sound
     temp = inb(0x61);
     if(temp != (temp | 3))

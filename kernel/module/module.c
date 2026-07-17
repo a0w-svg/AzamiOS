@@ -1,11 +1,14 @@
 /**
- * module.c  –  AzamiOS Kernel Module Registry Engine
+ * module.c  –  AzamiOS Kernel v2.0 Module Registry Engine (O(1) Registration)
  */
 #include "include/module.h"
 #include "../klibc/include/stdio.h"
 #include "../klibc/include/string.h"
+#include "../drivers/include/pci.h"
+#include "../drivers/include/driver.h"
 
 static kernel_module_t *g_mod_registry = (kernel_module_t*)0;
+static kernel_module_t *g_mod_tail = (kernel_module_t*)0;
 static int g_mod_count = 0;
 
 static const char *type_names[] = {
@@ -19,10 +22,10 @@ void module_register(kernel_module_t *mod) {
 
     if (!g_mod_registry) {
         g_mod_registry = mod;
+        g_mod_tail = mod;
     } else {
-        kernel_module_t *curr = g_mod_registry;
-        while (curr->next) curr = curr->next;
-        curr->next = mod;
+        g_mod_tail->next = mod;
+        g_mod_tail = mod;
     }
     g_mod_count++;
 }
@@ -33,6 +36,9 @@ int module_init_all(void) {
 
     /* Initialize in strict dependency order: CORE -> MEM -> FS -> DRV -> NET -> PROC */
     for (int t = MOD_CORE; t <= MOD_PROC; t++) {
+        if (t == MOD_DRV) {
+            pci_enumerate();
+        }
         kernel_module_t *curr = g_mod_registry;
         while (curr) {
             if ((int)curr->type == t && !curr->active) {
@@ -52,6 +58,9 @@ int module_init_all(void) {
                 }
             }
             curr = curr->next;
+        }
+        if (t == MOD_DRV) {
+            driver_probe_all();
         }
     }
     kprintf("=== Bootstrap Complete: %d / %d Modules Active ===\n\n", active_cnt, g_mod_count);
@@ -82,7 +91,7 @@ int module_get_summary_table(char *buf, int max_len) {
     if (!buf || max_len <= 0) return 0;
     buf[0] = '\0';
 
-    const char *header = "AzamiOS Ring 0 Kernel Module Registry:\n"
+    const char *header = "AzamiOS v2.0 Kernel Module Registry:\n"
                          "TYPE   MODULE     STATUS  DESCRIPTION\n"
                          "----------------------------------------------------\n";
     strncpy(buf, header, max_len - 1);

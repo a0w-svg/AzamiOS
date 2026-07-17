@@ -1,20 +1,18 @@
 /**
- * unistd.h  –  POSIX Standard Symbolic Constants and Types
+ * unistd.h — AzamiOS unistd wrapper
+ *
+ * Includes newlib's standard <unistd.h> and declares AzamiOS-specific
+ * syscall functions like exec().
  */
-#ifndef _UNISTD_H
-#define _UNISTD_H
 
-#include <sys/types.h>
+#ifndef _AZAMI_UNISTD_H
+#define _AZAMI_UNISTD_H
 
-#define STDIN_FILENO  0
-#define STDOUT_FILENO 1
-#define STDERR_FILENO 2
+#include_next <unistd.h>
 
-ssize_t read(int fd, void *buf, size_t count);
-ssize_t write(int fd, const void *buf, size_t count);
-int     close(int fd);
-void   *sbrk(int incr);
-pid_t   getpid(void);
-void   _exit(int status);
+void exec(const char *filename);
+int fork(void);
+void yield(void);
+int thread_create(void (*entry)(void*), void *arg, void *user_stack);
 
-#endif /* _UNISTD_H */
+#endif /* _AZAMI_UNISTD_H */

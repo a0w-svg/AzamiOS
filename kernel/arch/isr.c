@@ -1,15 +1,22 @@
 #include "./include/isr.h"
+#include "./include/smp.h"
+#include "./include/spinlock.h"
+#include "./include/apic.h"
+
 #include "../klibc/include/stdio.h"
 #include "./include/pic.h"
 #include "./include/idt.h"
 #include "../klibc/include/port.h"
 #include "../klibc/include/kpanic.h"
+#include "../mem/include/access_control.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include "../mem/include/paging.h"
 extern page_directory_entry_t page_directory[];
 
-isr_t interrupt_handlers[256];
+#define MAX_HANDLERS_PER_VEC 4
+isr_t interrupt_handlers[256][MAX_HANDLERS_PER_VEC];
+
 
 //interrupts code messages
 char *exception_messages[] = {
@@ -85,6 +92,24 @@ extern void isr_31();
 
 // syscall
 extern void isr_128();
+extern void isr_252();
+
+extern volatile uintptr_t g_tlb_shootdown_addr;
+extern volatile uint32_t g_tlb_shootdown_ack_count;
+
+static void tlb_shootdown_isr(registers_t *r) {
+    UNUSED(r);
+    uintptr_t addr = g_tlb_shootdown_addr;
+    if (addr == ~0UL) {
+        uintptr_t cr3;
+        asm volatile("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3));
+    } else {
+        asm volatile("invlpg (%0)" : : "r"(addr) : "memory");
+    }
+    apic_send_eoi();
+    atomic_inc(&g_tlb_shootdown_ack_count);
+}
+
 
 // IRQ
 extern void irq_0();
@@ -150,6 +175,9 @@ void init_isr(void)
     
     // register syscall for userspace (DPL = 3)
     idt_set_gate(128, (uintptr_t)isr_128, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE_USER);
+    idt_set_gate(252, (uintptr_t)isr_252, KERNEL_CODE_SEGMENT, BITS_32_INTERRUPT_GATE);
+    register_interrupt_handler(252, tlb_shootdown_isr);
+
     
     // initialize and remap PIC 
     init_PIC();
@@ -174,30 +202,53 @@ void init_isr(void)
     register_interrupt_handler(14, page_fault_handler);
     // load IDT table and enable interrupts
     idt_init();
-#if !defined(__x86_64__)
-    asm volatile("sti");
-#endif
 }
 
 /*
     Interrupt handler; Gets called from asm interrupt handler stub;
 */
-void exception_handler(registers_t *r)
-{
-    if(interrupt_handlers[r->int_no] != 0)
-    {
-        isr_t handler = interrupt_handlers[r->int_no];
-        handler(r);
+static void __attribute__((unused)) serial_hex_isr(uint64_t val) {
+    for (int i = 60; i >= 0; i -= 4) {
+        int d = (val >> i) & 0xF;
+        outb(0x3F8, d < 10 ? '0' + d : 'a' + (d - 10));
     }
-    else
-    {
-        if(r->int_no < 32){
-            PANIC(exception_messages[r->int_no]);
+}
+
+uintptr_t exception_handler(registers_t *r)
+{
+    cpu_data_t *cpu = smp_get_current_cpu();
+    cpu->active_context = (uintptr_t)r;
+
+    if (r->int_no < 32) {
+        kprintf("\n=== EXCEPTION %d AT EIP=0x%x ===\n", (uint32_t)r->int_no, (uint32_t)r->eip);
+        kprintf("  RAX=0x%x RBX=0x%x RCX=0x%x RDX=0x%x\n", (uint32_t)r->eax, (uint32_t)r->ebx, (uint32_t)r->ecx, (uint32_t)r->edx);
+        kprintf("  RSI=0x%x RDI=0x%x RBP=0x%x RSP=0x%x\n", (uint32_t)r->esi, (uint32_t)r->edi, (uint32_t)r->ebp, (uint32_t)r->esp);
+        if (r->esp && r->esp >= 0x400000 && r->esp < 0xC0000000) {
+            uint64_t *sp = (uint64_t*)r->esp;
+            kprintf("  USER STACK AT 0x%x: [0]=0x%x [1]=0x%x [2]=0x%x [3]=0x%x\n",
+                    (uint32_t)r->esp, (uint32_t)sp[0], (uint32_t)sp[1], (uint32_t)sp[2], (uint32_t)sp[3]);
         }
-        else{
+        if (r->ebp && r->ebp >= 0x400000 && r->ebp < 0xC0000000) {
+            uint64_t *bp = (uint64_t*)r->ebp;
+            kprintf("  USER RBP AT 0x%x: [0]=0x%x [1]=0x%x [2]=0x%x [3]=0x%x\n",
+                    (uint32_t)r->ebp, (uint32_t)bp[0], (uint32_t)bp[1], (uint32_t)bp[2], (uint32_t)bp[3]);
+        }
+    }
+    bool handled = false;
+    for (int i = 0; i < MAX_HANDLERS_PER_VEC; i++) {
+        if (interrupt_handlers[r->int_no][i] != 0) {
+            interrupt_handlers[r->int_no][i](r);
+            handled = true;
+        }
+    }
+    if (!handled) {
+        if (r->int_no < 32) {
+            PANIC(exception_messages[r->int_no]);
+        } else {
             PANIC("Unhandled Hardware Interrupt");
         }
     }
+    return cpu->active_context;
 }
 
 /*
@@ -205,73 +256,115 @@ void exception_handler(registers_t *r)
 */
 void register_interrupt_handler(uint8_t num, isr_t handler)
 {
-    interrupt_handlers[num] = handler;
+    for (int i = 0; i < MAX_HANDLERS_PER_VEC; i++) {
+        if (interrupt_handlers[num][i] == 0 || interrupt_handlers[num][i] == handler) {
+            interrupt_handlers[num][i] = handler;
+            return;
+        }
+    }
+    kprintf("isr: warning: max handlers reached for vector %d\n", num);
 }
 /*
 IRQ handler
 */
-void irq_handler(registers_t *r)
+uintptr_t irq_handler(registers_t *r)
 {
-    // check if interrupt comes from dedicated handler (for example: keyboard)
-    if(interrupt_handlers[r->int_no] != 0){
-        isr_t handler = interrupt_handlers[r->int_no];
-        handler(r);
-    }
-    // send EOI signal to PIC
+    cpu_data_t *cpu = smp_get_current_cpu();
+    cpu->active_context = (uintptr_t)r;
+
+    /*
+     * Send EOI before calling handlers so that if a handler triggers a context
+     * switch the PIC/APIC In-Service bit is already cleared — no deadlock.
+     */
     PIC_send_EOI(r->int_no - 32);
+    apic_send_eoi();
+
+    for (int i = 0; i < MAX_HANDLERS_PER_VEC; i++) {
+        if (interrupt_handlers[r->int_no][i] != 0) {
+            interrupt_handlers[r->int_no][i](r);
+        }
+    }
+    return cpu->active_context;
 }
 
 void page_fault_handler(registers_t *r) {
     uintptr_t cr2;
     asm volatile("mov %%cr2, %0" : "=r"(cr2));
-    
-    kprintf("\n[PAGE FAULT] CR2=0x%x at EIP=0x%x (err_code=0x%x)\n", (uint32_t)cr2, r->eip, (uint32_t)r->err_code);
 
-#if defined(__x86_64__)
+    /*
+     * Decode the error code pushed by the CPU (Intel SDM Vol.3 §6.15):
+     *   bit 0 (P)   : 0=not-present, 1=protection violation
+     *   bit 1 (W/R) : 0=read,        1=write
+     *   bit 2 (U/S) : 0=kernel CPL,  1=user CPL
+     *   bit 3 (RSVD): reserved bit violation
+     *   bit 4 (I/D) : 0=data,        1=instruction fetch (NX)
+     */
+    int pf_present  = (int)(r->err_code & 0x01); /* 0=missing page, 1=prot */
+    int pf_write    = (int)(r->err_code & 0x02);
+    int pf_user     = (int)(r->err_code & 0x04);
+    int pf_rsvd     = (int)(r->err_code & 0x08);
+    int pf_fetch    = (int)(r->err_code & 0x10);
+    (void)pf_write; (void)pf_rsvd; (void)pf_fetch;
+
+    if (pf_user) {
+        /*
+         * ── User-mode fault ───────────────────────────────────────────────
+         * Case A: page not present in user range → demand-page it.
+         * Case B: protection violation / NX / reserved → SEGFAULT.
+         */
+        if (!pf_present && ac_demand_page(cr2)) {
+            /* Page successfully allocated and mapped — resume the instruction */
+            return;
+        }
+
+        /* Bad access: log and kill the offending process */
+        kprintf("[PF] SEGFAULT: CR2=0x%016llx EIP/RIP=0x%016llx err=0x%x (user %s %s)\n",
+                (unsigned long long)cr2,
+                (unsigned long long)r->eip,
+                (uint32_t)r->err_code,
+                pf_present ? "protection" : "not-present",
+                pf_fetch   ? "exec"       : "access");
+        ac_kill_current_process("illegal memory access (SEGFAULT)");
+        /* ac_kill_current_process does not return */
+    }
+
+    /*
+     * ── Kernel-mode fault ─────────────────────────────────────────────────
+     * This is a kernel bug — cannot recover. Dump debug info then PANIC.
+     */
+    kprintf("\n[PAGE FAULT] kernel CR2=0x%016llx RIP=0x%016llx err=0x%x\n",
+            (unsigned long long)cr2,
+            (unsigned long long)r->eip,
+            (uint32_t)r->err_code);
+
+    /* Walk 4-level page table for debug info */
     uintptr_t cr3;
     asm volatile("mov %%cr3, %0" : "=r"(cr3));
     uint64_t *pml4 = (uint64_t*)(cr3 & ~0xFFFULL);
     uint32_t pml4_idx = (cr2 >> 39) & 0x1FF;
     uint64_t pml4e = pml4[pml4_idx];
-    kprintf("64-bit Walk: PML4E[%d]=0x%x%x\n", pml4_idx, (uint32_t)(pml4e >> 32), (uint32_t)pml4e);
+    kprintf("  PML4E[%u]=0x%08x%08x\n", pml4_idx,
+            (uint32_t)(pml4e >> 32), (uint32_t)pml4e);
     if (pml4e & 1) {
         uint64_t *pdpt = (uint64_t*)(uintptr_t)(pml4e & ~0xFFFULL);
         uint32_t pdpt_idx = (cr2 >> 30) & 0x1FF;
         uint64_t pdpte = pdpt[pdpt_idx];
-        kprintf("  PDPTE[%d]=0x%x%x\n", pdpt_idx, (uint32_t)(pdpte >> 32), (uint32_t)pdpte);
+        kprintf("  PDPTE[%u]=0x%08x%08x\n", pdpt_idx,
+                (uint32_t)(pdpte >> 32), (uint32_t)pdpte);
         if (pdpte & 1) {
             uint64_t *pd = (uint64_t*)(uintptr_t)(pdpte & ~0xFFFULL);
             uint32_t pd_idx = (cr2 >> 21) & 0x1FF;
             uint64_t pde = pd[pd_idx];
-            kprintf("  PDE[%d]=0x%x%x\n", pd_idx, (uint32_t)(pde >> 32), (uint32_t)pde);
+            kprintf("  PDE  [%u]=0x%08x%08x\n", pd_idx,
+                    (uint32_t)(pde >> 32), (uint32_t)pde);
             if ((pde & 1) && !(pde & 0x80)) {
                 uint64_t *pt = (uint64_t*)(uintptr_t)(pde & ~0xFFFULL);
                 uint32_t pt_idx = (cr2 >> 12) & 0x1FF;
                 uint64_t pte = pt[pt_idx];
-                kprintf("  PTE[%d]=0x%x%x\n", pt_idx, (uint32_t)(pte >> 32), (uint32_t)pte);
+                kprintf("  PTE  [%u]=0x%08x%08x\n", pt_idx,
+                        (uint32_t)(pte >> 32), (uint32_t)pte);
             }
         }
     }
-#else
-    int present = !(r->err_code & 0x1); // 0 = Page not found, 1 = security error
-    int rw = r->err_code & 0x2;  // 0 = read error, 2 = write error
-    int us = r->err_code & 0x4; // 0 = kernel fault, 4 = usermode fault
-
-    uint32_t pd_index = (uint32_t)((cr2 >> 22) & 0x3FF);
-    uint32_t pt_index = (uint32_t)((cr2 >> 12) & 0x3FF);
-    uint32_t pde_val = page_directory[pd_index].value;
-    uint32_t pte_val = 0;
-    if (page_directory[pd_index].present) {
-        page_table_t *pt = (page_table_t*)(uintptr_t)(page_directory[pd_index].table << 12);
-        pte_val = pt->pages[pt_index].value;
-    }
-
-    uintptr_t cr3;
-    asm volatile("mov %%cr3, %0" : "=r"(cr3));
-    uint32_t hw_pde = ((uint32_t*)cr3)[pd_index];
-
-    kprintf("DEBUG: cr3=0x%x, page_dir=0x%x, hw_pde=0x%x\n", (uint32_t)cr3, (uint32_t)(uintptr_t)page_directory, hw_pde);
-    kprintf("DEBUG: pd_index=%d, pde=0x%x, pt_index=%d, pte=0x%x\n", pd_index, pde_val, pt_index, pte_val);
-#endif
-    PANIC("Memory Access Violation (Page Fault)");
+    PANIC("Kernel Page Fault — memory corruption or kernel bug");
 }

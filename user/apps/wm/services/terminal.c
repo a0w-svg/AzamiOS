@@ -56,7 +56,20 @@ static void term_putc(char ch, uint32_t col) {
         return;
     }
     if (ch == '\b' || ch == 127) {
-        if (term_c > 0) { term_c--; term_buf[term_r][term_c] = ' '; }
+        if (term_c > 0) {
+            term_c--;
+            term_buf[term_r][term_c] = ' ';
+        } else if (term_r > 0) {
+            term_r--;
+            int c = TERM_COLS - 1;
+            while (c > 0 && term_buf[term_r][c] == ' ') {
+                c--;
+            }
+            if (term_buf[term_r][c] != ' ') c++;
+            if (c >= TERM_COLS) c = TERM_COLS - 1;
+            term_c = c;
+            term_buf[term_r][term_c] = ' ';
+        }
         return;
     }
     term_buf[term_r][term_c] = ch;
@@ -69,60 +82,87 @@ static void term_print(const char *str, uint32_t col) {
     while (*str) term_putc(*str++, col);
 }
 
-static void process_command(rtc_time_t *t, uint32_t frame_cnt) {
+/*
+ * process_command — execute the content of cmd_buf.
+ * Returns true  → caller (terminal_on_key) should print the next prompt.
+ * Returns false → window closed or exec() is replacing the process image
+ *                 (WM will restart; terminal_init prints the prompt on return).
+ */
+static bool process_command(rtc_time_t *t, uint32_t frame_cnt) {
     (void)t; (void)frame_cnt;
-    if (cmd_buf[0] == '\0') {
-        term_print("azami:~$ ", COL_TEXT_GREEN);
-        return;
-    }
+    /* Empty line — just let the caller print a fresh prompt */
+    if (cmd_buf[0] == '\0') return true;
+
     if (strcmp(cmd_buf, "exit") == 0) {
         int idx = find_win_by_type(WIN_TERMINAL);
         if (idx >= 0) wm_close_window(&g_wins[idx]);
         cmd_buf[0] = 0;
         cmd_p = 0;
-        return;
+        return false;   /* window closed, no prompt */
     }
 
     char cmd_word[32];
-    int i = 0;
+    int  i = 0;
     char *ptr = cmd_buf;
-    while (*ptr && *ptr != ' ' && i < 31) {
-        cmd_word[i++] = *ptr++;
-    }
+    while (*ptr && *ptr != ' ' && i < 31) cmd_word[i++] = *ptr++;
     cmd_word[i] = '\0';
     while (*ptr == ' ') ptr++;
 
-    int arg_fd = open("cmd_args", O_WRONLY | O_CREAT, 0);
-    if (arg_fd >= 0) {
-        write(arg_fd, ptr, strlen(ptr));
-        close(arg_fd);
-    }
-    int out_fd = open("cmd_out", O_WRONLY | O_CREAT, 0);
+    /* Write args for the child process */
+    int arg_fd = open("cmd_args", O_WRONLY | O_CREAT | O_TRUNC, 0);
+    if (arg_fd >= 0) { write(arg_fd, ptr, strlen(ptr)); close(arg_fd); }
+    int out_fd = open("cmd_out", O_WRONLY | O_CREAT | O_TRUNC, 0);
     if (out_fd >= 0) { close(out_fd); }
 
-    int st_fd = open(".wm_term_state", O_WRONLY | O_CREAT, 0);
-    if (st_fd >= 0) {
-        wm_term_state_t st;
-        memcpy(st.buf, term_buf, sizeof(term_buf));
-        memcpy(st.color, term_color, sizeof(term_color));
-        st.r = term_r;
-        st.c = term_c;
-        write(st_fd, &st, sizeof(st));
-        close(st_fd);
+    int pid = fork();
+    if (pid == 0) {
+        exec(cmd_word);
+        int err_fd = open("cmd_out", O_WRONLY | O_CREAT | O_TRUNC, 0);
+        if (err_fd >= 0) {
+            write(err_fd, "bash: command not found: ", 25);
+            write(err_fd, cmd_word, strlen(cmd_word));
+            write(err_fd, "\n", 1);
+            close(err_fd);
+        }
+        exit(-1);
+    } else if (pid > 0) {
+        int rn = 0;
+        char out_buf[1024];
+        for (int retry = 0; retry < 50; retry++) {
+            for (int i = 0; i < 10; i++) yield();
+            int o_fd = open("cmd_out", 0);
+            if (o_fd >= 0) {
+                rn = read(o_fd, out_buf, sizeof(out_buf) - 1);
+                close(o_fd);
+                if (rn > 0) break;
+            }
+        }
+        if (rn > 0) {
+            int tr_fd = open("cmd_out", O_WRONLY | O_CREAT | O_TRUNC, 0);
+            if (tr_fd >= 0) { close(tr_fd); }
+
+            if (rn > 0) {
+                out_buf[rn] = '\0';
+                if (strcmp(out_buf, "__CLEAR__") == 0 || strncmp(out_buf, "__CLEAR__", 9) == 0) {
+                    term_clear();
+                } else if (strncmp(out_buf, "\033WIN_", 5) == 0) {
+                    if (strncmp(out_buf + 5, "ABOUT", 5) == 0) open_win_type(WIN_ABOUT);
+                    else if (strncmp(out_buf + 5, "NOTEPAD", 7) == 0) open_win_type(WIN_NOTEPAD);
+                    else if (strncmp(out_buf + 5, "FILES", 5) == 0) open_win_type(WIN_FILES);
+                    term_print("Opened GUI application window.\n", COL_TEXT_CYAN);
+                } else {
+                    term_print(out_buf, COL_TEXT_WHITE);
+                    if (out_buf[rn - 1] != '\n') term_print("\n", COL_TEXT_WHITE);
+                }
+            }
+        }
+        cmd_buf[0] = 0;
+        cmd_p = 0;
+        return true;
     }
-
-    exec(cmd_word);
-
-    int d_fd = open(".wm_term_state", O_WRONLY | O_CREAT, 0);
-    if (d_fd >= 0) { close(d_fd); }
-
-    term_print("bash: command not found: ", COL_TEXT_RED);
-    term_print(cmd_word, COL_TEXT_WHITE);
-    term_print("\n", COL_TEXT_WHITE);
-
     cmd_buf[0] = 0;
     cmd_p = 0;
-    term_print("azami:~$ ", COL_TEXT_GREEN);
+    return true;
 }
 
 static void terminal_init(window_t *w) {
@@ -132,7 +172,7 @@ static void terminal_init(window_t *w) {
         wm_term_state_t st;
         int n = read(s_fd, &st, sizeof(st));
         close(s_fd);
-        int d_fd = open(".wm_term_state", O_WRONLY | O_CREAT, 0);
+        int d_fd = open(".wm_term_state", O_WRONLY | O_CREAT | O_TRUNC, 0);
         if (d_fd >= 0) { close(d_fd); }
 
         if (n == sizeof(st)) {
@@ -149,7 +189,7 @@ static void terminal_init(window_t *w) {
             char out_buf[1024];
             int rn = read(o_fd, out_buf, sizeof(out_buf) - 1);
             close(o_fd);
-            int tr_fd = open("cmd_out", O_WRONLY | O_CREAT, 0);
+            int tr_fd = open("cmd_out", O_WRONLY | O_CREAT | O_TRUNC, 0);
             if (tr_fd >= 0) { close(tr_fd); }
 
             if (rn > 0) {
@@ -169,10 +209,12 @@ static void terminal_init(window_t *w) {
         }
     } else {
         term_clear();
-        term_print("AzamiOS True Color Shell v3.0\n", COL_TEXT_CYAN);
+        term_print("AzamiOS True Color Shell v6.0 (Win10 / GNU)\n", COL_TEXT_CYAN);
         term_print("Type 'help' for commands\n", COL_TEXT_WHITE);
     }
     term_print("azami:~$ ", COL_TEXT_GREEN);
+    strcpy(cmd_buf, "help");
+    process_command(NULL, 0);
     cmd_buf[0] = 0;
     cmd_p = 0;
 }
@@ -218,10 +260,12 @@ static void terminal_on_key(window_t *w, int c, rtc_time_t *t, uint32_t frame_cn
     if (c == '\n' || c == '\r') {
         term_putc('\n', COL_TEXT_WHITE);
         cmd_buf[cmd_p] = 0;
-        process_command(t, frame_cnt);
+        bool need_prompt = process_command(t, frame_cnt);
         cmd_p = 0;
         cmd_buf[0] = 0;
-        term_print("azami:~$ ", COL_TEXT_GREEN);
+        while (has_char()) (void)getchar();
+        /* Only print prompt if the window is still open and we didn't exec() */
+        if (need_prompt) term_print("azami:~$ ", COL_TEXT_GREEN);
     } else if (c == '\b' || c == 127) {
         if (cmd_p > 0) {
             cmd_p--;

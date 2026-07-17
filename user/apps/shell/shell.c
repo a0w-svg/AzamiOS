@@ -70,6 +70,17 @@ static void tui_putc(char ch, uint32_t color) {
             term_c--;
             term_buf[term_r][term_c] = ' ';
             term_color[term_r][term_c] = COL_TEXT_WHITE;
+        } else if (term_r > 0) {
+            term_r--;
+            int c = COLS - 1;
+            while (c > 0 && term_buf[term_r][c] == ' ') {
+                c--;
+            }
+            if (term_buf[term_r][c] != ' ') c++;
+            if (c >= COLS) c = COLS - 1;
+            term_c = c;
+            term_buf[term_r][term_c] = ' ';
+            term_color[term_r][term_c] = COL_TEXT_WHITE;
         }
         return;
     }
@@ -122,7 +133,7 @@ void _start(void) {
         shell_state_t st;
         int n = read(s_fd, &st, sizeof(st));
         close(s_fd);
-        int d_fd = open(".shell_state", O_WRONLY | O_CREAT, 0);
+        int d_fd = open(".shell_state", O_WRONLY | O_CREAT | O_TRUNC, 0);
         if (d_fd >= 0) { close(d_fd); }
 
         if (n == sizeof(st)) {
@@ -139,7 +150,7 @@ void _start(void) {
             char out_buf[1024];
             int rn = read(o_fd, out_buf, sizeof(out_buf) - 1);
             close(o_fd);
-            int tr_fd = open("cmd_out", O_WRONLY | O_CREAT, 0);
+            int tr_fd = open("cmd_out", O_WRONLY | O_CREAT | O_TRUNC, 0);
             if (tr_fd >= 0) { close(tr_fd); }
 
             if (rn > 0) {
@@ -206,34 +217,55 @@ void _start(void) {
                 cmd_word[i] = '\0';
                 while (*ptr == ' ') ptr++;
 
-                int arg_fd = open("cmd_args", O_WRONLY | O_CREAT, 0);
+                int arg_fd = open("cmd_args", O_WRONLY | O_CREAT | O_TRUNC, 0);
                 if (arg_fd >= 0) {
                     write(arg_fd, ptr, strlen(ptr));
                     close(arg_fd);
                 }
-                int out_fd = open("cmd_out", O_WRONLY | O_CREAT, 0);
+                int out_fd = open("cmd_out", O_WRONLY | O_CREAT | O_TRUNC, 0);
                 if (out_fd >= 0) { close(out_fd); }
 
-                int st_fd = open(".shell_state", O_WRONLY | O_CREAT, 0);
-                if (st_fd >= 0) {
-                    shell_state_t st;
-                    memcpy(st.buf, term_buf, sizeof(term_buf));
-                    memcpy(st.color, term_color, sizeof(term_color));
-                    st.r = term_r;
-                    st.c = term_c;
-                    write(st_fd, &st, sizeof(st));
-                    close(st_fd);
+                int pid = fork();
+                if (pid == 0) {
+                    exec(cmd_word);
+                    int err_fd = open("cmd_out", O_WRONLY | O_CREAT | O_TRUNC, 0);
+                    if (err_fd >= 0) {
+                        write(err_fd, "bash: command not found: ", 25);
+                        write(err_fd, cmd_word, strlen(cmd_word));
+                        write(err_fd, "\n", 1);
+                        close(err_fd);
+                    }
+                    exit(-1);
+                } else if (pid > 0) {
+                    int rn = 0;
+                    char out_buf[1024];
+                    for (int retry = 0; retry < 50; retry++) {
+                        for (int i = 0; i < 10; i++) yield();
+                        int o_fd = open("cmd_out", 0);
+                        if (o_fd >= 0) {
+                            rn = read(o_fd, out_buf, sizeof(out_buf) - 1);
+                            close(o_fd);
+                            if (rn > 0) break;
+                        }
+                    }
+                    if (rn > 0) {
+                        int tr_fd = open("cmd_out", O_WRONLY | O_CREAT | O_TRUNC, 0);
+                        if (tr_fd >= 0) { close(tr_fd); }
+
+                        if (rn > 0) {
+                            out_buf[rn] = '\0';
+                            if (strcmp(out_buf, "__CLEAR__") == 0 || strncmp(out_buf, "__CLEAR__", 9) == 0) {
+                                tui_clear();
+                            } else if (strncmp(out_buf, "\033WIN_", 5) == 0) {
+                                tui_print("Opening application window in GUI...\n", COL_TEXT_CYAN);
+                            } else {
+                                tui_print(out_buf, COL_TEXT_WHITE);
+                                if (out_buf[rn - 1] != '\n') tui_print("\n", COL_TEXT_WHITE);
+                            }
+                        }
+                    }
                 }
-
-                exec(cmd_word);
-
-                int d_fd = open(".shell_state", O_WRONLY | O_CREAT, 0);
-                if (d_fd >= 0) { close(d_fd); }
-
-                tui_print("bash: command not found: ", COL_TEXT_RED);
-                tui_print(cmd_word, COL_TEXT_WHITE);
-                tui_print("\n", COL_TEXT_WHITE);
-
+                while (has_char()) (void)getchar();
                 p = 0;
                 cmd[0] = 0;
                 tui_print("azami@os:~$ ", COL_TEXT_GREEN);

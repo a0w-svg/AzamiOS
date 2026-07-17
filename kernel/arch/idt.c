@@ -15,7 +15,6 @@ extern bool g_is_uefi;
 void idt_set_gate(uint8_t num, uintptr_t handler, uint16_t selector, uint8_t flags)
 {
     idt_entry_t* idt_gate = &idt[num];
-#if defined(__x86_64__)
     idt_gate->base_low = (uint16_t)(handler & 0xFFFF);
     idt_gate->kernel_cs = selector;
     idt_gate->ist = 0;
@@ -23,13 +22,6 @@ void idt_set_gate(uint8_t num, uintptr_t handler, uint16_t selector, uint8_t fla
     idt_gate->base_mid = (uint16_t)((handler >> 16) & 0xFFFF);
     idt_gate->base_high = (uint32_t)((handler >> 32) & 0xFFFFFFFF);
     idt_gate->reserved = 0;
-#else
-    idt_gate->base_low = (uint16_t)(handler & 0xFFFF); // Sets the lower 16 bits of the ISR address.
-    idt_gate->kernel_cs = selector; // Sets offset to your kernel code selector.
-    idt_gate->reserved = 0; // This variable always must be zero.
-    idt_gate->attributes = flags;  // Sets the flags.
-    idt_gate->base_high = (uint16_t)((handler >> 16) & 0xFFFF); // Sets the Higher 16 bits of the ISR address;
-#endif
     // set  gate as used in system
     idt_sets[num] = true;
 }
@@ -44,6 +36,11 @@ void idt_init(void)
     
     // load pointer to IDT with use of memory operate
     __asm__ volatile ("lidt %0" : : "m"(idtr)); // load the new IDT
+}
+
+void idt_load_current(void)
+{
+    __asm__ volatile ("lidt %0" : : "m"(idtr));
 }
 /*
     This function removes the specified idt entry from array of IDT entries;

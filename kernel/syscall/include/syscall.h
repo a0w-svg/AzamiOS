@@ -1,5 +1,9 @@
 #ifndef SYSCALL_H
 #define SYSCALL_H
 
-void init_syscalls();
+#include <stdint.h>
+#include "../arch/include/isr.h"
+
+uintptr_t syscall_handler(registers_t *r);
+void init_syscalls(void);
 #endif

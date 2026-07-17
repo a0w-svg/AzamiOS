@@ -1,4 +1,5 @@
 #include "./include/x86arch.h"
+#include "../boot/boot_info.h"
 #include "./include/gdt.h"
 #include "./include/isr.h"
 #include "../drivers/include/terminal.h"
@@ -8,6 +9,7 @@
 #include "../drivers/include/kbc.h"
 #include "../mem/include/pmm.h"
 #include "../mem/include/paging.h"
+#include "../mem/include/security.h"
 #include "../../thirdparty/multiboot.h"
 #include "../drivers/include/rtc.h"
 #include "../drivers/include/mouse.h"
@@ -21,6 +23,8 @@
 #include "../filesystem/include/fat32.h"
 #include "../proc/include/process.h"
 #include "../proc/include/scheduler.h"
+#include "../proc/include/lpc.h"
+#include "../proc/include/exec_server.h"
 #include "./include/smp.h"
 #include "./include/cpu_check.h"
 #include "../drivers/include/ac97.h"
@@ -32,8 +36,10 @@
 #include "../drivers/include/pcnet.h"
 #include "../drivers/include/ne2k.h"
 #include "../drivers/include/ahci.h"
+#include "../drivers/include/nvme.h"
 #include "../drivers/include/es1370.h"
 #include "../drivers/include/uhci.h"
+#include "../drivers/include/xhci.h"
 #include "../drivers/include/dma.h"
 #include "../drivers/include/lpt.h"
 #include "../drivers/include/floppy.h"
@@ -76,12 +82,24 @@ static int mod_gameport_init(void) { gameport_init(); return 0; }
 static int mod_pcnet_init(void) { pcnet_init(); return 0; }
 static int mod_ne2k_init(void) { ne2k_init(); return 0; }
 static int mod_ahci_init(void) { ahci_init(); return 0; }
+static int mod_nvme_init(void) { nvme_init(); return 0; }
 static int mod_es1370_init(void) { es1370_init(); return 0; }
 static int mod_uhci_init(void) { uhci_init(); return 0; }
+static int mod_xhci_init(void) { xhci_init(); return 0; }
 static int mod_netstack_init(void) { net_stack_init(); return 0; }
 static int mod_sched_init(void) { process_init(); scheduler_init(); smp_init(); return 0; }
+static int mod_alpc_init(void) { lpc_init(); exec_server_init(); return 0; }
 static int mod_floppy_init(void) { floppy_init(); return 0; }
 static int mod_virtio_init(void) { virtio_init(); return 0; }
+
+extern int az_kernel_main(void);
+static azami_boot_info_t* g_cached_boot_info = (azami_boot_info_t*)0;
+
+static int mod_ntos_init(void) {
+    az_kernel_main();
+    return 0;
+}
+
 
 static bool pci_match(uint16_t vendor, uint16_t device) {
     uint8_t b, s, f;
@@ -89,7 +107,7 @@ static bool pci_match(uint16_t vendor, uint16_t device) {
 }
 
 static bool mod_ahci_probe(void) {
-    for (uint16_t bus = 0; bus < 256; bus++) {
+    for (uint16_t bus = 0; bus < 8; bus++) {
         for (uint8_t slot = 0; slot < 32; slot++) {
             if (pci_config_read16(bus, slot, 0, 0x00) == 0xFFFF) continue;
             uint32_t class_rev = pci_config_read32(bus, slot, 0, 0x08);
@@ -105,12 +123,39 @@ static bool mod_e1000_probe(void) { return pci_match(0x8086, 0x100E); }
 static bool mod_pcnet_probe(void) { return pci_match(0x1022, 0x2000); }
 static bool mod_ne2k_probe(void) { return pci_match(0x10EC, 0x8029); }
 static bool mod_uhci_probe(void) {
-    for (uint16_t bus = 0; bus < 256; bus++) {
+    for (uint16_t bus = 0; bus < 8; bus++) {
         for (uint8_t slot = 0; slot < 32; slot++) {
+            if (pci_config_read16(bus, slot, 0, 0x00) == 0xFFFF) continue;
             for (uint8_t func = 0; func < 8; func++) {
                 if (pci_config_read16(bus, slot, func, 0x00) == 0xFFFF) continue;
                 uint32_t class_rev = pci_config_read32(bus, slot, func, 0x08);
                 if ((class_rev >> 24) == 0x0C && ((class_rev >> 16) & 0xFF) == 0x03 && ((class_rev >> 8) & 0xFF) == 0x00) return true;
+            }
+        }
+    }
+    return false;
+}
+static bool mod_nvme_probe(void) {
+    for (uint16_t bus = 0; bus < 8; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            if (pci_config_read16(bus, slot, 0, 0x00) == 0xFFFF) continue;
+            for (uint8_t func = 0; func < 8; func++) {
+                if (pci_config_read16(bus, slot, func, 0x00) == 0xFFFF) continue;
+                uint32_t class_rev = pci_config_read32(bus, slot, func, 0x08);
+                if ((class_rev >> 24) == 0x01 && ((class_rev >> 16) & 0xFF) == 0x08 && ((class_rev >> 8) & 0xFF) == 0x02) return true;
+            }
+        }
+    }
+    return false;
+}
+static bool mod_xhci_probe(void) {
+    for (uint16_t bus = 0; bus < 8; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            if (pci_config_read16(bus, slot, 0, 0x00) == 0xFFFF) continue;
+            for (uint8_t func = 0; func < 8; func++) {
+                if (pci_config_read16(bus, slot, func, 0x00) == 0xFFFF) continue;
+                uint32_t class_rev = pci_config_read32(bus, slot, func, 0x08);
+                if ((class_rev >> 24) == 0x0C && ((class_rev >> 16) & 0xFF) == 0x03 && ((class_rev >> 8) & 0xFF) == 0x30) return true;
             }
         }
     }
@@ -142,6 +187,7 @@ static kernel_module_t kmods[] = {
     { "virtio",    "VirtIO Paravirtual Bus",    MOD_DRV,  virtio_probe,    mod_virtio_init,   0, 0, 0 },
     { "fat32",     "FAT32 Storage Driver",      MOD_FS,   0,               mod_fat32_init,    0, 0, 0 },
     { "ahci",      "SATA AHCI Controller",      MOD_DRV,  mod_ahci_probe,  mod_ahci_init,     0, 0, 0 },
+    { "nvme",      "NVMe PCIe Storage Controller", MOD_DRV, mod_nvme_probe, mod_nvme_init,    0, 0, 0 },
     { "acpi",      "ACPI Power Management",     MOD_DRV,  0,               mod_acpi_init,     0, 0, 0 },
     { "ac97",      "AC'97 Audio Controller",    MOD_DRV,  mod_ac97_probe,  mod_ac97_init,     0, 0, 0 },
     { "es1370",    "Ensoniq AudioPCI ES1370",   MOD_DRV,  mod_es1370_probe,mod_es1370_init,   0, 0, 0 },
@@ -151,9 +197,12 @@ static kernel_module_t kmods[] = {
     { "pcnet",     "AMD PCnet FAST III NIC",    MOD_DRV,  mod_pcnet_probe, mod_pcnet_init,    0, 0, 0 },
     { "ne2k",      "NE2000 / RTL8029 NIC",      MOD_DRV,  mod_ne2k_probe,  mod_ne2k_init,     0, 0, 0 },
     { "uhci",      "USB UHCI Root Hub",         MOD_DRV,  mod_uhci_probe,  mod_uhci_init,     0, 0, 0 },
+    { "xhci",      "USB 3.0 xHCI Root Hub",     MOD_DRV,  mod_xhci_probe,  mod_xhci_init,     0, 0, 0 },
     { "gameport",  "Analog Gameport Joystick",  MOD_DRV,  mod_gameport_probe,mod_gameport_init,0, 0, 0 },
     { "tcpip",     "TCP/IP Network Stack",      MOD_NET,  0,               mod_netstack_init, 0, 0, 0 },
-    { "scheduler", "SMP Multitasking Engine",   MOD_PROC, 0,               mod_sched_init,    0, 0, 0 }
+    { "scheduler", "SMP Multitasking Engine",   MOD_PROC, 0,               mod_sched_init,    0, 0, 0 },
+    { "alpc",      "NT ALPC Executive Subsystem", MOD_PROC, 0,             mod_alpc_init,     0, 0, 0 },
+    { "ntos",      "NT Executive & Win32k/LXSS/3D Engine", MOD_PROC, 0,    mod_ntos_init,     0, 0, 0 }
 };
 
 
@@ -162,81 +211,55 @@ uintptr_t start_addr = (uintptr_t)&__end;
 
 void x86_arch_init(unsigned long magic, unsigned long addr)
 {
-    // 1. basic terminal settings.
+    /* 1. Absolute earliest C-level COM1 serial init and diagnostic logging */
+    early_serial_init();
+    early_serial_puts("\r\n[KERNEL-C] Reached x86_arch_init. Performing structural validation on boot info...\r\n");
+
+    /* 2. Validate boot structures and bounds before any subsystem setup */
+    azami_boot_info_t boot_data;
+    if (!boot_info_validate_and_parse(magic, addr, &boot_data)) {
+        early_panic("Boot info structure validation failed (bad magic or out-of-bounds pointer)!");
+    }
+
+    /* 3. Basic terminal settings */
     terminal_clean();
-    kprintf("Welcome to AzamiOS (64-bit / UEFI Capable)!\n");
+    kprintf("\n"
+            "  ____ _____  _    __  __ ___ ___  ____  \n"
+            " / \\  /__  / / \\  |  \\/  |_ _/ _ \\/ ___| \n"
+            "/ _ \\   / / / _ \\ | |\\/| || | | | \\___ \\ \n"
+            "/ ___ \\ / /_/ ___ \\| |  | || | |_| |___) |\n"
+            "/_/   \\_\\____/_/   \\_\\_|  |_|___\\___/|____/ \n"
+            "AzamiOS v2.0 Modern Kernel — Fast, Modular & Easy to Debug\n\n");
 
-    // 2. Verify Bootloader Magic
-    if (magic != 0x2BADB002 && magic != 0xEF1B0072 && magic != 0x336ec578) {
-        kprintf("PANIC: Bootloader Error! Unknown magic number 0x%x.\n", (uint32_t)magic);
-        return; // halt kernel 
+    /* 4. Display validated boot protocol and memory layout */
+    kprintf("Validated Boot Protocol ID %d (Magic: 0x%x, Info Addr: 0x%x)\n",
+            (int)boot_data.protocol, (uint32_t)boot_data.raw_magic, (uint32_t)boot_data.raw_addr);
+    kprintf("Memory Status: Lower=%u KB, Upper=%u KB, Total=%u KB (~%u MB)\n",
+            (uint32_t)boot_data.mem_lower_kb, (uint32_t)boot_data.mem_upper_kb,
+            (uint32_t)boot_data.total_mem_kb, (uint32_t)(boot_data.total_mem_kb / 1024));
+    if (boot_data.has_framebuffer) {
+        kprintf("Framebuffer at 0x%x (%ux%u, %u bpp, pitch %u)\n",
+                (uint32_t)boot_data.fb_addr, boot_data.fb_width, boot_data.fb_height,
+                boot_data.fb_bpp, boot_data.fb_pitch);
+    }
+    if (boot_data.initrd_paddr) {
+        kprintf("Initrd/Ramdisk at 0x%x (size: %u bytes)\n",
+                (uint32_t)boot_data.initrd_paddr, (uint32_t)boot_data.initrd_size);
     }
 
-    if (magic == 0xEF1B0072 || magic == 0x336ec578) {
-        g_is_uefi = true;
-    }
+    g_is_uefi = (boot_data.protocol == BOOT_PROTO_UEFI);
+    g_mem_size_kb = (uint32_t)boot_data.total_mem_kb;
+    g_initrd_loc = (uintptr_t)boot_data.initrd_paddr;
+    g_cached_boot_info = &boot_data;
 
-    // 3. initialize CPU core tables
+    /* 5. Initialize CPU core tables */
     gdt_init();
     init_isr();
     init_syscalls();
+    stack_guard_init();
+    aslr_init();
 
-    uintptr_t free_mem_start = (uintptr_t)&__end;
-
-    if (magic == 0xEF1B0072 || magic == 0x336ec578) {
-        g_is_uefi = true;
-        if (magic == 0xEF1B0072) {
-            kprintf("Booted via UEFI 64-bit Firmware (PE32+ / GOP)\n");
-            uefi_boot_info_t* uefi_info = (uefi_boot_info_t*)addr;
-            if (uefi_info && uefi_info->framebuffer_base) {
-                kprintf("UEFI GOP Framebuffer at 0x%x (%dx%d, %d bpp)\n",
-                        (uint32_t)uefi_info->framebuffer_base, uefi_info->width, uefi_info->height, uefi_info->bpp);
-            }
-            g_initrd_loc = 0;
-        } else {
-            kprintf("Booted via 64-bit Direct/PVH Boot\n");
-            struct {
-                uint32_t magic;
-                uint32_t version;
-                uint32_t flags;
-                uint32_t nr_modules;
-                uint64_t modlist_paddr;
-            } __attribute__((packed)) *hvm = (void*)addr;
-            struct {
-                uint64_t paddr;
-                uint64_t size;
-                uint64_t cmdline_paddr;
-                uint64_t reserved;
-            } __attribute__((packed)) *mods = (void*)(uintptr_t)(hvm ? hvm->modlist_paddr : 0);
-            if (hvm) {
-                kprintf("PVH: hvm=0x%x nr_mods=%d modlist=0x%x\n", (uint32_t)(uintptr_t)hvm, hvm->nr_modules, (uint32_t)hvm->modlist_paddr);
-            }
-            if (hvm && hvm->nr_modules > 0 && mods) {
-                g_initrd_loc = (uintptr_t)mods[0].paddr;
-                kprintf("PVH: mod[0] paddr=0x%x size=0x%x\n", (uint32_t)mods[0].paddr, (uint32_t)mods[0].size);
-                if (mods[0].paddr < 16 * 1024 * 1024 && mods[0].paddr + mods[0].size > free_mem_start) {
-                    free_mem_start = mods[0].paddr + mods[0].size;
-                }
-            } else {
-                g_initrd_loc = 0;
-            }
-            kprintf("PVH: free_mem_start=0x%x\n", (uint32_t)free_mem_start);
-        }
-        g_mem_size_kb = 1024 * 1024; /* Assume 1GB RAM for 64-bit guest */
-    } else {
-        multiboot_info_t* bootinfo = (multiboot_info_t*)addr;
-        g_mem_size_kb = bootinfo->mem_lower + bootinfo->mem_upper + 1024;
-        if (bootinfo->flags & MULTIBOOT_INFO_MODS) {
-            if (bootinfo->mods_count > 0) {
-                multiboot_module_t *mods = (multiboot_module_t*)(uintptr_t)bootinfo->mods_addr;
-                g_initrd_loc = mods[0].mod_start;
-                for (uint32_t m = 0; m < bootinfo->mods_count; m++) {
-                    if (mods[m].mod_start < 16 * 1024 * 1024 && mods[m].mod_end > free_mem_start) free_mem_start = mods[m].mod_end;
-                }
-            }
-        }
-    }
-
+    uintptr_t free_mem_start = (uintptr_t)boot_data.safe_free_mem_start;
     free_mem_start = (free_mem_start + 4095) & ~4095;
     g_bitmap_addr = free_mem_start;
     uintptr_t bitmap_size_bytes = ((g_mem_size_kb * 1024 / 4096) + 7) / 8;

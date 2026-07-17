@@ -117,11 +117,65 @@ typedef struct {
     uint8_t  mac_addr[6];
 } net_config_t;
 
+/* ── TCP States & Socket Abstraction ───────────────────────────────── */
+typedef enum {
+    TCP_STATE_CLOSED = 0,
+    TCP_STATE_LISTEN,
+    TCP_STATE_SYN_SENT,
+    TCP_STATE_SYN_RCVD,
+    TCP_STATE_ESTABLISHED,
+    TCP_STATE_FIN_WAIT1,
+    TCP_STATE_FIN_WAIT2,
+    TCP_STATE_CLOSE_WAIT,
+    TCP_STATE_CLOSING,
+    TCP_STATE_LAST_ACK,
+    TCP_STATE_TIME_WAIT
+} tcp_state_t;
+
+typedef void (*tcp_rx_callback_t)(int sock_id, uint32_t src_ip, uint16_t src_port, const uint8_t *data, uint32_t len);
+typedef void (*udp_rx_callback_t)(int sock_id, uint32_t src_ip, uint16_t src_port, const uint8_t *data, uint32_t len);
+
+typedef struct {
+    bool              valid;
+    tcp_state_t       state;
+    uint16_t          local_port;
+    uint32_t          remote_ip;
+    uint16_t          remote_port;
+    uint32_t          seq_num;
+    uint32_t          ack_num;
+    tcp_rx_callback_t rx_cb;
+} tcp_socket_t;
+
+typedef struct {
+    bool              valid;
+    uint16_t          local_port;
+    udp_rx_callback_t rx_cb;
+} udp_socket_t;
+
 /* ── Public API ────────────────────────────────────────────────────── */
 void net_stack_init(void);
 void net_receive_packet(const uint8_t *packet, uint32_t len);
 void net_send_ping(uint32_t target_ip);
 void net_print_arp_cache(void);
 void net_print_status(void);
+
+/* Protocols & Hardening */
+bool net_dns_resolve(const char *domain, uint32_t *out_ip);
+bool net_dhcp_request(void);
+bool net_ntp_sync(uint32_t *out_epoch);
+uint32_t net_tcp_get_isn(void);
+
+/* Socket API */
+int  net_tcp_socket_open(tcp_rx_callback_t cb);
+bool net_tcp_bind(int sock_id, uint16_t local_port);
+bool net_tcp_listen(int sock_id);
+bool net_tcp_connect(int sock_id, uint32_t remote_ip, uint16_t remote_port);
+int  net_tcp_send(int sock_id, const uint8_t *data, uint32_t len);
+void net_tcp_close(int sock_id);
+
+int  net_udp_socket_open(udp_rx_callback_t cb);
+bool net_udp_bind(int sock_id, uint16_t local_port);
+int  net_udp_sendto(int sock_id, uint32_t dst_ip, uint16_t dst_port, const uint8_t *data, uint32_t len);
+void net_udp_close(int sock_id);
 
 #endif /* NET_STACK_H */

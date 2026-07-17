@@ -12,3 +12,7 @@ __attribute__((noreturn)) void __stack_chk_fail(void) {
         asm volatile("cli; hlt");
     }
 }
+
+void stack_guard_init(void) {
+    __stack_chk_guard = STACK_CHK_GUARD;
+}

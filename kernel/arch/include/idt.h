@@ -4,7 +4,6 @@
 #define BITS_32_INTERRUPT_GATE 0x8E
 #define BITS_32_INTERRUPT_GATE_USER 0xEE
 #define KERNEL_CODE_SEGMENT 0x08 // The offset  your kernel code selector is in your GDT.
-#if defined(__x86_64__)
 typedef struct 
 {
     uint16_t base_low;
@@ -15,16 +14,6 @@ typedef struct
     uint32_t base_high;
     uint32_t reserved;
 } __attribute__((packed)) idt_entry_t;
-#else
-typedef struct 
-{
-    uint16_t base_low;    // The lower 16 bits of the ISR's address;
-    uint16_t kernel_cs;  // The GDT segment selector that the CPU will load into CS before calling the ISR;
-    uint8_t reserved;    // Set always to zero;
-    uint8_t attributes;  // Type and attributes;
-    uint16_t base_high;   // The higher 16 bits of the ISR's address;
-} __attribute__((packed)) idt_entry_t;
-#endif
 
 typedef struct
 {
@@ -34,4 +23,5 @@ typedef struct
 
 void idt_set_gate(uint8_t num, uintptr_t handler , uint16_t selector, uint8_t flags);
 void idt_init(void);
+void idt_load_current(void);
 #endif

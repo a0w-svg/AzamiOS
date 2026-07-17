@@ -9,26 +9,24 @@
 **AzamiOS** is a custom operating system designed from the ground up with modularity, clean architectural separation, and portability in mind. It bridges the gap between classic PC BIOS booting and modern 64-bit UEFI firmware, offering dual-target compilation from a single unified codebase.
 
 Key technical highlights include:
-- **Dual-Architecture Support**: Seamlessly builds for both 32-bit legacy Multiboot (`i686`) and 64-bit native UEFI Long Mode (`x86_64`).
+- **64-bit Exclusive Architecture**: Designed purely for 64-bit native (`x86_64`) Long Mode.
 - **Filesystem Hierarchy Standard (FHS)**: Full Unix-like directory tree populated dynamically at boot (`/bin`, `/sbin`, `/etc`, `/dev`, `/proc`, `/var`, `/home`).
 - **Rich Hardware & Paravirtualization Drivers**: Native support for ATA IDE, SATA AHCI, Floppy DMA, and QEMU **VirtIO** block and networking devices.
 - **Portable Core C Library (`lib/`)**: Strictly decoupled library subsystem validated against host compilers to guarantee zero ring-0 kernel leakage into userspace.
 
 ---
 
-## 🏗️ Architecture Matrix
+## 🏗️ Architecture Overview
 
-AzamiOS uses polymorphic memory types (`uintptr_t`, `size_t`) and hardware gates (`g_is_uefi`) to allow single-source kernel compilation across distinct hardware initialization flows:
+AzamiOS uses clean 64-bit memory types (`uintptr_t`, `size_t`) and modern hardware abstractions:
 
-| Feature / Target | 32-Bit Legacy Target (`ARCH=i686`) | 64-Bit UEFI Target (`ARCH=x86_64`) |
-| :--- | :--- | :--- |
-| **Firmware / Bootloader** | Legacy BIOS / GRUB Multiboot 1 | Native UEFI Firmware (PE32+ Executable) |
-| **Entry Point** | `kernel/boot/boot.asm` | `kernel/boot/uefi_boot.c` (`efi_main`) |
-| **CPU Operating Mode** | 32-Bit Protected Mode | 64-Bit Long Mode (PML4 Paging active) |
-| **Linker Script** | `Link.ld` (Load at `0x100000`) | `Link64.ld` (Load at `0x400000`) |
-| **Display Subsystem** | VGA Text Mode / Multiboot LFB | UEFI Graphics Output Protocol (GOP) Framebuffer |
-| **Memory Map Discovery** | Multiboot Memory Map Table | UEFI `GetMemoryMap` & `ExitBootServices` |
-| **Compiler Flags** | `-m32 -fno-pie` | `-m64 -mno-red-zone -mcmodel=large` |
+| Feature | 64-Bit Target (`x86_64`) |
+| :--- | :--- |
+| **Firmware / Bootloader** | Multiboot / UEFI Compatible |
+| **CPU Operating Mode** | 64-Bit Long Mode (PML4 Paging active) |
+| **Linker Script** | `kernel.ld` |
+| **Display Subsystem** | Framebuffer / LFB / GOP |
+| **Compiler Flags** | `-m64 -mno-red-zone -mcmodel=large` |
 
 ---
 
@@ -77,18 +75,12 @@ chmod +x scripts/build_toolchain.sh
 
 ### 2. Compiling the OS
 
-#### Build for 32-Bit Multiboot (`ARCH=i686`)
-```bash
-make clean all
-```
-*Outputs: `build/kernel.bin` and `build/initrd.tar`*
-
-#### Build for 64-Bit UEFI (`ARCH=x86_64`)
+#### Build for 64-Bit (`x86_64`)
 ```bash
 make clean
-make ARCH=x86_64 kernel.elf
+make all
 ```
-*Outputs: `build/kernel.elf` (Verify format using `readelf -h build/kernel.elf`)*
+*Outputs: `build/kernel.elf` and `build/initrd.tar`*
 
 ### 3. Validating Library Decoupling
 To ensure that portable C libraries (`lib/string`, `lib/stdlib`, `lib/fs`, `lib/net`) contain zero kernel ring-0 dependencies, execute the host compilation unit test:

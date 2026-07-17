@@ -46,9 +46,9 @@ static void sysmon_render(window_t *w, rtc_time_t *t, uint32_t frame_cnt, int bl
     ty += 20;
     draw_rect(tx, ty, bw - 32, 1, COL_NOTE_LINE);
     ty += 10;
-    draw_text(tx, ty, "GPU    : Bochs VBE (640x480 32BPP)", COL_TEXT_DARK, COL_WIN_BODY);
+    draw_text(tx, ty, "GPU    : Intel i915 / Bochs VBE (1280x800 32BPP)", COL_TEXT_DARK, COL_WIN_BODY);
     ty += 14;
-    draw_text(tx, ty, "LFB    : 1.2 MB Identity Mapped", COL_TEXT_DARK, COL_WIN_BODY);
+    draw_text(tx, ty, "LFB    : 4.0 MB Identity Mapped (WXGA)", COL_TEXT_DARK, COL_WIN_BODY);
     ty += 14;
     draw_text(tx, ty, "CPU    : ", COL_TEXT_DARK, COL_WIN_BODY);
     draw_text(tx + 72, ty, cpu_str, COL_TEXT_DARK, COL_WIN_BODY);

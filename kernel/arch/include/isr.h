@@ -40,6 +40,6 @@ void init_isr();
 */
 void register_interrupt_handler(uint8_t num, isr_t handler);
 
-void exception_handler(registers_t *r);
-void irq_handler(registers_t *r);
+uintptr_t exception_handler(registers_t *r);
+uintptr_t irq_handler(registers_t *r);
 #endif

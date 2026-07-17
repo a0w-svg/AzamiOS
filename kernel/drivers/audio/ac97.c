@@ -7,6 +7,7 @@
 #include "../mem/include/mmp.h"
 #include "../mem/include/paging.h"
 #include "../mem/include/pmm.h"
+#include "../arch/include/spinlock.h"
 #include <stdbool.h>
 
 /* ── Intel AC'97 PCI identifiers ────────────────────────────────────────── */
@@ -71,6 +72,7 @@ static bool     ac97_present  = false;
 static uint16_t nam_base      = 0;    /* BAR0: mixer register I/O base     */
 static uint16_t nabm_base     = 0;    /* BAR1: bus master I/O base         */
 static uint8_t  ac97_irq      = 0;    /* IRQ line from PCI config space    */
+static volatile int ac97_lock = 0;
 
 /* BDL must be aligned and in physically contiguous low memory */
 static ac97_bdl_entry_t *bdl  = NULL;
@@ -111,13 +113,13 @@ static uint32_t alloc_phys_pages(uint32_t num_pages)
     /* Allocate the first page to get a base address */
     void *first = pmm_alloc_block();
     if (!first) return 0;
-    uint32_t base = (uint32_t)first;
+    uint32_t base = (uint32_t)(uintptr_t)first;
     paging_map_page(base, base, 0, 1);
 
     /* Allocate remaining contiguous pages */
     for (uint32_t i = 1; i < num_pages; i++) {
         void *page = pmm_alloc_block();
-        uint32_t addr = (uint32_t)page;
+        uint32_t addr = (uint32_t)(uintptr_t)page;
         paging_map_page(addr, addr, 0, 1);
     }
     return base;
@@ -152,6 +154,9 @@ static int16_t fast_sin16(uint32_t phase)
 static void ac97_play_startup_tone(void)
 {
     if (!ac97_present || !dma_buffer || !bdl) return;
+
+    unsigned long flags;
+    spinlock_acquire_irqsave(&ac97_lock, &flags);
 
     uint32_t sample_rate  = 48000;
     uint32_t tone_freq    = 440;
@@ -224,6 +229,7 @@ static void ac97_play_startup_tone(void)
     /* Start playback with interrupts enabled */
     nabm_write8(NABM_PCM_OUT_CR, CR_RPBM | CR_LVBIE | CR_IOCE);
 
+    spinlock_release_irqrestore(&ac97_lock, flags);
     kprintf("ac97: playing 440 Hz startup tone (%d ms)\n", duration_ms);
 }
 
@@ -235,6 +241,7 @@ static void ac97_play_startup_tone(void)
 void ac97_init(void)
 {
     uint8_t bus, slot, func;
+    ac97_lock = 0;
     kprintf("\nac97: probing PCI bus for Intel AC'97 Audio...\n");
 
     if (!pci_find_device(AC97_VENDOR_ID, AC97_DEVICE_ID, &bus, &slot, &func)) {
@@ -270,8 +277,7 @@ void ac97_init(void)
     /* ── Cold Reset the AC'97 controller ──────────────────────────────── */
     nabm_write32(NABM_GLOB_CNT, GC_CR);
     /* Wait for codec ready */
-    /* Busy-loop delay (~50ms) — cannot use pit_wait because init_pit may not be called yet */
-    for (volatile int _d = 0; _d < 500000; _d++);
+    for (volatile int _d = 0; _d < 5000; _d++);
 
     /* Enable PCM output via Global Control */
     nabm_write32(NABM_GLOB_CNT, GC_GIE | GC_CR);
@@ -279,7 +285,7 @@ void ac97_init(void)
     /* ── Reset the codec via NAM ──────────────────────────────────────── */
     nam_write16(NAM_RESET, 0x0001);
     /* Busy-loop delay (~20ms) */
-    for (volatile int _d = 0; _d < 200000; _d++);
+    for (volatile int _d = 0; _d < 5000; _d++);
 
     /* ── Set volumes to maximum (0 attenuation) ───────────────────────── */
     nam_write16(NAM_MASTER_VOL, 0x0000);   /* Master: L=0, R=0 (max) */
@@ -291,7 +297,7 @@ void ac97_init(void)
         kprintf("ac97: failed to allocate BDL memory\n");
         return;
     }
-    bdl = (ac97_bdl_entry_t *)bdl_phys;
+    bdl = (ac97_bdl_entry_t *)(uintptr_t)bdl_phys;
     memset(bdl, 0, BDL_MAX_ENTRIES * sizeof(ac97_bdl_entry_t));
 
     /* ── Allocate DMA sample buffer (AC97_DMA_BUF_SAMPLES × 2 bytes) ── */
@@ -300,9 +306,12 @@ void ac97_init(void)
     dma_buffer_phys = alloc_phys_pages(buf_pages);
     if (!dma_buffer_phys) {
         kprintf("ac97: failed to allocate DMA buffer\n");
+        pmm_free_block((void*)(uintptr_t)bdl_phys);
+        bdl = NULL;
+        bdl_phys = 0;
         return;
     }
-    dma_buffer = (int16_t *)dma_buffer_phys;
+    dma_buffer = (int16_t *)(uintptr_t)dma_buffer_phys;
     memset(dma_buffer, 0, buf_bytes);
 
     ac97_present = true;
@@ -330,9 +339,17 @@ void ac97_play(const int16_t *samples, uint32_t num_samples, uint32_t sample_rat
 {
     if (!ac97_present || !samples || num_samples == 0) return;
 
+    unsigned long flags;
+    spinlock_acquire_irqsave(&ac97_lock, &flags);
+
     /* Clamp to buffer size */
     if (num_samples > AC97_DMA_BUF_SAMPLES)
         num_samples = AC97_DMA_BUF_SAMPLES;
+
+    /* Stop any current playback before modifying BDL and buffer */
+    nabm_write8(NABM_PCM_OUT_CR, CR_RR);
+    for (volatile int i = 0; i < 10000; i++);
+    nabm_write8(NABM_PCM_OUT_CR, 0);
 
     /* Copy samples into DMA buffer */
     memcpy(dma_buffer, samples, num_samples * sizeof(int16_t));
@@ -344,11 +361,6 @@ void ac97_play(const int16_t *samples, uint32_t num_samples, uint32_t sample_rat
         nam_write16(NAM_EXT_AUDIO_CTRL, ext_ctrl | 0x0001);
         nam_write16(NAM_SAMPLE_RATE, (uint16_t)sample_rate);
     }
-
-    /* Stop any current playback */
-    nabm_write8(NABM_PCM_OUT_CR, CR_RR);
-    for (volatile int i = 0; i < 10000; i++);
-    nabm_write8(NABM_PCM_OUT_CR, 0);
 
     /* Set up BDL entries */
     uint32_t stereo_frames = num_samples / 2;
@@ -370,6 +382,8 @@ void ac97_play(const int16_t *samples, uint32_t num_samples, uint32_t sample_rat
     nabm_write8(NABM_PCM_OUT_LVI, (uint8_t)(entries - 1));
     nabm_write16(NABM_PCM_OUT_SR, SR_LVBCI | SR_BCIS | SR_FIFOE);
     nabm_write8(NABM_PCM_OUT_CR, CR_RPBM | CR_LVBIE | CR_IOCE);
+
+    spinlock_release_irqrestore(&ac97_lock, flags);
 }
 
 /*
@@ -378,10 +392,13 @@ void ac97_play(const int16_t *samples, uint32_t num_samples, uint32_t sample_rat
 void ac97_stop(void)
 {
     if (!ac97_present) return;
+    unsigned long flags;
+    spinlock_acquire_irqsave(&ac97_lock, &flags);
     /* Clear Run bit and reset DMA engine */
     nabm_write8(NABM_PCM_OUT_CR, CR_RR);
     for (volatile int i = 0; i < 10000; i++);
     nabm_write8(NABM_PCM_OUT_CR, 0);
     /* Clear status */
     nabm_write16(NABM_PCM_OUT_SR, SR_LVBCI | SR_BCIS | SR_FIFOE);
+    spinlock_release_irqrestore(&ac97_lock, flags);
 }

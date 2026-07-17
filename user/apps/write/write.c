@@ -32,7 +32,7 @@ void _start(void) {
         exit(0);
     }
 
-    int fd = open(fname, O_WRONLY | O_CREAT, 0);
+    int fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 0);
     if (fd >= 0) {
         write(fd, p, strlen(p));
         close(fd);

@@ -9,6 +9,7 @@
 #include "./include/font8x8.h"
 #include "../mem/include/paging.h"
 #include "./include/pci.h"
+#include "../include/virtio_gpu.h"
 
 #define VBE_DISPI_IOPORT_INDEX 0x01CE
 #define VBE_DISPI_IOPORT_DATA  0x01CF
@@ -62,7 +63,7 @@ void gfx_draw_rect(int x, int y, int w, int h, uint32_t color) {
         int ex = (x + w > GFX_WIDTH) ? GFX_WIDTH : x + w;
         if (sx >= ex) continue;
         uint32_t *dest = &gfx_backbuffer[iy * GFX_WIDTH + sx];
-        int cnt = ex - sx;
+        uintptr_t cnt = ex - sx;
         asm volatile("rep stosl" : "+D"(dest), "+c"(cnt) : "a"(color) : "memory");
     }
 }
@@ -95,20 +96,34 @@ void gfx_draw_text(int x, int y, const char *str, uint32_t color, uint32_t bg_co
 
 void gfx_clear(uint32_t color) {
     uint32_t *dest = gfx_backbuffer;
-    int cnt = GFX_WIDTH * GFX_HEIGHT;
+    uintptr_t cnt = (uintptr_t)GFX_WIDTH * (uintptr_t)GFX_HEIGHT;
     asm volatile("rep stosl" : "+D"(dest), "+c"(cnt) : "a"(color) : "memory");
 }
 
+void gfx_vsync(void) {
+    if (!g_gfx_enabled) return;
+    int guard = 0;
+    while ((inb(0x3DA) & 0x08) && guard++ < 100000);
+    guard = 0;
+    while (!(inb(0x3DA) & 0x08) && guard++ < 100000);
+}
+
 void gfx_flip(void) {
+    /* Route through Virtio-GPU 2D blit if available (no rep-movsd to LFB) */
+    if (virtio_gpu_is_active()) {
+        virtio_gpu_blit(gfx_backbuffer, GFX_WIDTH, GFX_HEIGHT);
+        return;
+    }
+
     if (!g_gfx_enabled || !lfb) return;
 
-    /* High speed 32-bit hardware burst transfer of entire 1.2 MB frame */
+    /* Bochs VBE fallback: 32-bit burst transfer to LFB */
     uint32_t *dest = lfb;
     const uint32_t *src = gfx_backbuffer;
-    int cnt = GFX_WIDTH * GFX_HEIGHT;
+    uintptr_t cnt = (uintptr_t)GFX_WIDTH * (uintptr_t)GFX_HEIGHT;
     asm volatile("rep movsd" : "+D"(dest), "+S"(src), "+c"(cnt) : : "memory");
 
-    /* Render mouse arrow directly onto LFB */
+    /* Render mouse arrow onto LFB */
     static const uint32_t cursor_bmp[12][9] = {
         {1,0,0,0,0,0,0,0,0},
         {1,1,0,0,0,0,0,0,0},

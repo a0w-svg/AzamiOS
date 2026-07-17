@@ -37,8 +37,11 @@
 #define ATA_SR_ERR          0x01    /* error                         */
 
 /* ─── Commands ───────────────────────────────────────────────────────────── */
-#define ATA_CMD_READ_PIO    0x20    /* read sectors (LBA28, PIO)     */
-#define ATA_CMD_IDENTIFY    0xEC    /* identify device               */
+#define ATA_CMD_READ_PIO      0x20  /* read sectors (LBA28, PIO)     */
+#define ATA_CMD_WRITE_PIO     0x30  /* write sectors (LBA28, PIO)    */
+#define ATA_CMD_READ_PIO_EXT  0x24  /* read sectors (LBA48, PIO)     */
+#define ATA_CMD_WRITE_PIO_EXT 0x34  /* write sectors (LBA48, PIO)    */
+#define ATA_CMD_IDENTIFY      0xEC  /* identify device               */
 
 /* ─── Drive select nibble (LBA mode) ─────────────────────────────────────── */
 #define ATA_DRIVE_MASTER    0xE0    /* master, LBA                   */
@@ -59,6 +62,7 @@ int ata_init(void);
  * @return  0 on success, -1 on timeout or error.
  */
 int ata_read_sectors(uint32_t lba, uint8_t count, uint16_t *buf);
+int ata_write_sectors(uint32_t lba, uint8_t count, const uint16_t *buf);
 
 /**
  * ata_get_device – return a pointer to the statically allocated block_device_t

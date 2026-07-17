@@ -4,7 +4,7 @@
  * Kernel-independent: reads a ustar archive loaded into RAM.
  * Only depends on lib/fs/vfs.h and lib/string/string.h.
  *
- * Compiles with: i686-elf-gcc -ffreestanding  OR  host gcc for testing.
+ * Compiles with: x86_64-elf-gcc -ffreestanding  OR  host gcc for testing.
  */
 #include "tarfs.h"
 #include "../string/string.h"

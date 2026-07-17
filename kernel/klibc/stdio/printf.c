@@ -16,6 +16,8 @@
  static volatile int kprintf_lock = 0;
 void kprintf(const char* format, ...)
 {
+    unsigned long flags;
+    asm volatile("pushf; pop %0; cli" : "=r"(flags) : : "memory");
     spinlock_acquire(&kprintf_lock);
     char *string; // Pointer to char* argument;
     char buf[50]; // Buffer used to converts numbers to strings;
@@ -107,4 +109,5 @@ void kprintf(const char* format, ...)
     }
     va_end(arg);
     spinlock_release(&kprintf_lock);
+    if (flags & 0x200) asm volatile("sti" : : : "memory");
 }

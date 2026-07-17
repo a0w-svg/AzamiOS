@@ -108,10 +108,10 @@ static int print_char(char ch, int col, int row, char attrib) {
     /* Scroll up one line when past the last row */
     if (offset >= MAX_ROWS * MAX_COLS * 2) {
         for (int i = 1; i < MAX_ROWS; i++)
-            vga_memcpy((uint8_t*)(get_offset(0, i)     + VIDEO_ADDR),
-                       (uint8_t*)(get_offset(0, i - 1) + VIDEO_ADDR),
+            vga_memcpy((uint8_t*)(uintptr_t)(get_offset(0, i)     + VIDEO_ADDR),
+                       (uint8_t*)(uintptr_t)(get_offset(0, i - 1) + VIDEO_ADDR),
                        MAX_COLS * 2);
-        char *last = (char*)(get_offset(0, MAX_ROWS - 1) + (uint8_t*)VIDEO_ADDR);
+        char *last = (char*)(uintptr_t)(get_offset(0, MAX_ROWS - 1) + VIDEO_ADDR);
         for (int i = 0; i < MAX_COLS * 2; i++) last[i] = 0;
         offset -= 2 * MAX_COLS;
     }

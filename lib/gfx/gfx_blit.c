@@ -7,7 +7,7 @@
  * The font data (font8x8.h) is self-contained static tables and the
  * font_get_glyph() inline — also no external kernel deps.
  *
- * Compiles with: i686-elf-gcc -ffreestanding  OR  host gcc for testing.
+ * Compiles with: x86_64-elf-gcc -ffreestanding  OR  host gcc for testing.
  */
 #include "gfx_blit.h"
 #include <stdint.h>
@@ -112,7 +112,7 @@ void gfx_blit_rect(gfx_blit_ctx_t *ctx,
         int ex = (x + w > ctx->width) ? ctx->width : x + w;
         if (sx >= ex) continue;
         uint32_t *dest = &ctx->backbuffer[iy * ctx->width + sx];
-        int cnt = ex - sx;
+        uintptr_t cnt = ex - sx;
         /* Fast 32-bit fill via rep stosl */
         asm volatile("rep stosl" : "+D"(dest), "+c"(cnt) : "a"(color) : "memory");
     }
@@ -120,7 +120,7 @@ void gfx_blit_rect(gfx_blit_ctx_t *ctx,
 
 void gfx_blit_clear(gfx_blit_ctx_t *ctx, uint32_t color) {
     uint32_t *dest = ctx->backbuffer;
-    int cnt = ctx->width * ctx->height;
+    uintptr_t cnt = (uintptr_t)ctx->width * (uintptr_t)ctx->height;
     asm volatile("rep stosl" : "+D"(dest), "+c"(cnt) : "a"(color) : "memory");
 }
 
@@ -161,8 +161,9 @@ void gfx_blit_line(gfx_blit_ctx_t *ctx, int x0, int y0, int x1, int y1, uint32_t
     int dy = -_abs(y1 - y0);
     int sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
+    int max_steps = dx - dy + 2;
 
-    while (1) {
+    while (max_steps-- > 0) {
         gfx_blit_put_pixel(ctx, x0, y0, color);
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -211,11 +212,27 @@ void gfx_blit_fill_circle(gfx_blit_ctx_t *ctx, int xc, int yc, int r, uint32_t c
     }
 }
 
+void gfx_blit_scroll(gfx_blit_ctx_t *ctx, int lines, uint32_t bg_color) {
+    if (!ctx || !ctx->backbuffer || lines <= 0) return;
+    if (lines >= ctx->height) {
+        gfx_blit_clear(ctx, bg_color);
+        return;
+    }
+    int rows_to_move = ctx->height - lines;
+    uint32_t *dst = ctx->backbuffer;
+    const uint32_t *src = ctx->backbuffer + lines * ctx->width;
+    int count = rows_to_move * ctx->width;
+    for (int i = 0; i < count; i++) {
+        dst[i] = src[i];
+    }
+    gfx_blit_rect(ctx, 0, ctx->height - lines, ctx->width, lines, bg_color);
+}
+
 void gfx_blit_flip(gfx_blit_ctx_t *ctx, uint32_t *lfb) {
     if (!lfb) return;
     uint32_t       *dest = lfb;
     const uint32_t *src  = ctx->backbuffer;
-    int             cnt  = ctx->width * ctx->height;
+    uintptr_t       cnt  = (uintptr_t)ctx->width * (uintptr_t)ctx->height;
     asm volatile("rep movsl" : "+D"(dest), "+S"(src), "+c"(cnt) : : "memory");
 }
 

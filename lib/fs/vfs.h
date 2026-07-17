@@ -81,6 +81,9 @@ int               close_fs(fs_node_t *node);
 directory_entry_t *readdir_fs(fs_node_t *node, uint32_t index);
 fs_node_t         *finddir_fs(fs_node_t *node, char *name);
 void               vfs_register_device(block_device_t *dev);
+block_device_t    *vfs_get_device(const char *name);
+int                vfs_mount(const char *dev_name, const char *mount_point, const char *fs_type);
+int                vfs_unmount(const char *mount_point);
 
 /* ── Unix-Style VFS Core Structures ───────────────────────────────── */
 struct vfs_file;

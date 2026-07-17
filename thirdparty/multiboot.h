@@ -54,7 +54,7 @@
 
 /* Flags to be set in the ’flags’ member of the multiboot info structure. */
 
-/* is there basic lower/upper memory information? */
+#ifndef MULTIBOOT_INFO_MEMORY
 #define MULTIBOOT_INFO_MEMORY                   0x00000001
 /* is there a boot device set? */
 #define MULTIBOOT_INFO_BOOTDEV                  0x00000002
@@ -88,6 +88,7 @@
 /* Is there video information? */
 #define MULTIBOOT_INFO_VBE_INFO                 0x00000800
 #define MULTIBOOT_INFO_FRAMEBUFFER_INFO         0x00001000
+#endif
 
 #ifndef ASM_FILE
 

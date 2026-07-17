@@ -34,7 +34,7 @@ static void acpi_map_table(uint32_t addr) {
     if (!addr) return;
     paging_map_page(addr & ~0xFFFu, addr & ~0xFFFu, 1, 0);
     paging_map_page((addr & ~0xFFFu) + 4096, (addr & ~0xFFFu) + 4096, 1, 0);
-    acpi_sdt_hdr_t *hdr = (acpi_sdt_hdr_t*)addr;
+    acpi_sdt_hdr_t *hdr = (acpi_sdt_hdr_t*)(uintptr_t)addr;
     uint32_t len = hdr->length;
     if (len > 1024 * 1024) len = 4096;
     uint32_t start_page = addr & ~0xFFFu;
@@ -48,10 +48,10 @@ static void acpi_map_table(uint32_t addr) {
 static void acpi_parse_dsdt(uint32_t dsdt_addr) {
     if (!dsdt_addr) return;
     acpi_map_table(dsdt_addr);
-    acpi_sdt_hdr_t *hdr = (acpi_sdt_hdr_t*)dsdt_addr;
+    acpi_sdt_hdr_t *hdr = (acpi_sdt_hdr_t*)(uintptr_t)dsdt_addr;
     if (strncmp(hdr->signature, "DSDT", 4) != 0) return;
 
-    uint8_t *p = (uint8_t*)dsdt_addr + sizeof(acpi_sdt_hdr_t);
+    uint8_t *p = (uint8_t*)(uintptr_t)dsdt_addr + sizeof(acpi_sdt_hdr_t);
     uint32_t len = hdr->length - sizeof(acpi_sdt_hdr_t);
 
     for (uint32_t i = 0; i < len - 7; i++) {
@@ -85,8 +85,8 @@ void acpi_init(void) {
 
     for (int area = 0; area < 2 && !g_rsdp; area++) {
         for (uint32_t addr = search_areas[area][0]; addr < search_areas[area][1]; addr += 16) {
-            if (strncmp((char*)addr, "RSD PTR ", 8) == 0) {
-                acpi_rsdp_t *r = (acpi_rsdp_t*)addr;
+            if (strncmp((char*)(uintptr_t)addr, "RSD PTR ", 8) == 0) {
+                acpi_rsdp_t *r = (acpi_rsdp_t*)(uintptr_t)addr;
                 uint8_t sum = 0;
                 uint8_t *b = (uint8_t*)r;
                 for (int i = 0; i < 20; i++) sum += b[i];
@@ -110,7 +110,7 @@ void acpi_init(void) {
 
     /* 2. Parse RSDT */
     acpi_map_table(g_rsdp->rsdt_address);
-    g_rsdt = (acpi_rsdt_t*)g_rsdp->rsdt_address;
+    g_rsdt = (acpi_rsdt_t*)(uintptr_t)g_rsdp->rsdt_address;
     if (!acpi_validate_checksum(&g_rsdt->header)) {
         kprintf("acpi: RSDT checksum invalid\n");
         return;
@@ -121,7 +121,7 @@ void acpi_init(void) {
 
     for (uint32_t i = 0; i < num_tables; i++) {
         acpi_map_table(g_rsdt->table_pointers[i]);
-        acpi_sdt_hdr_t *hdr = (acpi_sdt_hdr_t*)g_rsdt->table_pointers[i];
+        acpi_sdt_hdr_t *hdr = (acpi_sdt_hdr_t*)(uintptr_t)g_rsdt->table_pointers[i];
         char sig[5];
         memcpy(sig, hdr->signature, 4);
         sig[4] = 0;
@@ -205,3 +205,31 @@ void acpi_print_info(void) {
         kprintf("MADT Local APIC Base: 0x%x\n", g_madt->lapic_address);
     }
 }
+
+int acpi_get_cpus(uint8_t *apic_ids, int max_cpus) {
+    if (!g_acpi_enabled || !g_madt || !apic_ids || max_cpus <= 0) {
+        return 0;
+    }
+    int count = 0;
+    uint8_t *ptr = g_madt->entries;
+    uint8_t *end = ((uint8_t*)g_madt) + g_madt->header.length;
+
+    while (ptr + sizeof(acpi_madt_entry_hdr_t) <= end) {
+        acpi_madt_entry_hdr_t *hdr = (acpi_madt_entry_hdr_t*)ptr;
+        if (hdr->length < 2 || ptr + hdr->length > end) {
+            break;
+        }
+        if (hdr->type == 0 && hdr->length >= 8) {
+            uint8_t apic_id = ptr[3];
+            uint32_t flags = *((uint32_t*)&ptr[4]);
+            if ((flags & 1) || (flags & 2)) {
+                if (count < max_cpus) {
+                    apic_ids[count++] = apic_id;
+                }
+            }
+        }
+        ptr += hdr->length;
+    }
+    return count;
+}
+

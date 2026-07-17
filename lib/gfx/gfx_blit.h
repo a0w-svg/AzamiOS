@@ -66,6 +66,12 @@ void gfx_blit_circle(gfx_blit_ctx_t *ctx, int xc, int yc, int r, uint32_t color)
 void gfx_blit_fill_circle(gfx_blit_ctx_t *ctx, int xc, int yc, int r, uint32_t color);
 
 /**
+ * gfx_blit_scroll – scroll the entire backbuffer upward by lines rows.
+ * Exposes empty bottom lines filled with bg_color.
+ */
+void gfx_blit_scroll(gfx_blit_ctx_t *ctx, int lines, uint32_t bg_color);
+
+/**
  * gfx_blit_flip – copy the backbuffer to the linear framebuffer.
  * @param lfb  destination (physical/virtual LFB pointer, set by gfx_hw.c).
  */

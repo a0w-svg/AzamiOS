@@ -111,5 +111,7 @@ void acpi_reboot(void);
 uint32_t acpi_get_lapic_base(void);
 void acpi_print_info(void);
 bool acpi_is_enabled(void);
+int acpi_get_cpus(uint8_t *apic_ids, int max_cpus);
 
 #endif /* ACPI_H */
+

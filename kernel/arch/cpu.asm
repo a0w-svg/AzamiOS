@@ -1,52 +1,58 @@
-global gdt_flush ; Allows  the C code to call gdt_flush().
-gdt_flush:
-    mov eax, [esp+4]
-    lgdt [eax]         ; load the new GDT pointer.
+; kernel/arch/cpu.asm - 64-bit architecture CPU utilities
+[bits 64]
 
-    mov ax, 0x10       ; 0x10 is the offset in the GDT to our data segment.
-    mov ds, ax         ; loads all data segment selectors.
+section .text
+global gdt_flush
+global enter_usermode
+global enter_userspace
+global switch_page_dir
+
+; void gdt_flush(uintptr_t pointer)
+; RDI = pointer to gdt_ptr_t
+gdt_flush:
+    lgdt [rdi]
+    
+    mov ax, 0x10
+    mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    jmp 0x08:flush ; returns to the code segment.
 
-flush:
+    push 0x08
+    mov rax, .flush
+    push rax
+    retfq
+
+.flush:
     ret
 
-global enter_usermode
+; void switch_page_dir(void *dir)
+; RDI = physical address of page directory
+switch_page_dir:
+    mov cr3, rdi
+    ret
 
-; enter_usermode(uint32_t user_entry, uint32_t user_stack_top)
-;   user_entry     [esp+4]  -> ecx
-;   user_stack_top [esp+8]  -> edx
+; void enter_userspace(uintptr_t user_entry, uintptr_t user_stack_top)
+; void enter_usermode(uintptr_t user_entry, uintptr_t user_stack_top)
+; RDI = user_entry
+; RSI = user_stack_top
+enter_userspace:
 enter_usermode:
-    cli                        ; disable interrupts while building iret frame
-
-    mov ecx, [esp+4]           ; ecx = user entry point
-    mov edx, [esp+8]           ; edx = user stack top
-
-    ; switch data segments to ring-3 selectors (GDT index 4 = 0x20, + RPL 3 = 0x23)
+    cli
     mov ax, 0x23
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
 
-    ; Build the iret frame on the current (kernel) stack:
-    ;   [esp+0]  EIP    – user entry point
-    ;   [esp+4]  CS     – 0x1B  (GDT index 3, RPL 3)
-    ;   [esp+8]  EFLAGS – IF=1
-    ;   [esp+12] ESP    – user stack top     <-- was wrongly using kernel esp
-    ;   [esp+16] SS     – 0x23  (GDT index 4, RPL 3)
-    push 0x23                  ; SS  – user data segment, Ring 3
-    push edx                   ; ESP – user_stack_top (the argument we were passed)
-
+    push 0x23               ; User SS (Index 4 0x20 | RPL 3)
+    push rsi                ; User RSP (Userspace Stack Pointer)
     pushf
-    pop eax
-    or  eax, 0x200             ; IF=1: re-enable interrupts once in ring 3
-    push eax                   ; EFLAGS
+    pop rax
+    or rax, 0x202           ; IF=1 (Interrupts Enabled), bit 1 (reserved) = 1
+    push rax                ; RFLAGS
+    push 0x2B               ; User CS (Index 5 0x28 | RPL 3)
+    push rdi                ; User RIP (Entry point of userspace program)
 
-    push 0x1B                  ; CS  – user code segment, Ring 3
-    push ecx                   ; EIP – user_entry
-    iret
-
+    iretq

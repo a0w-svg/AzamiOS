@@ -1,10 +1,11 @@
 /**
  * gl.c — AzamiGL Software OpenGL 1.1 Implementation
  */
-#include "include/GL/gl.h"
-#include "include/math.h"
-#include "include/gui.h"
-#include "include/string.h"
+#include "GL/gl.h"
+#include <math.h>
+#include "gui.h"
+#include <string.h>
+
 
 /* Viewport state */
 static int g_vp_x = 0;

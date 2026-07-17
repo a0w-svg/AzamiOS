@@ -24,21 +24,46 @@ static void note_clear(void) {
     note_r = 0; note_c = 0;
 }
 
+static void note_scroll(void) {
+    for (int r = 0; r < NOTE_ROWS - 1; r++) {
+        memcpy(note_buf[r], note_buf[r + 1], NOTE_COLS);
+    }
+    for (int c = 0; c < NOTE_COLS; c++) {
+        note_buf[NOTE_ROWS - 1][c] = ' ';
+    }
+    note_r = NOTE_ROWS - 1;
+}
+
 static void note_putc(char ch) {
     if (ch == '\n' || ch == '\r') {
         note_c = 0; note_r++;
-        if (note_r >= NOTE_ROWS) note_r = NOTE_ROWS - 1;
+        if (note_r >= NOTE_ROWS) note_scroll();
         return;
     }
     if (ch == '\b' || ch == 127) {
-        if (note_c > 0) { note_c--; note_buf[note_r][note_c] = ' '; }
-        else if (note_r > 0) { note_r--; note_c = NOTE_COLS - 1; }
+        if (note_c > 0) {
+            note_c--;
+            note_buf[note_r][note_c] = ' ';
+        } else if (note_r > 0) {
+            note_r--;
+            int c = NOTE_COLS - 1;
+            while (c > 0 && note_buf[note_r][c] == ' ') {
+                c--;
+            }
+            if (note_buf[note_r][c] != ' ') c++;
+            if (c >= NOTE_COLS) c = NOTE_COLS - 1;
+            note_c = c;
+        }
         return;
     }
     if (note_c < NOTE_COLS && note_r < NOTE_ROWS) {
         note_buf[note_r][note_c] = ch;
         note_c++;
-        if (note_c >= NOTE_COLS) { note_c = 0; note_r++; if (note_r >= NOTE_ROWS) note_r = NOTE_ROWS - 1; }
+        if (note_c >= NOTE_COLS) {
+            note_c = 0;
+            note_r++;
+            if (note_r >= NOTE_ROWS) note_scroll();
+        }
     }
 }
 

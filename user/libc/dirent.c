@@ -1,9 +1,10 @@
 /**
  * dirent.c — AzamiOS libc: directory iteration
  */
-#include "include/dirent.h"
-#include "include/stdlib.h"
-#include "include/string.h"
+#include "dirent.h"
+#include <stdlib.h>
+#include <string.h>
+
 #include <unistd.h>
 #include <fcntl.h>
 

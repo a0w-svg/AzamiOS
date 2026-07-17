@@ -5,9 +5,10 @@
  * stored in fs_node_t.  The only output is via an optional log callback;
  * no direct kprintf or VGA access.
  *
- * Compiles with: i686-elf-gcc -ffreestanding  OR  host gcc for testing.
+ * Compiles with: x86_64-elf-gcc -ffreestanding  OR  host gcc for testing.
  */
 #include "vfs.h"
+#include "../string/string.h"
 
 /* Optional log callback — set by the kernel after boot.  NULL = silent. */
 static void (*vfs_log)(const char *fmt, ...) = (void*)0;
@@ -116,6 +117,73 @@ void vfs_register_device(block_device_t *dev) {
     }
 }
 
+block_device_t *vfs_get_device(const char *name) {
+    if (!name) return (void*)0;
+    const char *n = name;
+    if (n[0] == '/' && n[1] == 'd' && n[2] == 'e' && n[3] == 'v' && n[4] == '/') n += 5;
+    else if (n[0] == 'd' && n[1] == 'e' && n[2] == 'v' && n[3] == '/') n += 4;
+    for (int i = 0; i < device_count; i++) {
+        if (strcmp(device_list[i]->name, n) == 0) return device_list[i];
+    }
+    return (void*)0;
+}
+
+#define MAX_MOUNTS 8
+typedef struct {
+    char path[64];
+    fs_node_t *root_node;
+} vfs_mount_entry_t;
+
+static vfs_mount_entry_t g_mounts[MAX_MOUNTS];
+static int g_mount_count = 0;
+
+extern fs_node_t *fat32_mount(block_device_t *dev) __attribute__((weak));
+
+int vfs_mount(const char *dev_name, const char *mount_point, const char *fs_type) {
+    if (!dev_name || !mount_point) return -1;
+    block_device_t *dev = vfs_get_device(dev_name);
+    if (!dev) {
+        VFS_LOG("vfs_mount: device not found [%s]\n", dev_name);
+        return -1;
+    }
+    if (g_mount_count >= MAX_MOUNTS) return -1;
+
+    fs_node_t *mroot = (void*)0;
+    if (fs_type && (strcmp(fs_type, "fat32") == 0 || strcmp(fs_type, "vfat") == 0)) {
+        if (fat32_mount != (void*)0) {
+            mroot = fat32_mount(dev);
+        }
+    }
+    if (!mroot) {
+        mroot = initrd_create_file((char*)mount_point);
+        if (mroot) mroot->flags = FS_DIRECTORY | FS_MOUNTPOINT;
+    }
+
+    if (mroot) {
+        strncpy(g_mounts[g_mount_count].path, mount_point, 63);
+        g_mounts[g_mount_count].root_node = mroot;
+        g_mount_count++;
+        VFS_LOG("vfs_mount: mounted [%s] on [%s] (%s)\n", dev_name, mount_point, fs_type ? fs_type : "auto");
+        return 0;
+    }
+    return -1;
+}
+
+int vfs_unmount(const char *mount_point) {
+    if (!mount_point) return -1;
+    for (int i = 0; i < g_mount_count; i++) {
+        if (strcmp(g_mounts[i].path, mount_point) == 0) {
+            for (int j = i; j < g_mount_count - 1; j++) {
+                g_mounts[j] = g_mounts[j + 1];
+            }
+            g_mount_count--;
+            VFS_LOG("vfs_unmount: unmounted [%s]\n", mount_point);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* ── Unix-Style VFS Implementation & Legacy Bridge ────────────────── */
 
 #define VFS_MAX_FILES    32
@@ -163,14 +231,33 @@ static file_operations_t legacy_bridge_fops = {
 };
 
 vfs_file_t *vfs_open_file(const char *path, uint32_t flags) {
-    (void)flags;
     if (!path || !fs_root || !fs_root->finddir) return (void*)0;
 
-    fs_node_t *node = fs_root->finddir(fs_root, (char*)path);
+    fs_node_t *node = (void*)0;
+    for (int m = 0; m < g_mount_count; m++) {
+        size_t mlen = strlen(g_mounts[m].path);
+        if (strncmp(path, g_mounts[m].path, mlen) == 0) {
+            const char *subpath = path + mlen;
+            if (subpath[0] == '/') subpath++;
+            if (subpath[0] == '\0') {
+                node = g_mounts[m].root_node;
+            } else if (g_mounts[m].root_node && g_mounts[m].root_node->finddir) {
+                node = g_mounts[m].root_node->finddir(g_mounts[m].root_node, (char*)subpath);
+            }
+            break;
+        }
+    }
     if (!node) {
+        node = fs_root->finddir(fs_root, (char*)path);
+    }
+    if (!node && (flags & 0x0100)) {
         node = initrd_create_file((char*)path);
     }
     if (!node) return (void*)0;
+
+    if (flags & 0x0200) { /* O_TRUNC */
+        node->length = 0;
+    }
 
     vfs_inode_t *inode = (void*)0;
     for (int i = 0; i < VFS_MAX_INODES; i++) {

@@ -1,37 +1,46 @@
-CC      = i686-elf-gcc
-LD      = i686-elf-ld
+include ../../config.mk
 
-CFLAGS  = -ffreestanding -nostdlib -nostdinc -m32 -O2 -Wall -Wextra \
-          -fno-stack-protector -fno-pie -fno-pic \
-          -I/home/a0wsvg/opt/cross/lib/gcc/i686-elf/15.2.0/include \
-          -I../../libc/include
-
-LDFLAGS = -T link.ld -nostdlib --no-warn-rwx-segments
+CFLAGS  = $(USER_CFLAGS) -Ofast -fno-strict-aliasing -funroll-loops
+LDFLAGS = -T link.ld $(COMMON_LDFLAGS)
 
 SRCS    = main.c \
           wm_core.c \
+          wm_config.c \
           desktop.c \
           services/welcome.c \
           services/terminal.c \
           services/notepad.c \
           services/sysmon.c \
           services/files.c \
-          services/glcube.c
+          services/glcube.c \
+          services/pong.c \
+          services/ide.c \
+          services/settings.c \
+          services/snake.c \
+          services/minesweeper.c \
+          services/tetris.c \
+          services/python_repl.c \
+          services/netmon.c \
+          services/browser.c \
+          services/debugger.c \
+          ../../../lib/gfx/game_engine.c
 
 OBJS    = $(SRCS:.c=.o)
-LIBS    = ../../libc/libc.a
+LIBS    = $(AZAMI_LIB)
 TARGET  = wm
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-$(LIBS):
-	$(MAKE) -C ../../libc
 
 $(TARGET): $(OBJS) $(LIBS)
-	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
 
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(USER_LDLIBS)
+
+
+../../../lib/gfx/game_engine.o: ../../../lib/gfx/game_engine.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

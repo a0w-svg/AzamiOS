@@ -1,5 +1,5 @@
-; setjmp.asm — AzamiOS libc: non-local jumps (x86 32-bit)
-[BITS 32]
+; setjmp64.asm — AzamiOS libc: non-local jumps (x86_64 64-bit)
+[BITS 64]
 
 global setjmp
 global longjmp
@@ -7,34 +7,35 @@ global longjmp
 section .text
 
 ; int setjmp(jmp_buf env)
-; jmp_buf layout: [0]=EBX, [1]=ESI, [2]=EDI, [3]=EBP, [4]=ESP, [5]=EIP
+; RDI = env pointer
+; Saves: rbx, rsp, rbp, r12, r13, r14, r15, rip
 setjmp:
-    mov edx, [esp + 4]      ; edx = env
-    mov [edx + 0], ebx
-    mov [edx + 4], esi
-    mov [edx + 8], edi
-    mov [edx + 12], ebp
-    
-    lea eax, [esp + 4]      ; caller's ESP before call
-    mov [edx + 16], eax
-    
-    mov eax, [esp]          ; return address (EIP)
-    mov [edx + 20], eax
-    
+    mov [rdi + 0], rbx
+    lea rax, [rsp + 8]      ; caller's RSP before call
+    mov [rdi + 8], rax
+    mov [rdi + 16], rbp
+    mov [rdi + 24], r12
+    mov [rdi + 32], r13
+    mov [rdi + 40], r14
+    mov [rdi + 48], r15
+    mov rax, [rsp]          ; return address (RIP)
+    mov [rdi + 56], rax
     xor eax, eax            ; return 0
     ret
 
 ; void longjmp(jmp_buf env, int val)
+; RDI = env pointer, ESI = val
 longjmp:
-    mov edx, [esp + 4]      ; edx = env
-    mov eax, [esp + 8]      ; eax = val
+    mov eax, esi
     test eax, eax
     jnz .val_ok
-    inc eax                 ; val cannot be 0, return 1 if 0 passed
+    inc eax                 ; return 1 if 0 passed
 .val_ok:
-    mov ebx, [edx + 0]
-    mov esi, [edx + 4]
-    mov edi, [edx + 8]
-    mov ebp, [edx + 12]
-    mov esp, [edx + 16]
-    jmp [edx + 20]          ; jump to saved EIP
+    mov rbx, [rdi + 0]
+    mov rsp, [rdi + 8]
+    mov rbp, [rdi + 16]
+    mov r12, [rdi + 24]
+    mov r13, [rdi + 32]
+    mov r14, [rdi + 40]
+    mov r15, [rdi + 48]
+    jmp qword [rdi + 56]
