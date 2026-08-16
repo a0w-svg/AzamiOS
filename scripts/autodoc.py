@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+import os
+import re
+
+DIRECTORIES = ['kernel', 'drivers', 'arch', 'libc', 'userland']
+
+DIR_EXPLANATIONS = {
+    'arch/x86_64/boot': 'Boot protocol wrappers and early architecture initialization.',
+    'arch/x86_64/cpu': 'CPU-specific abstractions: GDT, IDT, LAPIC, SMP (Symmetric Multiprocessing), and interrupts.',
+    'arch/x86_64/mm': 'Architecture-specific memory management, primarily the 4-level paging Virtual Memory Manager (VMM).',
+    'arch/x86_64/syscall': 'Low-level x86_64 system call entry and exit points.',
+    'arch/x86_64/lib': 'Optimized architecture-specific routines (e.g. secure user-access wrappers).',
+    'drivers': 'Hardware drivers: AHCI (SATA), Bochs Graphics Adapter (BGA), PS/2 Input, UART console, and block device abstractions.',
+    'kernel': 'Core microkernel entry points and essential system headers.',
+    'kernel/fs': 'Virtual File System (VFS) and FAT32 file system implementations.',
+    'kernel/fs/ext2': 'ext2 file system driver (used for the initrd).',
+    'kernel/hal': 'Hardware Abstraction Layer (HAL) implementing NT/WDM-style device and driver registries, IRPs, and PCI bus enumeration.',
+    'kernel/ipc': 'Inter-Process Communication mechanisms (messaging and shared memory).',
+    'kernel/lib': 'Kernel-internal freestanding C library functions (string manipulation, memory copying).',
+    'kernel/mm': 'Hardware-independent memory management: Buddy allocator (PMM) and Slab/Bucket allocator (kmalloc).',
+    'kernel/object': 'NT-Style Object Manager for unified resource naming and lifecycle management.',
+    'kernel/sched': 'Completely Fair Scheduler (CFS), thread management, and 64-bit ELF executable loading.',
+    'kernel/security': 'Security hardening features such as stack canaries and execution protection.',
+    'kernel/syscall': 'System call dispatcher handling requests from user space.',
+    'libc': 'Userspace freestanding standard C library implementation.',
+    'userland/apps/azwm': 'AzamiOS Window Manager (Compositor and Desktop shell).',
+    'userland/apps/cat': 'Standard utility: concatenate and print files.',
+    'userland/apps/echo': 'Standard utility: print arguments to standard output.',
+    'userland/apps/init': 'System initialization and service management process (PID 1).',
+    'userland/apps/ls': 'Standard utility: list directory contents.',
+    'userland/apps/sh': 'Interactive command-line shell.'
+}
+
+def parse_header(filepath):
+    description = None
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for _ in range(10):
+                line = f.readline()
+                if not line:
+                    break
+                match = re.search(r'\*\s*AzamiOS\s*[-—]\s*(.+)', line)
+                if match:
+                    description = match.group(1).strip()
+                    break
+    except Exception:
+        pass
+    return description
+
+def parse_api_docs(filepath):
+    api_entries = []
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+            
+            # Find all /** ... */ comment blocks
+            matches = re.finditer(r'/\*\*(.*?)\*/', content, re.DOTALL)
+            for m in matches:
+                block = m.group(1)
+                # Clean up the block (remove leading * and spaces)
+                lines = [line.strip().lstrip('*').strip() for line in block.split('\n')]
+                # Filter out empty lines
+                lines = [line for line in lines if line]
+                
+                if lines:
+                    doc_text = " ".join(lines)
+                    # Check if it looks like a function or struct doc (contains '()' or 'struct')
+                    if '(' in doc_text or 'struct' in doc_text.lower():
+                        api_entries.append(doc_text)
+    except Exception:
+        pass
+    return api_entries
+
+def generate_docs():
+    modules_by_dir = {}
+    api_by_file = {}
+
+    for d in DIRECTORIES:
+        for root, _, files in os.walk(d):
+            c_files = sorted([f for f in files if f.endswith('.c') or f.endswith('.h')])
+            if not c_files:
+                continue
+            
+            modules = []
+            for f in c_files:
+                path = os.path.join(root, f)
+                desc = parse_header(path)
+                if desc:
+                    modules.append((f, desc))
+                
+                # Only parse API docs from headers to avoid duplicating function implementations
+                if f.endswith('.h'):
+                    apis = parse_api_docs(path)
+                    if apis:
+                        api_by_file[path] = apis
+            
+            if modules:
+                modules_by_dir[root] = modules
+
+    out_path = 'docs/MODULES.md'
+    with open(out_path, 'w', encoding='utf-8') as out:
+        out.write('# AzamiOS Modules & Architecture\n\n')
+        out.write('This document is automatically generated by `scripts/autodoc.py`.\n\n')
+
+        for directory in sorted(modules_by_dir.keys()):
+            out.write(f'## `{directory}/`\n\n')
+            
+            dir_key = directory.rstrip('/')
+            if dir_key in DIR_EXPLANATIONS:
+                out.write(f'> {DIR_EXPLANATIONS[dir_key]}\n\n')
+
+            for filename, desc in modules_by_dir[directory]:
+                out.write(f'- **`{filename}`**: {desc}\n')
+            out.write('\n')
+
+    api_out_path = 'docs/API.md'
+    with open(api_out_path, 'w', encoding='utf-8') as out:
+        out.write('# AzamiOS API Reference\n\n')
+        out.write('This document is automatically generated by `scripts/autodoc.py` from `/** ... */` comments in header files.\n\n')
+
+        for filepath in sorted(api_by_file.keys()):
+            out.write(f'## `{filepath}`\n\n')
+            for api in api_by_file[filepath]:
+                # Attempt to format it nicely if it has a '—' or '-' separator
+                match = re.match(r'([^—-]+)[—-]+(.*)', api)
+                if match:
+                    func_name = match.group(1).strip()
+                    desc = match.group(2).strip()
+                    out.write(f'- **`{func_name}`**: {desc}\n')
+                else:
+                    out.write(f'- {api}\n')
+            out.write('\n')
+
+    print(f"[Autodoc] Generated {out_path} and {api_out_path} successfully.")
+
+if __name__ == '__main__':
+    generate_docs()

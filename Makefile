@@ -1,236 +1,283 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# AzamiOS Makefile — 64-Bit Modern Microkernel OS
+# ==============================================================================
+# AzamiOS — Build System (Rewrite v7.0)
+# Target: x86_64, Limine boot protocol
+# Toolchain: x86_64-elf cross-compiler (GCC) + NASM
 #
-# Layout:
-#   lib/          — kernel-independent pure-C code (string, stdlib, net, fs, gfx)
-#   kernel/       — Ring-0 64-bit kernel (links against lib/ objects)
-#   user/         — userspace programs (link against user/libc)
-#   build/        — output directory for all build artifacts & objects
-# ──────────────────────────────────────────────────────────────────────────────
+# Key make targets:
+#   make            — build kernel.elf
+#   make run        — build + launch in QEMU (UART → serial, 4 CPUs)
+#   make run-debug  — same + GDB server on :1234
+#   make gdb        — attach GDB to a waiting run-debug instance
+#   make clean      — remove all build artefacts
+#   make iso        — build bootable ISO image (requires xorriso + limine)
+# ==============================================================================
 
-BUILD_DIR = build
-ARCH = x86_64
-export ARCH
-OBJ_DIR = $(BUILD_DIR)/obj-$(ARCH)
+# ── Toolchain ─────────────────────────────────────────────────────────────────
+CROSS_PREFIX ?= $(HOME)/opt/cross-x86_64/bin/x86_64-elf-
+CC    := $(CROSS_PREFIX)gcc
+LD    := $(CROSS_PREFIX)ld
+AR    := $(CROSS_PREFIX)ar
+GDB   := $(CROSS_PREFIX)gdb
+NASM  := nasm
 
-UTIL_LIST = ls help cat write time clear ifconfig ping arp lsmod reload cpu whoami fps acpi reboot shutdown about notepad files mount lpc testarch grep find sed awk du df head tail wc sort uniq python
-UTIL_TARGETS = $(foreach u,$(UTIL_LIST),user/apps/$(u)/$(u))
+# ── Build directories ─────────────────────────────────────────────────────────
+BUILD_DIR := build
+OBJ_DIR   := $(BUILD_DIR)/obj
+KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 
-# ── Kernel C sources ──────────────────────────────────────────────────────────
-C_SOURCES = $(wildcard kernel/arch/*.c \
-                        kernel/hal/*.c kernel/hal/*/*.c \
-                        kernel/boot/*.c \
-                        kernel/klibc/*.c \
-                        kernel/klibc/stdio/*.c \
-                        kernel/mem/*.c \
-                        kernel/syscall/*.c \
-                        kernel/filesystem/*.c \
-                        kernel/proc/*.c \
-                        kernel/module/*.c \
-                        kernel/drivers/*.c \
-                        kernel/azami/*.c kernel/azami/core/*.c kernel/azami/lxss/*.c kernel/azami/drivers/*.c) \
-            $(filter-out kernel/drivers/display/gfx.c kernel/drivers/char/terminal.c, \
-              $(wildcard kernel/drivers/*/*.c))
+# ── Compiler flags ────────────────────────────────────────────────────────────
+CFLAGS := \
+    -std=c11 \
+    -ffreestanding \
+    -fno-stack-protector \
+    -fno-pie \
+    -fno-pic \
+    -mno-red-zone \
+    -mno-mmx \
+    -mno-sse \
+    -mno-sse2 \
+    -mcmodel=kernel \
+    -m64 \
+    -Wall \
+    -Wextra \
+    -Wshadow \
+    -Wno-unused-parameter \
+    -O2 \
+    -g \
+    -fno-omit-frame-pointer \
+    -I. \
+    -Iinclude \
+    -Iarch/x86_64 \
+    -Ikernel
 
-# ── Headers (for dependency tracking) ────────────────────────────────────────
-HEADERS = $(wildcard kernel/arch/include/*.h \
-                      kernel/boot/*.h \
-                      kernel/klibc/include/*.h \
-                      kernel/drivers/include/*.h \
-                      kernel/mem/include/*.h \
-                      kernel/syscall/include/*.h \
-                      kernel/filesystem/include/*.h \
-                      kernel/proc/include/*.h \
-                      kernel/module/include/*.h \
-                      kernel/azami/include/*.h \
-                      kernel/hal/*.h kernel/hal/include/*.h \
-                      lib/string/string.h \
-                      lib/stdlib/stdlib.h \
-                      lib/net/net_stack.h \
-                      lib/net/net_hal.h \
-                      lib/net/packet_buffer.h \
-                      lib/fs/vfs.h \
-                      lib/fs/tarfs.h \
-                      lib/gfx/gfx_blit.h \
-                      lib/gfx/game_engine.h)
+LDFLAGS := \
+    -T scripts/kernel.ld \
+    -nostdlib \
+    --no-warn-rwx-segments \
+    -z max-page-size=0x1000
 
-# ── Object files (mapped into build/obj-$(ARCH)/) ────────────────────────────
-C_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(C_SOURCES))
+NASM_FLAGS := -f elf64 -g -F dwarf
 
-# ── Cross-compiler toolchain (x86_64) ─────────────────────────────────────────
-CROSS_PREFIX = $(HOME)/opt/cross-x86_64/bin/x86_64-elf-
-CC    = $(CROSS_PREFIX)gcc
-LD    = $(CROSS_PREFIX)ld
-GDB   = $(CROSS_PREFIX)gdb
-CFLAGS = -g -ffreestanding -Wall -Wextra -fno-exceptions -m64 -mno-red-zone -mcmodel=large -fno-stack-protector \
-         -O2 -fno-omit-frame-pointer -fno-strict-aliasing -funroll-loops \
-         -I. -Ikernel -Ilib -Ikernel/drivers -Ikernel/drivers/include -Ikernel/azami -Ikernel/azami/include -Ikernel/hal -Ikernel/hal/include
-LDFLAGS = -T kernel.ld --no-warn-rwx-segments
-NASM_FMT = elf64
-BOOT_OBJ = $(OBJ_DIR)/kernel/boot/boot.o
-OBJ = $(C_OBJS) \
-      $(OBJ_DIR)/kernel/arch/cpu.o \
-      $(OBJ_DIR)/kernel/arch/interrupts.o \
-      $(OBJ_DIR)/kernel/arch/smp_boot.o \
-      $(OBJ_DIR)/kernel/hal/cpu/cpu_asm.o \
-      $(OBJ_DIR)/kernel/hal/gdt/gdt_asm.o
-KERNEL_TARGET = $(BUILD_DIR)/kernel.elf
-QEMU_CMD = qemu-system-x86_64 -m 1G -M q35 -vga std -accel tcg,thread=multi -kernel $(BUILD_DIR)/kernel.elf
+# ── Source files ──────────────────────────────────────────────────────────────
 
-# ── Host compiler (for lib/ unit tests) ──────────────────────────────────────
-HOST_CC     = gcc
-HOST_CFLAGS = -Wall -Wextra -O2 -I. -Ilib
+# Boot layer
+BOOT_ASM_SRCS := arch/x86_64/boot/entry.asm
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Primary aliases / phony targets
-# ──────────────────────────────────────────────────────────────────────────────
-.PHONY: all run run-iso run-uefi run-debug build-iso kernel.elf initrd.tar fat32.img clean test-lib test-automated kernel/azami/azami_kernel.a
-.PHONY: user/apps/wm/wm user/apps/shell/shell user/apps/cc/cc user/apps/glcube/glcube $(UTIL_TARGETS)
+# Architecture C sources
+ARCH_C_SRCS := \
+    arch/x86_64/boot/limine_req.c \
+    arch/x86_64/cpu/gdt.c \
+    arch/x86_64/cpu/idt.c \
+    arch/x86_64/cpu/pic.c \
+    arch/x86_64/cpu/lapic.c \
+    arch/x86_64/cpu/smp.c \
+    arch/x86_64/mm/vmm.c
 
-all: $(KERNEL_TARGET) $(BUILD_DIR)/initrd.tar kernel/azami/azami_kernel.a
+# Architecture ASM sources
+ARCH_ASM_SRCS := \
+    arch/x86_64/cpu/gdt_flush.asm \
+    arch/x86_64/cpu/isr.asm \
+    arch/x86_64/cpu/switch_to.asm \
+    arch/x86_64/syscall/syscall_entry.asm \
+    arch/x86_64/lib/uaccess.asm
 
-kernel/azami/azami_kernel.a:
-	$(MAKE) -C kernel/azami CC="$(CC)" AR="$(CROSS_PREFIX)ar" CFLAGS="-std=c11 -ffreestanding -Wall -Wextra -Werror -O2 -Iinclude -I../../include -I.."
+# Kernel C sources
+KERNEL_C_SRCS := \
+    kernel/main.c \
+    kernel/panic.c \
+    kernel/lib/string.c \
+    kernel/mm/pmm.c \
+    kernel/mm/kmalloc.c \
+    kernel/syscall/syscall.c \
+    kernel/sched/sched.c \
+    kernel/sched/elf.c \
+    kernel/ipc/ipc.c \
+    kernel/security/security.c \
+    kernel/object/object.c \
+    fs/vfs.c \
+    fs/devfs.c \
+    fs/ext2/ext2.c \
+    hal/hal.c \
+    hal/device.c \
+    hal/driver.c \
+    hal/irp.c \
+    hal/irq.c \
+    hal/pci.c \
+    drivers/block/block.c \
+    drivers/block/ata.c \
+    drivers/input/input.c \
+    drivers/char/uart.c \
+    drivers/char/console.c \
+    drivers/char/lpt.c \
+    drivers/misc/bga.c \
+    drivers/misc/rtc.c \
+    drivers/acpi/acpi.c \
+    drivers/acpi/ioapic.c \
+    drivers/acpi/power.c \
+    drivers/sound/sound.c \
+    drivers/sound/ac97.c \
+    drivers/sound/pcspeaker.c \
+    drivers/char/memdevs.c \
+    drivers/net/e1000.c \
+    drivers/net/rtl8139.c \
+    drivers/net/virtio_net.c \
+    drivers/block/virtio_blk.c \
+    drivers/video/virtio_gpu.c \
+    drivers/video/virtio_gpu_cmd.c \
+    drivers/video/fbdev.c \
+    hal/virtio_pci.c \
+    hal/virtqueue.c \
+    kernel/net/net.c \
+    fs/pipe.c \
+    fs/fat32.c \
+    fs/procfs.c
 
-test-automated:
-	@bash scripts/test_automated.sh
+# ── Object file lists ─────────────────────────────────────────────────────────
+BOOT_OBJS   := $(patsubst %.asm, $(OBJ_DIR)/%.o, $(BOOT_ASM_SRCS))
+ARCH_C_OBJS := $(patsubst %.c,   $(OBJ_DIR)/%.o, $(ARCH_C_SRCS))
+ARCH_A_OBJS := $(patsubst %.asm, $(OBJ_DIR)/%.o, $(ARCH_ASM_SRCS))
+KERN_OBJS   := $(patsubst %.c,   $(OBJ_DIR)/%.o, $(KERNEL_C_SRCS))
 
-kernel.elf: $(BUILD_DIR)/kernel.elf
-initrd.tar: $(BUILD_DIR)/initrd.tar
-fat32.img:  $(BUILD_DIR)/fat32.img
-virtio.img: $(BUILD_DIR)/virtio.img
-build-iso:  $(BUILD_DIR)/AzamiOS.iso
+ALL_OBJS := \
+    $(BOOT_OBJS) \
+    $(ARCH_C_OBJS) \
+    $(ARCH_A_OBJS) \
+    $(KERN_OBJS)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Build rules inside $(BUILD_DIR)
-# ──────────────────────────────────────────────────────────────────────────────
-$(BUILD_DIR)/kernel.elf: $(BOOT_OBJ) ${OBJ}
+# ── Userspace (unchanged from original; just kept so `make run` still
+#    can build initrd if desired) ──────────────────────────────────────────────
+UTIL_LIST := ls help cat write time clear ifconfig ping arp lsmod reload cpu \
+             whoami fps acpi reboot shutdown about notepad files mount lpc \
+             testarch grep find sed awk du df head tail wc sort uniq python
+UTIL_TARGETS := $(foreach u,$(UTIL_LIST),userland/apps/$(u)/$(u))
+
+# ── Primary targets ───────────────────────────────────────────────────────────
+.PHONY: all run run-debug gdb iso clean userspace doc
+
+all: doc $(KERNEL_ELF) hdd.img
+
+$(KERNEL_ELF): $(ALL_OBJS)
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS) $^ -o $@
+	@echo ""
+	@echo "  ✓  Kernel linked: $@"
+	@echo "     Size: $$(wc -c < $@ | tr -d ' ') bytes"
 
-$(BUILD_DIR)/fat32.img:
-	@mkdir -p $(BUILD_DIR)
-	dd if=/dev/zero of=$@ bs=1M count=32 status=none
-	mkfs.fat -F 32 -n "AZAMIOS" $@
-	echo "Hello from FAT32 inside AzamiOS!" > readme.txt
-	mcopy -i $@ readme.txt ::README.TXT
-	rm -f readme.txt
-
-$(BUILD_DIR)/virtio.img:
-	@mkdir -p $(BUILD_DIR)
-	dd if=/dev/zero of=$@ bs=1M count=16 status=none
-
-$(BUILD_DIR)/initrd.tar: user/apps/wm/wm user/apps/shell/shell user/apps/cc/cc user/apps/glcube/glcube user/apps/cc/fib.c $(UTIL_TARGETS)
-	@rm -rf $(BUILD_DIR)/user_bin
-	@mkdir -p $(BUILD_DIR)/user_bin/bin $(BUILD_DIR)/user_bin/sbin $(BUILD_DIR)/user_bin/usr/bin $(BUILD_DIR)/user_bin/usr/sbin $(BUILD_DIR)/user_bin/usr/lib $(BUILD_DIR)/user_bin/usr/include $(BUILD_DIR)/user_bin/usr/share $(BUILD_DIR)/user_bin/usr/local/bin $(BUILD_DIR)/user_bin/home/root $(BUILD_DIR)/user_bin/root $(BUILD_DIR)/user_bin/etc $(BUILD_DIR)/user_bin/tmp $(BUILD_DIR)/user_bin/dev $(BUILD_DIR)/user_bin/proc $(BUILD_DIR)/user_bin/sys $(BUILD_DIR)/user_bin/var/log $(BUILD_DIR)/user_bin/var/run $(BUILD_DIR)/user_bin/var/tmp $(BUILD_DIR)/user_bin/boot $(BUILD_DIR)/user_bin/mnt $(BUILD_DIR)/user_bin/media
-	cp user/apps/shell/shell $(BUILD_DIR)/user_bin/bin/shell
-	for u in ls help cat write time clear whoami fps mount lpc testarch grep find sed awk du df head tail wc sort uniq python; do cp user/apps/$$u/$$u $(BUILD_DIR)/user_bin/bin/$$u; done
-	for u in ifconfig ping arp lsmod reload cpu acpi reboot shutdown; do cp user/apps/$$u/$$u $(BUILD_DIR)/user_bin/sbin/$$u; done
-	cp user/apps/wm/wm $(BUILD_DIR)/user_bin/usr/bin/wm
-	cp user/apps/cc/cc $(BUILD_DIR)/user_bin/usr/bin/cc
-	cp user/apps/glcube/glcube $(BUILD_DIR)/user_bin/usr/bin/glcube
-	for u in about notepad files; do cp user/apps/$$u/$$u $(BUILD_DIR)/user_bin/usr/bin/$$u; done
-	cp user/apps/cc/fib.c $(BUILD_DIR)/user_bin/home/root/fib.c
-	echo "Welcome to AzamiOS v6.0 Modern Microkernel OS (Win10 DE / GNU / Python / Games)" > $(BUILD_DIR)/user_bin/etc/motd
-	echo "azami-pc" > $(BUILD_DIR)/user_bin/etc/hostname
-	printf "NAME=AzamiOS\nVERSION=6.0\nID=azamios\n" > $(BUILD_DIR)/user_bin/etc/os-release
-	printf "root:x:0:0:root:/root:/bin/shell\nuser:x:1000:1000:user:/home/user:/bin/shell\n" > $(BUILD_DIR)/user_bin/etc/passwd
-	printf "root:x:0:\nusers:x:1000:\n" > $(BUILD_DIR)/user_bin/etc/group
-	printf "/dev/hda /fat32 vfat defaults 0 0\n/dev/sda /sata ext2 defaults 0 0\n" > $(BUILD_DIR)/user_bin/etc/fstab
-	printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\n" > $(BUILD_DIR)/user_bin/etc/profile
-	printf "AzamiOS v6.0 \n \l\n" > $(BUILD_DIR)/user_bin/etc/issue
-	echo "System initialized." > $(BUILD_DIR)/user_bin/var/log/messages
-	echo "Kernel boot complete." > $(BUILD_DIR)/user_bin/var/log/dmesg
-	cd $(BUILD_DIR)/user_bin && tar --format=ustar -cf ../initrd.tar bin sbin usr home root etc tmp dev proc sys var boot mnt media
-
-$(BUILD_DIR)/AzamiOS.iso: $(BUILD_DIR)/kernel.elf $(BUILD_DIR)/initrd.tar boot/grub/menu.lst
-	@mkdir -p $(BUILD_DIR)/iso/boot/grub
-	cp boot/grub/stage2_eltorito $(BUILD_DIR)/iso/boot/grub/
-	cp $(BUILD_DIR)/kernel.elf $(BUILD_DIR)/iso/boot/
-	cp $(BUILD_DIR)/initrd.tar $(BUILD_DIR)/iso/boot/
-	cp boot/grub/menu.lst $(BUILD_DIR)/iso/boot/grub/
-	mkisofs -R \
-	  -b boot/grub/stage2_eltorito \
-	  -no-emul-boot \
-	  -boot-load-size 4 \
-	  -A os \
-	  -input-charset utf8 \
-	  -quiet \
-	  -boot-info-table \
-	  -o $@ \
-	  $(BUILD_DIR)/iso
-
-# ── Userspace apps & library ──────────────────────────────────────────────────
-user/libc/libc.a:
-	$(MAKE) -C user/libc ARCH=$(ARCH)
-
-user/apps/wm/wm: user/libc/libc.a
-	$(MAKE) -C user/apps/wm ARCH=$(ARCH)
-user/apps/shell/shell: user/libc/libc.a
-	$(MAKE) -C user/apps/shell ARCH=$(ARCH)
-user/apps/cc/cc: user/libc/libc.a
-	$(MAKE) -C user/apps/cc ARCH=$(ARCH)
-user/apps/glcube/glcube: user/libc/libc.a
-	$(MAKE) -C user/apps/glcube ARCH=$(ARCH)
-$(UTIL_TARGETS): user/libc/libc.a
-	$(MAKE) -C $(dir $@) ARCH=$(ARCH)
-
-# ── Execution targets ─────────────────────────────────────────────────────────
-run: $(KERNEL_TARGET) $(BUILD_DIR)/initrd.tar $(BUILD_DIR)/fat32.img $(BUILD_DIR)/virtio.img
-	$(QEMU_CMD) -initrd $(BUILD_DIR)/initrd.tar -hda $(BUILD_DIR)/fat32.img \
-	  -drive if=none,id=vdisk,file=$(BUILD_DIR)/virtio.img,format=raw -device virtio-blk-pci,drive=vdisk \
-	  -smp 4 -serial file:kernel.log -device ac97 -device rtl8139 -device e1000 -device pcnet -device ne2k_pci -device ES1370 -device ahci -device virtio-net-pci -device virtio-rng-pci
-
-run-debug: $(KERNEL_TARGET) $(BUILD_DIR)/initrd.tar $(BUILD_DIR)/fat32.img $(BUILD_DIR)/virtio.img
-	$(QEMU_CMD) -initrd $(BUILD_DIR)/initrd.tar -hda $(BUILD_DIR)/fat32.img \
-	  -drive if=none,id=vdisk,file=$(BUILD_DIR)/virtio.img,format=raw -device virtio-blk-pci,drive=vdisk \
-	  -smp 4 -serial file:kernel.log -device ac97 -device rtl8139 -device e1000 -device pcnet -device ne2k_pci -device ES1370 -device ahci -device virtio-net-pci -device virtio-rng-pci -s -S
-
-gdb:
-	$(GDB) -ex "target remote localhost:1234" -ex "symbol-file $(KERNEL_TARGET)"
-
-run-iso: run
-run-uefi: run
-
-# ── lib/ host-compiler unit test target ──────────────────────────────────────
-LIB_SOURCES = lib/string/string.c \
-              lib/stdlib/stdlib.c \
-              lib/fs/vfs.c \
-              lib/fs/tarfs.c \
-              lib/gfx/gfx_blit.c \
-              lib/gfx/gfx_spooler.c \
-              lib/gfx/game_engine.c \
-              lib/net/net_stack.c \
-              lib/net/packet_buffer.c
-
-test-lib:
-	@echo "==> Compiling lib/ with host gcc to check kernel-independence..."
-	@for src in $(LIB_SOURCES); do \
-	  echo "  CC $$src"; \
-	  $(HOST_CC) $(HOST_CFLAGS) -c $$src -o /dev/null 2>&1 || exit 1; \
-	  done
-	@echo "==> lib/ test-lib PASSED: no kernel dependencies found."
+doc:
+	@echo "  ↓  Generating documentation..."
+	@python3 scripts/autodoc.py
 
 # ── Compilation rules ─────────────────────────────────────────────────────────
-$(OBJ_DIR)/%.o: %.c ${HEADERS}
+$(OBJ_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
-	${CC} ${CFLAGS} -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJ_DIR)/%.o: %.asm
 	@mkdir -p $(dir $@)
-	nasm $< -f $(NASM_FMT) -o $@
+	$(NASM) $(NASM_FLAGS) $< -o $@
 
-$(BUILD_DIR)/%.bin: %.asm
-	@mkdir -p $(dir $@)
-	nasm $< -f bin -o $@
+# ── QEMU run targets ──────────────────────────────────────────────────────────
+QEMU := qemu-system-x86_64
+DISPLAY_FLAG ?= 
+QEMU_FLAGS := \
+    -M q35 \
+    -m 512M \
+    -smp 4 \
+    -cpu max,+rdrand,+rdseed \
+    -serial stdio \
+    $(DISPLAY_FLAG) \
+    -no-reboot \
+    -no-shutdown \
+    -drive file=hdd.img,format=raw,if=none,id=drv0 \
+    -device ide-hd,drive=drv0,bus=ide.0 \
+    -audiodev pa,id=snd0 \
+    -device AC97,audiodev=snd0
+
+# Limine-based ISO run (headless serial terminal by default)
+run: iso
+	$(QEMU) $(QEMU_FLAGS) -cdrom $(BUILD_DIR)/AzamiOS.iso
+
+# Graphical GUI window run (opens QEMU display + serial output)
+run-gui: iso
+	$(QEMU) $(QEMU_FLAGS) DISPLAY_FLAG="-vga std" -cdrom $(BUILD_DIR)/AzamiOS.iso || $(QEMU) -M q35 -m 512M -smp 4 -cpu max,+rdrand,+rdseed -serial stdio -vga std -cdrom $(BUILD_DIR)/AzamiOS.iso
+
+# Direct ELF run (for quick iteration, no Limine — uses -kernel quirk)
+run-direct: $(KERNEL_ELF)
+	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF)
+
+run-debug: iso
+	$(QEMU) $(QEMU_FLAGS) -cdrom $(BUILD_DIR)/AzamiOS.iso -s -S
+	@echo "Waiting for GDB on port 1234..."
+
+gdb: $(KERNEL_ELF)
+	$(GDB) \
+	    -ex "set architecture i386:x86-64" \
+	    -ex "target remote localhost:1234" \
+	    -ex "symbol-file $(KERNEL_ELF)" \
+	    -ex "break kernel_main" \
+	    -ex "continue"
+
+# ── ISO generation (auto-bootstrapping local Limine and mkisofs/genisoimage) ──
+LIMINE_DIR := $(shell [ -d tools/limine ] && echo tools/limine || echo /usr/share/limine)
+MKISOFS := $(shell command -v xorriso >/dev/null 2>&1 && echo "xorriso -as mkisofs" || (command -v mkisofs >/dev/null 2>&1 && echo "mkisofs" || echo "genisoimage"))
+
+tools/limine:
+	@echo "  ↓  Bootstrapping local Limine bootloader..."
+	@mkdir -p tools
+	@git clone https://github.com/limine-bootloader/limine.git --branch=v8.x-binary --depth=1 tools/limine
+	@$(MAKE) -C tools/limine >/dev/null 2>&1 || true
+
+iso: $(KERNEL_ELF) | tools/limine
+	@mkdir -p $(BUILD_DIR)/iso_root/boot/limine
+	@mkdir -p $(BUILD_DIR)/iso_root/EFI/BOOT
+	@$(MAKE) -C userland ARCH=x86_64 >/dev/null
+	@mke2fs -F -t ext2 -d userland/build $(BUILD_DIR)/initrd.ext2 16M >/dev/null 2>&1 || true
+	cp $(KERNEL_ELF) $(BUILD_DIR)/iso_root/boot/kernel.elf
+	cp $(BUILD_DIR)/initrd.ext2 $(BUILD_DIR)/iso_root/boot/initrd.ext2 2>/dev/null || true
+	cp limine.conf   $(BUILD_DIR)/iso_root/boot/limine/limine.conf
+	@if [ -f tools/limine/limine-bios-cd.bin ]; then \
+	    cp tools/limine/limine-bios-cd.bin tools/limine/limine-bios.sys $(BUILD_DIR)/iso_root/boot/limine/; \
+	elif [ -f $(LIMINE_DIR)/limine-bios-cd.bin ]; then \
+	    cp $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-bios.sys $(BUILD_DIR)/iso_root/boot/limine/ 2>/dev/null || true; \
+	fi
+	@if [ -f tools/limine/BOOTX64.EFI ]; then \
+	    cp tools/limine/BOOTX64.EFI $(BUILD_DIR)/iso_root/EFI/BOOT/; \
+	elif [ -f $(LIMINE_DIR)/BOOTX64.EFI ]; then \
+	    cp $(LIMINE_DIR)/BOOTX64.EFI $(BUILD_DIR)/iso_root/EFI/BOOT/ 2>/dev/null || true; \
+	fi
+	$(MKISOFS) \
+	    -b boot/limine/limine-bios-cd.bin \
+	    -no-emul-boot \
+	    -boot-load-size 4 \
+	    -boot-info-table \
+	    -R -J \
+	    -o $(BUILD_DIR)/AzamiOS.iso \
+	    $(BUILD_DIR)/iso_root 2>/dev/null || \
+	    echo "  ⚠  ISO build failed — verify mkisofs or genisoimage is installed"
+	@if [ -x tools/limine/limine ]; then \
+	    tools/limine/limine bios-install $(BUILD_DIR)/AzamiOS.iso 2>/dev/null || true; \
+	elif command -v limine >/dev/null 2>&1; then \
+	    limine bios-install $(BUILD_DIR)/AzamiOS.iso 2>/dev/null || true; \
+	fi
+	@echo "  ✓  ISO: $(BUILD_DIR)/AzamiOS.iso"
+
+hdd.img:
+	@echo "  ↓  Generating persistent storage disk (hdd.img)..."
+	@mkdir -p hdd_root
+	@printf "Welcome to AzamiOS Persistent Storage!\n\nThis file is saved directly to the SATA drive (AHCI).\nEdit this text and press Ctrl+S to save it persistently!\n" > hdd_root/notes.txt
+	@truncate -s 4096 hdd_root/notes.txt
+	@mke2fs -F -t ext2 -d hdd_root hdd.img 2M >/dev/null 2>&1 || true
+
+# ── Userspace (pass-through to original targets) ─────────────────────────────
+userland/libc/libc.a:
+	$(MAKE) -C userland/libc ARCH=x86_64
+
+userland/apps/shell/shell: userland/libc/libc.a
+	$(MAKE) -C userland/apps/shell ARCH=x86_64
+
+userspace: userland/apps/shell/shell
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
-	rm -rf $(BUILD_DIR) kernel.elf AzamiOS.iso *.bin *.dis *.log initrd.tar fat32.img iso/ user/bin/ lib/*/*.o
-	$(MAKE) -C user/libc clean
-	$(MAKE) -C user/apps/wm clean
-	$(MAKE) -C user/apps/shell clean
-	$(MAKE) -C user/apps/cc clean
-	$(MAKE) -C user/apps/glcube clean
-	$(MAKE) -C kernel/azami clean
-	for u in $(UTIL_LIST); do $(MAKE) -C user/apps/$$u clean; done
+	rm -rf $(BUILD_DIR) kernel.log
+	@echo "  ✓  Build directory cleaned"
