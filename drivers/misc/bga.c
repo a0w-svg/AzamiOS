@@ -14,6 +14,7 @@
 #include "../../include/azami/types.h"
 #include "../../include/azami/fb.h"
 #include "../../fs/vfs.h"
+#include "../../kernel/sched/sched.h"
 
 
 /* BGA driver state */
@@ -51,7 +52,7 @@ void bga_set_video_mode(uint32_t width, uint32_t height, uint32_t bit_depth, uin
     bga_write_reg(VBE_DISPI_INDEX_XRES, width);
     bga_write_reg(VBE_DISPI_INDEX_YRES, height);
     bga_write_reg(VBE_DISPI_INDEX_VIRT_WIDTH, width);
-    bga_write_reg(VBE_DISPI_INDEX_VIRT_HEIGHT, height);
+    bga_write_reg(VBE_DISPI_INDEX_VIRT_HEIGHT, height * 2); /* Double-buffered VRAM */
     bga_write_reg(VBE_DISPI_INDEX_X_OFFSET, 0);
     bga_write_reg(VBE_DISPI_INDEX_Y_OFFSET, 0);
     bga_write_reg(VBE_DISPI_INDEX_BPP, bit_depth);
@@ -98,13 +99,13 @@ void bga_clear_screen(uint32_t color)
 
     if (g_bga.bpp == 32) {
         volatile uint32_t *fb = (volatile uint32_t *)g_bga.fb_virt;
-        uint32_t pixels = g_bga.width * g_bga.height;
+        uint32_t pixels = g_bga.width * g_bga.height * 2; /* Clear both double-buffer pages */
         for (uint32_t i = 0; i < pixels; i++) {
             fb[i] = color;
         }
     } else {
         /* Fallback for other bpp */
-        for (uint32_t y = 0; y < g_bga.height; y++) {
+        for (uint32_t y = 0; y < g_bga.height * 2; y++) {
             for (uint32_t x = 0; x < g_bga.width; x++) {
                 bga_put_pixel(x, y, color);
             }
@@ -154,7 +155,20 @@ static s64 bga_ioctl(struct file *filp, u32 cmd, u64 arg)
 
 static s64 bga_mmap(struct file *filp, virt_addr_t vaddr, size_t len, u32 prot, u32 flags, u64 offset)
 {
+    (void)filp; (void)prot; (void)flags;
     if (offset + len > g_bga.pitch * g_bga.height) return -1;
+
+    process_t *proc = sched_current_process();
+    if (!proc || !proc->pml4_phys) return -1;
+
+    u64 vmm_flags = VMM_F_PRESENT | VMM_F_USER | VMM_F_WRITE | VMM_F_NX | VMM_F_SHARED | VMM_F_PWT;
+    size_t pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    phys_addr_t phys_base = g_bga.fb_phys + offset;
+
+    for (size_t i = 0; i < pages; i++) {
+        vmm_map(proc->pml4_phys, vaddr + i * PAGE_SIZE,
+                phys_base + i * PAGE_SIZE, vmm_flags);
+    }
     return 0;
 }
 
@@ -226,7 +240,17 @@ void bga_init(void)
 
 phys_addr_t bga_get_fb_phys(void) { return g_bga.fb_phys; }
 size_t      bga_get_fb_size(void) { return (size_t)(g_bga.pitch * g_bga.height); }
+size_t      bga_get_fb_total_size(void) { return (size_t)(g_bga.pitch * g_bga.height * 2); }
+
+int bga_flip_buffer(uint32_t buffer_index)
+{
+    if (buffer_index > 1) return -1;
+    bga_write_reg(VBE_DISPI_INDEX_Y_OFFSET, (uint16_t)(buffer_index * g_bga.height));
+    return 0;
+}
+
 uint32_t    bga_get_width(void)   { return g_bga.width; }
 uint32_t    bga_get_height(void)  { return g_bga.height; }
 uint32_t    bga_get_pitch(void)   { return g_bga.pitch; }
 uint8_t     bga_get_bpp(void)     { return g_bga.bpp; }
+

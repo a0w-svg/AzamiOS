@@ -40,7 +40,8 @@ static spinlock_t g_vmm_lock = SPINLOCK_INIT;
 
 /* Return a pointer to a PTE table given its physical address via HHDM. */
 static inline u64 *phys_to_table(phys_addr_t p) {
-    return (u64 *)PHYS_TO_VIRT(p);
+    if (p >= 0xffff800000000000ULL) p = VIRT_TO_PHYS(p);
+    return (u64 *)PHYS_TO_VIRT(p & VMM_PHYS_MASK);
 }
 
 /* Allocate a zeroed 4 KB page table level (returns physical address). */
@@ -156,6 +157,7 @@ vmm_space_t vmm_create_space(void)
     phys_addr_t new_pml4_phys = alloc_table();
     if (!new_pml4_phys) return 0;
 
+    irqflags_t irqf = spinlock_lock_irqsave(&g_vmm_lock);
     u64 *new_pml4 = phys_to_table(new_pml4_phys);
     u64 *krn_pml4 = phys_to_table(g_kernel_pml4);
 
@@ -163,14 +165,20 @@ vmm_space_t vmm_create_space(void)
      * tables as the kernel's PML4. User entries (0–255) start as zero.    */
     for (int i = 0; i < 256; i++)  new_pml4[i] = 0;
     for (int i = 256; i < 512; i++) new_pml4[i] = krn_pml4[i];
+    spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
 
     return new_pml4_phys;
 }
 
 vmm_space_t vmm_clone_space(vmm_space_t src)
 {
+    if (!src) src = g_kernel_pml4;
+    if (src >= 0xffff800000000000ULL) src = VIRT_TO_PHYS(src);
+
     phys_addr_t dst_phys = alloc_table();
     if (!dst_phys) return 0;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_vmm_lock);
 
     u64 *src_pml4 = phys_to_table(src);
     u64 *dst_pml4 = phys_to_table(dst_phys);
@@ -198,9 +206,14 @@ vmm_space_t vmm_clone_space(vmm_space_t src)
                 if ((src_pdpt[pdpti] & VMM_F_WRITE) && (src_pdpt[pdpti] & VMM_F_USER) && !(src_pdpt[pdpti] & VMM_F_SHARED)) {
                     phys_addr_t new_phys = pmm_alloc_pages(512 * 512); /* 1 GB = 2^18 pages */
                     if (!new_phys) goto oom;
+                    /* BUG-09: release lock before 1 GB memcpy; dst pages are private */
+                    spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
                     u8 *src_pg = (u8 *)PHYS_TO_VIRT(src_pdpt[pdpti] & VMM_PHYS_MASK & ~0x3FFFFFFFUL);
                     u8 *dst_pg = (u8 *)PHYS_TO_VIRT(new_phys);
                     memcpy(dst_pg, src_pg, (size_t)PAGE_SIZE * 512 * 512);
+                    irqf = spinlock_lock_irqsave(&g_vmm_lock);
+                    /* Refresh pointers — src_pml4/src_pdpt may point into HHDM which is stable,
+                     * but dst_pml4/dst_pdpt were captured before; they are still valid (HHDM). */
                     dst_pdpt[pdpti] = new_phys | (src_pdpt[pdpti] & ~VMM_PHYS_MASK & ~VMM_F_HUGE);
                     dst_pdpt[pdpti] |= VMM_F_HUGE;
                 } else {
@@ -226,9 +239,12 @@ vmm_space_t vmm_clone_space(vmm_space_t src)
                     if ((src_pd[pdi] & VMM_F_WRITE) && (src_pd[pdi] & VMM_F_USER) && !(src_pd[pdi] & VMM_F_SHARED)) {
                         phys_addr_t new_phys = pmm_alloc_pages(512); /* 2 MB = 512 pages */
                         if (!new_phys) goto oom;
+                        /* BUG-09: release lock before 2 MB memcpy */
+                        spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
                         u8 *src_pg = (u8 *)PHYS_TO_VIRT(src_pd[pdi] & VMM_PHYS_MASK & ~0x1FFFFFUL);
                         u8 *dst_pg = (u8 *)PHYS_TO_VIRT(new_phys);
                         memcpy(dst_pg, src_pg, (size_t)PAGE_SIZE * 512);
+                        irqf = spinlock_lock_irqsave(&g_vmm_lock);
                         dst_pd[pdi] = new_phys | (src_pd[pdi] & ~VMM_PHYS_MASK & ~VMM_F_HUGE);
                         dst_pd[pdi] |= VMM_F_HUGE;
                     } else {
@@ -265,9 +281,11 @@ vmm_space_t vmm_clone_space(vmm_space_t src)
             }
         }
     }
+    spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
     return dst_phys;
 
 oom:
+    spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
     vmm_destroy_space(dst_phys);  /* clean up partial allocation */
     return 0;
 }
@@ -275,7 +293,9 @@ oom:
 void vmm_destroy_space(vmm_space_t space)
 {
     if (!space || space == g_kernel_pml4) return;
+    if (space >= 0xffff800000000000ULL) space = VIRT_TO_PHYS(space);
 
+    irqflags_t irqf = spinlock_lock_irqsave(&g_vmm_lock);
     u64 *pml4 = phys_to_table(space);
     for (int pml4i = 0; pml4i < 256; pml4i++) {  /* User half only */
         if (!(pml4[pml4i] & VMM_F_PRESENT)) continue;
@@ -312,6 +332,7 @@ void vmm_destroy_space(vmm_space_t space)
         pmm_free_page(pml4[pml4i] & VMM_PHYS_MASK);
     }
     pmm_free_page(space);
+    spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
 }
 
 /* ── Initialisation ───────────────────────────────────────────────────────── */

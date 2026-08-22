@@ -1,5 +1,5 @@
 /* ============================================================================
- * AzamiOS — Framebuffer ioctl definitions
+ * AzamiOS — Framebuffer ioctl definitions (Linux fbdev compatible)
  * File: include/azami/fb.h
  * ============================================================================ */
 #pragma once
@@ -7,7 +7,18 @@
 #include <azami/types.h>
 
 #define FBIOGET_VSCREENINFO 0x4600
+#define FBIOPUT_VSCREENINFO 0x4601
 #define FBIOGET_FSCREENINFO 0x4602
+#define FBIOPAN_DISPLAY     0x4606
+#define FBIOBLANK           0x4611
+#define FBIO_WAITFORVSYNC   0x4620
+
+#define FB_TYPE_PACKED_PIXELS      0
+#define FB_VISUAL_TRUECOLOR        2
+
+#define FB_BLANK_UNBLANK           0
+#define FB_BLANK_NORMAL            1
+#define FB_BLANK_POWERDOWN         4
 
 struct fb_bitfield {
     u32 offset;         /* beginning of bitfield */
@@ -28,10 +39,27 @@ struct fb_var_screeninfo {
     struct fb_bitfield green;
     struct fb_bitfield blue;
     struct fb_bitfield transp;
+    u32 nonstd;
+    u32 activate;
+    u32 height;
+    u32 width;
+    u32 accel_flags;
+    u32 pixclock;
+    u32 left_margin;
+    u32 right_margin;
+    u32 upper_margin;
+    u32 lower_margin;
+    u32 hsync_len;
+    u32 vsync_len;
+    u32 sync;
+    u32 vmode;
+    u32 rotate;
+    u32 colorspace;
+    u32 reserved[4];
 };
 
 struct fb_fix_screeninfo {
-    char id[16];        /* identification string eg "TT Builtin" */
+    char id[16];        /* identification string eg "AzamiFB" */
     unsigned long smem_start; /* Start of frame buffer mem (physical address) */
     u32 smem_len;       /* Length of frame buffer mem */
     u32 type;           /* see FB_TYPE_* */
@@ -44,4 +72,6 @@ struct fb_fix_screeninfo {
     unsigned long mmio_start; /* Start of Memory Mapped I/O (physical address) */
     u32 mmio_len;       /* Length of Memory Mapped I/O */
     u32 accel;          /* Indicate to driver which specific chip/card we have */
+    u16 capabilities;
+    u16 reserved[2];
 };

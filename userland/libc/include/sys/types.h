@@ -4,6 +4,12 @@
  * ============================================================================ */
 #pragma once
 
+#include <stdint.h>
+
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+
 typedef unsigned long size_t;
 typedef long          ssize_t;
 typedef long          off_t;
@@ -18,3 +24,5 @@ typedef unsigned long dev_t;
 typedef unsigned int  nlink_t;
 typedef long          blksize_t;
 typedef long          blkcnt_t;
+typedef unsigned long uintptr_t;
+typedef long          intptr_t;

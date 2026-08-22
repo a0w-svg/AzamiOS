@@ -51,10 +51,17 @@ void bga_clear_screen(uint32_t color);
 /** bga_get_fb_phys() — Physical base address of the BGA LFB, or 0 if not initialised. */
 phys_addr_t bga_get_fb_phys(void);
 
-/** bga_get_fb_size() — Byte size of the BGA framebuffer (pitch * height). */
+/** bga_get_fb_size() — Byte size of a single BGA framebuffer page (pitch * height). */
 size_t bga_get_fb_size(void);
+
+/** bga_get_fb_total_size() — Total double-buffered VRAM size (2 * pitch * height). */
+size_t bga_get_fb_total_size(void);
+
+/** bga_flip_buffer(buffer_index) — Zero-copy hardware flip to VRAM buffer 0 or 1. */
+int bga_flip_buffer(uint32_t buffer_index);
 
 uint32_t bga_get_width(void);
 uint32_t bga_get_height(void);
 uint32_t bga_get_pitch(void);
 uint8_t  bga_get_bpp(void);
+

@@ -279,54 +279,64 @@ static int ahci_issue_command(ahci_port_t *port)
 
 static s64 ahci_rw_sectors(block_dev_t *dev, u64 lba, u32 count, void *buf, int write)
 {
-    if (!dev || !dev->driver_data || !buf) return -(s64)EINVAL;
+    if (!dev || !dev->driver_data || !buf || count == 0) return -(s64)EINVAL;
     ahci_data_t *data = (ahci_data_t *)dev->driver_data;
     ahci_port_t *port = data->port;
 
     irqflags_t flags = spinlock_lock_irqsave(&data->lock);
 
-    port->is = (u32)-1;
-    int slot = 0;
-    ahci_cmd_header_t *cmdheader = (ahci_cmd_header_t *)PHYS_TO_VIRT((phys_addr_t)port->clb | ((u64)port->clbu << 32));
+    u32 sectors_done = 0;
+    u8 *dst = (u8 *)buf;
 
-    cmdheader[slot].cfl = sizeof(fis_reg_h2d_t) / sizeof(u32);
-    cmdheader[slot].w = write ? 1 : 0;
-    cmdheader[slot].prdtl = 1;
+    while (sectors_done < count) {
+        u32 chunk = count - sectors_done;
+        if (chunk > 128) chunk = 128; /* Up to 64 KB (128 sectors) per command */
 
-    ahci_cmd_table_t *cmdtbl = (ahci_cmd_table_t *)PHYS_TO_VIRT((phys_addr_t)cmdheader[slot].ctba | ((u64)cmdheader[slot].ctbau << 32));
-    __builtin_memset(cmdtbl, 0, sizeof(ahci_cmd_table_t));
+        port->is = (u32)-1;
+        int slot = 0;
+        ahci_cmd_header_t *cmdheader = (ahci_cmd_header_t *)PHYS_TO_VIRT((phys_addr_t)port->clb | ((u64)port->clbu << 32));
 
-    phys_addr_t phys_buf = VIRT_TO_PHYS((virt_addr_t)buf);
-    cmdtbl->prdt_entry[0].dba = (u32)phys_buf;
-    cmdtbl->prdt_entry[0].dbau = (u32)(phys_buf >> 32);
-    cmdtbl->prdt_entry[0].dbc = (count * dev->sector_size) - 1;
-    cmdtbl->prdt_entry[0].dbc |= (1U << 31);
+        cmdheader[slot].cfl = sizeof(fis_reg_h2d_t) / sizeof(u32);
+        cmdheader[slot].w = write ? 1 : 0;
+        cmdheader[slot].prdtl = 1;
 
-    fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t *)(&cmdtbl->cfis);
-    cmdfis->fis_type = FIS_TYPE_REG_H2D;
-    cmdfis->c = 1;
-    cmdfis->command = write ? ATA_CMD_WRITE_DMA_EX : ATA_CMD_READ_DMA_EX;
+        ahci_cmd_table_t *cmdtbl = (ahci_cmd_table_t *)PHYS_TO_VIRT((phys_addr_t)cmdheader[slot].ctba | ((u64)cmdheader[slot].ctbau << 32));
+        __builtin_memset(cmdtbl, 0, sizeof(ahci_cmd_table_t));
 
-    cmdfis->lba0 = (u8)lba;
-    cmdfis->lba1 = (u8)(lba >> 8);
-    cmdfis->lba2 = (u8)(lba >> 16);
-    cmdfis->device = 1 << 6; // LBA mode
+        phys_addr_t phys_buf = VIRT_TO_PHYS((virt_addr_t)(dst + (u64)sectors_done * dev->sector_size));
+        cmdtbl->prdt_entry[0].dba = (u32)phys_buf;
+        cmdtbl->prdt_entry[0].dbau = (u32)(phys_buf >> 32);
+        cmdtbl->prdt_entry[0].dbc = (chunk * dev->sector_size) - 1;
+        cmdtbl->prdt_entry[0].dbc |= (1U << 31);
 
-    cmdfis->lba3 = (u8)(lba >> 24);
-    cmdfis->lba4 = (u8)(lba >> 32);
-    cmdfis->lba5 = (u8)(lba >> 40);
+        fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t *)(&cmdtbl->cfis);
+        cmdfis->fis_type = FIS_TYPE_REG_H2D;
+        cmdfis->c = 1;
+        cmdfis->command = write ? ATA_CMD_WRITE_DMA_EX : ATA_CMD_READ_DMA_EX;
 
-    cmdfis->countl = count & 0xFF;
-    cmdfis->counth = (count >> 8) & 0xFF;
+        u64 cur_lba = lba + sectors_done;
+        cmdfis->lba0 = (u8)cur_lba;
+        cmdfis->lba1 = (u8)(cur_lba >> 8);
+        cmdfis->lba2 = (u8)(cur_lba >> 16);
+        cmdfis->device = 1 << 6; // LBA mode
 
-    s64 result;
-    if (ahci_issue_command(port) < 0) {
-        result = -(s64)EIO;
-    } else {
-        result = (s64)(count * dev->sector_size);
+        cmdfis->lba3 = (u8)(cur_lba >> 24);
+        cmdfis->lba4 = (u8)(cur_lba >> 32);
+        cmdfis->lba5 = (u8)(cur_lba >> 40);
+
+        cmdfis->countl = chunk & 0xFF;
+        cmdfis->counth = (chunk >> 8) & 0xFF;
+
+        if (ahci_issue_command(port) < 0) {
+            spinlock_unlock_irqrestore(&data->lock, flags);
+            return -(s64)EIO;
+        }
+
+        sectors_done += chunk;
     }
+
     spinlock_unlock_irqrestore(&data->lock, flags);
-    return result;
+    return (s64)(count * dev->sector_size);
 }
 
 static s64 ahci_read(block_dev_t *dev, u64 lba, u32 count, void *buf)

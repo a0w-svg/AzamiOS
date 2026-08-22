@@ -46,13 +46,23 @@
 #define AZ_WM_UNSUBSCRIBE_EVENTS   32  /* Cancel broadcast subscription             */
 #define AZ_WM_LAUNCH_APP           33  /* Ask server to spawn an ELF binary         */
 #define AZ_WM_SET_STRUT            34  /* Reserve screen edge (panel geometry)      */
+#define AZ_WM_SET_THEME            35  /* Set active system theme                   */
 
 /* Server -> Client (broadcasts) */
 #define AZ_WM_EVT_WINDOW_CREATED   40  /* Broadcast: a new window was created       */
 #define AZ_WM_EVT_WINDOW_DESTROYED 41  /* Broadcast: a window was destroyed         */
 #define AZ_WM_EVT_FOCUS_CHANGED    42  /* Broadcast: focus moved to another window  */
+#define AZ_WM_EVT_THEME_CHANGED    43  /* Broadcast: theme changed across system    */
 #define AZ_WM_SESSION_READY        50  /* sessiond -> subscribers: DE fully started */
 #define AZ_WM_TIMER_TICK           51  /* Kernel timer -> client: periodic tick     */
+
+/* ── Theme identifiers ─────────────────────────────────────────────────── */
+#define AZ_THEME_MOCHA       0   /* Catppuccin Mocha (Dark)      */
+#define AZ_THEME_LATTE       1   /* Catppuccin Latte (Light)     */
+#define AZ_THEME_NORD        2   /* Nord Frost                   */
+#define AZ_THEME_CYBERPUNK   3   /* Cyberpunk Neon               */
+#define AZ_THEME_OLED        4   /* Pure Black OLED              */
+#define AZ_THEME_COUNT       5
 
 /* ── Z-order band values (sent in set_zorder.band) ──────────────────────── */
 #define AZ_WM_ZORDER_BOTTOM   0   /* Wallpaper / root window */
@@ -69,8 +79,8 @@
 #define DE_STRUT_MAX_ENTRIES   16
 
 /* ── Cursor sprite dimensions (shared between desktop.c and compositor.c) */
-#define AZ_WM_CURSOR_W  12
-#define AZ_WM_CURSOR_H  19
+#define AZ_WM_CURSOR_W  14
+#define AZ_WM_CURSOR_H  21
 
 /* ── Maximum windows tracked by the taskbar ─────────────────────────────── */
 #define DE_TASKBAR_MAX_WINDOWS  24
@@ -131,6 +141,11 @@ typedef struct {
     unsigned int  new_wid;      /* Newly focused window (0 if none)          */
 } az_wm_evt_focus_payload_t;
 
+/* AZ_WM_SET_THEME / AZ_WM_EVT_THEME_CHANGED payload */
+typedef struct {
+    unsigned int  theme_id;     /* AZ_THEME_*                                */
+} az_wm_theme_payload_t;
+
 /* ── Convenience cast helpers ─────────────────────────────────────────────── */
 #define AZ_WM_MSG_ZORDER(msg_ptr) \
     ((az_wm_zorder_payload_t *)((msg_ptr)->_raw))
@@ -153,6 +168,9 @@ typedef struct {
 #define AZ_WM_MSG_EVT_FOCUS(msg_ptr) \
     ((az_wm_evt_focus_payload_t *)((msg_ptr)->_raw))
 
+#define AZ_WM_MSG_THEME(msg_ptr) \
+    ((az_wm_theme_payload_t *)((msg_ptr)->_raw))
+
 /* ── Static assertion: payloads fit in _raw[200] ─────────────────────────── */
 _Static_assert(sizeof(az_wm_zorder_payload_t)       <= 200, "zorder payload overflow");
 _Static_assert(sizeof(az_wm_subscribe_payload_t)    <= 200, "subscribe payload overflow");
@@ -161,3 +179,4 @@ _Static_assert(sizeof(az_wm_launch_payload_t)        <= 200, "launch payload ove
 _Static_assert(sizeof(az_wm_evt_created_payload_t)   <= 200, "evt_created payload overflow");
 _Static_assert(sizeof(az_wm_evt_destroyed_payload_t) <= 200, "evt_destroyed payload overflow");
 _Static_assert(sizeof(az_wm_evt_focus_payload_t)     <= 200, "evt_focus payload overflow");
+_Static_assert(sizeof(az_wm_theme_payload_t)         <= 200, "theme payload overflow");

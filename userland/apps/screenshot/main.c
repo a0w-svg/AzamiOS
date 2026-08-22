@@ -32,12 +32,12 @@ static int save_screenshot_ppm(const char *filename)
     /* Ensure framebuffer is mapped at 0x40000000 */
     az_fb_map((void *)0x40000000);
 
-    int fd = sys_open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return -1;
 
     char header[64];
     int hlen = snprintf(header, sizeof(header), "P6\n%u %u\n255\n", fb.width, fb.height);
-    sys_write(fd, header, hlen);
+    write(fd, header, hlen);
 
     /* Write RGB bytes row by row */
     static unsigned char row_buf[3840 * 3];
@@ -52,10 +52,10 @@ static int save_screenshot_ppm(const char *filename)
             row_buf[bpos++] = (c >> 8) & 0xFF;  /* Green */
             row_buf[bpos++] = c & 0xFF;         /* Blue */
         }
-        sys_write(fd, row_buf, bpos);
+        write(fd, row_buf, bpos);
     }
 
-    sys_close(fd);
+    close(fd);
     return 0;
 }
 

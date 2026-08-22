@@ -15,6 +15,7 @@
 #include "../../libc/include/stdio.h"
 #include "../../libc/include/stdlib.h"
 #include "../../libc/include/string.h"
+#include "../../libc/include/unistd.h"
 #include "../../libc/include/sys/syscall.h"
 #include "../../libc/include/az/ipc.h"
 #include "../azwm/protocol.h"
@@ -146,6 +147,8 @@ static int probe_azwm_readiness(int max_retries)
     return -1;
 }
 
+#include "../shared/sys_config.h"
+
 /* ============================================================================
  * _start
  * ============================================================================ */
@@ -153,6 +156,7 @@ int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
+    az_config_init_storage();
     de_log("[sessiond] Starting desktop session sequence...");
 
     /* ── Step 1: Spawn Display Server (/sbin/azwm.elf) ─────────────────── */
@@ -191,32 +195,26 @@ int main(int argc, char **argv)
     /* ── Step 4: Spawn Root Window / Animated Wallpaper ─────────────────── */
     if (splash_ok) render_splash(&g_splash_win, 45);
     int wp_pid = az_spawn("/sbin/wallpaper.elf");
-    if (wp_pid < 0) {
-        de_log("[sessiond] ERROR: az_spawn /sbin/wallpaper.elf failed!");
-    } else {
+    if (wp_pid >= 0) {
         de_log("[sessiond] wallpaper.elf spawned.");
     }
-
-    /* Small yield for wallpaper window to establish */
-    for (int i = 0; i < 20; i++) az_yield();
 
     /* ── Step 5: Spawn Taskbar ───────────────────────────────────────────── */
     if (splash_ok) render_splash(&g_splash_win, 75);
     int tb_pid = az_spawn("/sbin/taskbar.elf");
-    if (tb_pid < 0) {
-        de_log("[sessiond] ERROR: az_spawn /sbin/taskbar.elf failed!");
-    } else {
+    if (tb_pid >= 0) {
         de_log("[sessiond] taskbar.elf spawned.");
     }
 
-    /* Small yield for taskbar window to establish */
-    for (int i = 0; i < 25; i++) az_yield();
+    /* Auto-launch terminal emulator on startup */
+    int term_pid = az_spawn("/bin/terminal.elf");
+    if (term_pid >= 0) {
+        de_log("[sessiond] terminal.elf auto-spawned successfully.");
+    }
 
     /* ── Step 6: Dismiss Splash Screen ───────────────────────────────────── */
     if (splash_ok) {
         render_splash(&g_splash_win, 100);
-        for (int i = 0; i < 15; i++) az_yield();
-
         az_wm_msg_t destroy;
         memset(&destroy, 0, sizeof(destroy));
         destroy.type = AZ_WM_DESTROY_WINDOW;
@@ -228,7 +226,7 @@ int main(int argc, char **argv)
 
     /* ── Step 7: Session Watchdog Loop ───────────────────────────────────── */
     for (;;) {
-        az_yield();
+        sleep(1);
     }
 
     sys_exit(0);

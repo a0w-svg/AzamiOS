@@ -75,7 +75,7 @@ typedef struct {
             unsigned char focused;  /* 1 = gained, 0 = lost */
         } focus;
 
-        /* Generic padding to ensure union is large enough */
-        unsigned char _raw[200];
+        /* Generic padding to ensure struct matches 272-byte ipc_msg_t size */
+        unsigned char _raw[256];
     };
 } az_wm_msg_t;

@@ -8,10 +8,12 @@
 #include "virtio_blk.h"
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/mm/vmm.h"
+#include "../../arch/x86_64/cpu/spinlock.h"
 #include "../../kernel/lib/string.h"
 
 static virtio_blk_dev_t g_vblk_dev;
 static bool g_vblk_active = false;
+static spinlock_t g_vblk_lock = SPINLOCK_INIT;
 
 static s64 virtio_blk_read_sectors(struct block_dev *dev, u64 lba, u32 count, void *buf)
 {
@@ -36,7 +38,10 @@ static s64 virtio_blk_read_sectors(struct block_dev *dev, u64 lba, u32 count, vo
     u32 lens[3] = { sizeof(hdr), bytes_to_read, 1 };
     bool is_write[3] = { false, true, true }; /* Device reads hdr, writes data & status */
 
+    irqflags_t flags = spinlock_lock_irqsave(&g_vblk_lock);
+
     if (virtqueue_add_chain(vdev->vq, addrs, lens, is_write, 3, (void *)1) < 0) {
+        spinlock_unlock_irqrestore(&g_vblk_lock, flags);
         return -EIO;
     }
 
@@ -48,6 +53,8 @@ static s64 virtio_blk_read_sectors(struct block_dev *dev, u64 lba, u32 count, vo
         cookie = virtqueue_get_used(vdev->vq, NULL);
         __asm__ volatile("pause");
     }
+
+    spinlock_unlock_irqrestore(&g_vblk_lock, flags);
 
     if (status != VIRTIO_BLK_S_OK) return -EIO;
     return (s64)count;
@@ -76,7 +83,10 @@ static s64 virtio_blk_write_sectors(struct block_dev *dev, u64 lba, u32 count, c
     u32 lens[3] = { sizeof(hdr), bytes_to_write, 1 };
     bool is_write[3] = { false, false, true }; /* Device reads hdr & data, writes status */
 
+    irqflags_t flags = spinlock_lock_irqsave(&g_vblk_lock);
+
     if (virtqueue_add_chain(vdev->vq, addrs, lens, is_write, 3, (void *)1) < 0) {
+        spinlock_unlock_irqrestore(&g_vblk_lock, flags);
         return -EIO;
     }
 
@@ -88,6 +98,8 @@ static s64 virtio_blk_write_sectors(struct block_dev *dev, u64 lba, u32 count, c
         cookie = virtqueue_get_used(vdev->vq, NULL);
         __asm__ volatile("pause");
     }
+
+    spinlock_unlock_irqrestore(&g_vblk_lock, flags);
 
     if (status != VIRTIO_BLK_S_OK) return -EIO;
     return (s64)count;

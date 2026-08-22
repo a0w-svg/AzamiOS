@@ -9,6 +9,7 @@
 #include "../kernel/mm/kmalloc.h"
 #include "../kernel/lib/string.h"
 #include "../include/azami/defs.h"
+#include "../arch/x86_64/cpu/spinlock.h"
 #include "../userland/libc/include/sys/dirent.h"
 
 #define MAX_DEVICES 64
@@ -21,13 +22,20 @@ typedef struct {
     inode_t *inode;
 } devfs_node_t;
 
+static spinlock_t g_devfs_lock = SPINLOCK_INIT;
 static devfs_node_t g_devices[MAX_DEVICES];
 static u32 g_device_count = 0;
 
 /* Global function exposed to drivers */
 int devfs_register_device(const char *name, file_operations_t *fops, void *private_data)
 {
-    if (g_device_count >= MAX_DEVICES || !name) return -1;
+    if (!name) return -1;
+    
+    spinlock_lock(&g_devfs_lock);
+    if (g_device_count >= MAX_DEVICES) {
+        spinlock_unlock(&g_devfs_lock);
+        return -1;
+    }
     
     /* Check if already registered */
     for (u32 i = 0; i < g_device_count; i++) {
@@ -38,6 +46,7 @@ int devfs_register_device(const char *name, file_operations_t *fops, void *priva
                 g_devices[i].inode->i_fop = fops;
                 g_devices[i].inode->i_private = private_data;
             }
+            spinlock_unlock(&g_devfs_lock);
             return 0;
         }
     }
@@ -55,13 +64,20 @@ int devfs_register_device(const char *name, file_operations_t *fops, void *priva
         node->inode->i_fop = fops;
         node->inode->i_private = private_data;
     }
+    spinlock_unlock(&g_devfs_lock);
     
     return 0;
 }
 
 int devfs_register_block_device(const char *name, file_operations_t *fops, void *private_data)
 {
-    if (g_device_count >= MAX_DEVICES || !name) return -1;
+    if (!name) return -1;
+    
+    spinlock_lock(&g_devfs_lock);
+    if (g_device_count >= MAX_DEVICES) {
+        spinlock_unlock(&g_devfs_lock);
+        return -1;
+    }
     
     for (u32 i = 0; i < g_device_count; i++) {
         if (strcmp(g_devices[i].name, name) == 0) {
@@ -71,6 +87,7 @@ int devfs_register_block_device(const char *name, file_operations_t *fops, void 
                 g_devices[i].inode->i_fop = fops;
                 g_devices[i].inode->i_private = private_data;
             }
+            spinlock_unlock(&g_devfs_lock);
             return 0;
         }
     }
@@ -88,12 +105,14 @@ int devfs_register_block_device(const char *name, file_operations_t *fops, void 
         node->inode->i_fop = fops;
         node->inode->i_private = private_data;
     }
+    spinlock_unlock(&g_devfs_lock);
     
     return 0;
 }
 
 dentry_t *devfs_lookup(struct inode *dir, struct dentry *dentry)
 {
+    spinlock_lock(&g_devfs_lock);
     for (u32 i = 0; i < g_device_count; i++) {
         if (strcmp(dentry->d_name, g_devices[i].name) == 0) {
             if (!g_devices[i].inode) {
@@ -109,9 +128,11 @@ dentry_t *devfs_lookup(struct inode *dir, struct dentry *dentry)
                 g_devices[i].inode->i_sb = dir->i_sb;
             }
             dentry->d_inode = g_devices[i].inode;
+            spinlock_unlock(&g_devfs_lock);
             return dentry;
         }
     }
+    spinlock_unlock(&g_devfs_lock);
     return dentry; /* Negative dentry */
 }
 

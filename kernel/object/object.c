@@ -71,7 +71,7 @@ az_object_t *az_object_lookup(const char *name)
 
 void az_object_reference(az_object_t *obj)
 {
-    if (!obj) return;
+    if (!obj || (uintptr_t)obj < 0xffff800000000000ULL) return;
     spinlock_lock(&g_object_lock);
     obj->ref_count++;
     spinlock_unlock(&g_object_lock);
@@ -79,7 +79,7 @@ void az_object_reference(az_object_t *obj)
 
 void az_object_dereference(az_object_t *obj)
 {
-    if (!obj) return;
+    if (!obj || (uintptr_t)obj < 0xffff800000000000ULL) return;
     spinlock_lock(&g_object_lock);
     if (obj->ref_count > 0) {
         obj->ref_count--;
@@ -129,10 +129,9 @@ az_object_t *az_handle_get(process_t *proc, s64 handle_id)
 s64 az_handle_close(process_t *proc, s64 handle_id)
 {
     if (!proc || handle_id < 0 || handle_id >= 64) return -(s64)EBADF;
-    az_object_t *obj = proc->obj_handle_table[handle_id];
+    az_object_t *obj = (az_object_t *)__atomic_exchange_n(&proc->obj_handle_table[handle_id], NULL, __ATOMIC_SEQ_CST);
     if (!obj) return -(s64)EBADF;
 
-    proc->obj_handle_table[handle_id] = NULL;
     az_object_dereference(obj);
     return 0;
 }

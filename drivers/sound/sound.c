@@ -63,7 +63,8 @@ void sound_register_device(sound_device_t *dev)
         g_active_sound_dev = dev;
         
         devfs_register_device("dsp", &g_dsp_fops, dev);
-        pr_debug("[SOUND] Registered %s as /dev/dsp\n", dev->name);
+        devfs_register_device("audio", &g_dsp_fops, dev);
+        pr_debug("[SOUND] Registered %s as /dev/dsp and /dev/audio\n", dev->name);
     }
     spinlock_unlock(&g_sound_lock);
 }

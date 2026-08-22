@@ -23,8 +23,6 @@ void compositor_init(az_compositor_t *comp,
                      unsigned int w, unsigned int h, unsigned int pitch,
                      int server_channel)
 {
-    comp->frontbuf       = frontbuf;
-    comp->backbuf        = backbuf;
     comp->fb_width       = w;
     comp->fb_height      = h;
     comp->fb_pitch       = pitch;
@@ -32,10 +30,16 @@ void compositor_init(az_compositor_t *comp,
     comp->next_wid       = 1;
     comp->focused_window = 0; /* NULL */
     comp->cursor_x       = (int)(w / 2);
-    comp->cursor_y     = h / 2;
-    comp->old_cursor_x = comp->cursor_x;
-    comp->old_cursor_y = comp->cursor_y;
+    comp->cursor_y       = h / 2;
+    comp->old_cursor_x   = comp->cursor_x;
+    comp->old_cursor_y   = comp->cursor_y;
     comp->server_channel = server_channel;
+    comp->has_animating_windows = 0;
+
+    /* Setup hardware double-buffered VRAM pointers */
+    comp->frontbuf = frontbuf;
+    comp->backbuf  = backbuf;
+    comp->hw_page_flip = 0;
 
     comp->list_head = 0; /* NULL */
     comp->list_tail = 0; /* NULL */
@@ -48,6 +52,42 @@ void compositor_init(az_compositor_t *comp,
         comp->window_pool[i].prev = 0; /* NULL */
         comp->free_list = &comp->window_pool[i];
     }
+
+    compositor_damage_all(comp);
+}
+
+void compositor_damage(az_compositor_t *comp, int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+    int x1 = x + w;
+    int y1 = y + h;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x1 > (int)comp->fb_width) x1 = (int)comp->fb_width;
+    if (y1 > (int)comp->fb_height) y1 = (int)comp->fb_height;
+    if (x >= x1 || y >= y1) return;
+
+    if (!comp->has_damage) {
+        comp->dirty_min_x = x;
+        comp->dirty_min_y = y;
+        comp->dirty_max_x = x1;
+        comp->dirty_max_y = y1;
+        comp->has_damage = 1;
+    } else {
+        if (x < comp->dirty_min_x) comp->dirty_min_x = x;
+        if (y < comp->dirty_min_y) comp->dirty_min_y = y;
+        if (x1 > comp->dirty_max_x) comp->dirty_max_x = x1;
+        if (y1 > comp->dirty_max_y) comp->dirty_max_y = y1;
+    }
+}
+
+void compositor_damage_all(az_compositor_t *comp)
+{
+    comp->dirty_min_x = 0;
+    comp->dirty_min_y = 0;
+    comp->dirty_max_x = (int)comp->fb_width;
+    comp->dirty_max_y = (int)comp->fb_height;
+    comp->has_damage = 1;
 }
 
 /* ── Linked List Helpers ─────────────────────────────────────────────────── */
@@ -96,8 +136,8 @@ int compositor_create_window(az_compositor_t *comp,
     comp->free_list = win->next;
 
     /* Clamp window dimensions */
-    if (w == 0) w = 200;
-    if (h == 0) h = 150;
+    if (w < 100) w = 100;
+    if (h < 60)  h = 60;
     if (w > comp->fb_width)  w = comp->fb_width;
     if (h > comp->fb_height) h = comp->fb_height;
 
@@ -138,8 +178,11 @@ int compositor_create_window(az_compositor_t *comp,
     win->buffer_h    = h;
     win->pixels      = (unsigned int *)map_addr;
     win->shmem_id    = (unsigned int)shmem_id;
+    win->shm_bytes   = page_count * 4096;
     win->visible     = 1;
     win->focused     = 0;
+    win->anim_state  = AZWM_ANIM_NONE;
+    win->anim_step   = 0;
 
     int ti = 0;
     if (title) {
@@ -159,6 +202,7 @@ int compositor_create_window(az_compositor_t *comp,
     if (out_shmem_id) *out_shmem_id = (unsigned int)shmem_id;
 
     compositor_focus_window(comp, win);
+    compositor_trigger_open_animation(comp, win);
     return (int)win->wid;
 }
 
@@ -169,6 +213,12 @@ void compositor_destroy_window(az_compositor_t *comp, unsigned int wid)
     az_window_t *curr = comp->list_head;
     while (curr) {
         if (curr->wid == wid) {
+            int dmg_x = curr->x - AZWM_BORDER_W - 4;
+            int dmg_y = curr->y - (AZWM_TITLEBAR_H + AZWM_BORDER_W) - 4;
+            int dmg_w = (int)curr->width + 2 * AZWM_BORDER_W + 8;
+            int dmg_h = (int)curr->height + AZWM_TITLEBAR_H + 2 * AZWM_BORDER_W + 8;
+            compositor_damage(comp, dmg_x, dmg_y, dmg_w, dmg_h);
+
             if (curr->pixels) {
                 az_shmem_unmap((int)curr->shmem_id, curr->pixels);
                 curr->pixels = 0;
@@ -390,6 +440,7 @@ static void bb_fill_rounded_rect(az_compositor_t *comp, int rx, int ry, int rw, 
 
 static void draw_drop_shadow(az_compositor_t *comp, int rx, int ry, int rw, int rh)
 {
+    if (!comp || !comp->backbuf) return;
     int s = 12;
     unsigned int pitch_px = comp->fb_pitch / 4;
     int fb_w = (int)comp->fb_width;
@@ -605,7 +656,7 @@ static void render_window(az_compositor_t *comp, az_window_t *win)
         bb_fill_rect(comp, max_x - 3, max_y - 2, 1, 5, 0xFF1E1E2E);
     }
 
-    if (win->pixels) {
+    if (win->pixels && (unsigned long)win->pixels >= 0x40000000UL) {
         unsigned int pitch_px = comp->fb_pitch / 4;
         int max_rows = wh;
         if (win->buffer_h > 0 && max_rows > (int)win->buffer_h)
@@ -634,10 +685,14 @@ static void render_window(az_compositor_t *comp, az_window_t *win)
                 copy_w = (int)win->buffer_w - src_x;
             }
 
-            if (copy_w > 0) {
-                unsigned int *src_ptr = &win->pixels[(unsigned int)row * win->buffer_w + (unsigned int)src_x];
-                unsigned int *dst_ptr = &comp->backbuf[(unsigned int)sy * pitch_px + (unsigned int)dst_x];
-                memcpy(dst_ptr, src_ptr, (size_t)copy_w * sizeof(unsigned int));
+            if (copy_w > 0 && win->buffer_w > 0) {
+                unsigned long offset = (unsigned long)row * win->buffer_w + (unsigned long)src_x;
+                /* SHM Bounds validation: never read beyond allocated buffer */
+                if (win->shm_bytes == 0 || (offset + copy_w) * sizeof(unsigned int) <= win->shm_bytes) {
+                    unsigned int *src_ptr = &win->pixels[offset];
+                    unsigned int *dst_ptr = &comp->backbuf[(unsigned int)sy * pitch_px + (unsigned int)dst_x];
+                    memcpy(dst_ptr, src_ptr, (size_t)copy_w * sizeof(unsigned int));
+                }
             }
         }
     }
@@ -681,18 +736,42 @@ static void draw_snap_preview(az_compositor_t *comp)
         sy = AZWM_TITLEBAR_H + AZWM_BORDER_W;
         sw = fb_w - 2 * AZWM_BORDER_W;
         sh = fb_h - 40 - AZWM_TITLEBAR_H - 2 * AZWM_BORDER_W;
+    } else if (comp->snap_preview_mode == 4) {
+        /* Top-Left quarter snap */
+        sx = AZWM_BORDER_W;
+        sy = AZWM_TITLEBAR_H + AZWM_BORDER_W;
+        sw = (fb_w / 2) - 2 * AZWM_BORDER_W;
+        sh = (fb_h - 40) / 2 - AZWM_TITLEBAR_H - 2 * AZWM_BORDER_W;
+    } else if (comp->snap_preview_mode == 5) {
+        /* Top-Right quarter snap */
+        sx = (fb_w / 2) + AZWM_BORDER_W;
+        sy = AZWM_TITLEBAR_H + AZWM_BORDER_W;
+        sw = (fb_w / 2) - 2 * AZWM_BORDER_W;
+        sh = (fb_h - 40) / 2 - AZWM_TITLEBAR_H - 2 * AZWM_BORDER_W;
+    } else if (comp->snap_preview_mode == 6) {
+        /* Bottom-Left quarter snap */
+        sx = AZWM_BORDER_W;
+        sy = (fb_h - 40) / 2 + AZWM_BORDER_W;
+        sw = (fb_w / 2) - 2 * AZWM_BORDER_W;
+        sh = (fb_h - 40) / 2 - 2 * AZWM_BORDER_W;
+    } else if (comp->snap_preview_mode == 7) {
+        /* Bottom-Right quarter snap */
+        sx = (fb_w / 2) + AZWM_BORDER_W;
+        sy = (fb_h - 40) / 2 + AZWM_BORDER_W;
+        sw = (fb_w / 2) - 2 * AZWM_BORDER_W;
+        sh = (fb_h - 40) / 2 - 2 * AZWM_BORDER_W;
     }
 
     if (sw <= 0 || sh <= 0) return;
 
     unsigned int pitch_px = comp->fb_pitch / 4;
-    /* Translucent frosted glass tint (0x4089B4FA) */
+    /* Translucent frosted glass tint (0x4589B4FA) */
     for (int y = sy; y < sy + sh; y++) {
         if (y < 0 || y >= fb_h) continue;
         unsigned int *line = &comp->backbuf[y * pitch_px];
         for (int x = sx; x < sx + sw; x++) {
             if (x < 0 || x >= fb_w) continue;
-            line[x] = alpha_blend(line[x], 0xFF89B4FA, 64);
+            line[x] = alpha_blend(line[x], 0xFF89B4FA, 68);
         }
     }
 
@@ -786,6 +865,88 @@ static void draw_alt_tab_hud(az_compositor_t *comp)
     }
 }
 
+static const char *g_ctx_menu_items[] = {
+    " Terminal",
+    " File Manager",
+    " Text Editor",
+    " Calculator",
+    " Paint Studio",
+    " System Monitor",
+    " Settings",
+    " Refresh Desktop"
+};
+#define CTX_MENU_COUNT (sizeof(g_ctx_menu_items) / sizeof(g_ctx_menu_items[0]))
+
+static void draw_context_menu(az_compositor_t *comp)
+{
+    if (!comp->ctx_menu_active) return;
+
+    int mx = comp->ctx_menu_x;
+    int my = comp->ctx_menu_y;
+    int mw = 176;
+    int mh = (int)CTX_MENU_COUNT * 26 + 12;
+
+    if (mx + mw > (int)comp->fb_width - 8) mx = (int)comp->fb_width - mw - 8;
+    if (my + mh > (int)comp->fb_height - 48) my = (int)comp->fb_height - mh - 48;
+    if (mx < 8) mx = 8;
+    if (my < 8) my = 8;
+
+    /* Shadow */
+    draw_drop_shadow(comp, mx, my, mw, mh);
+
+    /* Main Menu Frame with top accent */
+    bb_fill_rounded_rect(comp, mx, my, mw, mh, 8, 0xFF181825);
+    bb_fill_rounded_rect(comp, mx, my, mw, 2, 0, 0xFF89B4FA);
+
+    /* Render Menu Items */
+    for (size_t i = 0; i < CTX_MENU_COUNT; i++) {
+        int iy = my + 6 + (int)i * 26;
+        bool is_hov = ((int)i == comp->ctx_menu_hover);
+
+        if (is_hov) {
+            bb_fill_rounded_rect(comp, mx + 6, iy, mw - 12, 24, 4, 0xFF313244);
+            bb_fill_rounded_rect(comp, mx + 8, iy + 4, 3, 16, 2, 0xFF89B4FA);
+        }
+
+        /* Dot indicator */
+        unsigned int dot_color = is_hov ? 0xFF89B4FA : 0xFF6C7086;
+        bb_fill_circle(comp, mx + 18, iy + 12, 3, dot_color);
+
+        /* Label */
+        desktop_draw_text_at(comp->backbuf, comp->fb_width, comp->fb_height,
+                             comp->fb_pitch / 4, mx + 28, iy + 6,
+                             g_ctx_menu_items[i],
+                             is_hov ? 0xFFFFFFFF : 0xFFCDD6F4);
+    }
+}
+
+static void compositor_restore_cursor_area(az_compositor_t *comp, int cx, int cy)
+{
+    unsigned int pitch_px = comp->fb_pitch / 4;
+    int ox = cx - 2;
+    int oy = cy - 2;
+    int cw = AZ_WM_CURSOR_W + 4;
+    int ch = AZ_WM_CURSOR_H + 4;
+    
+    for (int y = 0; y < ch; y++) {
+        int sy = oy + y;
+        if (sy < 0) continue;
+        if (sy >= (int)comp->fb_height) break;
+        int sx = ox;
+        int w = cw;
+        if (sx < 0) {
+            w += sx;
+            sx = 0;
+        }
+        if (sx + w > (int)comp->fb_width) w = (int)comp->fb_width - sx;
+        if (w > 0) {
+            memcpy(&comp->frontbuf[(unsigned int)sy * pitch_px + (unsigned int)sx], 
+                   &comp->backbuf[(unsigned int)sy * pitch_px + (unsigned int)sx], 
+                   (size_t)w * sizeof(unsigned int));
+        }
+    }
+}
+
 void compose_screen(az_compositor_t *comp)
 {
     unsigned int pitch_px = comp->fb_pitch / 4;
@@ -807,15 +968,43 @@ void compose_screen(az_compositor_t *comp)
         curr = curr->prev;
     }
 
-    /* ── 3. Draw Snapping Preview & Alt+Tab HUD Overlays ─────────────── */
+    /* ── 3. Draw Snapping Preview, Alt+Tab HUD & Context Menu Overlays ─── */
     draw_snap_preview(comp);
     draw_alt_tab_hud(comp);
+    draw_context_menu(comp);
 
-    /* ── 4. Flip: copy back buffer → front buffer (framebuffer) ───────── */
+    /* ── 4. Presentation: Hardware Zero-Copy Page Flip or Vectorized Blit ─ */
+    if (comp->hw_page_flip) {
+        int next_buf = 1 - comp->active_vram_buf;
+        if (az_fb_flip((unsigned int)next_buf) == 0) {
+            comp->active_vram_buf = next_buf;
+            comp->frontbuf = comp->vram_buf[comp->active_vram_buf];
+            comp->backbuf  = comp->vram_buf[1 - comp->active_vram_buf];
+
+            /* Draw mouse cursor directly to the newly flipped front buffer */
+            desktop_draw_cursor(comp->frontbuf, comp->fb_width, comp->fb_height, pitch_px,
+                                comp->cursor_x, comp->cursor_y);
+            comp->old_cursor_x = comp->cursor_x;
+            comp->old_cursor_y = comp->cursor_y;
+            comp->has_damage = 0;
+            comp->dirty_min_x = (int)comp->fb_width;
+            comp->dirty_min_y = (int)comp->fb_height;
+            comp->dirty_max_x = 0;
+            comp->dirty_max_y = 0;
+            return;
+        }
+    }
+
+    /* Fallback Double-Buffering: copy back buffer → front buffer */
     size_t total_bytes = (size_t)pitch_px * comp->fb_height * sizeof(unsigned int);
     memcpy(comp->frontbuf, comp->backbuf, total_bytes);
+    comp->has_damage = 0;
+    comp->dirty_min_x = (int)comp->fb_width;
+    comp->dirty_min_y = (int)comp->fb_height;
+    comp->dirty_max_x = 0;
+    comp->dirty_max_y = 0;
 
-    /* ── 5. Draw mouse cursor directly to frontbuf ────────────────────── */
+    /* Draw mouse cursor directly to frontbuf */
     desktop_draw_cursor(comp->frontbuf, comp->fb_width, comp->fb_height, pitch_px,
                         comp->cursor_x, comp->cursor_y);
     comp->old_cursor_x = comp->cursor_x;
@@ -826,29 +1015,8 @@ void compositor_update_cursor(az_compositor_t *comp)
 {
     unsigned int pitch_px = comp->fb_pitch / 4;
     
-    /* 1. Restore old cursor region from backbuf to frontbuf (margin of 2px covers 14x21 outline) */
-    int ox = comp->old_cursor_x - 2;
-    int oy = comp->old_cursor_y - 2;
-    int cw = AZ_WM_CURSOR_W + 4;
-    int ch = AZ_WM_CURSOR_H + 4;
-    
-    for (int y = 0; y < ch; y++) {
-        int sy = oy + y;
-        if (sy < 0) continue;
-        if (sy >= (int)comp->fb_height) break;
-        int sx = ox;
-        int w = cw;
-        if (sx < 0) {
-            w += sx;
-            sx = 0;
-        }
-        if (sx + w > (int)comp->fb_width) w = (int)comp->fb_width - sx;
-        if (w > 0) {
-            memcpy(&comp->frontbuf[sy * pitch_px + sx], 
-                   &comp->backbuf[sy * pitch_px + sx], 
-                   (size_t)w * sizeof(unsigned int));
-        }
-    }
+    /* 1. Restore old cursor region from backbuf to frontbuf */
+    compositor_restore_cursor_area(comp, comp->old_cursor_x, comp->old_cursor_y);
     
     /* 2. Draw new cursor to frontbuf */
     desktop_draw_cursor(comp->frontbuf, comp->fb_width, comp->fb_height, pitch_px,
@@ -857,3 +1025,120 @@ void compositor_update_cursor(az_compositor_t *comp)
     comp->old_cursor_x = comp->cursor_x;
     comp->old_cursor_y = comp->cursor_y;
 }
+
+/* ── Animation Engine ────────────────────────────────────────────────────── */
+
+void compositor_trigger_open_animation(az_compositor_t *comp, az_window_t *win)
+{
+    if (!win) return;
+    win->anim_state    = AZWM_ANIM_OPEN;
+    win->anim_step     = 0;
+    win->anim_target_x = win->x;
+    win->anim_target_y = win->y;
+    win->anim_target_w = win->width;
+    win->anim_target_h = win->height;
+
+    /* Zoom in from center point */
+    int cx = win->x + (int)win->width / 2;
+    int cy = win->y + (int)win->height / 2;
+    win->anim_start_w = win->width / 4;
+    win->anim_start_h = win->height / 4;
+    if (win->anim_start_w < 60) win->anim_start_w = 60;
+    if (win->anim_start_h < 40) win->anim_start_h = 40;
+    win->anim_start_x = cx - (int)win->anim_start_w / 2;
+    win->anim_start_y = cy - (int)win->anim_start_h / 2;
+
+    win->x = win->anim_start_x;
+    win->y = win->anim_start_y;
+    win->width = win->anim_start_w;
+    win->height = win->anim_start_h;
+    comp->has_animating_windows = 1;
+}
+
+void compositor_trigger_minimize_animation(az_compositor_t *comp, az_window_t *win, int dock_x, int dock_y)
+{
+    if (!win) return;
+    win->anim_state    = AZWM_ANIM_MINIMIZE;
+    win->anim_step     = 0;
+    win->anim_start_x  = win->x;
+    win->anim_start_y  = win->y;
+    win->anim_start_w  = win->width;
+    win->anim_start_h  = win->height;
+
+    win->saved_x = win->x;
+    win->saved_y = win->y;
+    win->saved_w = win->width;
+    win->saved_h = win->height;
+
+    win->anim_target_x = dock_x;
+    win->anim_target_y = dock_y;
+    win->anim_target_w = 40;
+    win->anim_target_h = 24;
+    comp->has_animating_windows = 1;
+}
+
+void compositor_trigger_restore_animation(az_compositor_t *comp, az_window_t *win, int dock_x, int dock_y)
+{
+    if (!win) return;
+    win->anim_state    = AZWM_ANIM_RESTORE;
+    win->anim_step     = 0;
+    win->visible       = 1;
+    win->anim_start_x  = dock_x;
+    win->anim_start_y  = dock_y;
+    win->anim_start_w  = 40;
+    win->anim_start_h  = 24;
+
+    win->anim_target_x = win->saved_x > 0 ? win->saved_x : win->x;
+    win->anim_target_y = win->saved_y > 0 ? win->saved_y : win->y;
+    win->anim_target_w = win->saved_w > 0 ? win->saved_w : win->width;
+    win->anim_target_h = win->saved_h > 0 ? win->saved_h : win->height;
+
+    win->x = win->anim_start_x;
+    win->y = win->anim_start_y;
+    win->width = win->anim_start_w;
+    win->height = win->anim_start_h;
+    comp->has_animating_windows = 1;
+}
+
+int compositor_animate_step(az_compositor_t *comp)
+{
+    int still_animating = 0;
+    az_window_t *curr = comp->list_head;
+    while (curr) {
+        if (curr->anim_state != AZWM_ANIM_NONE) {
+            curr->anim_step++;
+            /* Ease-out quadratic: progress = t * (512 - t) / 256 */
+            int t = curr->anim_step * 256 / AZWM_ANIM_STEPS;
+            if (t > 256) t = 256;
+            int ease = (t * (512 - t)) / 256;
+
+            curr->x = curr->anim_start_x + ((curr->anim_target_x - curr->anim_start_x) * ease) / 256;
+            curr->y = curr->anim_start_y + ((curr->anim_target_y - curr->anim_start_y) * ease) / 256;
+            curr->width = (unsigned int)((int)curr->anim_start_w + ((int)(curr->anim_target_w - curr->anim_start_w) * ease) / 256);
+            curr->height = (unsigned int)((int)curr->anim_start_h + ((int)(curr->anim_target_h - curr->anim_start_h) * ease) / 256);
+
+            if (curr->anim_step >= AZWM_ANIM_STEPS) {
+                if (curr->anim_state == AZWM_ANIM_MINIMIZE) {
+                    curr->visible = 0;
+                    curr->x = curr->saved_x;
+                    curr->y = curr->saved_y;
+                    curr->width = curr->saved_w;
+                    curr->height = curr->saved_h;
+                } else {
+                    curr->x = curr->anim_target_x;
+                    curr->y = curr->anim_target_y;
+                    curr->width = curr->anim_target_w;
+                    curr->height = curr->anim_target_h;
+                }
+                curr->anim_state = AZWM_ANIM_NONE;
+                curr->anim_step = 0;
+            } else {
+                still_animating = 1;
+            }
+        }
+        curr = curr->next;
+    }
+    comp->has_animating_windows = still_animating;
+    return still_animating;
+}
+

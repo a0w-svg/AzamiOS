@@ -87,16 +87,21 @@ int main(int argc, char **argv)
 
     if (count <= 0) count = 4;
 
-    const char *target_str = (optind < argc) ? argv[optind] : "10.0.2.2";
-    unsigned char target_ip[4] = { 10, 0, 2, 2 };
+    if (optind >= argc) {
+        fprintf(stderr, "Usage: ping [-c count] destination\n");
+        return 1;
+    }
+
+    const char *target_str = argv[optind];
+    unsigned char target_ip[4] = { 0, 0, 0, 0 };
     if (parse_ip(target_str, target_ip) < 0) {
         fprintf(stderr, "ping: invalid IP address '%s'\n", target_str);
         return 1;
     }
 
     int net_fd = open("/dev/net0", O_RDWR, 0);
-    unsigned char host_mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
-    unsigned char host_ip[4]  = { 10, 0, 2, 15 };
+    unsigned char host_mac[6] = { 0, 0, 0, 0, 0, 0 };
+    unsigned char host_ip[4]  = { 0, 0, 0, 0 };
 
     if (net_fd >= 0) {
         ioctl(net_fd, 0x8910 /* SIOCGIFHWADDR */, (unsigned long)host_mac);

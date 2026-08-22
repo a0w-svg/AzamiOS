@@ -292,18 +292,28 @@ int strerror_r(int errnum, char *buf, size_t buflen)
 void *memset(void *dest, int c, size_t n)
 {
     unsigned char *d = (unsigned char *)dest;
-    unsigned long c64 = (unsigned char)c;
-    c64 |= (c64 << 8);
-    c64 |= (c64 << 16);
-    c64 |= (c64 << 32);
+    unsigned long c8 = (unsigned char)c;
+    unsigned long c64 = c8 * 0x0101010101010101UL;
 
-    while (n > 0 && ((unsigned long)d & 7) != 0) { *d++ = (unsigned char)c; n--; }
+    size_t qwords = n >> 3;
+    size_t bytes  = n & 7;
 
-    unsigned long *d64 = (unsigned long *)d;
-    while (n >= 8) { *d64++ = c64; n -= 8; }
-
-    d = (unsigned char *)d64;
-    while (n--) *d++ = (unsigned char)c;
+    if (qwords > 0) {
+        __asm__ volatile(
+            "rep stosq"
+            : "+D"(d), "+c"(qwords)
+            : "a"(c64)
+            : "memory"
+        );
+    }
+    if (bytes > 0) {
+        __asm__ volatile(
+            "rep stosb"
+            : "+D"(d), "+c"(bytes)
+            : "a"((unsigned char)c)
+            : "memory"
+        );
+    }
     return dest;
 }
 
@@ -311,14 +321,26 @@ void *memcpy(void *dest, const void *src, size_t n)
 {
     unsigned char *d = (unsigned char *)dest;
     const unsigned char *s = (const unsigned char *)src;
-    if ((((unsigned long)d | (unsigned long)s) & 7) == 0) {
-        unsigned long *d64 = (unsigned long *)d;
-        const unsigned long *s64 = (const unsigned long *)s;
-        while (n >= 8) { *d64++ = *s64++; n -= 8; }
-        d = (unsigned char *)d64;
-        s = (const unsigned char *)s64;
+
+    size_t qwords = n >> 3;
+    size_t bytes  = n & 7;
+
+    if (qwords > 0) {
+        __asm__ volatile(
+            "rep movsq"
+            : "+D"(d), "+S"(s), "+c"(qwords)
+            :
+            : "memory"
+        );
     }
-    while (n--) *d++ = *s++;
+    if (bytes > 0) {
+        __asm__ volatile(
+            "rep movsb"
+            : "+D"(d), "+S"(s), "+c"(bytes)
+            :
+            : "memory"
+        );
+    }
     return dest;
 }
 
@@ -327,8 +349,20 @@ void *memmove(void *dest, const void *src, size_t n)
     unsigned char *d = (unsigned char *)dest;
     const unsigned char *s = (const unsigned char *)src;
     if (d == s || n == 0) return dest;
-    if (d < s)       { while (n--) *d++ = *s++; }
-    else             { d += n; s += n; while (n--) *--d = *--s; }
+    if (d < s || d >= s + n) {
+        return memcpy(dest, src, n);
+    } else {
+        d += n - 1;
+        s += n - 1;
+        __asm__ volatile(
+            "std\n\t"
+            "rep movsb\n\t"
+            "cld"
+            : "+D"(d), "+S"(s), "+c"(n)
+            :
+            : "memory"
+        );
+    }
     return dest;
 }
 
@@ -371,3 +405,263 @@ void *memmem(const void *haystack, size_t haystacklen, const void *needle, size_
     }
     return NULL;
 }
+
+/* ── POSIX strings.h & libgen.h ─────────────────────────────────────────── */
+
+char *strsignal(int sig)
+{
+    switch (sig) {
+        case 1:  return "Hangup";
+        case 2:  return "Interrupt";
+        case 3:  return "Quit";
+        case 4:  return "Illegal instruction";
+        case 5:  return "Trace/breakpoint trap";
+        case 6:  return "Aborted";
+        case 7:  return "Bus error";
+        case 8:  return "Floating point exception";
+        case 9:  return "Killed";
+        case 10: return "User defined signal 1";
+        case 11: return "Segmentation fault";
+        case 12: return "User defined signal 2";
+        case 13: return "Broken pipe";
+        case 14: return "Alarm clock";
+        case 15: return "Terminated";
+        case 17: return "Child exited";
+        case 18: return "Continued";
+        case 19: return "Stopped (signal)";
+        case 20: return "Stopped";
+        case 23: return "Urgent I/O condition";
+        case 24: return "CPU time limit exceeded";
+        case 25: return "File size limit exceeded";
+        case 28: return "Window changed";
+        case 29: return "I/O possible";
+        default: return "Unknown signal";
+    }
+}
+
+void psignal(int sig, const char *s)
+{
+    if (s && *s) {
+        sys_write(2, s, strlen(s));
+        sys_write(2, ": ", 2);
+    }
+    const char *sig_str = strsignal(sig);
+    sys_write(2, sig_str, strlen(sig_str));
+    sys_write(2, "\n", 1);
+}
+
+size_t strlcpy(char *dst, const char *src, size_t size)
+{
+    size_t srclen = strlen(src);
+    if (size > 0) {
+        size_t copylen = (srclen >= size) ? size - 1 : srclen;
+        memcpy(dst, src, copylen);
+        dst[copylen] = '\0';
+    }
+    return srclen;
+}
+
+size_t strlcat(char *dst, const char *src, size_t size)
+{
+    size_t dstlen = strlen(dst);
+    size_t srclen = strlen(src);
+    if (dstlen >= size) return size + srclen;
+    size_t copylen = (dstlen + srclen >= size) ? size - dstlen - 1 : srclen;
+    memcpy(dst + dstlen, src, copylen);
+    dst[dstlen + copylen] = '\0';
+    return dstlen + srclen;
+}
+
+int strcoll(const char *s1, const char *s2)
+{
+    return strcmp(s1, s2);
+}
+
+size_t strxfrm(char *dest, const char *src, size_t n)
+{
+    size_t len = strlen(src);
+    if (n > 0) {
+        size_t c = (len >= n) ? n - 1 : len;
+        memcpy(dest, src, c);
+        dest[c] = '\0';
+    }
+    return len;
+}
+
+void *memccpy(void *dest, const void *src, int c, size_t n)
+{
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned char *d = (unsigned char *)dest;
+    unsigned char uc = (unsigned char)c;
+    for (size_t i = 0; i < n; i++) {
+        d[i] = s[i];
+        if (s[i] == uc) return d + i + 1;
+    }
+    return NULL;
+}
+
+int ffsl(long i)
+{
+    if (i == 0) return 0;
+    return __builtin_ffsl(i);
+}
+
+int ffsll(long long i)
+{
+    if (i == 0) return 0;
+    return __builtin_ffsll(i);
+}
+
+int ffs(int i)
+{
+    if (i == 0) return 0;
+    return __builtin_ffs(i);
+}
+
+void bzero(void *s, size_t n)
+{
+    memset(s, 0, n);
+}
+
+void bcopy(const void *src, void *dest, size_t n)
+{
+    memmove(dest, src, n);
+}
+
+int bcmp(const void *s1, const void *s2, size_t n)
+{
+    return memcmp(s1, s2, n);
+}
+
+char *index(const char *s, int c)
+{
+    return strchr(s, c);
+}
+
+char *rindex(const char *s, int c)
+{
+    return strrchr(s, c);
+}
+
+char *basename(char *path)
+{
+    static char s_dot[] = ".";
+    static char s_slash[] = "/";
+    if (!path || !*path) return s_dot;
+    size_t len = strlen(path);
+    while (len > 1 && path[len - 1] == '/') {
+        path[--len] = '\0';
+    }
+    if (len == 1 && path[0] == '/') return s_slash;
+    char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+char *dirname(char *path)
+{
+    static char s_dot[] = ".";
+    static char s_slash[] = "/";
+    if (!path || !*path) return s_dot;
+    size_t len = strlen(path);
+    while (len > 1 && path[len - 1] == '/') {
+        path[--len] = '\0';
+    }
+    if (len == 1 && path[0] == '/') return s_slash;
+    char *slash = strrchr(path, '/');
+    if (!slash) return s_dot;
+    if (slash == path) return s_slash;
+    *slash = '\0';
+    return path;
+}
+
+/* ── Wide character string helpers ───────────────────────────────────────── */
+
+#include "include/wchar.h"
+
+size_t wcslen(const wchar_t *s)
+{
+    size_t len = 0;
+    while (s && *s++) len++;
+    return len;
+}
+
+wchar_t *wcscpy(wchar_t *dest, const wchar_t *src)
+{
+    wchar_t *d = dest;
+    while ((*d++ = *src++));
+    return dest;
+}
+
+wchar_t *wcsncpy(wchar_t *dest, const wchar_t *src, size_t n)
+{
+    wchar_t *d = dest;
+    while (n && (*d++ = *src++)) n--;
+    while (n--) *d++ = 0;
+    return dest;
+}
+
+int wcscmp(const wchar_t *s1, const wchar_t *s2)
+{
+    while (*s1 && (*s1 == *s2)) { s1++; s2++; }
+    return *(const unsigned int *)s1 - *(const unsigned int *)s2;
+}
+
+int wcsncmp(const wchar_t *s1, const wchar_t *s2, size_t n)
+{
+    if (n == 0) return 0;
+    while (--n && *s1 && (*s1 == *s2)) { s1++; s2++; }
+    return *(const unsigned int *)s1 - *(const unsigned int *)s2;
+}
+
+size_t mbstowcs(wchar_t *dest, const char *src, size_t n)
+{
+    size_t count = 0;
+    while (count < n && *src) {
+        if (dest) dest[count] = (wchar_t)(unsigned char)*src;
+        src++;
+        count++;
+    }
+    if (count < n && dest) dest[count] = 0;
+    return count;
+}
+
+size_t wcstombs(char *dest, const wchar_t *src, size_t n)
+{
+    size_t count = 0;
+    while (count < n && *src) {
+        if (dest) dest[count] = (char)(*src & 0x7F);
+        src++;
+        count++;
+    }
+    if (count < n && dest) dest[count] = '\0';
+    return count;
+}
+
+size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps)
+{
+    (void)ps;
+    if (!s || n == 0) return 0;
+    if (!*s) return 0;
+    if (pwc) *pwc = (wchar_t)(unsigned char)*s;
+    return 1;
+}
+
+size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps)
+{
+    (void)ps;
+    if (!s) return 1;
+    *s = (char)(wc & 0x7F);
+    return 1;
+}
+
+int mbtowc(wchar_t *pwc, const char *s, size_t n)
+{
+    return (int)mbrtowc(pwc, s, n, NULL);
+}
+
+int wctomb(char *s, wchar_t wc)
+{
+    return (int)wcrtomb(s, wc, NULL);
+}
+
+

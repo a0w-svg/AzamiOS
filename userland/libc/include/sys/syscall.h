@@ -16,7 +16,6 @@ typedef long ssize_t;
 #define SYS_fstat         5
 #define SYS_lstat         6
 #define SYS_poll          7
-#define SYS_waitpid       7
 #define SYS_lseek         8
 #define SYS_mmap          9
 #define SYS_munmap        11
@@ -30,6 +29,7 @@ typedef long ssize_t;
 #define SYS_access        21
 #define SYS_pipe          22
 #define SYS_select        23
+#define SYS_sched_yield   24
 #define SYS_dup           32
 #define SYS_dup2          33
 #define SYS_pause         34
@@ -46,6 +46,7 @@ typedef long ssize_t;
 #define SYS_listen        50
 #define SYS_getsockname   51
 #define SYS_getpeername   52
+#define SYS_socketpair    53
 #define SYS_setsockopt    54
 #define SYS_getsockopt    55
 #define SYS_fork          57
@@ -63,6 +64,8 @@ typedef long ssize_t;
 #define SYS_rename        82
 #define SYS_mkdir         83
 #define SYS_rmdir         84
+#define SYS_creat         85
+#define SYS_link          86
 #define SYS_unlink        87
 #define SYS_symlink       88
 #define SYS_readlink      89
@@ -84,15 +87,45 @@ typedef long ssize_t;
 #define SYS_getppid       110
 #define SYS_getpgrp       111
 #define SYS_setsid        112
+#define SYS_utime         132
 #define SYS_statfs        137
 #define SYS_fstatfs       138
+#define SYS_mount         165
+#define SYS_umount2       166
 #define SYS_reboot        169
 #define SYS_time          201
 #define SYS_getdents64    217
 #define SYS_clock_gettime 228
 #define SYS_exit_group    231
+#define SYS_tgkill        234
+#define SYS_utimes        235
+#define SYS_waitid        247
+#define SYS_openat        257
+#define SYS_mkdirat       258
+#define SYS_fchownat      260
+#define SYS_fstatat       262
+#define SYS_unlinkat      263
+#define SYS_renameat      264
+#define SYS_linkat        265
+#define SYS_symlinkat     266
+#define SYS_readlinkat    267
+#define SYS_fchmodat      268
+#define SYS_faccessat     269
+#define SYS_pselect6      270
+#define SYS_ppoll         271
+#define SYS_set_robust_list 273
+#define SYS_utimensat     280
 #define SYS_dup3          292
 #define SYS_pipe2         293
+#define SYS_prlimit64     302
+#define SYS_renameat2     316
+#define SYS_getrandom     318
+#define SYS_getfacl       328
+#define SYS_setfacl       329
+#define SYS_statx         332
+#define SYS_rseq          334
+#define SYS_close_range   436
+#define SYS_faccessat2    439
 
 /* ── Azami-specific syscall numbers ───────────────────────────────────────── */
 #define SYS_AZ_CHANNEL_CREATE  512
@@ -111,7 +144,10 @@ typedef long ssize_t;
 #define SYS_AZ_SYSSTAT         525
 #define SYS_AZ_SHMEM_DESTROY   526
 #define SYS_AZ_SHMEM_UNMAP     527
+#define SYS_AZ_CHANNEL_DESTROY 528
 #define SYS_AZ_SET_TIMER       529
+#define SYS_AZ_THREAD_EXIT     530
+#define SYS_AZ_FB_FLIP         531
 
 struct stat;
 struct statfs;
@@ -142,6 +178,7 @@ int sys_fchmod(int fd, unsigned int mode);
 int sys_chown(const char *path, unsigned int uid, unsigned int gid);
 int sys_fchown(int fd, unsigned int uid, unsigned int gid);
 unsigned int sys_umask(unsigned int mask);
+int sys_link(const char *oldpath, const char *newpath);
 int sys_symlink(const char *target, const char *linkpath);
 ssize_t sys_readlink(const char *path, char *buf, size_t bufsiz);
 int sys_pipe(int pipefd[2]);
@@ -166,6 +203,19 @@ int sys_kill(int pid, int sig);
 int sys_uname(struct utsname *buf);
 int sys_sysinfo(struct sysinfo *info);
 int sys_reboot(int magic1, int magic2, int cmd, void *arg);
+int sys_openat(int dirfd, const char *path, int flags, int mode);
+int sys_mkdirat(int dirfd, const char *path, unsigned int mode);
+int sys_fstatat(int dirfd, const char *path, struct stat *statbuf, int flags);
+int sys_unlinkat(int dirfd, const char *path, int flags);
+ssize_t sys_readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz);
+int sys_faccessat(int dirfd, const char *path, int mode, int flags);
+int sys_fchmodat(int dirfd, const char *path, unsigned int mode, int flags);
+int sys_fchownat(int dirfd, const char *path, unsigned int uid, unsigned int gid, int flags);
+int sys_symlinkat(const char *target, int newdirfd, const char *linkpath);
+int sys_linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags);
+struct timespec;
+int sys_renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
+int sys_utimensat(int dirfd, const char *pathname, const struct timespec *times, int flags);
 
 
 /* ── Inline syscall wrappers (0–6 arguments) ──────────────────────────────── */

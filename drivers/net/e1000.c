@@ -10,9 +10,11 @@
 #include "e1000.h"
 #include "../../hal/pci.h"
 #include "../../hal/device.h"
+#include "../../hal/irq.h"
 #include "../../kernel/mm/pmm.h"
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/mm/vmm.h"
+#include "../../arch/x86_64/cpu/idt.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
 #include "../../drivers/char/console.h"
 #include "../../kernel/lib/string.h"
@@ -22,6 +24,7 @@
 static e1000_device_t g_e1000_dev;
 static spinlock_t     g_e1000_lock = SPINLOCK_INIT;
 static bool           g_e1000_ready = false;
+static void e1000_irq_handler(pt_regs_t *r, void *ctx);
 
 /* ── MMIO Helpers ────────────────────────────────────────────────────────── */
 
@@ -279,6 +282,16 @@ int e1000_init(void)
         return -1;
     }
 
+    /* Register ISR and enable IRQ */
+    if (g_e1000_dev.irq > 0) {
+        extern void idt_register_irq(u8 vector, void (*fn)(pt_regs_t *, void *), void *ctx);
+        idt_register_irq(g_e1000_dev.irq + 32, e1000_irq_handler, NULL);
+        hal_irq_enable(g_e1000_dev.irq, g_e1000_dev.irq + 32);
+    }
+
+    /* Enable interrupts in controller */
+    e1000_write32(E1000_IMS, E1000_IMS_RXT0 | E1000_IMS_RXO | E1000_IMS_LSC | E1000_IMS_TXDW);
+
     g_e1000_ready = true;
     g_e1000_dev.link_up = true;
 
@@ -297,6 +310,39 @@ int e1000_init(void)
     pr_debug("[E1000] Registered /dev/net0 network interface successfully.\n");
 
     return 0;
+}
+
+void e1000_poll_rx(void)
+{
+    if (!g_e1000_ready) return;
+
+    irqflags_t flags = spinlock_lock_irqsave(&g_e1000_lock);
+    while (g_e1000_dev.rx_descs[g_e1000_dev.rx_cur].status & E1000_RXD_STAT_DD) {
+        u32 cur = g_e1000_dev.rx_cur;
+        u16 len = g_e1000_dev.rx_descs[cur].length;
+        u8 *pkt = g_e1000_dev.rx_buffers[cur];
+
+        if (len > 0) {
+            extern void net_process_incoming(const u8 *pkt, size_t len);
+            net_process_incoming(pkt, len);
+        }
+
+        g_e1000_dev.rx_descs[cur].status = 0;
+        e1000_write32(E1000_RDT, cur);
+        g_e1000_dev.rx_cur = (cur + 1) % E1000_NUM_RX_DESC;
+    }
+    spinlock_unlock_irqrestore(&g_e1000_lock, flags);
+}
+
+static void e1000_irq_handler(pt_regs_t *r, void *ctx)
+{
+    (void)r; (void)ctx;
+    u32 icr = e1000_read32(E1000_ICR);
+    if (!icr) return;
+
+    if (icr & (E1000_ICR_RXT0 | E1000_ICR_RXO | E1000_ICR_LSC)) {
+        e1000_poll_rx();
+    }
 }
 
 s64 e1000_send_packet(const void *data, size_t len)

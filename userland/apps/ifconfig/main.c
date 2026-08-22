@@ -60,9 +60,9 @@ int main(int argc, char **argv)
         }
     }
 
-    unsigned char mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
-    unsigned char ip[4]  = { 10, 0, 2, 15 };
-    unsigned char nm[4]  = { 255, 255, 255, 0 };
+    unsigned char mac[6] = { 0, 0, 0, 0, 0, 0 };
+    unsigned char ip[4]  = { 0, 0, 0, 0 };
+    unsigned char nm[4]  = { 0, 0, 0, 0 };
 
     if (fd >= 0) {
         ioctl(fd, SIOCGIFHWADDR, (unsigned long)mac);

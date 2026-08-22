@@ -46,7 +46,6 @@ int virtio_pci_init_device(device_t *dev, virtio_pci_device_t *virtio_dev)
     while (cap_ptr != 0) {
         u8 cap_id = pci_config_read8(info->bus, info->slot, info->func, cap_ptr);
         if (cap_id == 0x09) { /* PCI_CAP_ID_VNDR */
-            u8 cap_len  = pci_config_read8(info->bus, info->slot, info->func, cap_ptr + 2);
             u8 cfg_type = pci_config_read8(info->bus, info->slot, info->func, cap_ptr + 3);
             u8 bar      = pci_config_read8(info->bus, info->slot, info->func, cap_ptr + 4);
             u32 offset  = pci_config_read32(info->bus, info->slot, info->func, cap_ptr + 8);

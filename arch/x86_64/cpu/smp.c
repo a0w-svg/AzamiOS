@@ -30,6 +30,8 @@ u32 smp_cpu_count(void)
     return g_cpu_count;
 }
 
+volatile bool g_smp_sched_active = false;
+
 void ap_c_entry(struct limine_smp_info *info)
 {
     if (!info) return;
@@ -53,10 +55,19 @@ void ap_c_entry(struct limine_smp_info *info)
     /* Initialize Local APIC on this CPU */
     lapic_init();
 
-    /* Apply SMEP / SMAP / NXE on AP */
+    /* Enable FPU & SSE/SSE2 on AP (clear EM/TS, set MP, OSFXSR, OSXMMEXCPT) */
+    u64 cr0 = read_cr0();
+    cr0 &= ~(1ULL << 2); /* clear EM */
+    cr0 &= ~(1ULL << 3); /* clear TS */
+    cr0 |=  (1ULL << 1); /* set MP */
+    write_cr0(cr0);
+
+    /* Apply OSFXSR / OSXMMEXCPT / SMEP / SMAP on AP */
     extern u8 g_smep_enabled;
     extern u8 g_smap_enabled;
     u64 cr4 = read_cr4();
+    cr4 |= (1ULL << 9);  /* OSFXSR */
+    cr4 |= (1ULL << 10); /* OSXMMEXCPT */
     if (g_smep_enabled) cr4 |= (1ULL << 20);
     if (g_smap_enabled) cr4 |= (1ULL << 21);
     write_cr4(cr4);
@@ -72,9 +83,17 @@ void ap_c_entry(struct limine_smp_info *info)
     /* Signal that this AP is online */
     __atomic_add_fetch(&g_aps_online, 1, __ATOMIC_SEQ_CST);
 
-    /* Enable interrupts and halt loop until scheduler starts */
-    cpu_sti();
-    for (;;) cpu_hlt();
+    /* Wait until BSP finishes early kernel initialization and activates scheduler */
+    while (!__atomic_load_n(&g_smp_sched_active, __ATOMIC_SEQ_CST)) {
+        cpu_pause();
+    }
+
+    /* Start Local APIC periodic preemption timer on this AP (100 Hz = 10ms tick) */
+    lapic_timer_start(100);
+
+    /* Start CFS scheduler on this AP */
+    extern void sched_start(void);
+    sched_start();
 }
 
 static void ap_entry(struct limine_smp_info *info)

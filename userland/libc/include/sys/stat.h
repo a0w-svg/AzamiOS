@@ -1,14 +1,11 @@
 /* ============================================================================
- * AzamiOS Userspace — File Status Header
+ * AzamiOS Userspace — File Status Header (sys/stat.h)
  * File: userland/libc/include/sys/stat.h
  * ============================================================================ */
 #pragma once
 
-#include <stdint.h>
-#include <stddef.h>
-
-typedef uint32_t mode_t;
-typedef int64_t  off_t;
+#include "types.h"
+#include "../time.h"
 
 #define S_IFMT      0170000
 #define S_IFSOCK    0140000
@@ -27,6 +24,10 @@ typedef int64_t  off_t;
 #define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
 #define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
+#define S_ISUID 04000
+#define S_ISGID 02000
+#define S_ISVTX 01000
+
 #define S_IRWXU 0700
 #define S_IRUSR 0400
 #define S_IWUSR 0200
@@ -41,6 +42,9 @@ typedef int64_t  off_t;
 #define S_IROTH 0004
 #define S_IWOTH 0002
 #define S_IXOTH 0001
+
+#define UTIME_NOW  ((1L << 30) - 1L)
+#define UTIME_OMIT ((1L << 30) - 2L)
 
 struct stat {
     uint64_t st_dev;
@@ -63,10 +67,19 @@ struct stat {
     int64_t  _unused[3];
 };
 
+struct timespec;
+
 int stat(const char *path, struct stat *statbuf);
 int fstat(int fd, struct stat *statbuf);
 int lstat(const char *path, struct stat *statbuf);
+int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags);
 int chmod(const char *path, mode_t mode);
 int fchmod(int fd, mode_t mode);
+int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags);
 int mkdir(const char *pathname, mode_t mode);
+int mkdirat(int dirfd, const char *pathname, mode_t mode);
+int mknod(const char *pathname, mode_t mode, dev_t dev);
+int mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev);
 mode_t umask(mode_t mask);
+int futimens(int fd, const struct timespec times[2]);
+int utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags);

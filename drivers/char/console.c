@@ -184,14 +184,29 @@ void kputs(const char *s)
     spinlock_unlock_irqrestore(&g_console_lock, irqf);
 }
 
-/* ── kprintf: minimal format string implementation ───────────────────────── */
-
-static void kprintf_puts(const char *s)
+static void kprintf_puts(const char *s, s32 prec, u32 width, bool left_align)
 {
-    while (*s) kputc(*s++);
+    if (!s) s = "(null)";
+    u32 slen = 0;
+    while (s[slen]) slen++;
+    if (prec >= 0 && (u32)prec < slen) slen = (u32)prec;
+
+    u32 pad_count = (width > slen) ? (width - slen) : 0;
+
+    if (!left_align) {
+        for (u32 i = 0; i < pad_count; i++) kputc(' ');
+    }
+
+    for (u32 i = 0; i < slen; i++) {
+        kputc(s[i]);
+    }
+
+    if (left_align) {
+        for (u32 i = 0; i < pad_count; i++) kputc(' ');
+    }
 }
 
-static void kprintf_u64(u64 v, u32 base, bool upper, u32 min_width, char pad)
+static void kprintf_u64(u64 v, u32 base, bool upper, u32 min_width, bool left_align, char pad)
 {
     static const char lo[] = "0123456789abcdef";
     static const char hi[] = "0123456789ABCDEF";
@@ -201,11 +216,16 @@ static void kprintf_u64(u64 v, u32 base, bool upper, u32 min_width, char pad)
     if (v == 0) { buf[len++] = '0'; }
     while (v) { buf[len++] = digits[v % base]; v /= base; }
     int pad_count = (min_width > (u32)len) ? (int)(min_width - len) : 0;
-    for (int i = 0; i < pad_count; i++) kputc(pad);
+    if (!left_align) {
+        for (int i = 0; i < pad_count; i++) kputc(pad);
+    }
     for (int i = len - 1; i >= 0; i--) kputc(buf[i]);
+    if (left_align) {
+        for (int i = 0; i < pad_count; i++) kputc(' ');
+    }
 }
 
-static void kprintf_s64(s64 v, u32 min_width, char pad)
+static void kprintf_s64(s64 v, u32 min_width, bool left_align, char pad)
 {
     bool neg = false;
     u64 uv;
@@ -225,13 +245,14 @@ static void kprintf_s64(s64 v, u32 min_width, char pad)
         kputc('-');
         for (int i = 0; i < pad_count; i++) kputc('0');
         for (int i = len - 1; i >= 0; i--) kputc(buf[i]);
-    } else if (neg) {
+    } else if (!left_align) {
         for (int i = 0; i < pad_count; i++) kputc(pad);
-        kputc('-');
+        if (neg) kputc('-');
         for (int i = len - 1; i >= 0; i--) kputc(buf[i]);
     } else {
-        for (int i = 0; i < pad_count; i++) kputc(pad);
+        if (neg) kputc('-');
         for (int i = len - 1; i >= 0; i--) kputc(buf[i]);
+        for (int i = 0; i < pad_count; i++) kputc(' ');
     }
 }
 
@@ -246,13 +267,20 @@ void kprintf(const char *fmt, ...)
         p++;
         if (!*p) break; /* Stop if string ends with % */
 
-        bool   is_long  = false;
-        bool   is_llong = false;
-        u32    width    = 0;
-        s32    prec     = -1;   /* -1 = no precision specified */
-        char   pad      = ' ';
+        bool   left_align = false;
+        bool   is_long    = false;
+        bool   is_llong   = false;
+        u32    width      = 0;
+        s32    prec       = -1;   /* -1 = no precision specified */
+        char   pad        = ' ';
 
-        if (*p == '0') { pad = '0'; p++; }
+        while (*p == '-' || *p == '+' || *p == '0' || *p == ' ') {
+            if (*p == '-') left_align = true;
+            else if (*p == '0') pad = '0';
+            p++;
+        }
+        if (left_align) pad = ' ';
+
         while (*p >= '0' && *p <= '9') { width = width * 10 + (u32)(*p - '0'); p++; }
         if (*p == '.') {
             p++;
@@ -261,6 +289,7 @@ void kprintf(const char *fmt, ...)
         }
         if (*p == 'l') { is_long  = true; p++; }
         if (*p == 'l') { is_llong = true; p++; }
+        if (*p == 'z') { is_long  = true; p++; }
         
         if (!*p) break; /* Stop if string ends prematurely after modifiers */
 
@@ -268,41 +297,36 @@ void kprintf(const char *fmt, ...)
         case 'd': case 'i': {
             s64 v = is_llong ? va_arg(ap, s64)
                              : (is_long ? va_arg(ap, long) : va_arg(ap, int));
-            kprintf_s64(v, width, pad);
+            kprintf_s64(v, width, left_align, pad);
             break;
         }
         case 'u': {
             u64 v = is_llong ? va_arg(ap, u64)
                              : (is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int));
-            kprintf_u64(v, 10, false, width, pad);
+            kprintf_u64(v, 10, false, width, left_align, pad);
             break;
         }
         case 'x': {
             u64 v = is_llong ? va_arg(ap, u64)
                              : (is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int));
-            kprintf_u64(v, 16, false, width, pad);
+            kprintf_u64(v, 16, false, width, left_align, pad);
             break;
         }
         case 'X': {
             u64 v = is_llong ? va_arg(ap, u64)
                              : (is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int));
-            kprintf_u64(v, 16, true, width, pad);
+            kprintf_u64(v, 16, true, width, left_align, pad);
             break;
         }
         case 'p': {
             uintptr_t v = (uintptr_t)va_arg(ap, void *);
-            kprintf_puts("0x");
-            kprintf_u64((u64)v, 16, false, 16, '0');
+            kprintf_puts("0x", -1, 0, false);
+            kprintf_u64((u64)v, 16, false, 16, false, '0');
             break;
         }
         case 's': {
             const char *s = va_arg(ap, const char *);
-            if (!s) s = "(null)";
-            if (prec >= 0) {
-                for (s32 i = 0; i < prec && s[i]; i++) kputc(s[i]);
-            } else {
-                kprintf_puts(s);
-            }
+            kprintf_puts(s, prec, width, left_align);
             break;
         }
         case 'c': kputc((char)va_arg(ap, int)); break;

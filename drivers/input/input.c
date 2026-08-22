@@ -346,94 +346,96 @@ static void mouse_irq_handler(pt_regs_t *r, void *ctx)
     /* NOTE: EOI is sent by isr_dispatch() via hal_irq_eoi() after this
      * handler returns. Do NOT call lapic_eoi() here. */
 
-    irqflags_t irqf = spinlock_lock_irqsave(&g_ps2_lock);
-    u8 status = inb(0x64);
-    if (!(status & 0x01) || !(status & 0x20)) {
-        /* Not a mouse byte or no data — spurious; isr_dispatch will still send EOI */
+    while (1) {
+        irqflags_t irqf = spinlock_lock_irqsave(&g_ps2_lock);
+        u8 status = inb(0x64);
+        if (!(status & 0x01) || !(status & 0x20)) {
+            /* No more mouse data in the output buffer */
+            spinlock_unlock_irqrestore(&g_ps2_lock, irqf);
+            break;
+        }
+
+        u8 data = inb(0x60);
         spinlock_unlock_irqrestore(&g_ps2_lock, irqf);
-        return;
-    }
 
-    u8 data = inb(0x60);
-    spinlock_unlock_irqrestore(&g_ps2_lock, irqf);
+        cpu_info_t *cpu = smp_get_cpu();
+        u32 now_ticks = cpu ? (u32)cpu->ticks : 0;
 
-    cpu_info_t *cpu = smp_get_cpu();
-    u32 now_ticks = cpu ? (u32)cpu->ticks : 0;
+        /* If > 10 ticks (100ms) elapsed mid-packet, reset to byte 0 to prevent permanent desync */
+        if (g_mouse_cycle != 0 && (now_ticks - g_last_mouse_tick) > 10) {
+            g_mouse_cycle = 0;
+        }
+        g_last_mouse_tick = now_ticks;
 
-    /* If > 3 ticks (30ms) elapsed mid-packet, reset to byte 0 to prevent permanent desync */
-    if (g_mouse_cycle != 0 && (now_ticks - g_last_mouse_tick) > 3) {
-        g_mouse_cycle = 0;
-    }
-    g_last_mouse_tick = now_ticks;
-
-    /* Discard out-of-sync packets (bit 3 must be 1, and overflow bits 6/7 must be 0 for byte 0) */
-    if (g_mouse_cycle == 0 && (!(data & 0x08) || (data & 0xC0))) {
-        return;
-    }
-
-    g_mouse_bytes[g_mouse_cycle] = data;
-    g_mouse_cycle = (g_mouse_cycle + 1) % g_mouse_packet_size;
-
-    if (g_mouse_cycle == 0) {
-        /* Full packet received */
-        u8  flags   = g_mouse_bytes[0];
-        s16 dx      = 0;
-        s16 dy      = 0;
-        s8  dz      = 0;
-        u8  buttons = flags & 0x07;
-
-        /* Sign extend 9-bit delta values */
-        if (!(flags & 0x40)) { /* Not X overflow */
-            if (flags & 0x10) {
-                dx = (s16)((u16)g_mouse_bytes[1] | 0xFF00);
-            } else {
-                dx = (s16)(g_mouse_bytes[1] & 0x00FF);
-            }
+        /* Discard out-of-sync packets (bit 3 must be 1, and overflow bits 6/7 must be 0 for byte 0) */
+        if (g_mouse_cycle == 0 && (!(data & 0x08) || (data & 0xC0))) {
+            continue;
         }
 
-        if (!(flags & 0x80)) { /* Not Y overflow */
-            if (flags & 0x20) {
-                dy = (s16)((u16)g_mouse_bytes[2] | 0xFF00);
-            } else {
-                dy = (s16)(g_mouse_bytes[2] & 0x00FF);
+        g_mouse_bytes[g_mouse_cycle] = data;
+        g_mouse_cycle = (g_mouse_cycle + 1) % g_mouse_packet_size;
+
+        if (g_mouse_cycle == 0) {
+            /* Full packet received */
+            u8  flags   = g_mouse_bytes[0];
+            s16 dx      = 0;
+            s16 dy      = 0;
+            s8  dz      = 0;
+            u8  buttons = flags & 0x07;
+
+            /* Sign extend 9-bit delta values */
+            if (!(flags & 0x40)) { /* Not X overflow */
+                if (flags & 0x10) {
+                    dx = (s16)((u16)g_mouse_bytes[1] | 0xFF00);
+                } else {
+                    dx = (s16)(g_mouse_bytes[1] & 0x00FF);
+                }
             }
-        }
 
-        /* PS/2 mouse Y is inverted (moving up is positive in PS/2, negative in screen space) */
-        dy = -dy;
-
-        /* Handle 4th byte for IntelliMouse / Explorer extensions */
-        if (g_mouse_packet_size == 4) {
-            u8 b4 = g_mouse_bytes[3];
-            if (g_mouse_id == 3) {
-                dz = (s8)b4;
-            } else if (g_mouse_id == 4) {
-                u8 z = b4 & 0x0F;
-                if (z & 0x08) dz = (s8)(z | 0xF0);
-                else dz = (s8)z;
-                if (b4 & 0x10) buttons |= MOUSE_BTN_4;
-                if (b4 & 0x20) buttons |= MOUSE_BTN_5;
+            if (!(flags & 0x80)) { /* Not Y overflow */
+                if (flags & 0x20) {
+                    dy = (s16)((u16)g_mouse_bytes[2] | 0xFF00);
+                } else {
+                    dy = (s16)(g_mouse_bytes[2] & 0x00FF);
+                }
             }
+
+            /* PS/2 mouse Y is inverted (moving up is positive in PS/2, negative in screen space) */
+            dy = -dy;
+
+            /* Handle 4th byte for IntelliMouse / Explorer extensions */
+            if (g_mouse_packet_size == 4) {
+                u8 b4 = g_mouse_bytes[3];
+                if (g_mouse_id == 3) {
+                    dz = (s8)b4;
+                } else if (g_mouse_id == 4) {
+                    u8 z = b4 & 0x0F;
+                    if (z & 0x08) dz = (s8)(z | 0xF0);
+                    else dz = (s8)z;
+                    if (b4 & 0x10) buttons |= MOUSE_BTN_4;
+                    if (b4 & 0x20) buttons |= MOUSE_BTN_5;
+                }
+            }
+
+            /* Update absolute position */
+            g_mouse_x += dx;
+            g_mouse_y += dy;
+            if (g_mouse_x < 0)    g_mouse_x = 0;
+            if (g_mouse_y < 0)    g_mouse_y = 0;
+            if (g_mouse_x > 4095) g_mouse_x = 4095;
+            if (g_mouse_y > 4095) g_mouse_y = 4095;
+
+            input_event_t evt;
+            __builtin_memset(&evt, 0, sizeof(evt));
+            evt.type          = INPUT_EVENT_MOUSE;
+            evt.mouse_dx      = dx;
+            evt.mouse_dy      = dy;
+            evt.mouse_dz      = dz;
+            evt.mouse_buttons = buttons;
+            evt.timestamp     = now_ticks;
+
+            queue_push(&evt);
         }
-
-        /* Update absolute position */
-        g_mouse_x += dx;
-        g_mouse_y += dy;
-        if (g_mouse_x < 0)    g_mouse_x = 0;
-        if (g_mouse_y < 0)    g_mouse_y = 0;
-        if (g_mouse_x > 4095) g_mouse_x = 4095;
-        if (g_mouse_y > 4095) g_mouse_y = 4095;
-
-        input_event_t evt;
-        __builtin_memset(&evt, 0, sizeof(evt));
-        evt.type          = INPUT_EVENT_MOUSE;
-        evt.mouse_dx      = dx;
-        evt.mouse_dy      = dy;
-        evt.mouse_dz      = dz;
-        evt.mouse_buttons = buttons;
-        evt.timestamp     = now_ticks;
-
-        queue_push(&evt);
     }
     /* EOI is handled by isr_dispatch() after this function returns */
 }
@@ -486,8 +488,8 @@ static void mouse_init(void)
         g_mouse_packet_size = 3;
     }
 
-    /* Set sample rate, resolution, and enable data reporting */
-    ps2_mouse_write(0xF3); ps2_mouse_write(100); /* Sample rate */
+    /* Set sample rate (200 Hz for ultra-smooth tracking), resolution, and enable data reporting */
+    ps2_mouse_write(0xF3); ps2_mouse_write(200); /* 200 Hz Sample rate */
     ps2_mouse_write(0xE8); ps2_mouse_write(3);   /* Resolution */
     ps2_mouse_write(0xF4);                       /* Enable data reporting */
 
@@ -519,8 +521,33 @@ static s64 input_fops_read(struct file *filp, void *buf, size_t len, u64 *offset
     return -(s64)EAGAIN;
 }
 
+static s64 mouse_fops_read(struct file *filp, void *buf, size_t len, u64 *offset)
+{
+    (void)filp; (void)offset;
+    if (!buf || len < 3) return -(s64)EINVAL;
+    
+    input_event_t evt;
+    while (input_poll(&evt) == 0) {
+        if (evt.type == INPUT_EVENT_MOUSE) {
+            u8 packet[3];
+            packet[0] = 0x08 | (evt.mouse_buttons & 0x07);
+            if (evt.mouse_dx < 0) packet[0] |= 0x10;
+            if (-evt.mouse_dy < 0) packet[0] |= 0x20;
+            packet[1] = (u8)(evt.mouse_dx & 0xFF);
+            packet[2] = (u8)(-evt.mouse_dy & 0xFF);
+            __builtin_memcpy(buf, packet, 3);
+            return 3;
+        }
+    }
+    return -(s64)EAGAIN;
+}
+
 static file_operations_t input_fops = {
     .read = input_fops_read,
+};
+
+static file_operations_t mouse_fops = {
+    .read = mouse_fops_read,
 };
 
 void input_init(void)
@@ -541,6 +568,9 @@ void input_init(void)
     keyboard_update_leds();
 
     devfs_register_device("input0", &input_fops, NULL);
+    devfs_register_device("event0", &input_fops, NULL);
+    devfs_register_device("psaux", &mouse_fops, NULL);
+    devfs_register_device("mice", &mouse_fops, NULL);
 
     pr_debug("[INPUT] PS/2 Keyboard (IRQ1) and Mouse (IRQ12) initialized\n");
 }

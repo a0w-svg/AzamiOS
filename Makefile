@@ -125,12 +125,26 @@ KERNEL_C_SRCS := \
     drivers/video/virtio_gpu.c \
     drivers/video/virtio_gpu_cmd.c \
     drivers/video/fbdev.c \
+    drivers/video/drm.c \
     hal/virtio_pci.c \
     hal/virtqueue.c \
     kernel/net/net.c \
+    kernel/net/net_buf.c \
+    kernel/net/arp.c \
+    kernel/net/ipv4.c \
+    kernel/net/icmp.c \
+    kernel/net/udp.c \
+    kernel/net/tcp.c \
+    kernel/net/socket.c \
+    kernel/net/dhcp.c \
     fs/pipe.c \
     fs/fat32.c \
-    fs/procfs.c
+    fs/procfs.c \
+    kernel/security/acl.c \
+    drivers/misc/virtio_rng.c \
+    drivers/net/pcnet.c \
+    drivers/block/fdc.c \
+    drivers/sound/hda.c
 
 # ── Object file lists ─────────────────────────────────────────────────────────
 BOOT_OBJS   := $(patsubst %.asm, $(OBJ_DIR)/%.o, $(BOOT_ASM_SRCS))
@@ -181,25 +195,29 @@ QEMU := qemu-system-x86_64
 DISPLAY_FLAG ?= 
 QEMU_FLAGS := \
     -M q35 \
-    -m 512M \
+    -m 1536M \
     -smp 4 \
     -cpu max,+rdrand,+rdseed \
     -serial stdio \
+    -vga std \
     $(DISPLAY_FLAG) \
     -no-reboot \
     -no-shutdown \
-    -drive file=hdd.img,format=raw,if=none,id=drv0 \
+    -drive file=hdd.img,format=raw,if=none,id=drv0,cache=writeback \
     -device ide-hd,drive=drv0,bus=ide.0 \
+    -netdev user,id=net0,net=10.0.2.0/24,dhcpstart=10.0.2.15 \
+    -device e1000,netdev=net0 \
     -audiodev pa,id=snd0 \
-    -device AC97,audiodev=snd0
+    -device AC97,audiodev=snd0 \
+    -device intel-hda -device hda-duplex,audiodev=snd0 \
+    -device virtio-rng-pci
 
-# Limine-based ISO run (headless serial terminal by default)
+# Limine-based ISO run (GUI window + serial terminal)
 run: iso
 	$(QEMU) $(QEMU_FLAGS) -cdrom $(BUILD_DIR)/AzamiOS.iso
 
-# Graphical GUI window run (opens QEMU display + serial output)
-run-gui: iso
-	$(QEMU) $(QEMU_FLAGS) DISPLAY_FLAG="-vga std" -cdrom $(BUILD_DIR)/AzamiOS.iso || $(QEMU) -M q35 -m 512M -smp 4 -cpu max,+rdrand,+rdseed -serial stdio -vga std -cdrom $(BUILD_DIR)/AzamiOS.iso
+# Graphical GUI window run
+run-gui: run
 
 # Direct ELF run (for quick iteration, no Limine — uses -kernel quirk)
 run-direct: $(KERNEL_ELF)
@@ -231,7 +249,7 @@ iso: $(KERNEL_ELF) | tools/limine
 	@mkdir -p $(BUILD_DIR)/iso_root/boot/limine
 	@mkdir -p $(BUILD_DIR)/iso_root/EFI/BOOT
 	@$(MAKE) -C userland ARCH=x86_64 >/dev/null
-	@mke2fs -F -t ext2 -d userland/build $(BUILD_DIR)/initrd.ext2 16M >/dev/null 2>&1 || true
+	@mke2fs -F -t ext2 -b 4096 -d userland/build $(BUILD_DIR)/initrd.ext2 120M
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso_root/boot/kernel.elf
 	cp $(BUILD_DIR)/initrd.ext2 $(BUILD_DIR)/iso_root/boot/initrd.ext2 2>/dev/null || true
 	cp limine.conf   $(BUILD_DIR)/iso_root/boot/limine/limine.conf
@@ -266,7 +284,7 @@ hdd.img:
 	@mkdir -p hdd_root
 	@printf "Welcome to AzamiOS Persistent Storage!\n\nThis file is saved directly to the SATA drive (AHCI).\nEdit this text and press Ctrl+S to save it persistently!\n" > hdd_root/notes.txt
 	@truncate -s 4096 hdd_root/notes.txt
-	@mke2fs -F -t ext2 -d hdd_root hdd.img 2M >/dev/null 2>&1 || true
+	@mke2fs -F -t ext2 -d hdd_root hdd.img 32M >/dev/null 2>&1 || true
 
 # ── Userspace (pass-through to original targets) ─────────────────────────────
 userland/libc/libc.a:

@@ -39,6 +39,10 @@ u64 console_get_klog_size(void);
 
 #ifdef CONFIG_DEBUG_LOGS
 #define kdebug(...) kprintf("[DEBUG] " __VA_ARGS__)
+#define pr_debug(fmt, ...) kprintf(fmt, ##__VA_ARGS__)
 #else
 #define kdebug(...) do {} while(0)
+#ifndef pr_debug
+#define pr_debug(fmt, ...) do {} while(0)
+#endif
 #endif

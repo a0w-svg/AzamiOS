@@ -30,6 +30,7 @@ static s64 pipe_read(file_t *filp, void *buf, size_t len, u64 *offset)
     if (!pipe || !buf) return -(s64)EINVAL;
     if (len == 0) return 0;
 
+    bool nonblock = !!(filp->f_flags & O_NONBLOCK);
     u8 *dst = (u8 *)buf;
     size_t bytes_read = 0;
 
@@ -58,6 +59,12 @@ static s64 pipe_read(file_t *filp, void *buf, size_t len, u64 *offset)
             return 0; /* EOF */
         }
 
+        /* POSIX-08: return EAGAIN immediately if O_NONBLOCK is set */
+        if (nonblock) {
+            spinlock_unlock(&pipe->lock);
+            return (bytes_read > 0) ? (s64)bytes_read : -(s64)EAGAIN;
+        }
+
         /* Block receiver */
         thread_t *curr = sched_current_thread();
         pipe_wait_push(&pipe->read_wait, curr);
@@ -74,6 +81,7 @@ static s64 pipe_write(file_t *filp, const void *buf, size_t len, u64 *offset)
     if (!pipe || !buf) return -(s64)EINVAL;
     if (len == 0) return 0;
 
+    bool nonblock = !!(filp->f_flags & O_NONBLOCK);
     const u8 *src = (const u8 *)buf;
     size_t bytes_written = 0;
 
@@ -101,10 +109,19 @@ static s64 pipe_write(file_t *filp, const void *buf, size_t len, u64 *offset)
             if (bytes_written == len) {
                 return (s64)bytes_written;
             }
+            /* Partial write — loop to write the rest */
+            if (nonblock) return (s64)bytes_written;
             continue;
         }
 
-        /* Buffer is full: block sender */
+        /* Buffer is full */
+        /* POSIX-08: return EAGAIN immediately if O_NONBLOCK is set */
+        if (nonblock) {
+            spinlock_unlock(&pipe->lock);
+            return (bytes_written > 0) ? (s64)bytes_written : -(s64)EAGAIN;
+        }
+
+        /* Block sender */
         thread_t *curr = sched_current_thread();
         pipe_wait_push(&pipe->write_wait, curr);
         spinlock_unlock(&pipe->lock);
@@ -132,6 +149,7 @@ static s64 pipe_read_release(struct inode *inode, file_t *filp)
     spinlock_unlock(&pipe->lock);
 
     if (should_free) {
+        if (filp->f_inode) kfree(filp->f_inode);
         kfree(pipe);
     }
     return 0;
@@ -156,6 +174,7 @@ static s64 pipe_write_release(struct inode *inode, file_t *filp)
     spinlock_unlock(&pipe->lock);
 
     if (should_free) {
+        if (filp->f_inode) kfree(filp->f_inode);
         kfree(pipe);
     }
     return 0;
@@ -189,23 +208,37 @@ int pipe_create(file_t **read_file, file_t **write_file)
     pipe->read_wait = NULL;
     pipe->write_wait = NULL;
 
+    inode_t *pinode = (inode_t *)kzalloc(sizeof(inode_t));
+    if (!pinode) {
+        kfree(pipe);
+        return -(s64)ENOMEM;
+    }
+    pinode->i_mode = S_IFIFO | 0600;
+    pinode->i_size = 0;
+    pinode->i_blocks = 0;
+    pinode->i_ino = (u64)(uintptr_t)pipe;
+
     file_t *rf = (file_t *)kzalloc(sizeof(file_t));
     if (!rf) {
+        kfree(pinode);
         kfree(pipe);
         return -(s64)ENOMEM;
     }
     file_t *wf = (file_t *)kzalloc(sizeof(file_t));
     if (!wf) {
         kfree(rf);
+        kfree(pinode);
         kfree(pipe);
         return -(s64)ENOMEM;
     }
 
+    rf->f_inode = pinode;
     rf->f_op = &pipe_read_fops;
     rf->f_flags = O_RDONLY;
     rf->f_count = 1;
     rf->private_data = pipe;
 
+    wf->f_inode = pinode;
     wf->f_op = &pipe_write_fops;
     wf->f_flags = O_WRONLY;
     wf->f_count = 1;

@@ -346,7 +346,7 @@ static dentry_t *fat32_lookup(inode_t *dir, dentry_t *dentry)
                 }
                 name[nlen] = '\0';
 
-                if (strcmp(dentry->d_name, name) == 0) {
+                if (strcasecmp(dentry->d_name, name) == 0) {
                     inode_t *inode = (inode_t *)kzalloc(sizeof(inode_t));
                     fat32_node_data_t *child_nd = (fat32_node_data_t *)kzalloc(sizeof(fat32_node_data_t));
                     if (inode && child_nd) {

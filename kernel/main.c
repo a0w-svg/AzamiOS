@@ -198,16 +198,23 @@ void kernel_main(void)
     /* ── Step 15: NT-Style Object Manager Namespace ──────────────────────── */
     az_object_manager_init();
 
+    extern void acl_init(void);
+    acl_init();
+
     /* ── Step 16: Hardware Abstraction Layer (Device Tree + PCI) ──────────── */
     hal_init();
-    extern int ata_init(void);
-    ata_init();
     block_ahci_init();
+
+    extern int fdc_init(void);
+    fdc_init();
 
     /* Probe VirtIO and legacy PCI devices */
     extern int virtio_blk_init(device_t *dev);
     extern int virtio_net_init(device_t *dev);
     extern int virtio_gpu_init(device_t *dev);
+    extern int virtio_rng_init(device_t *dev);
+    extern int pcnet_init(device_t *dev);
+    extern int hda_init(device_t *dev);
     extern int e1000_init(void);
     extern int rtl8139_init(void);
     extern void net_init(void);
@@ -219,12 +226,19 @@ void kernel_main(void)
             virtio_blk_init(child);
             virtio_net_init(child);
             virtio_gpu_init(child);
+            virtio_rng_init(child);
+            pcnet_init(child);
+            hda_init(child);
             child = child->sibling;
         }
     }
 
     extern void bga_init(void);
     bga_init();
+    extern void fbdev_init(void);
+    fbdev_init();
+    extern void drm_init(void);
+    drm_init();
     ac97_init();
 
     /* Initialize Network Interface Drivers & Stack */
@@ -272,7 +286,8 @@ void kernel_main(void)
         pr_debug("[INITRD] No initrd module passed by Limine.\n");
     }
 
-    if (vfs_mount("sata0", "/hdd", "ext2", NULL) == 0) {
+    vfs_mkdir("/hdd", 0755);
+    if (vfs_mount("sata0", "/hdd", "ext2", NULL) == 0 || vfs_mount("hda", "/hdd", "ext2", NULL) == 0) {
         pr_debug("[STORAGE] Mounted persistent SATA drive to /hdd\n");
     } else {
         pr_debug("[STORAGE] Warning: Failed to mount sata0 to /hdd\n");
@@ -302,6 +317,10 @@ void kernel_main(void)
 
     /* Enable Local APIC periodic timer for scheduler preemption (vec 48) */
     lapic_timer_start(100); /* 100 Hz = 10 ms tick */
+
+    /* Signal all APs to start their local APIC timer and enter the CFS scheduler */
+    extern volatile bool g_smp_sched_active;
+    __atomic_store_n(&g_smp_sched_active, true, __ATOMIC_SEQ_CST);
 
     /* Start scheduling on the bootstrap processor (never returns) */
     sched_start();

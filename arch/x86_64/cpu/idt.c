@@ -5,12 +5,15 @@
 
 #include "idt.h"
 #include "gdt.h"     /* SEL_KERNEL_CODE */
+#include "smp.h"     /* smp_get_cpu */
 #include "pic.h"     /* pic_eoi() */
 #include "../../../drivers/char/console.h"
 #include "../../../include/azami/defs.h"
 #include "../../../hal/irq.h"
 #include "../../../kernel/uaccess.h"
 #include "../../../kernel/sched/sched.h"
+#include "../../../kernel/mm/pmm.h"
+#include "../mm/vmm.h"
 
 /* ── IDT storage (256 entries × 16 bytes = 4 KB, page-aligned) ───────────── */
 static idt_entry_t g_idt[256] __aligned(4096);
@@ -126,13 +129,16 @@ void idt_init(void)
 
     /* LAPIC timer */
     idt_set_gate(48,  (uintptr_t)isr_48,  IST_NONE, 0, IDT_TYPE_INT_GATE);
+    /* SMP Reschedule IPI */
+    extern void isr_49(void);
+    idt_set_gate(49,  (uintptr_t)isr_49,  IST_NONE, 0, IDT_TYPE_INT_GATE);
     /* TLB shootdown IPI */
     idt_set_gate(251, (uintptr_t)isr_251, IST_NONE, 0, IDT_TYPE_INT_GATE);
     /* LAPIC spurious */
     idt_set_gate(255, (uintptr_t)isr_255, IST_NONE, 0, IDT_TYPE_INT_GATE);
 
     /* Fill any remaining gates with isr_0 as a safe fallback */
-    for (int v = 49; v <= 250; v++) {
+    for (int v = 50; v <= 250; v++) {
         if (g_idt[v].offset_low == 0)
             idt_set_gate((u8)v, (uintptr_t)isr_0, IST_NONE, 0, IDT_TYPE_INT_GATE);
     }
@@ -163,6 +169,19 @@ void isr_dispatch(pt_regs_t *r)
     if (vec == 48) { /* Timer */
         extern void sched_tick(pt_regs_t *r);
         sched_tick(r);
+        if ((r->cs & 3) != 0) {
+            sched_check_reschedule();
+        }
+        return;
+    }
+
+    /* Handle SMP Reschedule IPI (49) */
+    if (vec == 49) {
+        extern void lapic_eoi(void);
+        lapic_eoi();
+        if ((r->cs & 3) != 0) {
+            sched_check_reschedule();
+        }
         return;
     }
 
@@ -188,12 +207,46 @@ void isr_dispatch(pt_regs_t *r)
             uintptr_t fault_addr = 0;
             if (vec == 14) {
                 __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
-                kprintf("[FAULT] User process '%s' (PID %u) terminated due to #PF at RIP=0x%016llx, CR2=0x%016llx (err=0x%llx)\n",
+
+                /* Demand-paged User Stack Expansion (Linux-standard 8MB user stack region) */
+                if ((r->err_code & 1) == 0 && fault_addr >= 0x00007ff000000000ULL && fault_addr < 0x00007fffffffe000ULL && proc) {
+                    phys_addr_t new_page = pmm_alloc_page();
+                    if (new_page) {
+                        __builtin_memset((void *)PHYS_TO_VIRT(new_page), 0, PAGE_SIZE);
+                        vmm_map(proc->pml4_phys, ALIGN_DOWN(fault_addr, PAGE_SIZE), new_page, VMM_USER_RW);
+                        return; /* Resumed user thread with expanded stack */
+                    }
+                }
+
+                u64 ucr3;
+                __asm__ volatile("mov %%cr3, %0" : "=r"(ucr3));
+                u64 *upml4 = (u64 *)PHYS_TO_VIRT(ucr3 & ~0xFFFULL);
+                u64 upml4e = upml4[(fault_addr >> 39) & 0x1FF];
+                u64 updpte = 0, upde = 0, upte = 0;
+                if (upml4e & 1) {
+                    u64 *updpt = (u64 *)PHYS_TO_VIRT(upml4e & 0x000FFFFFFFFFF000ULL);
+                    updpte = updpt[(fault_addr >> 30) & 0x1FF];
+                    if (updpte & 1) {
+                        u64 *upd = (u64 *)PHYS_TO_VIRT(updpte & 0x000FFFFFFFFFF000ULL);
+                        upde = upd[(fault_addr >> 21) & 0x1FF];
+                        if (upde & 1) {
+                            u64 *upt = (u64 *)PHYS_TO_VIRT(upde & 0x000FFFFFFFFFF000ULL);
+                            upte = upt[(fault_addr >> 12) & 0x1FF];
+                        }
+                    }
+                }
+                kprintf("[FAULT] User process '%s' (PID %u) terminated due to #PF at RIP=0x%016llx, CR2=0x%016llx (err=0x%llx)\n"
+                        "        CR3=0x%llx PML4E=0x%llx PDPTE=0x%llx PDE=0x%llx PTE=0x%llx\n",
                         proc ? proc->name : "unknown",
                         proc ? proc->pid : 0,
                         (unsigned long long)r->rip,
                         (unsigned long long)fault_addr,
-                        (unsigned long long)r->err_code);
+                        (unsigned long long)r->err_code,
+                        (unsigned long long)ucr3,
+                        (unsigned long long)upml4e,
+                        (unsigned long long)updpte,
+                        (unsigned long long)upde,
+                        (unsigned long long)upte);
             } else {
                 kprintf("[FAULT] User process '%s' (PID %u) terminated due to %s (vec=%llu) at RIP=0x%016llx (err=0x%llx)\n",
                         proc ? proc->name : "unknown",
@@ -205,6 +258,26 @@ void isr_dispatch(pt_regs_t *r)
             sys_exit_impl(r);
             return;
         }
+
+        kprintf("[ISR] Kernel Exception %llu (%s)  err=0x%016llx\n"
+                "  RIP=0x%016llx  CS=0x%llx  RFLAGS=0x%016llx\n"
+                "  RAX=0x%016llx  RBX=0x%016llx  RCX=0x%016llx  RDX=0x%016llx\n"
+                "  RSI=0x%016llx  RDI=0x%016llx  RBP=0x%016llx  RSP=0x%016llx\n"
+                "  R8 =0x%016llx  R9 =0x%016llx  R10=0x%016llx  R11=0x%016llx\n"
+                "  R12=0x%016llx  R13=0x%016llx  R14=0x%016llx  R15=0x%016llx\n",
+                (unsigned long long)vec, name,
+                (unsigned long long)r->err_code,
+                (unsigned long long)r->rip,
+                (unsigned long long)r->cs,
+                (unsigned long long)r->rflags,
+                (unsigned long long)r->rax,  (unsigned long long)r->rbx,
+                (unsigned long long)r->rcx,  (unsigned long long)r->rdx,
+                (unsigned long long)r->rsi,  (unsigned long long)r->rdi,
+                (unsigned long long)r->rbp,  (unsigned long long)r->rsp,
+                (unsigned long long)r->r8,   (unsigned long long)r->r9,
+                (unsigned long long)r->r10,  (unsigned long long)r->r11,
+                (unsigned long long)r->r12,  (unsigned long long)r->r13,
+                (unsigned long long)r->r14,  (unsigned long long)r->r15);
 
         if (vec == 14) {
             /* Kernel-mode #PF: read CR2 and dump page table walk */
@@ -260,6 +333,14 @@ void isr_dispatch(pt_regs_t *r)
                 (unsigned long long)r->r12,  (unsigned long long)r->r13,
                 (unsigned long long)r->r14,  (unsigned long long)r->r15);
 
+        kprintf("  Stack dump at RSP=0x%016llx:\n", (unsigned long long)r->rsp);
+        u64 *s = (u64 *)r->rsp;
+        if (s && ((uintptr_t)s >= 0xffff800000000000ULL)) {
+            for (int i = 0; i < 8; i++) {
+                kprintf("    [RSP+%02x] = 0x%016llx\n", i * 8, (unsigned long long)s[i]);
+            }
+        }
+
         kernel_panic("Unhandled CPU exception %llu (%s)", (unsigned long long)vec, name);
 
     } else {
@@ -271,5 +352,6 @@ void isr_dispatch(pt_regs_t *r)
 
         /* Send EOI */
         hal_irq_eoi((u8)vec);
+        sched_check_reschedule();
     }
 }

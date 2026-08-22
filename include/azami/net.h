@@ -5,6 +5,8 @@
 #pragma once
 
 #include "types.h"
+#include "net_buf.h"
+#include "arp.h"
 
 #define ETH_ALEN 6
 #define ETH_P_IP  0x0800
@@ -76,6 +78,10 @@ typedef struct net_device {
 #define SIOCSIFADDR     0x8916
 #define SIOCGIFNETMASK  0x891b
 #define SIOCSIFNETMASK  0x891c
+#define SIOCGIFGW       0x891d
+#define SIOCSIFGW       0x891e
+#define SIOCGIFDNS      0x891f
+#define SIOCSIFDNS      0x8921
 #define SIOCGIFNAME     0x8920
 #define SIOCGIFPING     0x8930
 
@@ -89,4 +95,10 @@ void net_get_ip(u8 ip_out[4]);
 void net_set_ip(const u8 ip_in[4]);
 void net_get_netmask(u8 mask_out[4]);
 void net_set_netmask(const u8 mask_in[4]);
+void net_get_gateway(u8 gw_out[4]);
+void net_set_gateway(const u8 gw_in[4]);
+void net_get_dns(u8 dns_out[4]);
+void net_set_dns(const u8 dns_in[4]);
 int  net_ioctl(u32 cmd, u64 arg);
+u16  net_checksum(const void *data, size_t len);
+s64  net_send_raw(const void *data, size_t len);

@@ -96,6 +96,10 @@ int az_fb_info(az_fb_info_t *info);
 /** az_fb_map(virt_addr) — Map the hardware framebuffer at the given address. Returns 0 or negative errno. */
 int az_fb_map(void *virt_addr);
 
+/** az_fb_flip(buffer_index) — Zero-copy hardware flip between display buffer 0 and 1. Returns 0 or negative errno. */
+int az_fb_flip(unsigned int buffer_index);
+
+
 /* ── Process API ──────────────────────────────────────────────────────────── */
 
 /** az_spawn(path) — Spawn a new process from an ELF binary. Returns child PID or negative errno. */

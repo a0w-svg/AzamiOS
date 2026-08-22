@@ -42,12 +42,40 @@
 #define TRAY_M    8   /* tray right margin */
 
 /* Window button geometry (pill-shaped) */
-#define WB_ORIGIN  (SB_X + SB_W + 12)
 #define WB_W       140
 #define WB_H        40
 #define WB_GAP       5
 #define WB_MAX        12  /* maximum visible window buttons before overflow */
 #define WB_RADIUS     8   /* pill corner radius */
+
+/* Quick Launch Dock */
+typedef struct {
+    char glyph;
+    const char *label;
+    const char *path;
+    unsigned int color;
+} dock_app_t;
+
+static const dock_app_t g_dock_apps[] = {
+    { 'T', "Terminal",    "/bin/terminal.elf",    0xFFA6E3A1 }, /* Green */
+    { 'F', "Files",       "/bin/filemanager.elf", 0xFFF9E2AF }, /* Yellow */
+    { 'E', "Editor",      "/bin/texteditor.elf",  0xFF89B4FA }, /* Blue */
+    { 'C', "Calc",        "/bin/calculator.elf",  0xFFFAB387 }, /* Peach */
+    { 'P', "Paint",       "/bin/paint.elf",       0xFFCBA6F7 }, /* Mauve */
+    { 'A', "Audio",       "/bin/audioplayer.elf", 0xFFF38BA8 }, /* Flamingo/Pink */
+    { 'S', "Settings",    "/bin/settings.elf",    0xFF74C7EC }, /* Sapphire */
+    { 'M', "Sysmon",      "/bin/sysmon.elf",      0xFF94E2D5 }, /* Teal */
+    { 'X', "XClock",      "/bin/xclock.elf",      0xFF89DCEB }, /* Sky */
+    { 'Y', "XEyes",       "/bin/xeyes.elf",       0xFFF5C2E7 }, /* Pink */
+    { 'K', "XCalc",       "/bin/xcalc.elf",       0xFFF9E2AF }, /* Yellow */
+    { 'G', "XDemo",       "/bin/xgui_demo.elf",   0xFFB4BEFE }, /* Lavender */
+};
+#define NUM_DOCK_APPS ((int)(sizeof(g_dock_apps) / sizeof(g_dock_apps[0])))
+#define DOCK_X        (SB_X + SB_W + 12)
+#define DOCK_BTN_W    30
+#define DOCK_BTN_H    36
+#define DOCK_GAP      4
+#define WB_ORIGIN     (DOCK_X + NUM_DOCK_APPS * (DOCK_BTN_W + DOCK_GAP) + 8)
 
 /* ── Catppuccin Mocha palette (ARGB) ────────────────────────────────────────── */
 #define C_BG          0xFF0A0A14  /* deeper than crust — premium dark panel      */
@@ -106,101 +134,29 @@ static unsigned int  g_win_count  = 0;
 static unsigned int  g_focus_wid  = 0;
 static int           g_overflow   = 0;
 
+/* Volume state */
+static int           g_vol_level = 80; /* 0..100 */
+static int           g_vol_muted = 0;
+
 /* ── Real-time clock (Bug 3 fix) ─────────────────────────────────────────── */
-struct tb_timespec {
-    long tv_sec;
-    long tv_nsec;
-};
-
-static int tb_clock_gettime(struct tb_timespec *ts)
-{
-    /* SYS_clock_gettime = 228, CLOCK_REALTIME = 0 */
-    unsigned long ret;
-    __asm__ volatile ("syscall"
-        : "=a"(ret)
-        : "a"(228UL), "D"(0UL), "S"((unsigned long)ts)
-        : "rcx", "r11", "memory");
-    return (int)(long)ret;
-}
-
-/* Decode a unix timestamp into HH:MM and day-of-week/date components */
-static void tb_decode_time(long unix_sec, int *out_h, int *out_m,
-                            int *out_wday, int *out_mday, int *out_mon)
-{
-    /* Days since epoch: 1970-01-01 was a Thursday (wday=4) */
-    long days    = unix_sec / 86400;
-    long rem_sec = unix_sec % 86400;
-    if (rem_sec < 0) { rem_sec += 86400; days--; }
-
-    *out_h = (int)(rem_sec / 3600);
-    *out_m = (int)((rem_sec % 3600) / 60);
-
-    /* Simplified Gregorian calendar */
-    *out_wday = (int)((days + 4) % 7);  /* 0=Sun */
-
-    long y = 1970;
-    while (1) {
-        int leap = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0);
-        long days_y = leap ? 366 : 365;
-        if (days < days_y) break;
-        days -= days_y;
-        y++;
-    }
-    static const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    int leap2 = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0);
-    int mon = 0;
-    while (mon < 12) {
-        int md = mdays[mon] + (mon == 1 && leap2 ? 1 : 0);
-        if (days < md) break;
-        days -= md;
-        mon++;
-    }
-    *out_mon  = mon + 1;
-    *out_mday = (int)days + 1;
-}
-
-static const char *g_day_names[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-static const char *g_mon_names[12] = {"Jan","Feb","Mar","Apr","May","Jun",
-                                       "Jul","Aug","Sep","Oct","Nov","Dec"};
+#include "../../libc/include/time.h"
 
 /* Build "HH:MM" string */
 static void tb_build_clock(char buf[6])
 {
-    struct tb_timespec ts;
-    int h = 0, m = 0;
-    if (tb_clock_gettime(&ts) == 0) {
-        int wday, mday, mon;
-        tb_decode_time(ts.tv_sec, &h, &m, &wday, &mday, &mon);
-    }
-    buf[0] = '0' + (char)(h / 10);
-    buf[1] = '0' + (char)(h % 10);
-    buf[2] = ':';
-    buf[3] = '0' + (char)(m / 10);
-    buf[4] = '0' + (char)(m % 10);
-    buf[5] = '\0';
+    time_t t = time(NULL);
+    struct tm tm_info;
+    localtime_r(&t, &tm_info);
+    snprintf(buf, 6, "%02d:%02d", tm_info.tm_hour, tm_info.tm_min);
 }
 
-/* Build "Mon 14" date string */
+/* Build "Mon Jan 14" date string */
 static void tb_build_date(char *buf, int max)
 {
-    struct tb_timespec ts;
-    if (tb_clock_gettime(&ts) != 0) {
-        buf[0] = '-'; buf[1] = '\0'; return;
-    }
-    int h, m, wday, mday, mon;
-    tb_decode_time(ts.tv_sec, &h, &m, &wday, &mday, &mon);
-    (void)h; (void)m;
-    const char *dn = g_day_names[wday < 7 ? wday : 0];
-    const char *mn = g_mon_names[(mon >= 1 && mon <= 12) ? mon - 1 : 0];
-    int i = 0;
-    buf[i++] = dn[0]; buf[i++] = dn[1]; buf[i++] = dn[2];
-    buf[i++] = ' ';
-    buf[i++] = mn[0]; buf[i++] = mn[1]; buf[i++] = mn[2];
-    buf[i++] = ' ';
-    if (mday >= 10) buf[i++] = '0' + (char)(mday / 10);
-    buf[i++] = '0' + (char)(mday % 10);
-    buf[i] = '\0';
-    (void)max;
+    time_t t = time(NULL);
+    struct tm tm_info;
+    localtime_r(&t, &tm_info);
+    strftime(buf, max, "%a %b %e", &tm_info);
 }
 
 /* ── Drawing primitives ──────────────────────────────────────────────────────── */
@@ -489,7 +445,23 @@ static void taskbar_draw(void)
     tb_draw_wifi(tray_start_x + 8, SB_Y + 12, C_WIFI);
 
     /* Sound / Volume icon */
-    tb_draw_sound(tray_start_x + 24, SB_Y + 12, 0xFFF9E2AF);
+    unsigned int snd_col = g_vol_muted ? 0xFFF38BA8 : 0xFFF9E2AF;
+    tb_draw_sound(tray_start_x + 24, SB_Y + 12, snd_col);
+
+    /* Mini Volume Level Bar (3 segment bars) */
+    if (!g_vol_muted) {
+        int bars = (g_vol_level * 3) / 100;
+        if (bars < 1 && g_vol_level > 0) bars = 1;
+        if (bars >= 1) tb_fill_rect(tray_start_x + 39, SB_Y + 18, 2, 4, 0xFFA6E3A1);
+        if (bars >= 2) tb_fill_rect(tray_start_x + 42, SB_Y + 15, 2, 7, 0xFFA6E3A1);
+        if (bars >= 3) tb_fill_rect(tray_start_x + 45, SB_Y + 12, 2, 10, 0xFFA6E3A1);
+    } else {
+        /* X mark on sound icon */
+        tb_put_pixel(tray_start_x + 39, SB_Y + 14, 0xFFF38BA8);
+        tb_put_pixel(tray_start_x + 41, SB_Y + 16, 0xFFF38BA8);
+        tb_put_pixel(tray_start_x + 39, SB_Y + 16, 0xFFF38BA8);
+        tb_put_pixel(tray_start_x + 41, SB_Y + 14, 0xFFF38BA8);
+    }
 
     /* Clock text "HH:MM" (large, right-aligned) */
     char clk[6];
@@ -591,9 +563,46 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
         return;
     }
 
-    /* Left-click on Tray Clock / Calendar area → launch Clock & Calendar widget */
+    /* Left-click on Quick Launch Dock icons */
+    if (lclick) {
+        for (int i = 0; i < NUM_DOCK_APPS; i++) {
+            int btn_x = DOCK_X + i * (DOCK_BTN_W + DOCK_GAP);
+            int btn_y = SB_Y + 2;
+            if (lx >= btn_x && lx < btn_x + DOCK_BTN_W && ly >= btn_y && ly < btn_y + DOCK_BTN_H) {
+                az_wm_msg_t lmsg;
+                memset(&lmsg, 0, sizeof(lmsg));
+                lmsg.type = AZ_WM_LAUNCH_APP;
+                az_wm_launch_payload_t *pl = AZ_WM_MSG_LAUNCH(&lmsg);
+                const char *path = g_dock_apps[i].path;
+                unsigned int j;
+                for (j = 0; j < AZ_WM_LAUNCH_PATH_MAX - 1 && path[j]; j++)
+                    pl->path[j] = path[j];
+                pl->path[j] = '\0';
+                az_channel_send(g_srv, (az_ipc_msg_t *)&lmsg);
+                taskbar_draw();
+                return;
+            }
+        }
+    }
+
+    /* Left-click on Tray Sound / Volume area → cycle volume / toggle mute */
     int tray_start_x = (int)g_w - TRAY_W - TRAY_M;
-    if (lclick && lx >= tray_start_x && lx < (int)g_w) {
+    if (lclick && lx >= tray_start_x + 20 && lx < tray_start_x + 50) {
+        if (g_vol_muted) {
+            g_vol_muted = 0;
+        } else if (g_vol_level >= 100) {
+            g_vol_muted = 1;
+            g_vol_level = 0;
+        } else {
+            g_vol_level = (g_vol_level + 25);
+            if (g_vol_level > 100) g_vol_level = 100;
+        }
+        taskbar_draw();
+        return;
+    }
+
+    /* Left-click on Tray Clock / Calendar area → launch Clock & Calendar widget */
+    if (lclick && lx >= tray_start_x + 50 && lx < (int)g_w) {
         az_wm_msg_t lmsg;
         memset(&lmsg, 0, sizeof(lmsg));
         lmsg.type = AZ_WM_LAUNCH_APP;

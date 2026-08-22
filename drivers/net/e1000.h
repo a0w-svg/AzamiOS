@@ -55,6 +55,23 @@
 #define E1000_TCTL_CT_SHIFT 4       /* Collision Threshold */
 #define E1000_TCTL_COLD_SHIFT 12    /* Collision Distance */
 
+/* ── Interrupt Bits (ICR / IMS / IMC) ─────────────────────────────────────── */
+#define E1000_ICR_TXDW   (1 << 0)
+#define E1000_ICR_TXQE   (1 << 1)
+#define E1000_ICR_LSC    (1 << 2)
+#define E1000_ICR_RXSEQ  (1 << 3)
+#define E1000_ICR_RXDMT0 (1 << 4)
+#define E1000_ICR_RXO    (1 << 6)
+#define E1000_ICR_RXT0   (1 << 7)
+
+#define E1000_IMS_TXDW   (1 << 0)
+#define E1000_IMS_TXQE   (1 << 1)
+#define E1000_IMS_LSC    (1 << 2)
+#define E1000_IMS_RXSEQ  (1 << 3)
+#define E1000_IMS_RXDMT0 (1 << 4)
+#define E1000_IMS_RXO    (1 << 6)
+#define E1000_IMS_RXT0   (1 << 7)
+
 /* ── Descriptors ─────────────────────────────────────────────────────────── */
 typedef struct __attribute__((packed)) {
     u64 addr;
@@ -106,5 +123,6 @@ typedef struct {
 int  e1000_init(void);
 s64  e1000_send_packet(const void *data, size_t len);
 s64  e1000_recv_packet(void *buf, size_t max_len);
+void e1000_poll_rx(void);
 void e1000_get_mac(u8 mac_out[6]);
 bool e1000_is_link_up(void);

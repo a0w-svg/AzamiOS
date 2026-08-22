@@ -183,20 +183,31 @@ static process_t *find_proc_by_pid(u32 pid)
 
 static size_t format_pid_status(u32 pid, char *buf, size_t max)
 {
-    process_t *p = find_proc_by_pid(pid);
-    if (!p) return (size_t)snprintf(buf, max, "State: X (dead)\n");
-
-    const char *state_str = p->is_zombie ? "Z (zombie)" : "R (running)";
-    u32 ppid = p->parent ? p->parent->pid : 0;
+    char name[32] = "process";
+    char state_str[16] = "R (running)";
+    u32 ppid = 0;
     u32 thread_cnt = 0;
-    for (thread_t *t = p->threads; t; t = t->proc_next) thread_cnt++;
+    u64 vmsize_kb = 64;
+    bool found = false;
 
-    u64 vmsize_kb = 0;
-    if (p->heap_end >= p->heap_start) {
-        vmsize_kb = (p->heap_end - p->heap_start) / 1024 + 64;
-    } else {
-        vmsize_kb = 64;
+    sched_lock();
+    process_t *p = find_proc_by_pid(pid);
+    if (p) {
+        found = true;
+        if (p->name[0]) {
+            strncpy(name, p->name, sizeof(name) - 1);
+            name[sizeof(name) - 1] = '\0';
+        }
+        if (p->is_zombie) strcpy(state_str, "Z (zombie)");
+        if (p->parent) ppid = p->parent->pid;
+        for (thread_t *t = p->threads; t; t = t->proc_next) thread_cnt++;
+        if (p->heap_end >= p->heap_start) {
+            vmsize_kb = (p->heap_end - p->heap_start) / 1024 + 64;
+        }
     }
+    sched_unlock();
+
+    if (!found) return (size_t)snprintf(buf, max, "State: X (dead)\n");
 
     return (size_t)snprintf(buf, max,
         "Name:   %s\n"
@@ -206,26 +217,47 @@ static size_t format_pid_status(u32 pid, char *buf, size_t max)
         "PPid:   %u\n"
         "Threads:%u\n"
         "VmSize: %8llu kB\n",
-        p->name[0] ? p->name : "process",
-        state_str, p->pid, p->pid, ppid, thread_cnt, (unsigned long long)vmsize_kb);
+        name, state_str, pid, pid, ppid, thread_cnt, (unsigned long long)vmsize_kb);
 }
 
 static size_t format_pid_cmdline(u32 pid, char *buf, size_t max)
 {
+    char name[32] = "";
+    sched_lock();
     process_t *p = find_proc_by_pid(pid);
-    if (!p) return 0;
-    return (size_t)snprintf(buf, max, "%s\n", p->name[0] ? p->name : "");
+    if (p && p->name[0]) {
+        strncpy(name, p->name, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+    }
+    sched_unlock();
+    return (size_t)snprintf(buf, max, "%s\n", name);
 }
 
 static size_t format_pid_stat(u32 pid, char *buf, size_t max)
 {
+    char name[32] = "app";
+    char state = 'R';
+    u32 ppid = 0;
+    bool found = false;
+
+    sched_lock();
     process_t *p = find_proc_by_pid(pid);
-    if (!p) return 0;
-    char state = p->is_zombie ? 'Z' : 'R';
-    u32 ppid = p->parent ? p->parent->pid : 0;
+    if (p) {
+        found = true;
+        if (p->name[0]) {
+            strncpy(name, p->name, sizeof(name) - 1);
+            name[sizeof(name) - 1] = '\0';
+        }
+        if (p->is_zombie) state = 'Z';
+        if (p->parent) ppid = p->parent->pid;
+    }
+    sched_unlock();
+
+    if (!found) return 0;
+
     return (size_t)snprintf(buf, max,
         "%u (%s) %c %u 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        p->pid, p->name[0] ? p->name : "app", state, ppid);
+        pid, name, state, ppid);
 }
 
 /* --------------------------------------------------------------------------
@@ -261,7 +293,10 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
                 if (name[i] < '0' || name[i] > '9') { is_num = false; break; }
                 pid = pid * 10 + (u32)(name[i] - '0');
             }
-            if (is_num && pid > 0 && find_proc_by_pid(pid)) {
+            sched_lock();
+            bool proc_exists = (find_proc_by_pid(pid) != NULL);
+            sched_unlock();
+            if (is_num && pid > 0 && proc_exists) {
                 dentry->d_inode = procfs_alloc_inode(dir->i_sb, 1000 + pid, S_IFDIR | 0555, PROCFS_TYPE_PID_DIR, pid);
             }
         }

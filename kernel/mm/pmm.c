@@ -321,6 +321,9 @@ void pmm_free(phys_addr_t phys, u32 order)
 
 static u32 pages_to_order(size_t count)
 {
+    if (count > (1UL << PMM_MAX_ORDER)) {
+        return (u32)-1;
+    }
     u32 order = 0;
     while ((1UL << order) < count && order < PMM_MAX_ORDER) {
         order++;
@@ -331,7 +334,9 @@ static u32 pages_to_order(size_t count)
 phys_addr_t pmm_alloc_pages(size_t page_count)
 {
     if (page_count == 0) return 0;
-    return pmm_alloc(pages_to_order(page_count));
+    u32 order = pages_to_order(page_count);
+    if (order > PMM_MAX_ORDER) return 0;
+    return pmm_alloc(order);
 }
 
 phys_addr_t pmm_alloc_32(u32 order)
@@ -346,7 +351,7 @@ phys_addr_t pmm_alloc_32(u32 order)
         free_block_t *curr = g_free_list[found];
         while (curr) {
             phys_addr_t phys = VIRT_TO_PHYS((uintptr_t)curr);
-            if (phys + ((phys_addr_t)(PAGE_SIZE << order)) <= 0xFFFFFFFFULL) {
+            if (phys + ((phys_addr_t)(PAGE_SIZE << found)) <= 0x100000000ULL) {
                 target_blk = curr;
                 break;
             }
@@ -382,13 +387,17 @@ phys_addr_t pmm_alloc_32(u32 order)
 phys_addr_t pmm_alloc_pages_32(size_t page_count)
 {
     if (page_count == 0) return 0;
-    return pmm_alloc_32(pages_to_order(page_count));
+    u32 order = pages_to_order(page_count);
+    if (order > PMM_MAX_ORDER) return 0;
+    return pmm_alloc_32(order);
 }
 
 void pmm_free_pages(phys_addr_t phys, size_t page_count)
 {
     if (phys == 0 || page_count == 0) return;
-    pmm_free(phys, pages_to_order(page_count));
+    u32 order = pages_to_order(page_count);
+    if (order > PMM_MAX_ORDER) return;
+    pmm_free(phys, order);
 }
 
 u64 pmm_get_free_pages(void)  { return g_free_frames;  }

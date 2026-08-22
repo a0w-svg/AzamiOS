@@ -21,6 +21,12 @@ typedef unsigned long irqflags_t;
 
 #define SPINLOCK_INIT  { 0, 0 }   /* ticket=0, serving=0 */
 
+static __always_inline void spinlock_init(spinlock_t *l)
+{
+    __atomic_store_n(&l->ticket, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&l->serving, 0U, __ATOMIC_RELAXED);
+}
+
 /**
  * spinlock_lock(lock) — Acquire the spinlock (busy-wait with pause).
  * Does NOT save or modify interrupt flags.

@@ -19,6 +19,10 @@
 #define O_APPEND    0x0400
 #define O_NONBLOCK  0x0800
 #define O_DIRECTORY 0x10000
+#define O_CLOEXEC   0x80000
+
+/* File descriptor flags */
+#define FD_CLOEXEC  1
 
 /* lseek origins */
 #define SEEK_SET    0
@@ -182,7 +186,8 @@ typedef struct file {
     inode_t *f_inode;
     file_operations_t *f_op;
     u64 f_pos;
-    u32 f_flags;
+    u32 f_flags;    /* Open-file-description flags (O_RDONLY/O_RDWR, O_NONBLOCK, ...) */
+    u32 f_fd_flags; /* Per-FD flags: FD_CLOEXEC (1) — not shared across dup/fork */
     u32 f_mode;
     u32 f_count; /* Reference count */
     void *private_data; /* Used by drivers/filesystems for state */
@@ -222,6 +227,7 @@ s64 vfs_path_lookup(const char *path, dentry_t **out_dentry);
 
 /* System Call Implementations (Internal to fs/vfs.c but exposed to syscall.c) */
 file_t *vfs_open(const char *path, u32 flags, u32 mode);
+file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno);
 s64 vfs_close(file_t *file);
 s64 vfs_read(file_t *file, void *buf, size_t size);
 s64 vfs_write(file_t *file, const void *buf, size_t size);

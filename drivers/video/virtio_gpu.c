@@ -9,9 +9,11 @@
 #include "../../kernel/mm/kmalloc.h"
 #include "../../kernel/mm/pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
+#include "../../arch/x86_64/cpu/spinlock.h"
 #include <azami/debug.h>
 
 virtio_gpu_state_t g_gpu;
+static spinlock_t g_gpu_lock = SPINLOCK_INIT;
 
 int virtio_gpu_send_command(virtio_gpu_state_t *gpu, void *cmd, u32 cmd_size, void *resp, u32 resp_size)
 {
@@ -22,8 +24,11 @@ int virtio_gpu_send_command(virtio_gpu_state_t *gpu, void *cmd, u32 cmd_size, vo
     u32 lens[2] = {cmd_size, resp_size};
     bool is_write[2] = {false, true}; /* Device reads cmd, writes resp */
 
+    irqflags_t flags = spinlock_lock_irqsave(&g_gpu_lock);
+
     int cookie = 1;
     if (virtqueue_add_chain(gpu->controlq, addrs, lens, is_write, 2, (void *)(uintptr_t)cookie) < 0) {
+        spinlock_unlock_irqrestore(&g_gpu_lock, flags);
         pr_debug("[VIRTIO-GPU] Failed to add command to virtqueue\n");
         return -1;
     }
@@ -38,6 +43,8 @@ int virtio_gpu_send_command(virtio_gpu_state_t *gpu, void *cmd, u32 cmd_size, vo
         /* In a real OS we'd yield or wait for an interrupt here */
         __asm__ volatile("pause");
     }
+
+    spinlock_unlock_irqrestore(&g_gpu_lock, flags);
 
     struct virtio_gpu_ctrl_hdr *hdr = (struct virtio_gpu_ctrl_hdr *)resp;
     if (hdr->type >= VIRTIO_GPU_RESP_ERR_UNSPEC) {

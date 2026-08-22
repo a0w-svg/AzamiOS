@@ -57,17 +57,72 @@ int az_shmem_destroy(int shmem_id)
     return (int)syscall1(SYS_AZ_SHMEM_DESTROY, (long)shmem_id);
 }
 
+#include "include/fcntl.h"
+#include "include/unistd.h"
+#include "include/sys/ioctl.h"
+#include "include/sys/mman.h"
+#include "include/linux/fb.h"
+
 /* ── Framebuffer ──────────────────────────────────────────────────────────── */
 
 int az_fb_info(az_fb_info_t *info)
 {
+    if (!info) return -1;
+    int fd = open("/dev/fb0", O_RDONLY);
+    if (fd >= 0) {
+        struct fb_var_screeninfo var;
+        struct fb_fix_screeninfo fix;
+        if (ioctl(fd, FBIOGET_VSCREENINFO, &var) == 0 &&
+            ioctl(fd, FBIOGET_FSCREENINFO, &fix) == 0) {
+            info->width  = var.xres;
+            info->height = var.yres;
+            info->pitch  = fix.line_length;
+            info->bpp    = var.bits_per_pixel;
+            close(fd);
+            return 0;
+        }
+        close(fd);
+    }
     return (int)syscall1(SYS_AZ_FB_INFO, (long)info);
 }
 
 int az_fb_map(void *virt_addr)
 {
+    int fd = open("/dev/fb0", O_RDWR);
+    if (fd >= 0) {
+        struct fb_var_screeninfo var;
+        struct fb_fix_screeninfo fix;
+        if (ioctl(fd, FBIOGET_VSCREENINFO, &var) == 0 &&
+            ioctl(fd, FBIOGET_FSCREENINFO, &fix) == 0) {
+            size_t len = (size_t)(fix.line_length * (var.yres_virtual ? var.yres_virtual : var.yres * 2));
+            if (len == 0) len = (size_t)var.xres * var.yres * 4 * 2;
+            int flags = MAP_SHARED;
+            if (virt_addr) flags |= MAP_FIXED;
+            void *m = mmap(virt_addr, len, PROT_READ | PROT_WRITE, flags, fd, 0);
+            close(fd);
+            if (m != MAP_FAILED) return 0;
+        }
+        close(fd);
+    }
     return (int)syscall1(SYS_AZ_FB_MAP, (long)virt_addr);
 }
+
+int az_fb_flip(unsigned int buffer_index)
+{
+    int fd = open("/dev/fb0", O_RDWR);
+    if (fd >= 0) {
+        struct fb_var_screeninfo var;
+        if (ioctl(fd, FBIOGET_VSCREENINFO, &var) == 0) {
+            var.yoffset = buffer_index * var.yres;
+            int ret = ioctl(fd, FBIOPAN_DISPLAY, &var);
+            close(fd);
+            if (ret == 0) return 0;
+        }
+        close(fd);
+    }
+    return (int)syscall1(SYS_AZ_FB_FLIP, (long)buffer_index);
+}
+
 
 /* ── Process Management ───────────────────────────────────────────────────── */
 

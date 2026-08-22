@@ -5,6 +5,7 @@
 
 #include "../../libc/include/stdio.h"
 #include "../../libc/include/stdlib.h"
+#include "../../libc/include/unistd.h"
 #include "../../libc/include/sys/syscall.h"
 #include "../../libc/include/az/ipc.h"
 
@@ -31,7 +32,7 @@ int main(int argc, char **argv)
 
     /* ── PID 1 Idle & Zombie Reaper Loop ─────────────────────────────────── */
     for (;;) {
-        az_yield();
+        sleep(1);
     }
 
     return 0;

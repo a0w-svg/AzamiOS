@@ -14,32 +14,24 @@
 static inline void de_log(const char *msg)
 {
     if (!msg) return;
-    int fd = sys_open("/session.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd >= 0) {
-        size_t len = 0;
-        while (msg[len]) len++;
-        sys_write(fd, msg, len);
-        sys_write(fd, "\n", 1);
-        sys_close(fd);
-    }
+    size_t len = 0;
+    while (msg[len]) len++;
+    sys_write(1, msg, len);
+    sys_write(1, "\n", 1);
 }
 
 static inline void de_log_fmt(const char *prefix, const char *msg)
 {
     if (!prefix && !msg) return;
-    int fd = sys_open("/session.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd >= 0) {
-        if (prefix) {
-            size_t plen = 0;
-            while (prefix[plen]) plen++;
-            sys_write(fd, prefix, plen);
-        }
-        if (msg) {
-            size_t mlen = 0;
-            while (msg[mlen]) mlen++;
-            sys_write(fd, msg, mlen);
-        }
-        sys_write(fd, "\n", 1);
-        sys_close(fd);
+    if (prefix) {
+        size_t plen = 0;
+        while (prefix[plen]) plen++;
+        sys_write(1, prefix, plen);
     }
+    if (msg) {
+        size_t mlen = 0;
+        while (msg[mlen]) mlen++;
+        sys_write(1, msg, mlen);
+    }
+    sys_write(1, "\n", 1);
 }

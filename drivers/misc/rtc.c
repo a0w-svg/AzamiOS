@@ -152,7 +152,7 @@ u64 rtc_to_unix_time(const rtc_time_t *t)
     }
     u64 days = (365 * y) + (y / 4) - (y / 100) + (y / 400);
     days += (306 * (m + 1)) / 10;
-    days += d - 719528; /* Unix epoch adjustment */
+    days += d - 719591; /* Unix epoch adjustment (1970-01-01) */
     
     return days * 86400 + t->hour * 3600 + t->minute * 60 + t->second;
 }

@@ -3,7 +3,7 @@
  * File: kernel/ipc/ipc.c
  * ============================================================================ */
 
-#define DEBUG 1
+#define DEBUG 0
 #include <azami/debug.h>
 #include "ipc.h"
 #include "../mm/kmalloc.h"
@@ -342,6 +342,7 @@ s64 ipc_shmem_map(ipc_shmem_t *shmem, process_t *target_proc, virt_addr_t virt_a
 
     target_proc->shmem_maps[slot].shmem_id = shmem->shmem_id;
     target_proc->shmem_maps[slot].virt_addr = virt_addr;
+    target_proc->shmem_maps[slot].shmem_ptr = (void *)shmem;
     __atomic_add_fetch(&shmem->refcount, 1, __ATOMIC_SEQ_CST);
     spinlock_unlock(&g_ipc_lock);
 
@@ -409,10 +410,11 @@ s64 ipc_shmem_unmap(ipc_shmem_t *shmem, process_t *target_proc, virt_addr_t virt
     spinlock_lock(&g_ipc_lock);
     bool found = false;
     for (int i = 0; i < MAX_SHMEM_PER_PROC; i++) {
-        if (target_proc->shmem_maps[i].shmem_id == shmem->shmem_id &&
+        if (target_proc->shmem_maps[i].shmem_ptr == (void *)shmem &&
             target_proc->shmem_maps[i].virt_addr == virt_addr) {
             target_proc->shmem_maps[i].shmem_id = 0;
             target_proc->shmem_maps[i].virt_addr = 0;
+            target_proc->shmem_maps[i].shmem_ptr = NULL;
             found = true;
             break;
         }
@@ -433,14 +435,11 @@ s64 ipc_shmem_unmap(ipc_shmem_t *shmem, process_t *target_proc, virt_addr_t virt
 void ipc_shmem_unmap_all(process_t *proc)
 {
     if (!proc) return;
-    /* We must loop over MAX_SHMEM_PER_PROC and if mapped, find the shmem_id and unmap it */
     for (int i = 0; i < MAX_SHMEM_PER_PROC; i++) {
-        if (proc->shmem_maps[i].shmem_id != 0) {
-            ipc_shmem_t *shmem = ipc_shmem_find(proc->shmem_maps[i].shmem_id);
-            if (shmem) {
-                ipc_shmem_unmap(shmem, proc, proc->shmem_maps[i].virt_addr);
-                ipc_shmem_put(shmem); /* Balance the refcount bump from ipc_shmem_find() */
-            }
+        if (proc->shmem_maps[i].shmem_ptr != NULL) {
+            ipc_shmem_t *shmem = (ipc_shmem_t *)proc->shmem_maps[i].shmem_ptr;
+            virt_addr_t vaddr = proc->shmem_maps[i].virt_addr;
+            ipc_shmem_unmap(shmem, proc, vaddr);
         }
     }
 }

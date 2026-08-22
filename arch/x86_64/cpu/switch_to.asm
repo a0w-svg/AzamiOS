@@ -11,6 +11,26 @@ bits 64
 section .text
 
 global switch_to_asm
+global fpu_save_asm
+global fpu_restore_asm
+
+; void fpu_save_asm(void *fpu_state);
+; RDI = pointer to 16-byte aligned 512-byte area
+fpu_save_asm:
+    test rdi, rdi
+    jz .done_save
+    fxsave64 [rdi]
+.done_save:
+    ret
+
+; void fpu_restore_asm(const void *fpu_state);
+; RDI = pointer to 16-byte aligned 512-byte area
+fpu_restore_asm:
+    test rdi, rdi
+    jz .done_restore
+    fxrstor64 [rdi]
+.done_restore:
+    ret
 
 switch_to_asm:
     ; Push callee-saved (non-volatile) System V AMD64 registers onto current stack

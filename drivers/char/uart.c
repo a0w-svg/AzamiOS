@@ -265,6 +265,44 @@ static s64 uart_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
             spinlock_unlock(&p->lock);
             return 0;
         }
+        case 0x5401: { /* TCGETS */
+            if (!arg || arg >= 0x8000000000000000ULL) return -1;
+            struct {
+                u32 c_iflag;
+                u32 c_oflag;
+                u32 c_cflag;
+                u32 c_lflag;
+                u8  c_line;
+                u8  c_cc[32];
+                u32 c_ispeed;
+                u32 c_ospeed;
+            } term;
+            __builtin_memset(&term, 0, sizeof(term));
+            term.c_iflag = 0x0500;
+            term.c_oflag = 0x0005;
+            term.c_cflag = 0x00BF;
+            term.c_lflag = 0x8A3B;
+            term.c_ispeed = 38400;
+            term.c_ospeed = 38400;
+            if (copy_to_user((void *)arg, &term, sizeof(term)) != 0) return -1;
+            return 0;
+        }
+        case 0x5402:   /* TCSETS */
+        case 0x5403:   /* TCSETSW */
+        case 0x5404:   /* TCSETSF */
+        case 0x5414:   /* TIOCSWINSZ */
+            return 0;
+        case 0x5413: { /* TIOCGWINSZ */
+            if (!arg || arg >= 0x8000000000000000ULL) return -1;
+            struct {
+                u16 ws_row;
+                u16 ws_col;
+                u16 ws_xpixel;
+                u16 ws_ypixel;
+            } ws = { .ws_row = 25, .ws_col = 80, .ws_xpixel = 640, .ws_ypixel = 400 };
+            if (copy_to_user((void *)arg, &ws, sizeof(ws)) != 0) return -1;
+            return 0;
+        }
         default:
             return -1;
     }

@@ -9,6 +9,7 @@
 #include "../../kernel/mm/kmalloc.h"
 #include "../../drivers/char/console.h"
 #include "../../drivers/misc/rtc.h"
+#include "../../arch/x86_64/cpu/spinlock.h"
 
 /* Forward declarations */
 static s64 ext2_mount(file_system_type_t *fs_type, const char *dev_name, const char *dir_name, void *data);
@@ -22,6 +23,8 @@ static s64 ext2_unlink(struct inode *dir, struct dentry *dentry);
 static s64 ext2_rmdir(struct inode *dir, struct dentry *dentry);
 static s64 ext2_rename(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry);
 static s64 ext2_symlink(struct inode *dir, struct dentry *dentry, const char *symname);
+static s64 ext2_readlink(struct dentry *dentry, char *buf, size_t bufsiz);
+static u32 ext2_get_pblk(struct inode *inode, u32 lblk, bool allocate);
 
 
 static inode_operations_t ext2_inode_ops = {
@@ -32,6 +35,7 @@ static inode_operations_t ext2_inode_ops = {
     .rmdir = ext2_rmdir,
     .rename = ext2_rename,
     .symlink = ext2_symlink,
+    .readlink = ext2_readlink,
 };
 
 static file_operations_t ext2_file_ops = {
@@ -40,16 +44,89 @@ static file_operations_t ext2_file_ops = {
     .readdir = ext2_file_readdir,
 };
 
+#define EXT2_BCACHE_BUCKETS 256
+#define EXT2_BCACHE_WAYS    4
+
+typedef struct {
+    ext2_fs_info_t *fs;
+    u32 block;
+    bool valid;
+    bool dirty;
+    u32 access_count;
+    u8 data[4096];
+} ext2_bcache_slot_t;
+
+static ext2_bcache_slot_t g_ext2_bcache[EXT2_BCACHE_BUCKETS][EXT2_BCACHE_WAYS];
+static u32 g_ext2_bcache_timer = 0;
+static spinlock_t g_ext2_bcache_lock = SPINLOCK_INIT;
+
+static inline u32 ext2_bcache_hash(ext2_fs_info_t *fs, u32 block)
+{
+    return (u32)(((uintptr_t)fs ^ block ^ (block >> 8)) % EXT2_BCACHE_BUCKETS);
+}
+
 static s64 ext2_read_block(ext2_fs_info_t *fs, u32 block, void *buf)
 {
+    if (!fs || !fs->bdev || !fs->bdev->ops || !fs->bdev->ops->read_sectors) return -(s64)EINVAL;
+    
+    u32 bucket = ext2_bcache_hash(fs, block);
+    u32 min_access = 0xFFFFFFFF;
+    int lru_way = 0;
+    
+    spinlock_lock(&g_ext2_bcache_lock);
+    for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
+        ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
+        if (slot->valid && slot->fs == fs && slot->block == block) {
+            slot->access_count = ++g_ext2_bcache_timer;
+            __builtin_memcpy(buf, slot->data, fs->block_size);
+            spinlock_unlock(&g_ext2_bcache_lock);
+            return 0;
+        }
+        if (!slot->valid) {
+            lru_way = way;
+            min_access = 0;
+        } else if (slot->access_count < min_access) {
+            min_access = slot->access_count;
+            lru_way = way;
+        }
+    }
+    
+    ext2_bcache_slot_t *victim = &g_ext2_bcache[bucket][lru_way];
     u64 lba = (u64)block * (fs->block_size / fs->bdev->sector_size);
     u32 count = fs->block_size / fs->bdev->sector_size;
-    return fs->bdev->ops->read_sectors(fs->bdev, lba, count, buf);
+    s64 ret = fs->bdev->ops->read_sectors(fs->bdev, lba, count, victim->data);
+    if (ret < 0) {
+        spinlock_unlock(&g_ext2_bcache_lock);
+        return ret;
+    }
+    
+    victim->fs = fs;
+    victim->block = block;
+    victim->valid = true;
+    victim->dirty = false;
+    victim->access_count = ++g_ext2_bcache_timer;
+    
+    __builtin_memcpy(buf, victim->data, fs->block_size);
+    spinlock_unlock(&g_ext2_bcache_lock);
+    return 0;
 }
 
 static s64 ext2_write_block(ext2_fs_info_t *fs, u32 block, void *buf)
 {
-    if (!fs->bdev->ops->write_sectors) return -(s64)ENOSYS;
+    if (!fs || !fs->bdev || !fs->bdev->ops || !fs->bdev->ops->write_sectors) return -(s64)ENOSYS;
+    
+    u32 bucket = ext2_bcache_hash(fs, block);
+    spinlock_lock(&g_ext2_bcache_lock);
+    for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
+        ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
+        if (slot->valid && slot->fs == fs && slot->block == block) {
+            __builtin_memcpy(slot->data, buf, fs->block_size);
+            slot->access_count = ++g_ext2_bcache_timer;
+            break;
+        }
+    }
+    spinlock_unlock(&g_ext2_bcache_lock);
+    
     u64 lba = (u64)block * (fs->block_size / fs->bdev->sector_size);
     u32 count = fs->block_size / fs->bdev->sector_size;
     return fs->bdev->ops->write_sectors(fs->bdev, lba, count, buf);
@@ -156,6 +233,12 @@ static s64 ext2_mount(file_system_type_t *fs_type, const char *dev_name, const c
     root_inode->i_ino = EXT2_ROOT_INO;
     root_inode->i_mode = root_ino_disk.i_mode;
     root_inode->i_size = root_ino_disk.i_size;
+    root_inode->i_blocks = root_ino_disk.i_blocks;
+    root_inode->i_uid = root_ino_disk.i_uid;
+    root_inode->i_gid = root_ino_disk.i_gid;
+    root_inode->i_atime = root_ino_disk.i_atime;
+    root_inode->i_mtime = root_ino_disk.i_mtime;
+    root_inode->i_ctime = root_ino_disk.i_ctime;
     root_inode->i_sb = vfs_sb;
     root_inode->i_op = &ext2_inode_ops;
     root_inode->i_fop = &ext2_file_ops;
@@ -203,16 +286,16 @@ static s64 ext2_mount(file_system_type_t *fs_type, const char *dev_name, const c
 static struct dentry *ext2_lookup(struct inode *dir, struct dentry *dentry)
 {
     ext2_fs_info_t *fs = (ext2_fs_info_t *)dir->i_sb->s_fs_info;
-    ext2_inode_info_t *dir_priv = (ext2_inode_info_t *)dir->i_private;
-    
     if (!S_ISDIR(dir->i_mode)) return NULL;
     
     void *buf = kzalloc(fs->block_size);
     if (!buf) return NULL;
     
-    /* Simple iteration over direct blocks only for now */
-    for (int i = 0; i < 12; i++) {
-        u32 block = dir_priv->i_block[i];
+    u32 num_blocks = (u32)((dir->i_size + fs->block_size - 1) / fs->block_size);
+    if (num_blocks == 0) num_blocks = 12;
+    
+    for (u32 lblk = 0; lblk < num_blocks; lblk++) {
+        u32 block = ext2_get_pblk(dir, lblk, false);
         if (!block) continue;
         
         ext2_read_block(fs, block, buf);
@@ -247,6 +330,12 @@ static struct dentry *ext2_lookup(struct inode *dir, struct dentry *dentry)
                     inode->i_ino = ent->inode;
                     inode->i_mode = ino_disk.i_mode;
                     inode->i_size = ino_disk.i_size;
+                    inode->i_blocks = ino_disk.i_blocks;
+                    inode->i_uid = ino_disk.i_uid;
+                    inode->i_gid = ino_disk.i_gid;
+                    inode->i_atime = ino_disk.i_atime;
+                    inode->i_mtime = ino_disk.i_mtime;
+                    inode->i_ctime = ino_disk.i_ctime;
                     inode->i_sb = dir->i_sb;
                     inode->i_op = &ext2_inode_ops;
                     inode->i_fop = &ext2_file_ops;
@@ -294,6 +383,11 @@ static void ext2_sync_inode(ext2_fs_info_t *fs, struct inode *inode)
     ino_disk->i_mode = inode->i_mode;
     ino_disk->i_size = inode->i_size;
     ino_disk->i_blocks = inode->i_blocks;
+    ino_disk->i_atime = inode->i_atime;
+    ino_disk->i_mtime = inode->i_mtime;
+    ino_disk->i_ctime = inode->i_ctime;
+    ino_disk->i_uid = inode->i_uid;
+    ino_disk->i_gid = inode->i_gid;
     
     ext2_inode_info_t *priv = (ext2_inode_info_t *)inode->i_private;
     __builtin_memcpy(ino_disk->i_block, priv->i_block, sizeof(priv->i_block));
@@ -498,37 +592,75 @@ void ext2_truncate(struct inode *inode) {
 /* File Read */
 static s64 ext2_file_read(struct file *filp, void *buf, size_t len, u64 *offset)
 {
+    if (!filp || !filp->f_inode || !filp->f_inode->i_sb || !buf) return -(s64)EINVAL;
     ext2_fs_info_t *fs = (ext2_fs_info_t *)filp->f_inode->i_sb->s_fs_info;
+    if (!fs) return -(s64)EINVAL;
     
     if (*offset >= filp->f_inode->i_size) return 0;
     if (len > filp->f_inode->i_size - *offset) {
         len = (size_t)(filp->f_inode->i_size - *offset);
     }
+    if (len == 0) return 0;
     
-    void *block_buf = kzalloc(fs->block_size);
-    if (!block_buf) return -(s64)ENOMEM;
-    
+    u8 *dst = (u8 *)buf;
     size_t bytes_read = 0;
+    void *temp_buf = NULL;
+    
     while (bytes_read < len) {
-        u32 lblk = (*offset + bytes_read) / fs->block_size;
-        u32 blk_offset = (*offset + bytes_read) % fs->block_size;
+        u64 cur_pos = *offset + bytes_read;
+        u32 lblk = (u32)(cur_pos / fs->block_size);
+        u32 blk_offset = (u32)(cur_pos % fs->block_size);
         
         u32 pblk = ext2_get_pblk(filp->f_inode, lblk, false);
         
-        size_t chunk = fs->block_size - blk_offset;
-        if (chunk > len - bytes_read) chunk = len - bytes_read;
+        /* If offset is not block-aligned or remaining length is smaller than a block */
+        if (blk_offset != 0 || (len - bytes_read) < fs->block_size) {
+            size_t chunk = fs->block_size - blk_offset;
+            if (chunk > len - bytes_read) chunk = len - bytes_read;
+            
+            if (pblk) {
+                if (!temp_buf) {
+                    temp_buf = kmalloc(fs->block_size);
+                    if (!temp_buf) break;
+                }
+                ext2_read_block(fs, pblk, temp_buf);
+                __builtin_memcpy(dst + bytes_read, (u8 *)temp_buf + blk_offset, chunk);
+            } else {
+                __builtin_memset(dst + bytes_read, 0, chunk);
+            }
+            bytes_read += chunk;
+            continue;
+        }
+        
+        /* Detect contiguous multi-block runs to burst read directly into destination */
+        u32 run_blocks = 1;
+        size_t max_blocks = (len - bytes_read) / fs->block_size;
+        if (max_blocks > 64) max_blocks = 64; /* Up to 64 blocks (64 KB) per burst */
         
         if (pblk) {
-            ext2_read_block(fs, pblk, block_buf);
-            __builtin_memcpy((u8*)buf + bytes_read, (u8*)block_buf + blk_offset, chunk);
+            while (run_blocks < max_blocks) {
+                u32 next_pblk = ext2_get_pblk(filp->f_inode, lblk + run_blocks, false);
+                if (next_pblk != pblk + run_blocks) break;
+                run_blocks++;
+            }
+            
+            u64 lba = (u64)pblk * (fs->block_size / fs->bdev->sector_size);
+            u32 sec_count = run_blocks * (fs->block_size / fs->bdev->sector_size);
+            fs->bdev->ops->read_sectors(fs->bdev, lba, sec_count, dst + bytes_read);
         } else {
-            /* Hole */
-            __builtin_memset((u8*)buf + bytes_read, 0, chunk);
+            while (run_blocks < max_blocks) {
+                u32 next_pblk = ext2_get_pblk(filp->f_inode, lblk + run_blocks, false);
+                if (next_pblk != 0) break;
+                run_blocks++;
+            }
+            __builtin_memset(dst + bytes_read, 0, run_blocks * fs->block_size);
         }
-        bytes_read += chunk;
+        
+        bytes_read += run_blocks * fs->block_size;
     }
     
-    kfree(block_buf);
+    if (temp_buf) kfree(temp_buf);
+    
     *offset += bytes_read;
     return (s64)bytes_read;
 }
@@ -918,11 +1050,50 @@ static s64 ext2_unlink(struct inode *dir, struct dentry *dentry) {
     return 0;
 }
 
+static bool ext2_is_dir_empty(struct inode *dir) {
+    ext2_fs_info_t *fs = (ext2_fs_info_t *)dir->i_sb->s_fs_info;
+    void *buf = kzalloc(fs->block_size);
+    if (!buf) return false;
+
+    u32 lblk = 0;
+    while (lblk < (dir->i_size + fs->block_size - 1) / fs->block_size) {
+        u32 pblk = ext2_get_pblk(dir, lblk, false);
+        if (!pblk) { lblk++; continue; }
+
+        ext2_read_block(fs, pblk, buf);
+        u32 offset = 0;
+        while (offset < fs->block_size) {
+            ext2_dir_entry_t *ent = (ext2_dir_entry_t *)((u8*)buf + offset);
+            if (ent->rec_len == 0) break;
+
+            if (ent->inode != 0) {
+                if (ent->name_len == 1 && ent->name[0] == '.') {
+                    /* "." entry is allowed */
+                } else if (ent->name_len == 2 && ent->name[0] == '.' && ent->name[1] == '.') {
+                    /* ".." entry is allowed */
+                } else {
+                    /* Found an actual child file or subdirectory */
+                    kfree(buf);
+                    return false;
+                }
+            }
+            offset += ent->rec_len;
+        }
+        lblk++;
+    }
+
+    kfree(buf);
+    return true;
+}
+
 static s64 ext2_rmdir(struct inode *dir, struct dentry *dentry) {
     if (!dentry->d_inode) return -(s64)ENOENT;
     if (!S_ISDIR(dentry->d_inode->i_mode)) return -(s64)ENOTDIR;
     
-    // In a real OS we should check if directory is empty. For now assume it is.
+    if (!ext2_is_dir_empty(dentry->d_inode)) {
+        return -(s64)ENOTEMPTY;
+    }
+
     s64 err = ext2_remove_dir_entry(dir, dentry->d_name);
     if (err < 0) return err;
     
@@ -939,6 +1110,15 @@ static s64 ext2_rmdir(struct inode *dir, struct dentry *dentry) {
 static s64 ext2_rename(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry) {
     if (!old_dentry->d_inode) return -(s64)ENOENT;
     
+    /* If destination entry already exists, remove/unlink it first */
+    if (new_dentry->d_inode) {
+        if (S_ISDIR(new_dentry->d_inode->i_mode)) {
+            ext2_rmdir(new_dir, new_dentry);
+        } else {
+            ext2_unlink(new_dir, new_dentry);
+        }
+    }
+
     u8 ftype = S_ISDIR(old_dentry->d_inode->i_mode) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
     s64 err = ext2_add_dir_entry(new_dir, old_dentry->d_inode->i_ino, new_dentry->d_name, ftype);
     if (err < 0) return err;
@@ -947,6 +1127,7 @@ static s64 ext2_rename(struct inode *old_dir, struct dentry *old_dentry, struct 
 
     /* Update the dcache so the new dentry points to the moved inode */
     new_dentry->d_inode = old_dentry->d_inode;
+    old_dentry->d_inode = NULL;
     return 0;
 }
 
@@ -1012,6 +1193,44 @@ static s64 ext2_symlink(struct inode *dir, struct dentry *dentry, const char *sy
     return 0;
 }
 
+static s64 ext2_readlink(struct dentry *dentry, char *buf, size_t bufsiz)
+{
+    if (!dentry || !dentry->d_inode || !buf || bufsiz == 0) return -(s64)EINVAL;
+    inode_t *inode = dentry->d_inode;
+    ext2_inode_info_t *priv = (ext2_inode_info_t *)inode->i_private;
+    if (!priv) return -(s64)EIO;
+
+    ext2_fs_info_t *fs = (ext2_fs_info_t *)inode->i_sb->s_fs_info;
+    if (!fs) return -(s64)EIO;
+
+    u64 size = inode->i_size;
+    size_t copy_len = (size < bufsiz) ? (size_t)size : bufsiz;
+
+    if (size <= 60) {
+        /* Fast symlink: target path is stored directly inside i_block */
+        const char *target = (const char *)priv->i_block;
+        for (size_t i = 0; i < copy_len; i++) buf[i] = target[i];
+        return (s64)copy_len;
+    }
+
+    /* Slow symlink stored in data block */
+    u32 blk = priv->i_block[0];
+    if (!blk) return -(s64)EIO;
+
+    void *blk_buf = kzalloc(fs->block_size);
+    if (!blk_buf) return -(s64)ENOMEM;
+
+    s64 r = ext2_read_block(fs, blk, blk_buf);
+    if (r < 0) {
+        kfree(blk_buf);
+        return r;
+    }
+
+    for (size_t i = 0; i < copy_len; i++) buf[i] = ((const char *)blk_buf)[i];
+    kfree(blk_buf);
+    return (s64)copy_len;
+}
+
 void ext2_init(void)
 {
     vfs_register_fs(&ext2_fs_type);
@@ -1071,7 +1290,17 @@ u32 ext2_alloc_block(ext2_fs_info_t *fs) {
         if (fs->bgdt[bg].bg_free_blocks_count == 0) continue;
         
         u8 *bitmap = ext2_get_block_bitmap(fs, bg);
-        for (u32 bit = 0; bit < fs->blocks_per_group; bit++) {
+        u32 total_bits = fs->blocks_per_group;
+        u32 bit = 0;
+
+        /* Fast 64-bit word skip */
+        u64 *wptr = (u64 *)bitmap;
+        while (bit + 64 <= total_bits && *wptr == ~0ULL) {
+            bit += 64;
+            wptr++;
+        }
+
+        for (; bit < total_bits; bit++) {
             if (!ext2_test_bit(bitmap, bit)) {
                 ext2_set_bit(bitmap, bit);
                 fs->bgdt[bg].bg_free_blocks_count--;
@@ -1105,7 +1334,17 @@ u32 ext2_alloc_inode(ext2_fs_info_t *fs) {
         if (fs->bgdt[bg].bg_free_inodes_count == 0) continue;
         
         u8 *bitmap = ext2_get_inode_bitmap(fs, bg);
-        for (u32 bit = 0; bit < fs->inodes_per_group; bit++) {
+        u32 total_bits = fs->inodes_per_group;
+        u32 bit = 0;
+
+        /* Fast 64-bit word skip */
+        u64 *wptr = (u64 *)bitmap;
+        while (bit + 64 <= total_bits && *wptr == ~0ULL) {
+            bit += 64;
+            wptr++;
+        }
+
+        for (; bit < total_bits; bit++) {
             if (!ext2_test_bit(bitmap, bit)) {
                 ext2_set_bit(bitmap, bit);
                 fs->bgdt[bg].bg_free_inodes_count--;

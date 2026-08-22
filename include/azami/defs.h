@@ -68,8 +68,11 @@
 #define ENOBUFS     105 /* No buffer space available */
 #define EISCONN     106 /* Transport endpoint is already connected */
 #define ENOTCONN    107 /* Transport endpoint is not connected */
+#define ESHUTDOWN   108 /* Cannot send after transport endpoint shutdown */
 #define ETIMEDOUT   110 /* Connection timed out */
 #define ECONNREFUSED 111 /* Connection refused */
+#define EALREADY    114 /* Operation already in progress */
+#define EINPROGRESS 115 /* Operation now in progress */
 
 /* --------------------------------------------------------------------------
  * Compiler attribute shorthands

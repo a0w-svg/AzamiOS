@@ -128,8 +128,10 @@ static file_operations_t g_random_fops = {
 
 static s64 kmsg_read(file_t *filp, void *buf, size_t len, u64 *offset)
 {
-    (void)filp; (void)buf; (void)len; (void)offset;
-    return 0; /* EOF for now */
+    (void)filp;
+    if (!buf || len == 0 || !offset) return 0;
+    extern s64 console_read_klog(void *buf, size_t max_len, u64 *offset);
+    return console_read_klog(buf, len, offset);
 }
 
 static s64 kmsg_write(file_t *filp, const void *buf, size_t len, u64 *offset)
@@ -176,9 +178,57 @@ static s64 console_dev_write(file_t *filp, const void *buf, size_t len, u64 *off
     return (s64)len;
 }
 
+static s64 console_dev_ioctl(file_t *filp, u32 cmd, u64 arg)
+{
+    (void)filp;
+    if (cmd == 0x5401 /* TCGETS */) {
+        if (!arg || arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        struct {
+            u32 c_iflag;
+            u32 c_oflag;
+            u32 c_cflag;
+            u32 c_lflag;
+            u8  c_line;
+            u8  c_cc[32];
+            u32 c_ispeed;
+            u32 c_ospeed;
+        } term;
+        __builtin_memset(&term, 0, sizeof(term));
+        term.c_iflag = 0x0500;
+        term.c_oflag = 0x0005;
+        term.c_cflag = 0x00BF;
+        term.c_lflag = 0x8A3B;
+        term.c_ispeed = 38400;
+        term.c_ospeed = 38400;
+        extern s64 copy_to_user(void *dst, const void *src, size_t n);
+        if (copy_to_user((void *)arg, &term, sizeof(term)) != 0) return -(s64)EFAULT;
+        return 0;
+    }
+    if (cmd == 0x5402 /* TCSETS */ || cmd == 0x5403 /* TCSETSW */ || cmd == 0x5404 /* TCSETSF */) {
+        return 0;
+    }
+    if (cmd == 0x5413 /* TIOCGWINSZ */) {
+        if (!arg || arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        struct {
+            u16 ws_row;
+            u16 ws_col;
+            u16 ws_xpixel;
+            u16 ws_ypixel;
+        } ws = { .ws_row = 25, .ws_col = 80, .ws_xpixel = 640, .ws_ypixel = 400 };
+        extern s64 copy_to_user(void *dst, const void *src, size_t n);
+        if (copy_to_user((void *)arg, &ws, sizeof(ws)) != 0) return -(s64)EFAULT;
+        return 0;
+    }
+    if (cmd == 0x5414 /* TIOCSWINSZ */) {
+        return 0;
+    }
+    return -(s64)EINVAL;
+}
+
 static file_operations_t g_console_dev_fops = {
     .read = console_dev_read,
     .write = console_dev_write,
+    .ioctl = console_dev_ioctl,
 };
 
 /* ── Initialization ──────────────────────────────────────────────────────── */
@@ -192,4 +242,8 @@ void memdevs_init(void)
     devfs_register_device("urandom", &g_random_fops, NULL);
     devfs_register_device("kmsg", &g_kmsg_fops, NULL);
     devfs_register_device("console", &g_console_dev_fops, NULL);
+    devfs_register_device("tty", &g_console_dev_fops, NULL);
+    devfs_register_device("tty0", &g_console_dev_fops, NULL);
+    devfs_register_device("tty1", &g_console_dev_fops, NULL);
+    devfs_register_device("ptmx", &g_console_dev_fops, NULL);
 }

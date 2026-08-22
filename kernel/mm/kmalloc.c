@@ -93,22 +93,33 @@ void *kmalloc(size_t size)
     irqflags_t flags = spinlock_lock_irqsave(&b->lock);
 
     if (!b->free_list) {
-        /* Allocate a new physical page and slice it into blocks for this bucket */
+        /* PERF-03: Release bucket lock before calling pmm_alloc_page() to avoid
+         * holding two locks simultaneously (bucket -> pmm). Build the slice list
+         * locally and re-acquire the lock only to splice it in. */
+        spinlock_unlock_irqrestore(&b->lock, flags);
+
         phys_addr_t page = pmm_alloc_page();
-        if (!page) {
-            spinlock_unlock_irqrestore(&b->lock, flags);
-            return NULL;
-        }
+        if (!page) return NULL;
 
         u8 *virt = (u8 *)PHYS_TO_VIRT(page);
         size_t blk_size = b->block_size;
         size_t count = PAGE_SIZE / blk_size;
 
+        /* Build local free list from the new page */
+        free_block_t *local_head = NULL;
         for (size_t j = 0; j < count; j++) {
             free_block_t *blk = (free_block_t *)(virt + j * blk_size);
-            blk->next = b->free_list;
-            b->free_list = blk;
+            blk->next = local_head;
+            local_head = blk;
         }
+
+        /* Re-acquire bucket lock to splice in the new blocks */
+        flags = spinlock_lock_irqsave(&b->lock);
+        /* Another CPU may have refilled while we were unlocked; append ours anyway */
+        free_block_t *tail = local_head;
+        while (tail->next) tail = tail->next;
+        tail->next = b->free_list;
+        b->free_list = local_head;
     }
 
     free_block_t *blk = b->free_list;
@@ -171,6 +182,8 @@ void kfree(void *ptr)
 
     block_hdr_t *hdr = ((block_hdr_t *)ptr) - 1;
     if (hdr->magic != KMALLOC_MAGIC) {
+        pr_debug("[KMALLOC] Corrupted kfree ptr=%p, hdr=%p, magic=0x%x (expected 0x%x), caller=%p\n",
+                 ptr, hdr, (unsigned int)hdr->magic, (unsigned int)KMALLOC_MAGIC, __builtin_return_address(0));
         PANIC("kfree called on corrupted or non-kmalloc pointer!");
     }
 

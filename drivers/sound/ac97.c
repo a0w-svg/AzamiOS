@@ -3,7 +3,7 @@
  * File: drivers/sound/ac97.c
  * ============================================================================ */
 
-#define DEBUG 1
+/* BUG-1 fix: removed duplicate #define DEBUG 1 */
 #define DEBUG 1
 #include "../../include/azami/debug.h"
 #include "ac97.h"
@@ -103,37 +103,39 @@ static s64 ac97_write_pcm(const u8 *data, u64 len)
     return (s64)written;
 }
 
+/* BUG-11 fix: use irqsave locking to match ac97_write_pcm and prevent
+ * deadlock if the AC97 IRQ fires while ioctl is in progress. */
 static s64 ac97_ioctl(u64 cmd, void *arg)
 {
-    spinlock_lock(&g_ac97_lock);
+    irqflags_t irqf = spinlock_lock_irqsave(&g_ac97_lock);
     if (!g_nam_bar) {
-        spinlock_unlock(&g_ac97_lock);
+        spinlock_unlock_irqrestore(&g_ac97_lock, irqf);
         return -1;
     }
 
     switch (cmd) {
     case SOUND_PCM_WRITE_VOLUME: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) { spinlock_unlock(&g_ac97_lock); return -1; }
+        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) { spinlock_unlock_irqrestore(&g_ac97_lock, irqf); return -1; }
         u32 vol;
-        if (copy_from_user(&vol, arg, sizeof(u32)) != 0) { spinlock_unlock(&g_ac97_lock); return -1; }
+        if (copy_from_user(&vol, arg, sizeof(u32)) != 0) { spinlock_unlock_irqrestore(&g_ac97_lock, irqf); return -1; }
         u8 left = (vol & 0xFF) * 31 / 100;
         u8 right = ((vol >> 8) & 0xFF) * 31 / 100;
         u16 raw_vol = ((31 - (left & 0x1F)) << 8) | (31 - (right & 0x1F));
         ac97_outw(g_nam_bar, AC97_NAMBAR_MASTER_VOL, raw_vol);
         ac97_outw(g_nam_bar, AC97_NAMBAR_PCM_OUT_VOL, raw_vol);
-        spinlock_unlock(&g_ac97_lock);
+        spinlock_unlock_irqrestore(&g_ac97_lock, irqf);
         return 0;
     }
     case SOUND_PCM_WRITE_RATE: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) { spinlock_unlock(&g_ac97_lock); return -1; }
+        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) { spinlock_unlock_irqrestore(&g_ac97_lock, irqf); return -1; }
         u32 rate;
-        if (copy_from_user(&rate, arg, sizeof(u32)) != 0) { spinlock_unlock(&g_ac97_lock); return -1; }
+        if (copy_from_user(&rate, arg, sizeof(u32)) != 0) { spinlock_unlock_irqrestore(&g_ac97_lock, irqf); return -1; }
         ac97_outw(g_nam_bar, AC97_NAMBAR_PCM_FRONT_RATE, (u16)rate);
-        spinlock_unlock(&g_ac97_lock);
+        spinlock_unlock_irqrestore(&g_ac97_lock, irqf);
         return 0;
     }
     default:
-        spinlock_unlock(&g_ac97_lock);
+        spinlock_unlock_irqrestore(&g_ac97_lock, irqf);
         return -1;
     }
 }
@@ -169,7 +171,10 @@ static void ac97_scan_tree(device_t *node)
             hal_irq_enable(g_ac97_irq, g_ac97_irq + 32);
 
             ac97_outd(g_nabm_bar, 0x2C, 0x02); /* Reset */
-            for(volatile int i=0; i<100000; i++);
+            /* BUG-12 fix: use I/O-port reads for a portable delay instead of a
+             * CPU-speed-dependent busy loop.  Each inb on port 0x80 (POST port)
+             * costs roughly 1 µs, giving ~100 µs total. */
+            for (int _d = 0; _d < 100; _d++) inb(0x80);
 
             ac97_outw(g_nam_bar, AC97_NAMBAR_MASTER_VOL, 0x0000);
             ac97_outw(g_nam_bar, AC97_NAMBAR_PCM_OUT_VOL, 0x0000);
@@ -179,22 +184,27 @@ static void ac97_scan_tree(device_t *node)
             if (!bdl_phys) return;
             g_bdl = (ac97_bdl_entry_t *)PHYS_TO_VIRT(bdl_phys);
 
-            bool alloc_ok = true;
+            /* BUG-13 fix: track allocation count so we can free on failure */
+            int alloc_count = 0;
             for (int i = 0; i < AC97_BDL_ENTRIES; i++) {
                 phys_addr_t buf_phys = pmm_alloc_pages_32(1);
                 if (!buf_phys) {
-                    alloc_ok = false;
-                    break;
+                    /* Free all previously allocated DMA buffers */
+                    for (int j = 0; j < alloc_count; j++) {
+                        pmm_free_pages(
+                            VIRT_TO_PHYS((virt_addr_t)g_audio_buffers[j]), 1);
+                        g_audio_buffers[j] = NULL;
+                    }
+                    pmm_free_pages(bdl_phys, 1);
+                    g_bdl = NULL;
+                    pr_debug("[AC97] Failed to allocate low 32-bit DMA buffers.\n");
+                    return;
                 }
                 g_audio_buffers[i] = (u8 *)PHYS_TO_VIRT(buf_phys);
                 g_bdl[i].ptr = (u32)buf_phys;
                 g_bdl[i].samples = 0;
                 g_bdl[i].flags = 0;
-            }
-
-            if (!alloc_ok) {
-                pr_debug("[AC97] Failed to allocate low 32-bit DMA buffers.\n");
-                return;
+                alloc_count++;
             }
 
             ac97_outd(g_nabm_bar, AC97_PO_BDBAR, (u32)bdl_phys);

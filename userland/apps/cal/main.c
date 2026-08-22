@@ -64,8 +64,16 @@ int main(int argc, char **argv)
         printf("   ");
     }
 
+    int today_day = (tm_info) ? tm_info->tm_mday : -1;
+    int today_mon = (tm_info) ? (tm_info->tm_mon + 1) : -1;
+    int today_yr  = (tm_info) ? (tm_info->tm_year + 1900) : -1;
+
     for (int d = 1; d <= days; d++) {
-        printf("%2d ", d);
+        if (d == today_day && month == today_mon && year == today_yr) {
+            printf("\033[1;35;7m%2d\033[0m ", d);
+        } else {
+            printf("%2d ", d);
+        }
         if ((first_dow + d) % 7 == 0 || d == days) {
             printf("\n");
         }

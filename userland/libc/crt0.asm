@@ -7,6 +7,7 @@
 global _start
 extern main
 extern exit
+extern __libc_init
 
 section .text
 _start:
@@ -20,19 +21,28 @@ _start:
     ; [rsp + 8*(argc+1)] = NULL
     ; [rsp + 8*(argc+2)] = envp[0]
 
-    ; Pop argc into RDI
-    pop rdi
+    ; Pop argc into R12
+    pop r12
 
-    ; RSI = argv pointer
-    mov rsi, rsp
+    ; R13 = argv pointer
+    mov r13, rsp
 
-    ; RDX = envp pointer = &argv[argc + 1]
-    lea rdx, [rsi + rdi*8 + 8]
+    ; R14 = envp pointer = &argv[argc + 1]
+    lea r14, [r13 + r12*8 + 8]
 
     ; Align stack to 16 bytes for System V AMD64 ABI
     and rsp, -16
 
+    ; Initialize libc environment
+    mov rdi, r12
+    mov rsi, r13
+    mov rdx, r14
+    call __libc_init
+
     ; Call main(argc, argv, envp)
+    mov rdi, r12
+    mov rsi, r13
+    mov rdx, r14
     call main
 
     ; Exit with return code from main

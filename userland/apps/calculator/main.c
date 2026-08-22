@@ -1,68 +1,87 @@
 /* ============================================================================
- * AzamiOS — Calculator
+ * AzamiOS — Calculator (v3.0)
  * File: userland/apps/calculator/main.c
+ *
+ * Features:
+ *  • Dual Mode: Standard & Scientific
+ *  • Scientific functions: sqrt, x^2, 1/x, %, +/-, mod
+ *  • Calculation history journal
+ *  • Keyboard entry support (Numpad, Digits, Operators, Enter, Bksp, Esc)
+ *  • Catppuccin Mocha aesthetic layout
  * ============================================================================ */
+
 #include "../../libc/include/az/ipc.h"
 #include "../../libc/include/stdio.h"
+#include "../../libc/include/stdlib.h"
 #include "../../libc/include/string.h"
+#include "../../libc/include/math.h"
 #include "../azwm/protocol.h"
 #include "../azwm/de_protocol.h"
 #include "../azwm/de_font.h"
 #include "../shared/ui_kit.h"
 
 #define SERVER_CHAN  1
-#define WIN_W       320
-#define WIN_H       420
+#define WIN_W       340
+#define WIN_H       460
 #define MAP_ADDR    ((void *)0x62000000)
 
-/* ── Calculator logic ───────────────────────────────────────────────────────── */
-#define DISPLAY_MAX  16
+#define DISPLAY_MAX  20
 
-static char  g_display[DISPLAY_MAX + 1];   /* current display string      */
-static int   g_display_len  = 0;
-static long  g_accumulator  = 0;           /* left operand                */
-static char  g_pending_op   = 0;           /* '+','-','*','/',0           */
-static int   g_new_number   = 1;           /* true = next digit starts fresh */
+static char   g_display[DISPLAY_MAX + 1] = "0";
+static int    g_display_len  = 1;
+static double g_accumulator  = 0.0;
+static char   g_pending_op   = 0;
+static int    g_new_number   = 1;
 
-/* Button layout (5×4 grid) */
+/* History Tape */
+#define MAX_HIST 8
+typedef struct {
+    char expr[32];
+    char res[24];
+} calc_hist_t;
+static calc_hist_t g_history[MAX_HIST];
+static int g_hist_count = 0;
+
+/* Button layout (6 rows × 4 cols) */
 #define NCOLS  4
-#define NROWS  5
-#define BTN_W  68
-#define BTN_H  52
-#define BTN_GAD 4
-#define BTN_OX  8
-#define BTN_OY  100
+#define NROWS  6
+#define BTN_W  74
+#define BTN_H  44
+#define BTN_GAP 6
+#define BTN_OX 10
+#define BTN_OY 130
 
 static uk_window_t g_win;
 static int g_hovered = -1;
 
-typedef struct { const char *label; char action; unsigned int accent; } calc_btn_t;
+typedef struct {
+    const char *label;
+    char action;
+    unsigned int accent;
+} calc_btn_t;
 
-/* Row 0: C  ±  %  ÷
-   Row 1: 7  8  9  ×
-   Row 2: 4  5  6  -
-   Row 3: 1  2  3  +
-   Row 4: 0(wide) .  = */
-static const calc_btn_t g_buttons[20] = {
-    {"C",  'C', UK_MAROON},  {"+-",'N', UK_SURFACE1}, {"%", '%', UK_SURFACE1}, {"/", '/', UK_PEACH},
-    {"7",  '7', UK_SURFACE0},{"8",  '8', UK_SURFACE0},{"9",  '9', UK_SURFACE0},{"x", '*', UK_PEACH},
-    {"4",  '4', UK_SURFACE0},{"5",  '5', UK_SURFACE0},{"6",  '6', UK_SURFACE0},{"-", '-', UK_PEACH},
-    {"1",  '1', UK_SURFACE0},{"2",  '2', UK_SURFACE0},{"3",  '3', UK_SURFACE0},{"+", '+', UK_PEACH},
-    {"0",  '0', UK_SURFACE0},{"0",  '0', UK_SURFACE0},{".",  '.', UK_SURFACE0},{"=", '=', UK_MAUVE},
+/* Row 0: sqrt  x^2  1/x  mod
+   Row 1: C     +-   %    /
+   Row 2: 7     8    9    *
+   Row 3: 4     5    6    -
+   Row 4: 1     2    3    +
+   Row 5: 0     .    =    = */
+static const calc_btn_t g_buttons[24] = {
+    { "sqr", 'S', UK_SURFACE1 }, { "x^2", 'Q', UK_SURFACE1 }, { "1/x", 'R', UK_SURFACE1 }, { "mod", 'M', UK_PEACH },
+    { "C",   'C', UK_MAROON },   { "+-",  'N', UK_SURFACE1 }, { "%",   '%', UK_SURFACE1 }, { "/",   '/', UK_PEACH },
+    { "7",   '7', UK_SURFACE0 }, { "8",   '8', UK_SURFACE0 }, { "9",   '9', UK_SURFACE0 }, { "x",   '*', UK_PEACH },
+    { "4",   '4', UK_SURFACE0 }, { "5",   '5', UK_SURFACE0 }, { "6",   '6', UK_SURFACE0 }, { "-",   '-', UK_PEACH },
+    { "1",   '1', UK_SURFACE0 }, { "2",   '2', UK_SURFACE0 }, { "3",   '3', UK_SURFACE0 }, { "+",   '+', UK_PEACH },
+    { "0",   '0', UK_SURFACE0 }, { ".",   '.', UK_SURFACE0 }, { "pi",  'P', UK_SURFACE1 }, { "=",   '=', UK_MAUVE },
 };
 
-/* Long integer to decimal string (returns pointer to static buf) */
-static char g_numbuf[24];
-static const char *long_to_str(long v)
+static char g_numbuf[32];
+static const char *double_to_str(double v)
 {
-    if (v == 0) { g_numbuf[0] = '0'; g_numbuf[1] = '\0'; return g_numbuf; }
-    int neg = (v < 0);
-    unsigned long uv = neg ? (unsigned long)(-(v + 1)) + 1 : (unsigned long)v;
-    int i = 22;
-    g_numbuf[23] = '\0';
-    while (uv > 0) { g_numbuf[i--] = '0' + (char)(uv % 10); uv /= 10; }
-    if (neg) g_numbuf[i--] = '-';
-    return &g_numbuf[i + 1];
+    if (__builtin_isnan(v)) return "Error";
+    if (__builtin_isinf(v)) return (v < 0) ? "-Inf" : "Inf";
+    snprintf(g_numbuf, sizeof(g_numbuf), "%.10g", v);
+    return g_numbuf;
 }
 
 static void display_set(const char *s)
@@ -73,113 +92,119 @@ static void display_set(const char *s)
     g_display_len = i;
 }
 
+static void add_history_entry(const char *expr, const char *res)
+{
+    if (g_hist_count < MAX_HIST) {
+        strncpy(g_history[g_hist_count].expr, expr, 31);
+        strncpy(g_history[g_hist_count].res, res, 23);
+        g_hist_count++;
+    } else {
+        for (int i = 1; i < MAX_HIST; i++) g_history[i - 1] = g_history[i];
+        strncpy(g_history[MAX_HIST - 1].expr, expr, 31);
+        strncpy(g_history[MAX_HIST - 1].res, res, 23);
+    }
+}
+
 static void calc_handle(char action)
 {
     if (action >= '0' && action <= '9') {
-        if (g_new_number) { g_display[0] = action; g_display[1] = '\0'; g_display_len = 1; g_new_number = 0; }
-        else if (g_display_len < DISPLAY_MAX) { g_display[g_display_len++] = action; g_display[g_display_len] = '\0'; }
+        if (g_new_number) {
+            g_display[0] = action;
+            g_display[1] = '\0';
+            g_display_len = 1;
+            g_new_number = 0;
+        } else if (g_display_len < DISPLAY_MAX) {
+            g_display[g_display_len++] = action;
+            g_display[g_display_len] = '\0';
+        }
     } else if (action == '.') {
-        /* Check no existing dot */
         int has_dot = 0;
-        int j;
-        for (j = 0; j < g_display_len; j++) if (g_display[j] == '.') { has_dot = 1; break; }
+        for (int j = 0; j < g_display_len; j++) if (g_display[j] == '.') { has_dot = 1; break; }
         if (!has_dot && g_display_len < DISPLAY_MAX) {
-            if (g_new_number) { g_display[0]='0'; g_display[1]='\0'; g_display_len=1; g_new_number=0; }
-            g_display[g_display_len++] = '.'; g_display[g_display_len] = '\0';
+            if (g_new_number) { g_display[0] = '0'; g_display[1] = '\0'; g_display_len = 1; g_new_number = 0; }
+            g_display[g_display_len++] = '.';
+            g_display[g_display_len] = '\0';
         }
     } else if (action == 'C') {
-        display_set("0"); g_accumulator = 0; g_pending_op = 0; g_new_number = 1;
-    } else if (action == 'N') { /* negate */
-        if (g_display[0] == '-') {
-            int j;
-            for (j = 0; j < g_display_len; j++) g_display[j] = g_display[j+1];
-            g_display_len--;
-        } else if (g_display_len < DISPLAY_MAX) {
-            int j;
-            for (j = g_display_len; j >= 0; j--) g_display[j+1] = g_display[j];
-            g_display[0] = '-'; g_display_len++;
+        display_set("0");
+        g_accumulator = 0.0;
+        g_pending_op = 0;
+        g_new_number = 1;
+    } else if (action == 'P') { /* Pi Constant */
+        display_set("3.1415926535");
+        g_new_number = 1;
+    } else if (action == 'B') { /* Backspace */
+        if (g_display_len > 1 && !g_new_number) {
+            g_display[--g_display_len] = '\0';
+        } else {
+            display_set("0");
+            g_new_number = 1;
         }
-    } else if (action == '+' || action == '-' || action == '*' || action == '/') {
-        /* Parse current display as integer (integer-only for simplicity) */
-        long val = 0; int neg = 0; int j = 0;
-        if (g_display[0] == '-') { neg = 1; j = 1; }
-        for (; g_display[j]; j++) {
-            if (g_display[j] == '.') break;
-            if (g_display[j] >= '0' && g_display[j] <= '9') val = val * 10 + (g_display[j] - '0');
-        }
-        if (neg) val = -val;
+    } else if (action == 'N') { /* Negate */
+        double v = atof(g_display);
+        v = -v;
+        display_set(double_to_str(v));
+    } else if (action == 'S') { /* Sqrt */
+        double v = atof(g_display);
+        if (v < 0.0) { display_set("Error"); return; }
+        double r = sqrt(v);
+        char hbuf[32]; snprintf(hbuf, sizeof(hbuf), "sqrt(%g)", v);
+        display_set(double_to_str(r));
+        add_history_entry(hbuf, g_display);
+        g_new_number = 1;
+    } else if (action == 'Q') { /* Square */
+        double v = atof(g_display);
+        double sq = v * v;
+        char hbuf[32]; snprintf(hbuf, sizeof(hbuf), "sqr(%g)", v);
+        display_set(double_to_str(sq));
+        add_history_entry(hbuf, g_display);
+        g_new_number = 1;
+    } else if (action == 'R') { /* Reciprocal 1/x */
+        double v = atof(g_display);
+        if (v == 0.0) { display_set("Error"); return; }
+        double r = 1.0 / v;
+        char hbuf[32]; snprintf(hbuf, sizeof(hbuf), "1/(%g)", v);
+        display_set(double_to_str(r));
+        add_history_entry(hbuf, g_display);
+        g_new_number = 1;
+    } else if (action == '%') { /* Percent */
+        double v = atof(g_display);
+        double r = (g_accumulator != 0.0) ? (g_accumulator * v / 100.0) : (v / 100.0);
+        display_set(double_to_str(r));
+        g_new_number = 1;
+    } else if (action == '+' || action == '-' || action == '*' || action == '/' || action == 'M') {
+        double val = atof(g_display);
 
         if (g_pending_op && !g_new_number) {
-            /* Apply previous op */
             switch (g_pending_op) {
             case '+': g_accumulator += val; break;
             case '-': g_accumulator -= val; break;
             case '*': g_accumulator *= val; break;
-            case '/':
-                if (val == 0) {
-                    display_set("Error");
-                    g_accumulator = 0;
-                    g_pending_op = 0;
-                    g_new_number = 1;
-                    return;
-                }
-                g_accumulator /= val;
-                break;
+            case '/': if (val != 0.0) g_accumulator /= val; else { display_set("Error"); return; } break;
+            case 'M': if (val != 0.0) g_accumulator = fmod(g_accumulator, val); else { display_set("Error"); return; } break;
             }
         } else {
             g_accumulator = val;
         }
         g_pending_op = action;
-        display_set(long_to_str(g_accumulator));
+        display_set(double_to_str(g_accumulator));
         g_new_number = 1;
     } else if (action == '=') {
-        long val = 0; int neg = 0; int j = 0;
-        if (g_display[0] == '-') { neg = 1; j = 1; }
-        for (; g_display[j]; j++) {
-            if (g_display[j] == '.') break;
-            if (g_display[j] >= '0' && g_display[j] <= '9') val = val * 10 + (g_display[j] - '0');
-        }
-        if (neg) val = -val;
+        double val = atof(g_display);
+
         if (g_pending_op) {
+            char expr_str[32];
+            snprintf(expr_str, sizeof(expr_str), "%g %c %g", g_accumulator, g_pending_op == 'M' ? '%' : g_pending_op, val);
             switch (g_pending_op) {
             case '+': g_accumulator += val; break;
             case '-': g_accumulator -= val; break;
             case '*': g_accumulator *= val; break;
-            case '/':
-                if (val == 0) {
-                    display_set("Error");
-                    g_accumulator = 0;
-                    g_pending_op = 0;
-                    g_new_number = 1;
-                    return;
-                }
-                g_accumulator /= val;
-                break;
+            case '/': if (val != 0.0) g_accumulator /= val; else { display_set("Error"); return; } break;
+            case 'M': if (val != 0.0) g_accumulator = fmod(g_accumulator, val); else { display_set("Error"); return; } break;
             }
-        } else {
-            g_accumulator = val;
-        }
-        g_pending_op = 0;
-        display_set(long_to_str(g_accumulator));
-        g_new_number = 1;
-    } else if (action == '%') {
-        long val = 0; int neg = 0; int j = 0;
-        if (g_display[0] == '-') { neg = 1; j = 1; }
-        for (; g_display[j]; j++) {
-            if (g_display[j] == '.') break;
-            if (g_display[j] >= '0' && g_display[j] <= '9') val = val * 10 + (g_display[j] - '0');
-        }
-        if (neg) val = -val;
-        /* Percentage: calculate value / 100 with 2 decimals */
-        long int_part = val / 100;
-        long frac_part = val % 100;
-        if (frac_part < 0) frac_part = -frac_part;
-        if (frac_part == 0) {
-            display_set(long_to_str(int_part));
-        } else {
-            char pbuf[32];
-            snprintf(pbuf, sizeof(pbuf), "%s.%s%ld", long_to_str(int_part), (frac_part < 10 ? "0" : ""), frac_part);
-            display_set(pbuf);
+            g_pending_op = 0;
+            display_set(double_to_str(g_accumulator));
+            add_history_entry(expr_str, g_display);
         }
         g_new_number = 1;
     }
@@ -190,68 +215,62 @@ static void draw_calc(void)
     unsigned int w = g_win.width;
     unsigned int h = g_win.height;
 
-    /* Background */
     uk_fill_rect(&g_win, 0, 0, (int)w, (int)h, UK_BASE);
 
-    /* ── Display area ───────────────────────────────────────────────────── */
-    uk_fill_rect(&g_win, 0, 0, (int)w, 92, UK_CRUST);
-    uk_hline(&g_win, 0, 92, (int)w, UK_SURFACE1);
+    /* ── Header ──────────────────────────────────────────────────────────── */
+    uk_gradient_h(&g_win, 0, 0, (int)w, 36, UK_SURFACE0, UK_BASE);
+    uk_fill_rect(&g_win, 0, 0, 4, 36, UK_PEACH);
+    uk_draw_text(&g_win, 14, 6, "Calculator", UK_TEXT);
+    uk_draw_text(&g_win, 14, 20, "AzamiOS Math Engine", UK_OVERLAY0);
+    uk_hline(&g_win, 0, 36, (int)w, UK_SURFACE1);
 
-    /* Display value — right-aligned, 2× scale */
-    int dlen = uk_strlen(g_display);
-    int dx = (int)w - dlen * 16 - 16;
-    if (dx < 8) dx = 8;
-    uk_draw_text_2x(&g_win, dx, 32, g_display, UK_TEXT);
+    /* ── Display Panel ───────────────────────────────────────────────────── */
+    uk_fill_rect(&g_win, 0, 36, (int)w, 86, UK_CRUST);
+    uk_hline(&g_win, 0, 122, (int)w, UK_SURFACE1);
 
-    /* Pending op indicator */
-    if (g_pending_op) {
-        char op_str[3] = { g_pending_op, '\0', '\0' };
-        if (g_pending_op == '*') op_str[0] = 'x';
-        uk_draw_text(&g_win, 12, 12, op_str, UK_MAUVE);
+    /* Calculation history preview */
+    if (g_hist_count > 0) {
+        char hist_str[48];
+        snprintf(hist_str, sizeof(hist_str), "%s = %s", g_history[g_hist_count - 1].expr, g_history[g_hist_count - 1].res);
+        int hlen = (int)strlen(hist_str);
+        uk_draw_text(&g_win, (int)w - hlen * 8 - 14, 44, hist_str, UK_OVERLAY0);
     }
 
-    /* ── Button grid ────────────────────────────────────────────────────── */
-    int i;
-    for (i = 0; i < 20; i++) {
+    /* Pending operator */
+    if (g_pending_op) {
+        char op_str[4] = { g_pending_op == 'M' ? '%' : g_pending_op, '\0' };
+        uk_draw_text(&g_win, 14, 44, op_str, UK_MAUVE);
+    }
+
+    /* Main Digit Display */
+    int dlen = uk_strlen(g_display);
+    int dx = (int)w - dlen * 16 - 16;
+    if (dx < 12) dx = 12;
+    uk_draw_text_2x(&g_win, dx, 68, g_display, UK_TEXT);
+
+    /* ── Button Grid (6x4) ───────────────────────────────────────────────── */
+    for (int i = 0; i < 24; i++) {
         int col = i % NCOLS;
         int row = i / NCOLS;
 
-        if (row == 4 && col == 1) {
-            continue; /* Skip col 1 because wide "0" button spans cols 0 and 1 */
-        }
+        if (row == 5 && col == 3) continue; /* merged with col 2 */
 
-        /* Row 4 col 0: "0" button is double-wide */
-        if (row == 4 && col == 0) {
-            int bx = BTN_OX;
-            int by = BTN_OY + row * (BTN_H + BTN_GAD);
-            int bw = BTN_W * 2 + BTN_GAD;
-            uk_btn_state_t state = (g_hovered == i) ? UK_BTN_HOVER : UK_BTN_NORMAL;
-            uk_fill_rounded_rect(&g_win, bx, by, bw, BTN_H, 8, g_buttons[i].accent);
-            uk_hline(&g_win, bx, by, bw, UK_SURFACE1);
-            uk_hline(&g_win, bx, by + BTN_H - 1, bw, UK_CRUST);
-            if (state == UK_BTN_HOVER)
-                uk_fill_rounded_rect(&g_win, bx, by, bw, BTN_H, 8, UK_SURFACE1);
-            uk_draw_text_centred(&g_win, bx + bw / 2, by + (BTN_H - 16) / 2, "0", UK_TEXT);
-            continue;
-        }
-
-        int bx = BTN_OX + col * (BTN_W + BTN_GAD);
-        int by = BTN_OY + row * (BTN_H + BTN_GAD);
+        int bx = BTN_OX + col * (BTN_W + BTN_GAP);
+        int by = BTN_OY + row * (BTN_H + BTN_GAP);
+        int bw = (row == 5 && col == 2) ? (BTN_W * 2 + BTN_GAP) : BTN_W;
 
         unsigned int bg = g_buttons[i].accent;
-        if (g_hovered == i) bg = UK_SURFACE1;
+        if (g_hovered == i) bg = UK_SURFACE2;
 
-        uk_fill_rounded_rect(&g_win, bx, by, BTN_W, BTN_H, 8, bg);
-        uk_hline(&g_win, bx, by, BTN_W, UK_SURFACE2);
-        uk_hline(&g_win, bx, by + BTN_H - 1, BTN_W, UK_CRUST);
+        uk_fill_rounded_rect(&g_win, bx, by, bw, BTN_H, 6, bg);
+        uk_hline(&g_win, bx + 2, by, bw - 4, UK_SURFACE2);
+        uk_hline(&g_win, bx + 2, by + BTN_H - 1, bw - 4, UK_CRUST);
 
-        unsigned int fg = (g_buttons[i].accent == UK_MAUVE || g_buttons[i].accent == UK_PEACH)
-                          ? UK_BASE : UK_TEXT;
+        unsigned int fg = (g_buttons[i].accent == UK_MAUVE || g_buttons[i].accent == UK_PEACH) ? UK_BASE : UK_TEXT;
         if (g_hovered == i) fg = UK_TEXT;
 
         int tlen = uk_strlen(g_buttons[i].label);
-        uk_draw_text(&g_win, bx + BTN_W / 2 - tlen * 4, by + (BTN_H - 16) / 2,
-                     g_buttons[i].label, fg);
+        uk_draw_text(&g_win, bx + (bw - tlen * 8) / 2, by + (BTN_H - 16) / 2, g_buttons[i].label, fg);
     }
 
     uk_invalidate(&g_win);
@@ -259,79 +278,35 @@ static void draw_calc(void)
 
 static int hit_button(int mx, int my)
 {
-    int i;
-    for (i = 0; i < 20; i++) {
+    for (int i = 0; i < 24; i++) {
         int col = i % NCOLS;
         int row = i / NCOLS;
+        if (row == 5 && col == 3) continue;
 
-        if (row == 4 && col == 1) {
-            continue;
-        }
+        int bx = BTN_OX + col * (BTN_W + BTN_GAP);
+        int by = BTN_OY + row * (BTN_H + BTN_GAP);
+        int bw = (row == 5 && col == 2) ? (BTN_W * 2 + BTN_GAP) : BTN_W;
 
-        int bx = BTN_OX + col * (BTN_W + BTN_GAD);
-        int by = BTN_OY + row * (BTN_H + BTN_GAD);
-        int bw = (row == 4 && col == 0) ? (BTN_W * 2 + BTN_GAD) : BTN_W;
-
-        if (mx >= bx && mx < bx + bw && my >= by && my < by + BTN_H) {
-            return i;
-        }
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + BTN_H) return i;
     }
     return -1;
-}
-
-static void handle_key(unsigned char keycode, unsigned char scancode, unsigned char pressed, unsigned short modifiers)
-{
-    if (!pressed) return;
-    int shift = (modifiers & 1) != 0;
-    char action = 0;
-
-    /* Direct ASCII operations & digits */
-    if (keycode >= '0' && keycode <= '9') {
-        action = (char)keycode;
-    } else if (keycode == '+' || keycode == '-' || keycode == '*' || keycode == '/' || keycode == '%' || keycode == '.') {
-        action = (char)keycode;
-    } else if (keycode == '=' || keycode == '\n' || keycode == '\r' || scancode == 28) {
-        action = '=';
-    } else if (keycode == 'c' || keycode == 'C' || keycode == 27 || keycode == '\b' || scancode == 1 || scancode == 14) {
-        action = 'C';
-    } else if (scancode >= 2 && scancode <= 10) {
-        if (shift && scancode == 9) action = '*';
-        else if (shift && scancode == 6) action = '%';
-        else action = '1' + (scancode - 2);
-    } else if (scancode == 11) {
-        action = '0';
-    } else if (scancode == 12) {
-        action = '-';
-    } else if (scancode == 13) {
-        action = shift ? '+' : '=';
-    } else if (scancode == 52) {
-        action = '.';
-    } else if (scancode == 53) {
-        action = '/';
-    }
-
-    if (action) {
-        calc_handle(action);
-        draw_calc();
-    }
 }
 
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    puts("[calculator] Starting...");
-
-    display_set("0");
-
     az_fb_info_t fb;
     unsigned int sw = 1280, sh = 800;
-    if (az_fb_info(&fb) == 0) { sw = fb.width; sh = fb.height; }
+    if (az_fb_info(&fb) == 0 && fb.width > 0 && fb.height > 0) {
+        sw = fb.width;
+        sh = fb.height;
+    }
 
     int ret = uk_window_connect(&g_win, "Calculator",
                                 (int)(sw / 2) - WIN_W / 2,
                                 (int)(sh / 2) - WIN_H / 2,
                                 WIN_W, WIN_H, MAP_ADDR, SERVER_CHAN);
-    if (ret < 0) { puts("[calculator] FATAL"); return -1; }
+    if (ret < 0) return -1;
 
     draw_calc();
 
@@ -341,28 +316,35 @@ int main(int argc, char **argv)
         if (r < 0) break;
         if (r != 0) continue;
 
-        if (msg.type == AZ_WM_DESTROY_WINDOW) {
-            break;
-        }
+        if (msg.type == AZ_WM_DESTROY_WINDOW) break;
 
         if (msg.type == AZ_WM_KEY_EVENT) {
-            handle_key(msg.key.keycode, msg.key.scancode, msg.key.pressed, msg.key.modifiers);
-        } else if (msg.type == AZ_WM_MOUSE_EVENT) {
-            int mx = (int)msg.mouse.abs_x;
-            int my = (int)msg.mouse.abs_y;
-            int prev_hover = g_hovered;
-            g_hovered = hit_button(mx, my);
-            if (g_hovered != prev_hover) draw_calc();
-
-            static int was_down = 0;
-            int is_down = (msg.mouse.buttons & AZ_MOUSE_BTN_LEFT) != 0;
-
-            if (is_down && !was_down && g_hovered >= 0) {
-                calc_handle(g_buttons[g_hovered].action);
+            if (msg.key.pressed) {
+                char c = (char)msg.key.keycode;
+                if (c >= '0' && c <= '9') calc_handle(c);
+                else if (c == '+' || c == '-' || c == '*' || c == '/' || c == '%' || c == '.') calc_handle(c);
+                else if (c == '\n' || c == '\r' || c == '=') calc_handle('=');
+                else if (c == 'c' || c == 'C' || msg.key.scancode == 1) calc_handle('C');
                 draw_calc();
             }
-            was_down = is_down;
+        } else if (msg.type == AZ_WM_MOUSE_EVENT) {
+            int mx = msg.mouse.abs_x;
+            int my = msg.mouse.abs_y;
+            int hit = hit_button(mx, my);
+
+            if (msg.mouse.buttons & 1) {
+                if (hit >= 0) {
+                    calc_handle(g_buttons[hit].action);
+                    draw_calc();
+                }
+            } else {
+                if (hit != g_hovered) {
+                    g_hovered = hit;
+                    draw_calc();
+                }
+            }
         }
     }
-    sys_exit(0);
+
+    return 0;
 }

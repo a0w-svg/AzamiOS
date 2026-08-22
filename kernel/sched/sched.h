@@ -12,7 +12,9 @@ typedef enum {
     THREAD_READY = 0,
     THREAD_RUNNING,
     THREAD_BLOCKED,
+    THREAD_BLOCKED_PENDING,
     THREAD_SLEEPING,
+    THREAD_SLEEPING_PENDING,
     THREAD_DYING,
     THREAD_ZOMBIE
 } thread_state_t;
@@ -20,6 +22,10 @@ typedef enum {
 struct process;
 struct az_object;
 typedef struct az_object az_object_t;
+
+typedef struct __attribute__((aligned(16))) {
+    u8 buffer[512];
+} fpu_state_t;
 
 /**
  * struct thread — Microkernel execution unit.
@@ -30,20 +36,72 @@ typedef struct thread {
     u64             kernel_rsp;      /* Saved kernel stack pointer on context switch */
     u64             kernel_stack_top;/* Top of dedicated kernel stack for ring-0 transitions */
     thread_state_t  state;           /* Thread state */
+    bool            unblock_pending; /* Signal from sched_unblock during context switch */
     u64             vruntime;        /* Completely Fair Scheduler virtual runtime */
     u32             priority;        /* Thread priority (weight modifier for CFS) */
     u32             cpu_id;          /* Currently assigned logical CPU */
     pt_regs_t      *user_regs;       /* Saved user frame during syscalls/interrupts */
     u64             sleep_end_ticks; /* Ticks when sleeping should end */
+    fpu_state_t     fpu_state;       /* 512-byte FXSAVE/FXRSTOR area */
     struct thread  *next;            /* Ready queue / list pointer */
     struct thread  *proc_next;       /* Next thread in the same process */
 } thread_t;
 
-#define MAX_SHMEM_PER_PROC 16
+/* ── POSIX Signals ────────────────────────────────────────────────────────── */
+#define SIGHUP     1
+#define SIGINT     2
+#define SIGQUIT    3
+#define SIGILL     4
+#define SIGTRAP    5
+#define SIGABRT    6
+#define SIGBUS     7
+#define SIGFPE     8
+#define SIGKILL    9
+#define SIGUSR1    10
+#define SIGSEGV    11
+#define SIGUSR2    12
+#define SIGPIPE    13
+#define SIGALRM    14
+#define SIGTERM    15
+#define SIGCHLD    17
+#define SIGCONT    18
+#define SIGSTOP    19
+#define SIGTSTP    20
+#define SIGWINCH   28
+#define _NSIG      64
+
+typedef u64 sigset_t;
+
+typedef void (*sighandler_t)(int);
+#define SIG_DFL ((sighandler_t)0)
+#define SIG_IGN ((sighandler_t)1)
+#define SIG_ERR ((sighandler_t)-1)
+
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+
+#define SA_NOCLDSTOP 0x00000001
+#define SA_NOCLDWAIT 0x00000002
+#define SA_SIGINFO   0x00000004
+#define SA_RESTORER  0x04000000
+#define SA_RESTART   0x10000000
+#define SA_NODEFER   0x40000000
+#define SA_RESETHAND 0x80000000
+
+typedef struct sigaction {
+    sighandler_t sa_handler;
+    u64          sa_flags;
+    void       (*sa_restorer)(void);
+    sigset_t     sa_mask;
+} sigaction_t;
+
+#define MAX_SHMEM_PER_PROC 64
 
 typedef struct {
     u32 shmem_id;
     virt_addr_t virt_addr;
+    void *shmem_ptr;
 } proc_shmem_map_t;
 
 /**
@@ -57,6 +115,7 @@ typedef struct process {
     struct process *parent;          /* Parent process */
     struct process *next;            /* Global process list pointer */
     void           *handle_table[64];      /* VFS file descriptor table */
+    u8              fd_flags[64];          /* File descriptor flags (FD_CLOEXEC) */
     az_object_t    *obj_handle_table[64];  /* Object Manager handle table */
     proc_shmem_map_t shmem_maps[MAX_SHMEM_PER_PROC]; /* Shared memory mappings */
     virt_addr_t     heap_start;            /* Base of user heap for brk */
@@ -66,6 +125,16 @@ typedef struct process {
     bool            is_zombie;             /* Process terminated, awaiting waitpid */
     struct thread  *wait_thread;          /* Parent thread waiting on child exit */
     char            cwd[256];              /* Current working directory */
+    u32             umask;                 /* POSIX-02: per-process file creation mask (default 022) */
+    u32             uid;                   /* Real User ID */
+    u32             gid;                   /* Real Group ID */
+    u32             euid;                  /* Effective User ID */
+    u32             egid;                  /* Effective Group ID */
+    sigaction_t     sigactions[_NSIG];     /* Signal handlers */
+    sigset_t        sig_pending;           /* Pending signals bitmask */
+    sigset_t        sig_blocked;           /* Blocked signals bitmask */
+    u64             fs_base;               /* x86_64 FS_BASE (User TLS) */
+    u64             gs_base;               /* x86_64 GS_BASE (User TLS) */
 } process_t;
 
 /** sched_init() — Initialize CFS scheduler and per-CPU idle threads. */
@@ -107,8 +176,14 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys);
 /** proc_destroy(proc) — Unlink and free process container. */
 void proc_destroy(process_t *proc);
 
-/** thread_create(proc, entry, arg, is_kernel) — Create a new execution thread. */
+/** thread_create(proc, entry, arg, is_kernel) — Create a new execution thread and enqueue. */
 thread_t *thread_create(process_t *proc, uintptr_t entry, uintptr_t arg, bool is_kernel);
+
+/** thread_create_ex(proc, entry, arg, is_kernel, enqueue) — Create a new execution thread with optional enqueue. */
+thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool is_kernel, bool enqueue);
+
+/** sched_enqueue_thread(t) — Add a prepared thread to the CFS ready queue. */
+void sched_enqueue_thread(thread_t *t);
 
 /** sched_exit_thread() — Terminate current thread and reschedule (never returns). */
 __noreturn void sched_exit_thread(void);

@@ -356,6 +356,16 @@ int de_comp_handle_message(az_compositor_t *comp, de_comp_state_t *de,
         return 0;
     }
 
+    case AZ_WM_SET_THEME: {
+        az_wm_theme_payload_t *pl = AZ_WM_MSG_THEME(msg);
+        az_wm_msg_t bmsg;
+        memset(&bmsg, 0, sizeof(bmsg));
+        bmsg.type = AZ_WM_EVT_THEME_CHANGED;
+        AZ_WM_MSG_THEME(&bmsg)->theme_id = pl->theme_id;
+        broadcast(de, &bmsg);
+        return 1;
+    }
+
     default:
         break;
     }

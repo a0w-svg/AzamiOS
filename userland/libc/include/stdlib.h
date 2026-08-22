@@ -41,6 +41,7 @@ void *calloc(size_t nmemb, size_t size);
 void *realloc(void *ptr, size_t size);
 void  free(void *ptr);
 void *aligned_alloc(size_t alignment, size_t size);
+int   posix_memalign(void **memptr, size_t alignment, size_t size);
 
 /* Numeric conversion */
 int                atoi(const char *nptr);
@@ -50,6 +51,7 @@ long               strtol(const char *nptr, char **endptr, int base);
 long long          strtoll(const char *nptr, char **endptr, int base);
 unsigned long      strtoul(const char *nptr, char **endptr, int base);
 unsigned long long strtoull(const char *nptr, char **endptr, int base);
+double             atof(const char *nptr);
 double             strtod(const char *nptr, char **endptr);
 float              strtof(const char *nptr, char **endptr);
 char              *itoa(int value, char *str, int base);
@@ -63,8 +65,17 @@ ldiv_t    ldiv(long numer, long denom);
 lldiv_t   lldiv(long long numer, long long denom);
 
 /* Pseudo-random */
-int  rand(void);
-void srand(unsigned int seed);
+int             rand(void);
+void            srand(unsigned int seed);
+double          drand48(void);
+double          erand48(unsigned short xsubi[3]);
+long            lrand48(void);
+long            nrand48(unsigned short xsubi[3]);
+long            mrand48(void);
+long            jrand48(unsigned short xsubi[3]);
+void            srand48(long seedval);
+unsigned short *seed48(unsigned short seed16v[3]);
+void            lcong48(unsigned short param[7]);
 
 /* Searching and sorting */
 void  qsort(void *base, size_t nmemb, size_t size,
@@ -72,10 +83,28 @@ void  qsort(void *base, size_t nmemb, size_t size,
 void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
               int (*compar)(const void *, const void *));
 
+/* Temporary paths & file creation */
+int   mkstemp(char *tmpl);
+char *mkdtemp(char *tmpl);
+char *mktemp(char *tmpl);
+char *realpath(const char *path, char *resolved_path);
+int   getsubopt(char **optionp, char * const *tokens, char **valuep);
+
 /* Environment and process control */
+extern char **environ;
 char *getenv(const char *name);
 int   setenv(const char *name, const char *value, int overwrite);
 int   unsetenv(const char *name);
 int   putenv(char *string);
+int   clearenv(void);
+int   system(const char *command);
 void  exit(int status) __attribute__((noreturn));
 void  abort(void)       __attribute__((noreturn));
+int   atexit(void (*fn)(void));
+
+/* GCC runtime support — stack protector & C++ atexit machinery */
+#include <stdint.h>
+extern uintptr_t __stack_chk_guard;
+void __stack_chk_fail(void) __attribute__((noreturn));
+int  __cxa_atexit(void (*fn)(void *), void *arg, void *dso);
+void __cxa_finalize(void *dso);

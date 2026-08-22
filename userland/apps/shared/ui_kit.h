@@ -23,7 +23,7 @@
 #include "de_log.h"
 
 /* ============================================================================
- * Catppuccin Mocha palette (0xFFRRGGBB / ARGB)
+ * Color definitions & Multi-Theme System
  * ============================================================================ */
 #define UK_CRUST      0xFF11111B
 #define UK_MANTLE     0xFF181825
@@ -51,6 +51,74 @@
 #define UK_PINK       0xFFF5C2E7
 #define UK_FLAMINGO   0xFFF2CDCD
 #define UK_ROSEWATER  0xFFF5E0DC
+
+typedef struct {
+    const char   *name;
+    unsigned int  crust;
+    unsigned int  mantle;
+    unsigned int  base;
+    unsigned int  surface0;
+    unsigned int  surface1;
+    unsigned int  surface2;
+    unsigned int  overlay0;
+    unsigned int  overlay1;
+    unsigned int  text;
+    unsigned int  accent;
+    unsigned int  accent_sec;
+    unsigned int  red;
+    unsigned int  green;
+    unsigned int  yellow;
+    unsigned int  blue;
+} uk_theme_palette_t;
+
+static const uk_theme_palette_t g_uk_themes[AZ_THEME_COUNT] = {
+    [AZ_THEME_MOCHA] = {
+        .name       = "Catppuccin Mocha",
+        .crust      = 0xFF11111B, .mantle     = 0xFF181825, .base       = 0xFF1E1E2E,
+        .surface0   = 0xFF313244, .surface1   = 0xFF45475A, .surface2   = 0xFF585B70,
+        .overlay0   = 0xFF6C7086, .overlay1   = 0xFF7F849C, .text       = 0xFFCDD6F4,
+        .accent     = 0xFFCBA6F7, .accent_sec = 0xFFFAB387,
+        .red        = 0xFFF38BA8, .green      = 0xFFA6E3A1, .yellow     = 0xFFF9E2AF, .blue = 0xFF89B4FA,
+    },
+    [AZ_THEME_LATTE] = {
+        .name       = "Catppuccin Latte",
+        .crust      = 0xFFDCE0E8, .mantle     = 0xFFE6E9EF, .base       = 0xFFEFF1F5,
+        .surface0   = 0xFFCCD0DA, .surface1   = 0xFFBCC0CC, .surface2   = 0xFFACB0BE,
+        .overlay0   = 0xFF9CA0B0, .overlay1   = 0xFF8C8FA1, .text       = 0xFF4C4F69,
+        .accent     = 0xFF8839EF, .accent_sec = 0xFFFE640B,
+        .red        = 0xFFD20F39, .green      = 0xFF40A02B, .yellow     = 0xFFDF8E1D, .blue = 0xFF1E66F5,
+    },
+    [AZ_THEME_NORD] = {
+        .name       = "Nord Arctic",
+        .crust      = 0xFF242933, .mantle     = 0xFF2E3440, .base       = 0xFF3B4252,
+        .surface0   = 0xFF434C5E, .surface1   = 0xFF4C566A, .surface2   = 0xFF5A657D,
+        .overlay0   = 0xFF7885A0, .overlay1   = 0xFF9AA7C0, .text       = 0xFFECEFF4,
+        .accent     = 0xFF88C0D0, .accent_sec = 0xFF81A1C1,
+        .red        = 0xFFBF616A, .green      = 0xFFA3BE8C, .yellow     = 0xFFEBCB8B, .blue = 0xFF5E81AC,
+    },
+    [AZ_THEME_CYBERPUNK] = {
+        .name       = "Cyberpunk Neon",
+        .crust      = 0xFF05050A, .mantle     = 0xFF0D0D18, .base       = 0xFF141424,
+        .surface0   = 0xFF202038, .surface1   = 0xFF2E2E50, .surface2   = 0xFF424270,
+        .overlay0   = 0xFF6868A0, .overlay1   = 0xFF8F8FD0, .text       = 0xFFF0F6FC,
+        .accent     = 0xFF00FFCC, .accent_sec = 0xFFFF007F,
+        .red        = 0xFFFF2A6D, .green      = 0xFF05FFA1, .yellow     = 0xFFFFE600, .blue = 0xFF00F0FF,
+    },
+    [AZ_THEME_OLED] = {
+        .name       = "OLED Pure Dark",
+        .crust      = 0xFF000000, .mantle     = 0xFF050505, .base       = 0xFF0A0A0A,
+        .surface0   = 0xFF181818, .surface1   = 0xFF242424, .surface2   = 0xFF323232,
+        .overlay0   = 0xFF555555, .overlay1   = 0xFF777777, .text       = 0xFFFFFFFF,
+        .accent     = 0xFF3B82F6, .accent_sec = 0xFF10B981,
+        .red        = 0xFFEF4444, .green      = 0xFF22C55E, .yellow     = 0xFFEAB308, .blue = 0xFF60A5FA,
+    },
+};
+
+static inline const uk_theme_palette_t *uk_get_theme_palette(unsigned int theme_id)
+{
+    if (theme_id >= AZ_THEME_COUNT) theme_id = AZ_THEME_MOCHA;
+    return &g_uk_themes[theme_id];
+}
 
 /* ============================================================================
  * Window connection state
@@ -194,16 +262,48 @@ static inline void uk_gradient_h(uk_window_t *w,
     }
 }
 
-/* Draw a circle (filled) */
+/* Draw a circle (filled) — high-speed scanline rasterizer */
 static inline void uk_fill_circle(uk_window_t *w, int cx, int cy, int r, unsigned int col)
 {
-    int x, y;
-    for (y = cy - r; y <= cy + r; y++) {
-        for (x = cx - r; x <= cx + r; x++) {
-            int dx = x - cx, dy = y - cy;
-            if (dx * dx + dy * dy <= r * r)
-                uk_put_pixel(w, x, y, col);
+    if (r <= 0 || !w || !w->pixels) return;
+    int r2 = r * r;
+    int fb_w = (int)w->width;
+    int fb_h = (int)w->height;
+
+    for (int y = -r; y <= r; y++) {
+        int py = cy + y;
+        if (py < 0 || py >= fb_h) continue;
+        int rem = r2 - y * y;
+        if (rem < 0) continue;
+        int max_x = 0;
+        while ((max_x + 1) * (max_x + 1) <= rem) max_x++;
+
+        int x0 = cx - max_x;
+        int x1 = cx + max_x + 1;
+        if (x0 < 0) x0 = 0;
+        if (x1 > fb_w) x1 = fb_w;
+        if (x0 >= x1) continue;
+
+        unsigned int *dst = &w->pixels[(unsigned int)py * w->width + (unsigned int)x0];
+        int count = x1 - x0;
+        unsigned long long col64 = ((unsigned long long)col << 32) | (unsigned long long)col;
+        if (((unsigned long)dst & 7) && count > 0) {
+            *dst++ = col;
+            count--;
         }
+        unsigned long long *dst64 = (unsigned long long *)dst;
+        while (count >= 4) {
+            dst64[0] = col64;
+            dst64[1] = col64;
+            dst64 += 2;
+            count -= 4;
+        }
+        if (count >= 2) {
+            *dst64++ = col64;
+            count -= 2;
+        }
+        dst = (unsigned int *)dst64;
+        if (count > 0) *dst = col;
     }
 }
 
@@ -366,8 +466,14 @@ static inline void uk_draw_scrollbar(uk_window_t *w,
                                       int x, int y, int h,
                                       int thumb_pos, int thumb_h)
 {
-    uk_fill_rect(w, x, y, 8, h, UK_SURFACE0);
-    uk_fill_rect(w, x + 1, y + thumb_pos, 6, thumb_h, UK_SURFACE2);
+    if (!w || !w->pixels || h <= 0) return;
+    if (thumb_h < 6) thumb_h = 6;
+    if (thumb_h > h) thumb_h = h;
+    if (thumb_pos < 0) thumb_pos = 0;
+    if (thumb_pos + thumb_h > h) thumb_pos = h - thumb_h;
+
+    uk_fill_rounded_rect(w, x, y, 8, h, 3, UK_SURFACE0);
+    uk_fill_rounded_rect(w, x + 1, y + thumb_pos, 6, thumb_h, 2, UK_SURFACE2);
 }
 
 /* ============================================================================
@@ -673,6 +779,29 @@ static inline void uk_vline(uk_window_t *w, int x, int y, int len, unsigned int 
     uk_fill_rect(w, x, y, 1, len, col);
 }
 
+static inline void uk_line(uk_window_t *w, int x0, int y0, int x1, int y1, unsigned int col)
+{
+    int dx = (x1 >= x0) ? (x1 - x0) : (x0 - x1);
+    int dy = (y1 >= y0) ? (y1 - y0) : (y0 - y1);
+    int sx = (x0 < x1) ? 1 : -1;
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx - dy;
+
+    for (;;) {
+        uk_put_pixel(w, x0, y0, col);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) {
+            err -= dy;
+            x0 += sx;
+        }
+        if (e2 < dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
 /* ============================================================================
  * Modern Extended Controls
  * ============================================================================ */
@@ -793,5 +922,172 @@ static inline void uk_draw_toggle_modern(uk_window_t *w, int x, int y, int activ
     uk_fill_rounded_rect(w, x, y, width, height, 10, bg);
     int knob_x = active ? (x + width - 18) : (x + 2);
     uk_fill_circle(w, knob_x + 8, y + 10, 7, UK_TEXT);
+}
+
+/* Anti-aliased line drawing (Bresenham with subpixel alpha) */
+static inline void uk_draw_line_aa(uk_window_t *w, int x0, int y0, int x1, int y1, unsigned int col)
+{
+    int dx = (x1 >= x0) ? (x1 - x0) : (x0 - x1);
+    int sx = (x0 < x1) ? 1 : -1;
+    int dy = (y1 >= y0) ? (y1 - y0) : (y0 - y1);
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx - dy;
+    int e2;
+    int ed = (dx + dy == 0) ? 1 : (dx > dy ? dx : dy);
+
+    while (1) {
+        if (x0 >= 0 && (unsigned int)x0 < w->width && y0 >= 0 && (unsigned int)y0 < w->height) {
+            w->pixels[(unsigned int)y0 * w->width + (unsigned int)x0] = col;
+        }
+        e2 = err;
+        int x2 = x0;
+        if (2 * e2 >= -dx) {
+            if (x0 == x1 && y0 == y1) break;
+            if (e2 + dy < 2 * ed && y0 + sy >= 0 && (unsigned int)(y0 + sy) < w->height && x0 >= 0 && (unsigned int)x0 < w->width) {
+                int dist = e2 + dy;
+                if (dist < 0) dist = 0;
+                int a = 255 - (255 * dist) / (2 * ed);
+                if (a < 0) a = 0;
+                if (a > 255) a = 255;
+                unsigned int *p = &w->pixels[(unsigned int)(y0 + sy) * w->width + (unsigned int)x0];
+                *p = uk_blend(*p, col, (unsigned int)a);
+            }
+            err -= dy;
+            x0 += sx;
+        }
+        if (2 * e2 <= dy) {
+            if (x2 == x1 && y0 == y1) break;
+            if (dx - e2 < 2 * ed && x2 + sx >= 0 && (unsigned int)(x2 + sx) < w->width && y0 >= 0 && (unsigned int)y0 < w->height) {
+                int dist = dx - e2;
+                if (dist < 0) dist = 0;
+                int a = 255 - (255 * dist) / (2 * ed);
+                if (a < 0) a = 0;
+                if (a > 255) a = 255;
+                unsigned int *p = &w->pixels[(unsigned int)y0 * w->width + (unsigned int)(x2 + sx)];
+                *p = uk_blend(*p, col, (unsigned int)a);
+            }
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+/* Rounded rectangle border outline */
+static inline void uk_draw_rounded_rect_outline(uk_window_t *w, int x, int y, int rw, int rh, int radius, unsigned int border_col)
+{
+    if (rw <= 0 || rh <= 0) return;
+    if (radius * 2 > rw) radius = rw / 2;
+    if (radius * 2 > rh) radius = rh / 2;
+
+    /* Top & bottom horizontal segments */
+    uk_fill_rect(w, x + radius, y, rw - 2 * radius, 1, border_col);
+    uk_fill_rect(w, x + radius, y + rh - 1, rw - 2 * radius, 1, border_col);
+
+    /* Left & right vertical segments */
+    uk_fill_rect(w, x, y + radius, 1, rh - 2 * radius, border_col);
+    uk_fill_rect(w, x + rw - 1, y + radius, 1, rh - 2 * radius, border_col);
+
+    /* Four corner arcs */
+    for (int cy = -radius; cy <= 0; cy++) {
+        for (int cx = -radius; cx <= 0; cx++) {
+            int d = cx * cx + cy * cy;
+            if (d <= radius * radius && d >= (radius - 1) * (radius - 1)) {
+                uk_put_pixel(w, x + radius + cx, y + radius + cy, border_col);
+                uk_put_pixel(w, x + rw - 1 - radius - cx, y + radius + cy, border_col);
+                uk_put_pixel(w, x + radius + cx, y + rh - 1 - radius - cy, border_col);
+                uk_put_pixel(w, x + rw - 1 - radius - cx, y + rh - 1 - radius - cy, border_col);
+            }
+        }
+    }
+}
+
+/* Modern text input box with placeholder, focus glow, and blinking cursor */
+static inline void uk_draw_textbox(uk_window_t *w, int x, int y, int width, int height,
+                                   const char *text, const char *placeholder, int focused, int cursor_pos)
+{
+    unsigned int bg_col = UK_MANTLE;
+    unsigned int border_col = focused ? UK_BLUE : UK_SURFACE1;
+
+    uk_fill_rounded_rect(w, x, y, width, height, 6, bg_col);
+    uk_draw_rounded_rect_outline(w, x, y, width, height, 6, border_col);
+
+    if (focused) {
+        /* Subtle focus glow line */
+        uk_fill_rect(w, x + 6, y + height - 2, width - 12, 2, UK_BLUE);
+    }
+
+    int text_y = y + (height - 16) / 2;
+    if (text && text[0]) {
+        uk_draw_text_clip(w, x + 8, text_y, text, UK_TEXT, width - 16);
+    } else if (placeholder && placeholder[0]) {
+        uk_draw_text_clip(w, x + 8, text_y, placeholder, UK_OVERLAY0, width - 16);
+    }
+
+    if (focused && cursor_pos >= 0) {
+        int cx = x + 8 + cursor_pos * 8;
+        if (cx < x + width - 10) {
+            uk_fill_rect(w, cx, text_y, 2, 16, UK_BLUE);
+        }
+    }
+}
+
+/* Floating dark tooltip balloon */
+static inline void uk_draw_tooltip(uk_window_t *w, int x, int y, const char *text)
+{
+    if (!text || !text[0]) return;
+    int len = uk_strlen(text);
+    int tw = len * 8 + 16;
+    int th = 24;
+
+    if (x + tw > (int)w->width - 4) x = (int)w->width - tw - 4;
+    if (y + th > (int)w->height - 4) y = (int)w->height - th - 4;
+    if (x < 4) x = 4;
+    if (y < 4) y = 4;
+
+    uk_fill_rounded_rect(w, x, y, tw, th, 4, UK_CRUST);
+    uk_draw_rounded_rect_outline(w, x, y, tw, th, 4, UK_SURFACE2);
+    uk_draw_text(w, x + 8, y + 4, text, UK_TEXT);
+}
+
+/* Circular arc gauge indicator with fixed-point trigonometric circle rasterizer */
+static inline void uk_draw_gauge(uk_window_t *w, int cx, int cy, int radius, int percent, unsigned int color)
+{
+    if (radius <= 4 || !w || !w->pixels) return;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+
+    int r_in = radius - 4;
+    int r_out = radius;
+
+    for (int y = -r_out; y <= r_out; y++) {
+        for (int x = -r_out; x <= r_out; x++) {
+            int d = x * x + y * y;
+            if (d >= r_in * r_in && d <= r_out * r_out) {
+                uk_put_pixel(w, cx + x, cy + y, UK_SURFACE0);
+            }
+        }
+    }
+
+    static const short sin_tab[64] = {
+           0,  100,  199,  296,  391,  482,  568,  649,
+         724,  791,  851,  903,  946,  979, 1002, 1017,
+        1024, 1017, 1002,  979,  946,  903,  851,  791,
+         724,  649,  568,  482,  391,  296,  199,  100,
+           0, -100, -199, -296, -391, -482, -568, -649,
+        -724, -791, -851, -903, -946, -979,-1002,-1017,
+       -1024,-1017,-1002, -979, -946, -903, -851, -791,
+        -724, -649, -568, -482, -391, -296, -199, -100
+    };
+
+    int rad_mid = (r_in + r_out) / 2;
+    int fill_steps = (percent * 64) / 100;
+
+    for (int i = 0; i <= fill_steps && i < 64; i++) {
+        int sin_val = sin_tab[i];
+        int cos_val = sin_tab[(i + 16) & 63];
+        int px = cx + (rad_mid * sin_val) / 1024;
+        int py = cy - (rad_mid * cos_val) / 1024;
+        uk_fill_circle(w, px, py, 2, color);
+    }
 }
 

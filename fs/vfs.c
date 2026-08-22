@@ -7,6 +7,7 @@
 #include <azami/debug.h>
 #include "vfs.h"
 #include "../kernel/mm/kmalloc.h"
+#include "../kernel/lib/string.h"
 #include "../arch/x86_64/cpu/spinlock.h"
 #include "../drivers/char/console.h"
 #include "../include/azami/defs.h"
@@ -73,16 +74,8 @@ dentry_t *dcache_lookup(dentry_t *parent, const char *name)
     spinlock_lock(&g_vfs_lock);
     dentry_t *child = parent->d_subdirs;
     while (child) {
-        bool match = true;
-        int i;
-        for (i = 0; i < VFS_NAME_MAX; i++) {
-            if (name[i] != child->d_name[i]) {
-                match = false;
-                break;
-            }
-            if (name[i] == '\0') break;
-        }
-        if (match && i < VFS_NAME_MAX) {
+        /* QUALITY-01: use strncmp instead of hand-rolled comparison loop */
+        if (strncmp(name, child->d_name, VFS_NAME_MAX) == 0) {
             spinlock_unlock(&g_vfs_lock);
             return child;
         }
@@ -243,7 +236,7 @@ s64 vfs_path_lookup(const char *path, dentry_t **out_dentry)
 {
     if (!path || !g_vfs_root) return -(s64)ENOENT;
     
-    char resolved[256];
+    char resolved[512];
     if (vfs_resolve_path("/", path, resolved, sizeof(resolved)) == 0) {
         path = resolved;
     } else if (path[0] != '/') {
@@ -324,61 +317,106 @@ s64 vfs_path_lookup(const char *path, dentry_t **out_dentry)
  * Syscall Implementations
  * -------------------------------------------------------------------------- */
 
-file_t *vfs_open(const char *path, u32 flags, u32 mode)
+/* vfs_open_err: like vfs_open but sets *out_errno on failure so callers
+ * can distinguish ENOENT from EEXIST (BUG-10). */
+file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno)
 {
+    if (out_errno) *out_errno = -(s64)ENOENT; /* default */
+
     dentry_t *dentry = NULL;
     s64 err = vfs_path_lookup(path, &dentry);
     
+    if (err == 0 && dentry && dentry->d_inode && (flags & O_CREAT) && (flags & O_EXCL)) {
+        /* BUG-10 fix: file exists and O_EXCL was requested → EEXIST */
+        if (out_errno) *out_errno = -(s64)EEXIST;
+        return NULL;
+    }
+
     if (err == -(s64)ENOENT && dentry && (flags & O_CREAT)) {
         if (!dentry->d_parent || !dentry->d_parent->d_inode || !dentry->d_parent->d_inode->i_op || !dentry->d_parent->d_inode->i_op->create) {
-            if (!dentry->d_inode) kfree(dentry); /* Free negative dentry */
+            if (!dentry->d_inode) kfree(dentry);
+            if (out_errno) *out_errno = -(s64)ENOENT;
             return NULL;
         }
         err = dentry->d_parent->d_inode->i_op->create(dentry->d_parent->d_inode, dentry, mode);
         if (err < 0) {
             if (!dentry->d_inode) kfree(dentry);
+            if (out_errno) *out_errno = err;
             return NULL;
         }
-        /* Now that it has an inode, cache it securely */
         dcache_add(dentry);
     } else if (err < 0) {
-        if (dentry && !dentry->d_inode) kfree(dentry); /* Free negative dentry */
+        if (dentry && !dentry->d_inode) kfree(dentry);
+        if (out_errno) *out_errno = err;
         return NULL;
     }
     
-    /* If O_CREAT was NOT passed, but the file was missing, err == ENOENT is handled by the err < 0 block above */
-    
-    if (!dentry || !dentry->d_inode) return NULL;
+    if (!dentry || !dentry->d_inode) { if (out_errno) *out_errno = -(s64)ENOENT; return NULL; }
+
+    if ((flags & O_DIRECTORY) && !S_ISDIR(dentry->d_inode->i_mode)) {
+        if (out_errno) *out_errno = -(s64)ENOTDIR;
+        return NULL;
+    }
+    if (S_ISDIR(dentry->d_inode->i_mode) && ((flags & 3) == O_WRONLY || (flags & 3) == O_RDWR)) {
+        if (out_errno) *out_errno = -(s64)EISDIR;
+        return NULL;
+    }
     
     file_t *f = (file_t *)kzalloc(sizeof(file_t));
-    if (!f) return NULL;
+    if (!f) { if (out_errno) *out_errno = -(s64)ENOMEM; return NULL; }
     
     f->f_dentry = dentry;
-    f->f_inode = dentry->d_inode;
-    f->f_op = dentry->d_inode->i_fop;
-    f->f_flags = flags;
-    f->f_mode = mode;
-    f->f_pos = 0;
-    f->f_count = 1;
+    f->f_inode  = dentry->d_inode;
+    f->f_op     = dentry->d_inode->i_fop;
+    f->f_flags  = flags;
+    f->f_mode   = mode;
+    f->f_pos    = (flags & O_APPEND) ? dentry->d_inode->i_size : 0;
+    f->f_count  = 1;
+
+    if ((flags & O_TRUNC) && ((flags & 3) == O_WRONLY || (flags & 3) == O_RDWR) && S_ISREG(dentry->d_inode->i_mode)) {
+        vfs_truncate(f, 0);
+        f->f_pos = 0;
+    }
     
     if (f->f_op && f->f_op->open) {
         if (f->f_op->open(f->f_inode, f) < 0) {
             kfree(f);
+            if (out_errno) *out_errno = -(s64)EIO;
             return NULL;
         }
     }
+    if (out_errno) *out_errno = 0;
     return f;
+}
+
+file_t *vfs_open(const char *path, u32 flags, u32 mode)
+{
+    return vfs_open_err(path, flags, mode, NULL);
+}
+
+static inline bool is_valid_vfs_file(const file_t *file)
+{
+    if (!file) return false;
+    uintptr_t addr = (uintptr_t)file;
+    return (addr >= 0xFFFF800000000000ULL);
+}
+
+static inline bool is_valid_vfs_fop(const file_operations_t *fop)
+{
+    if (!fop) return false;
+    uintptr_t addr = (uintptr_t)fop;
+    return (addr >= 0xFFFF800000000000ULL);
 }
 
 s64 vfs_close(file_t *file)
 {
-    if (!file) return -(s64)EBADF;
+    if (!is_valid_vfs_file(file)) return -(s64)EBADF;
     
-    if (__atomic_sub_fetch(&file->f_count, 1, __ATOMIC_SEQ_CST) > 0) {
-        return 0; /* Still referenced by another handle (e.g. child process) */
+    if (__atomic_sub_fetch(&file->f_count, 1, __ATOMIC_SEQ_CST) != 0) {
+        return 0; /* Still referenced by another handle, or already zero */
     }
     
-    if (file->f_op && file->f_op->release) {
+    if (is_valid_vfs_fop(file->f_op) && file->f_op->release) {
         file->f_op->release(file->f_inode, file);
     }
     kfree(file);
@@ -387,8 +425,8 @@ s64 vfs_close(file_t *file)
 
 s64 vfs_read(file_t *file, void *buf, size_t size)
 {
-    if (!file || !buf) return -(s64)EBADF;
-    if (file->f_op && file->f_op->read) {
+    if (!is_valid_vfs_file(file) || !buf) return -(s64)EBADF;
+    if (is_valid_vfs_fop(file->f_op) && file->f_op->read) {
         return file->f_op->read(file, buf, size, &file->f_pos);
     }
     return -(s64)EINVAL;
@@ -396,8 +434,11 @@ s64 vfs_read(file_t *file, void *buf, size_t size)
 
 s64 vfs_write(file_t *file, const void *buf, size_t size)
 {
-    if (!file || !buf) return -(s64)EBADF;
-    if (file->f_op && file->f_op->write) {
+    if (!is_valid_vfs_file(file) || !buf) return -(s64)EBADF;
+    if (file->f_flags & O_APPEND && file->f_inode) {
+        file->f_pos = file->f_inode->i_size;
+    }
+    if (is_valid_vfs_fop(file->f_op) && file->f_op->write) {
         return file->f_op->write(file, buf, size, &file->f_pos);
     }
     return -(s64)EINVAL;
@@ -405,21 +446,17 @@ s64 vfs_write(file_t *file, const void *buf, size_t size)
 
 s64 vfs_lseek(file_t *file, s64 offset, int whence)
 {
-    if (!file || !file->f_inode) return -(s64)EBADF;
+    if (!is_valid_vfs_file(file) || !file->f_inode) return -(s64)EBADF;
+
+    /* POSIX-01: lseek on a FIFO/pipe must return ESPIPE */
+    if (S_ISFIFO(file->f_inode->i_mode)) return -(s64)ESPIPE;
     
     s64 new_pos = 0;
     switch (whence) {
-        case SEEK_SET:
-            new_pos = offset;
-            break;
-        case SEEK_CUR:
-            new_pos = file->f_pos + offset;
-            break;
-        case SEEK_END:
-            new_pos = file->f_inode->i_size + offset;
-            break;
-        default:
-            return -(s64)EINVAL;
+        case SEEK_SET: new_pos = offset; break;
+        case SEEK_CUR: new_pos = file->f_pos + offset; break;
+        case SEEK_END: new_pos = file->f_inode->i_size + offset; break;
+        default:       return -(s64)EINVAL;
     }
     if (new_pos < 0) return -(s64)EINVAL;
     file->f_pos = new_pos;
@@ -458,7 +495,7 @@ s64 vfs_stat(const char *path, struct stat *statbuf)
 
 s64 vfs_fstat(file_t *file, struct stat *statbuf)
 {
-    if (!file || !file->f_inode) return -(s64)EBADF;
+    if (!is_valid_vfs_file(file) || !file->f_inode) return -(s64)EBADF;
     if (!statbuf) return -(s64)EINVAL;
     
     inode_t *i = file->f_inode;
@@ -479,8 +516,8 @@ s64 vfs_fstat(file_t *file, struct stat *statbuf)
 
 s64 vfs_ioctl(file_t *file, u32 cmd, u64 arg)
 {
-    if (!file) return -(s64)EBADF;
-    if (file->f_op && file->f_op->ioctl) {
+    if (!is_valid_vfs_file(file)) return -(s64)EBADF;
+    if (is_valid_vfs_fop(file->f_op) && file->f_op->ioctl) {
         return file->f_op->ioctl(file, cmd, arg);
     }
     return -(s64)EINVAL;
@@ -603,7 +640,16 @@ s64 vfs_rename(const char *oldpath, const char *newpath)
 s64 vfs_truncate(file_t *file, u64 length)
 {
     if (!file || !file->f_inode) return -(s64)EBADF;
-    file->f_inode->i_size = length;
+    if (length == 0) {
+        extern void ext2_truncate(struct inode *inode);
+        if (file->f_inode->i_sb && file->f_inode->i_sb->s_magic == 0xEF53) {
+            ext2_truncate(file->f_inode);
+        } else {
+            file->f_inode->i_size = 0;
+        }
+    } else {
+        file->f_inode->i_size = length;
+    }
     return 0;
 }
 

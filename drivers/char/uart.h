@@ -9,7 +9,7 @@
 #define UART_COM2  0x2F8
 
 /* IOCTL Commands */
-#define UART_SET_BAUD 0x5401
+#define UART_SET_BAUD 0x5450
 
 /** uart_init(port) — Initialise 16550 UART at the given I/O base port. */
 void uart_init(u16 port);
