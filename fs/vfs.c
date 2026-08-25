@@ -41,6 +41,18 @@ dentry_t *dcache_alloc(dentry_t *parent, const char *name)
     return d;
 }
 
+#define DCACHE_HASH_SIZE 256
+static dentry_t *g_dcache_hash[DCACHE_HASH_SIZE];
+
+static inline u32 dcache_hash_fn(dentry_t *parent, const char *name)
+{
+    u32 hash = (u32)(uintptr_t)parent ^ 0x9e3779b9;
+    for (size_t i = 0; name[i] && i < VFS_NAME_MAX; i++) {
+        hash = (hash * 31) + (u8)name[i];
+    }
+    return hash & (DCACHE_HASH_SIZE - 1);
+}
+
 void dcache_add(dentry_t *dentry)
 {
     if (!dentry || !dentry->d_parent || !dentry->d_inode) return;
@@ -48,6 +60,10 @@ void dcache_add(dentry_t *dentry)
     spinlock_lock(&g_vfs_lock);
     dentry->d_sibling = dentry->d_parent->d_subdirs;
     dentry->d_parent->d_subdirs = dentry;
+
+    u32 bucket = dcache_hash_fn(dentry->d_parent, dentry->d_name);
+    dentry->d_hash_next = g_dcache_hash[bucket];
+    g_dcache_hash[bucket] = dentry;
     spinlock_unlock(&g_vfs_lock);
 }
 
@@ -64,6 +80,17 @@ void dcache_remove(dentry_t *dentry)
         }
         curr = &(*curr)->d_sibling;
     }
+
+    u32 bucket = dcache_hash_fn(dentry->d_parent, dentry->d_name);
+    dentry_t **hcurr = &g_dcache_hash[bucket];
+    while (*hcurr) {
+        if (*hcurr == dentry) {
+            *hcurr = dentry->d_hash_next;
+            dentry->d_hash_next = NULL;
+            break;
+        }
+        hcurr = &(*hcurr)->d_hash_next;
+    }
     spinlock_unlock(&g_vfs_lock);
 }
 
@@ -72,10 +99,22 @@ dentry_t *dcache_lookup(dentry_t *parent, const char *name)
     if (!parent) return NULL;
     
     spinlock_lock(&g_vfs_lock);
+    u32 bucket = dcache_hash_fn(parent, name);
+    dentry_t *entry = g_dcache_hash[bucket];
+    while (entry) {
+        if (entry->d_parent == parent && strncmp(name, entry->d_name, VFS_NAME_MAX) == 0) {
+            spinlock_unlock(&g_vfs_lock);
+            return entry;
+        }
+        entry = entry->d_hash_next;
+    }
+
+    /* Fallback: check direct child list */
     dentry_t *child = parent->d_subdirs;
     while (child) {
-        /* QUALITY-01: use strncmp instead of hand-rolled comparison loop */
         if (strncmp(name, child->d_name, VFS_NAME_MAX) == 0) {
+            child->d_hash_next = g_dcache_hash[bucket];
+            g_dcache_hash[bucket] = child;
             spinlock_unlock(&g_vfs_lock);
             return child;
         }
@@ -232,9 +271,38 @@ s64 vfs_resolve_path(const char *cwd, const char *path, char *out_buf, size_t ou
     return 0;
 }
 
-s64 vfs_path_lookup(const char *path, dentry_t **out_dentry)
+void dentry_build_path(dentry_t *d, char *buf, size_t max)
+{
+    if (!d || !buf || max < 2) return;
+    if (d == g_vfs_root || !d->d_parent) {
+        buf[0] = '/';
+        buf[1] = '\0';
+        return;
+    }
+    char stack[16][VFS_NAME_MAX];
+    int count = 0;
+    dentry_t *curr = d;
+    while (curr && curr != g_vfs_root && curr->d_parent && count < 16) {
+        strncpy(stack[count++], curr->d_name, VFS_NAME_MAX - 1);
+        curr = curr->d_parent;
+    }
+    size_t off = 0;
+    buf[off++] = '/';
+    for (int i = count - 1; i >= 0; i--) {
+        size_t nlen = strlen(stack[i]);
+        if (off + nlen + 1 < max) {
+            memcpy(buf + off, stack[i], nlen);
+            off += nlen;
+            if (i > 0) buf[off++] = '/';
+        }
+    }
+    buf[off] = '\0';
+}
+
+static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry, int symlink_depth)
 {
     if (!path || !g_vfs_root) return -(s64)ENOENT;
+    if (symlink_depth > 16) return -(s64)ELOOP;
     
     char resolved[512];
     if (vfs_resolve_path("/", path, resolved, sizeof(resolved)) == 0) {
@@ -282,7 +350,6 @@ s64 vfs_path_lookup(const char *path, dentry_t **out_dentry)
                 }
             } else {
                 next = new_dentry; /* Might be negative, meaning file doesn't exist */
-                /* Do NOT cache negative dentries to avoid memory leaks */
             }
         }
         
@@ -291,11 +358,41 @@ s64 vfs_path_lookup(const char *path, dentry_t **out_dentry)
         if (!next->d_inode) {
             if (*p) {
                 /* Missing intermediate directory */
-                kfree(next); /* Free the negative dentry as it wasn't cached */
+                kfree(next);
                 return -(s64)ENOENT;
             } else {
                 *out_dentry = next;
-                return -(s64)ENOENT; /* Return the negative dentry for create() */
+                return -(s64)ENOENT;
+            }
+        }
+        
+        /* If component is a symbolic link, resolve it */
+        if (S_ISLNK(next->d_inode->i_mode)) {
+            char link_target[512];
+            s64 read_res = -1;
+            if (next->d_inode->i_op && next->d_inode->i_op->readlink) {
+                read_res = next->d_inode->i_op->readlink(next, link_target, sizeof(link_target) - 1);
+            }
+            if (read_res > 0) {
+                link_target[read_res] = '\0';
+                char target_full[512];
+                if (link_target[0] == '/') {
+                    if (*p) {
+                        snprintf(target_full, sizeof(target_full), "%s/%s", link_target, p);
+                    } else {
+                        strncpy(target_full, link_target, sizeof(target_full) - 1);
+                        target_full[sizeof(target_full) - 1] = '\0';
+                    }
+                } else {
+                    char parent_path[512];
+                    dentry_build_path(curr, parent_path, sizeof(parent_path));
+                    if (*p) {
+                        snprintf(target_full, sizeof(target_full), "%s/%s/%s", parent_path, link_target, p);
+                    } else {
+                        snprintf(target_full, sizeof(target_full), "%s/%s", parent_path, link_target);
+                    }
+                }
+                return vfs_path_lookup_internal(target_full, out_dentry, symlink_depth + 1);
             }
         }
         
@@ -312,6 +409,12 @@ s64 vfs_path_lookup(const char *path, dentry_t **out_dentry)
     *out_dentry = curr;
     return 0;
 }
+
+s64 vfs_path_lookup(const char *path, dentry_t **out_dentry)
+{
+    return vfs_path_lookup_internal(path, out_dentry, 0);
+}
+
 
 /* --------------------------------------------------------------------------
  * Syscall Implementations
@@ -398,7 +501,7 @@ static inline bool is_valid_vfs_file(const file_t *file)
 {
     if (!file) return false;
     uintptr_t addr = (uintptr_t)file;
-    return (addr >= 0xFFFF800000000000ULL);
+    return (addr >= 0xFFFF800000000000ULL && addr < 0xFFFFFFFF80000000ULL);
 }
 
 static inline bool is_valid_vfs_fop(const file_operations_t *fop)
@@ -407,6 +510,7 @@ static inline bool is_valid_vfs_fop(const file_operations_t *fop)
     uintptr_t addr = (uintptr_t)fop;
     return (addr >= 0xFFFF800000000000ULL);
 }
+
 
 s64 vfs_close(file_t *file)
 {

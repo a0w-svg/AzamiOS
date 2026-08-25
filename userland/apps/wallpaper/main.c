@@ -414,10 +414,10 @@ static void wp_add_icon_entry(const char *label, const char *path, const char *g
     g_desktop_icons[idx].is_custom_pos = 0;
 
     /* Dynamic grid placement: column-major layout */
-    int margin_x = 32;
-    int margin_y = 36;
-    int gap_x = 88;
-    int gap_y = 88;
+    int margin_x = 20;
+    int margin_y = 30;
+    int gap_x = 104;
+    int gap_y = 86;
     int max_rows = ((int)screen_h - 70 - margin_y) / gap_y;
     if (max_rows < 1) max_rows = 1;
 
@@ -429,10 +429,10 @@ static void wp_add_icon_entry(const char *label, const char *path, const char *g
 
 static void wp_auto_arrange_icons(unsigned int screen_w, unsigned int screen_h)
 {
-    int margin_x = 32;
-    int margin_y = 36;
-    int gap_x = 88;
-    int gap_y = 88;
+    int margin_x = 20;
+    int margin_y = 30;
+    int gap_x = 104;
+    int gap_y = 86;
     int max_rows = ((int)screen_h - 70 - margin_y) / gap_y;
     if (max_rows < 1) max_rows = 1;
 
@@ -602,13 +602,24 @@ static void wp_draw_icon(unsigned int *pixels, unsigned int w, unsigned int h, d
     int gy = icon->y + 13;
     de_font_draw_str(pixels, w, w, h, gx, gy, icon->glyph, 0xFF11111B);
 
-    /* Label text centered below icon (max 10 chars per line) */
+    /* Label text centered below icon (max 11 chars per line) */
+    char disp_label[16];
     int llen = 0;
-    while (icon->label[llen]) llen++;
+    while (icon->label[llen] && llen < 40) llen++;
+    if (llen > 11) {
+        memcpy(disp_label, icon->label, 8);
+        disp_label[8] = '.';
+        disp_label[9] = '.';
+        disp_label[10] = '\0';
+        llen = 10;
+    } else {
+        memcpy(disp_label, icon->label, llen);
+        disp_label[llen] = '\0';
+    }
     int lx = icon->x + 28 - (llen * 8) / 2;
     int ly = icon->y + 60;
-    de_font_draw_str(pixels, w, w, h, lx + 1, ly + 1, icon->label, 0xFF0B0B12);
-    de_font_draw_str(pixels, w, w, h, lx,     ly,     icon->label, hovered ? 0xFFFFFFFF : 0xFFCDD6F4);
+    de_font_draw_str(pixels, w, w, h, lx + 1, ly + 1, disp_label, 0xFF0B0B12);
+    de_font_draw_str(pixels, w, w, h, lx,     ly,     disp_label, hovered ? 0xFFFFFFFF : 0xFFCDD6F4);
 }
 
 static void wp_draw_context_menu(unsigned int *pixels, unsigned int w, unsigned int h, int x, int y, int hover)

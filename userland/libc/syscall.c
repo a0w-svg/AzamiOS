@@ -21,6 +21,8 @@
 #include "include/sys/statvfs.h"
 #include "include/sys/timeb.h"
 #include "include/shadow.h"
+#include "include/sys/statx.h"
+#include "include/sys/uio.h"
 
 int errno = 0;
 
@@ -849,33 +851,31 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
     return ret;
 }
 
-ssize_t readv(int fd, const void *iov, int iovcnt)
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 {
     if (!iov || iovcnt <= 0) return -1;
-    const struct { void *iov_base; size_t iov_len; } *vec = (const void *)iov;
     ssize_t total = 0;
     for (int i = 0; i < iovcnt; i++) {
-        if (vec[i].iov_len > 0) {
-            ssize_t r = read(fd, vec[i].iov_base, vec[i].iov_len);
+        if (iov[i].iov_len > 0) {
+            ssize_t r = read(fd, iov[i].iov_base, iov[i].iov_len);
             if (r < 0) return (total > 0) ? total : -1;
             total += r;
-            if ((size_t)r < vec[i].iov_len) break;
+            if ((size_t)r < iov[i].iov_len) break;
         }
     }
     return total;
 }
 
-ssize_t writev(int fd, const void *iov, int iovcnt)
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
     if (!iov || iovcnt <= 0) return -1;
-    const struct { void *iov_base; size_t iov_len; } *vec = (const void *)iov;
     ssize_t total = 0;
     for (int i = 0; i < iovcnt; i++) {
-        if (vec[i].iov_len > 0) {
-            ssize_t w = write(fd, vec[i].iov_base, vec[i].iov_len);
+        if (iov[i].iov_len > 0) {
+            ssize_t w = write(fd, iov[i].iov_base, iov[i].iov_len);
             if (w < 0) return (total > 0) ? total : -1;
             total += w;
-            if ((size_t)w < vec[i].iov_len) break;
+            if ((size_t)w < iov[i].iov_len) break;
         }
     }
     return total;
@@ -883,8 +883,17 @@ ssize_t writev(int fd, const void *iov, int iovcnt)
 
 int chroot(const char *path)
 {
-    (void)path;
-    return 0;
+    return (int)__syscall_ret(syscall1(SYS_chroot, (long)path));
+}
+
+int nice(int inc)
+{
+    int curr = (int)syscall2(SYS_getpriority, 0 /* PRIO_PROCESS */, 0);
+    int newprio = curr + inc;
+    if (syscall3(SYS_setpriority, 0 /* PRIO_PROCESS */, 0, newprio) < 0) {
+        return -1;
+    }
+    return (int)syscall2(SYS_getpriority, 0 /* PRIO_PROCESS */, 0);
 }
 
 unsigned int alarm(unsigned int seconds)
@@ -906,8 +915,7 @@ int sched_yield(void)
 
 int flock(int fd, int operation)
 {
-    (void)fd; (void)operation;
-    return 0;
+    return (int)__syscall_ret(syscall2(SYS_flock, fd, operation));
 }
 
 /* ── POSIX *at System Call Family ────────────────────────────────────────── */
@@ -1064,14 +1072,12 @@ int mknod(const char *pathname, mode_t mode, dev_t dev)
 
 int posix_fadvise(int fd, off_t offset, off_t len, int advice)
 {
-    (void)fd; (void)offset; (void)len; (void)advice;
-    return 0;
+    return (int)__syscall_ret(syscall4(SYS_fadvise64, fd, offset, len, advice));
 }
 
 int posix_fallocate(int fd, off_t offset, off_t len)
 {
-    (void)fd; (void)offset; (void)len;
-    return 0;
+    return (int)__syscall_ret(syscall4(SYS_fallocate, fd, 0, offset, len));
 }
 
 /* ── Identity & Process Groups ───────────────────────────────────────────── */
@@ -1098,28 +1104,22 @@ int setegid(gid_t egid)
 
 int getpgid(int pid)
 {
-    if (pid == 0) return getpgrp();
-    return pid;
+    return (int)__syscall_ret(syscall1(SYS_getpgid, pid));
 }
 
 int getsid(int pid)
 {
-    if (pid == 0) return getpid();
-    return pid;
+    return (int)__syscall_ret(syscall1(SYS_getsid, pid));
 }
 
 int getgroups(int size, gid_t list[])
 {
-    if (size < 0) { errno = EINVAL; return -1; }
-    if (size == 0) return 1;
-    if (list) list[0] = getgid();
-    return 1;
+    return (int)__syscall_ret(syscall2(SYS_getgroups, size, (long)list));
 }
 
 int setgroups(size_t size, const gid_t *list)
 {
-    (void)size; (void)list;
-    return 0;
+    return (int)__syscall_ret(syscall2(SYS_setgroups, size, (long)list));
 }
 
 int initgroups(const char *user, gid_t group)
@@ -1136,6 +1136,12 @@ static char s_domainname[64] = "local";
 int gethostname(char *name, size_t len)
 {
     if (!name || len == 0) { errno = EINVAL; return -1; }
+    struct utsname u;
+    if (uname(&u) == 0 && u.nodename[0]) {
+        strncpy(name, u.nodename, len);
+        name[len - 1] = '\0';
+        return 0;
+    }
     strncpy(name, s_hostname, len);
     name[len - 1] = '\0';
     return 0;
@@ -1144,14 +1150,24 @@ int gethostname(char *name, size_t len)
 int sethostname(const char *name, size_t len)
 {
     if (!name || len >= sizeof(s_hostname)) { errno = EINVAL; return -1; }
-    strncpy(s_hostname, name, len);
-    s_hostname[len] = '\0';
-    return 0;
+    long ret = syscall2(SYS_sethostname, (long)name, len);
+    if (ret == 0) {
+        strncpy(s_hostname, name, len);
+        s_hostname[len] = '\0';
+        return 0;
+    }
+    return (int)__syscall_ret(ret);
 }
 
 int getdomainname(char *name, size_t len)
 {
     if (!name || len == 0) { errno = EINVAL; return -1; }
+    struct utsname u;
+    if (uname(&u) == 0 && u.domainname[0]) {
+        strncpy(name, u.domainname, len);
+        name[len - 1] = '\0';
+        return 0;
+    }
     strncpy(name, s_domainname, len);
     name[len - 1] = '\0';
     return 0;
@@ -1160,9 +1176,13 @@ int getdomainname(char *name, size_t len)
 int setdomainname(const char *name, size_t len)
 {
     if (!name || len >= sizeof(s_domainname)) { errno = EINVAL; return -1; }
-    strncpy(s_domainname, name, len);
-    s_domainname[len] = '\0';
-    return 0;
+    long ret = syscall2(SYS_setdomainname, (long)name, len);
+    if (ret == 0) {
+        strncpy(s_domainname, name, len);
+        s_domainname[len] = '\0';
+        return 0;
+    }
+    return (int)__syscall_ret(ret);
 }
 
 int getentropy(void *buffer, size_t length)
@@ -1196,7 +1216,7 @@ int getlogin_r(char *buf, size_t bufsize)
 
 void sync(void)
 {
-    /* Sync cached metadata */
+    syscall0(SYS_sync);
 }
 
 int fchdir(int fd)
@@ -1304,4 +1324,355 @@ struct spwd *getspnam(const char *name)
 struct spwd *getspent(void) { return &s_root_spwd; }
 void setspent(void) {}
 void endspent(void) {}
+
+int fsync(int fd)
+{
+    return (int)__syscall_ret(syscall1(SYS_fsync, fd));
+}
+
+int fdatasync(int fd)
+{
+    return (int)__syscall_ret(syscall1(SYS_fdatasync, fd));
+}
+
+int syncfs(int fd)
+{
+    return (int)__syscall_ret(syscall1(SYS_syncfs, fd));
+}
+
+int setreuid(uid_t ruid, uid_t euid)
+{
+    return (int)__syscall_ret(syscall2(SYS_setreuid, ruid, euid));
+}
+
+int setregid(gid_t rgid, gid_t egid)
+{
+    return (int)__syscall_ret(syscall2(SYS_setregid, rgid, egid));
+}
+
+int setresuid(uid_t ruid, uid_t euid, uid_t suid)
+{
+    (void)suid;
+    return (int)__syscall_ret(syscall2(SYS_setresuid, ruid, euid));
+}
+
+int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid)
+{
+    return (int)__syscall_ret(syscall3(SYS_getresuid, (long)ruid, (long)euid, (long)suid));
+}
+
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid)
+{
+    (void)sgid;
+    return (int)__syscall_ret(syscall2(SYS_setresgid, rgid, egid));
+}
+
+int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid)
+{
+    return (int)__syscall_ret(syscall3(SYS_getresgid, (long)rgid, (long)egid, (long)sgid));
+}
+
+int clock_getres(clockid_t clk_id, struct timespec *res)
+{
+    return (int)__syscall_ret(syscall2(SYS_clock_getres, clk_id, (long)res));
+}
+
+int clock_settime(clockid_t clk_id, const struct timespec *tp)
+{
+    return (int)__syscall_ret(syscall2(SYS_clock_settime, clk_id, (long)tp));
+}
+
+int clock_nanosleep(clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remain)
+{
+    return (int)__syscall_ret(syscall4(SYS_clock_nanosleep, clock_id, flags, (long)request, (long)remain));
+}
+
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags)
+{
+    return (ssize_t)__syscall_ret(syscall3(SYS_getrandom, (long)buf, buflen, flags));
+}
+
+ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
+{
+    return (ssize_t)__syscall_ret(syscall4(SYS_sendfile, out_fd, in_fd, (long)offset, count));
+}
+
+ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out, off_t *off_out, size_t len, unsigned int flags)
+{
+    return (ssize_t)__syscall_ret(syscall6(SYS_copy_file_range, fd_in, (long)off_in, fd_out, (long)off_out, len, flags));
+}
+
+int fallocate(int fd, int mode, off_t offset, off_t len)
+{
+    return (int)__syscall_ret(syscall4(SYS_fallocate, fd, mode, offset, len));
+}
+
+int statx(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *statxbuf)
+{
+    return (int)__syscall_ret(syscall5(SYS_statx, dirfd, (long)pathname, flags, mask, (long)statxbuf));
+}
+
+int sync_file_range(int fd, off_t offset, off_t nbytes, unsigned int flags)
+{
+    return (int)__syscall_ret(syscall4(SYS_sync_file_range, fd, offset, nbytes, flags));
+}
+
+ssize_t readahead(int fd, off_t offset, size_t count)
+{
+    return (ssize_t)__syscall_ret(syscall3(SYS_readahead, fd, offset, count));
+}
+
+ssize_t splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out, size_t len, unsigned int flags)
+{
+    return (ssize_t)__syscall_ret(syscall6(SYS_splice, fd_in, (long)off_in, fd_out, (long)off_out, len, flags));
+}
+
+ssize_t tee(int fd_in, int fd_out, size_t len, unsigned int flags)
+{
+    return (ssize_t)__syscall_ret(syscall4(SYS_tee, fd_in, fd_out, len, flags));
+}
+
+ssize_t vmsplice(int fd, const struct iovec *iov, size_t nr_segs, unsigned int flags)
+{
+    return (ssize_t)__syscall_ret(syscall4(SYS_vmsplice, fd, (long)iov, nr_segs, flags));
+}
+
+int epoll_create(int size)
+{
+    return (int)__syscall_ret(syscall1(SYS_epoll_create, size));
+}
+
+int epoll_create1(int flags)
+{
+    return (int)__syscall_ret(syscall1(SYS_epoll_create1, flags));
+}
+
+int epoll_ctl(int epfd, int op, int fd, void *event)
+{
+    return (int)__syscall_ret(syscall4(SYS_epoll_ctl, epfd, op, fd, (long)event));
+}
+
+int epoll_wait(int epfd, void *events, int maxevents, int timeout)
+{
+    return (int)__syscall_ret(syscall4(SYS_epoll_wait, epfd, (long)events, maxevents, timeout));
+}
+
+int epoll_pwait(int epfd, void *events, int maxevents, int timeout, const void *sigmask)
+{
+    (void)sigmask;
+    return (int)__syscall_ret(syscall5(SYS_epoll_pwait, epfd, (long)events, maxevents, timeout, (long)sigmask));
+}
+
+int eventfd(unsigned int initval, int flags)
+{
+    return (int)__syscall_ret(syscall2(SYS_eventfd2, initval, flags));
+}
+
+int eventfd_read(int fd, uint64_t *value)
+{
+    ssize_t ret = read(fd, value, sizeof(uint64_t));
+    return (ret == sizeof(uint64_t)) ? 0 : -1;
+}
+
+int eventfd_write(int fd, uint64_t value)
+{
+    ssize_t ret = write(fd, &value, sizeof(uint64_t));
+    return (ret == sizeof(uint64_t)) ? 0 : -1;
+}
+
+int timerfd_create(int clockid, int flags)
+{
+    return (int)__syscall_ret(syscall2(SYS_timerfd_create, clockid, flags));
+}
+
+int timerfd_settime(int fd, int flags, const struct itimerspec *new_value, struct itimerspec *old_value)
+{
+    return (int)__syscall_ret(syscall4(SYS_timerfd_settime, fd, flags, (long)new_value, (long)old_value));
+}
+
+int timerfd_gettime(int fd, struct itimerspec *curr_value)
+{
+    return (int)__syscall_ret(syscall2(SYS_timerfd_gettime, fd, (long)curr_value));
+}
+
+int signalfd(int fd, const void *mask, int flags)
+{
+    return (int)__syscall_ret(syscall4(SYS_signalfd4, fd, (long)mask, sizeof(unsigned long), flags));
+}
+
+long futex(uint32_t *uaddr, int op, uint32_t val, const struct timespec *timeout, uint32_t *uaddr2, uint32_t val3)
+{
+    return __syscall_ret(syscall6(SYS_futex, (long)uaddr, op, val, (long)timeout, (long)uaddr2, val3));
+}
+
+void *mremap(void *old_address, size_t old_size, size_t new_size, int flags, ...)
+{
+    void *new_address = 0;
+    if (flags & 1 /* MREMAP_MAYMOVE */) {
+        /* Optional 5th arg */
+    }
+    return (void *)__syscall_ret(syscall5(SYS_mremap, (long)old_address, old_size, new_size, flags, (long)new_address));
+}
+
+int mincore(void *addr, size_t length, unsigned char *vec)
+{
+    return (int)__syscall_ret(syscall3(SYS_mincore, (long)addr, length, (long)vec));
+}
+
+int personality(unsigned long persona)
+{
+    return (int)__syscall_ret(syscall1(SYS_personality, persona));
+}
+
+int membarrier(int cmd, unsigned int flags, int cpu_id)
+{
+    (void)cpu_id;
+    return (int)__syscall_ret(syscall2(SYS_membarrier, cmd, flags));
+}
+
+
+int prctl(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5)
+{
+    return (int)__syscall_ret(syscall5(SYS_prctl, option, arg2, arg3, arg4, arg5));
+}
+
+unsigned long getauxval(unsigned long type)
+{
+    switch (type) {
+    case 6:  /* AT_PAGESZ */ return 4096;
+    case 11: /* AT_UID */    return (unsigned long)getuid();
+    case 12: /* AT_EUID */   return (unsigned long)geteuid();
+    case 13: /* AT_GID */    return (unsigned long)getgid();
+    case 14: /* AT_EGID */   return (unsigned long)getegid();
+    case 17: /* AT_CLKTCK */ return 100;
+    case 23: /* AT_SECURE */ return 0;
+    default: return 0;
+    }
+}
+
+int adjtimex(void *buf)
+{
+    (void)buf;
+    return 0;
+}
+
+int ntp_adjtime(void *buf)
+{
+    (void)buf;
+    return 0;
+}
+
+int sched_setaffinity(pid_t pid, size_t cpusetsize, const void *mask)
+{
+    return (int)__syscall_ret(syscall3(SYS_sched_setaffinity, pid, cpusetsize, (long)mask));
+}
+
+int sched_getaffinity(pid_t pid, size_t cpusetsize, void *mask)
+{
+    return (int)__syscall_ret(syscall3(SYS_sched_getaffinity, pid, cpusetsize, (long)mask));
+}
+
+int sched_rr_get_interval(pid_t pid, struct timespec *tp)
+{
+    (void)pid;
+    if (!tp) { errno = EINVAL; return -1; }
+    tp->tv_sec = 0;
+    tp->tv_nsec = 10000000L; /* 10ms default timeslice */
+    return 0;
+}
+
+int klogctl(int type, char *bufp, int len)
+{
+    return (int)__syscall_ret(syscall3(SYS_syslog, type, (long)bufp, len));
+}
+
+int swapon(const char *path, int swapflags)
+{
+    return (int)__syscall_ret(syscall2(SYS_swapon, (long)path, swapflags));
+}
+
+int swapoff(const char *path)
+{
+    return (int)__syscall_ret(syscall1(SYS_swapoff, (long)path));
+}
+
+int inotify_init(void)
+{
+    return (int)__syscall_ret(syscall0(SYS_inotify_init));
+}
+
+int inotify_init1(int flags)
+{
+    return (int)__syscall_ret(syscall1(SYS_inotify_init1, flags));
+}
+
+int inotify_add_watch(int fd, const char *pathname, uint32_t mask)
+{
+    return (int)__syscall_ret(syscall3(SYS_inotify_add_watch, fd, (long)pathname, mask));
+}
+
+int inotify_rm_watch(int fd, int wd)
+{
+    return (int)__syscall_ret(syscall2(SYS_inotify_rm_watch, fd, wd));
+}
+
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size)
+{
+    return __syscall_ret(syscall4(SYS_getxattr, (long)path, (long)name, (long)value, size));
+}
+
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size)
+{
+    return __syscall_ret(syscall4(SYS_lgetxattr, (long)path, (long)name, (long)value, size));
+}
+
+ssize_t fgetxattr(int fd, const char *name, void *value, size_t size)
+{
+    return __syscall_ret(syscall4(SYS_fgetxattr, fd, (long)name, (long)value, size));
+}
+
+int setxattr(const char *path, const char *name, const void *value, size_t size, int flags)
+{
+    return (int)__syscall_ret(syscall5(SYS_setxattr, (long)path, (long)name, (long)value, size, flags));
+}
+
+int lsetxattr(const char *path, const char *name, const void *value, size_t size, int flags)
+{
+    return (int)__syscall_ret(syscall5(SYS_lsetxattr, (long)path, (long)name, (long)value, size, flags));
+}
+
+int fsetxattr(int fd, const char *name, const void *value, size_t size, int flags)
+{
+    return (int)__syscall_ret(syscall5(SYS_fsetxattr, fd, (long)name, (long)value, size, flags));
+}
+
+ssize_t listxattr(const char *path, char *list, size_t size)
+{
+    return __syscall_ret(syscall3(SYS_listxattr, (long)path, (long)list, size));
+}
+
+ssize_t llistxattr(const char *path, char *list, size_t size)
+{
+    return __syscall_ret(syscall3(SYS_llistxattr, (long)path, (long)list, size));
+}
+
+ssize_t flistxattr(int fd, char *list, size_t size)
+{
+    return __syscall_ret(syscall3(SYS_flistxattr, fd, (long)list, size));
+}
+
+int removexattr(const char *path, const char *name)
+{
+    return (int)__syscall_ret(syscall2(SYS_removexattr, (long)path, (long)name));
+}
+
+int lremovexattr(const char *path, const char *name)
+{
+    return (int)__syscall_ret(syscall2(SYS_lremovexattr, (long)path, (long)name));
+}
+
+int fremovexattr(int fd, const char *name)
+{
+    return (int)__syscall_ret(syscall2(SYS_fremovexattr, fd, (long)name));
+}
 

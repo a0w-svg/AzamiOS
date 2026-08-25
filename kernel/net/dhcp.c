@@ -15,6 +15,7 @@
 #include "../../include/azami/udp.h"
 #include "../../include/azami/dhcp.h"
 #include "../../kernel/mm/kmalloc.h"
+#include "../../kernel/sched/sched.h"
 #include "../../kernel/lib/string.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
 
@@ -55,12 +56,20 @@ static void send_dhcp_udp(const dhcp_packet_t *pkt, size_t total_len)
     ipv4_send(buf, bcast_ip, IP_PROTO_UDP);
 }
 
+static u32 g_dhcp_xid_counter = 0x55AA3412;
+
+static u32 generate_dhcp_xid(void)
+{
+    g_dhcp_xid_counter = (g_dhcp_xid_counter * 1103515245 + 12345) & 0x7FFFFFFF;
+    return g_dhcp_xid_counter ^ 0x3A5C9B1D;
+}
+
 void dhcp_init(void)
 {
     spinlock_lock(&g_dhcp_lock);
     memset(&g_dhcp_lease, 0, sizeof(g_dhcp_lease));
     g_dhcp_lease.state = DHCP_STATE_INIT;
-    g_dhcp_lease.xid = 0x55AA3412;
+    g_dhcp_lease.xid = generate_dhcp_xid();
     spinlock_unlock(&g_dhcp_lock);
 
     pr_debug("[DHCP] RFC 2131 DHCP client subsystem initialized.\n");
@@ -73,6 +82,9 @@ int dhcp_start_discovery(void)
     u8 host_mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
     net_device_t *dev = net_get_default_device();
     if (dev) memcpy(host_mac, dev->mac, 6);
+
+    g_dhcp_lease.xid = generate_dhcp_xid();
+    g_dhcp_lease.state = DHCP_STATE_SELECTING;
 
     dhcp_packet_t pkt;
     memset(&pkt, 0, sizeof(pkt));
@@ -115,28 +127,54 @@ int dhcp_start_discovery(void)
 
     size_t opt_len = (size_t)(opt - pkt.options);
     size_t total_len = sizeof(dhcp_packet_t) - sizeof(pkt.options) + opt_len;
-
-    g_dhcp_lease.state = DHCP_STATE_SELECTING;
+    u32 current_xid = g_dhcp_lease.xid;
     spinlock_unlock(&g_dhcp_lock);
 
-    pr_debug("[DHCP] Broadcasting DHCPDISCOVER (xid: 0x%08x)...\n", g_dhcp_lease.xid);
-    send_dhcp_udp(&pkt, total_len);
+    pr_debug("[DHCP] Broadcasting DHCPDISCOVER (xid: 0x%08x)...\n", current_xid);
 
-    /* Poll network to receive DHCPOFFER and complete DHCPACK handshake */
-    for (int i = 0; i < 300; i++) {
-        extern void net_poll(void);
-        net_poll();
-        spinlock_lock(&g_dhcp_lock);
-        if (g_dhcp_lease.state == DHCP_STATE_BOUND) {
+    /* Broadcast initial discovery packets */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        send_dhcp_udp(&pkt, total_len);
+
+        for (int i = 0; i < 20; i++) {
+            extern void net_poll(void);
+            net_poll();
+
+            spinlock_lock(&g_dhcp_lock);
+            if (g_dhcp_lease.state == DHCP_STATE_BOUND) {
+                spinlock_unlock(&g_dhcp_lock);
+                return 0; /* Lease successfully acquired */
+            }
             spinlock_unlock(&g_dhcp_lock);
-            break;
+
+            for (volatile int d = 0; d < 2000; d++) {
+                cpu_pause();
+            }
         }
-        spinlock_unlock(&g_dhcp_lock);
-        for (volatile int d = 0; d < 30000; d++) cpu_pause();
     }
+
+    spinlock_lock(&g_dhcp_lock);
+    if (g_dhcp_lease.state != DHCP_STATE_BOUND) {
+        static const u8 def_ip[4] = { 10, 0, 2, 15 };
+        static const u8 def_mask[4] = { 255, 255, 255, 0 };
+        static const u8 def_gw[4] = { 10, 0, 2, 2 };
+        static const u8 def_dns[4] = { 10, 0, 2, 3 };
+
+        net_set_ip(def_ip);
+        net_set_netmask(def_mask);
+        net_set_gateway(def_gw);
+        net_set_dns(def_dns);
+    }
+    spinlock_unlock(&g_dhcp_lock);
 
     return 0;
 }
+
+int dhcp_trigger_renew(void)
+{
+    return dhcp_start_discovery();
+}
+
 
 static void dhcp_send_request(const dhcp_lease_t *lease)
 {
@@ -289,11 +327,13 @@ void dhcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         g_dhcp_lease.lease_time = opt_lease;
         g_dhcp_lease.state = DHCP_STATE_REQUESTING;
 
-        pr_debug("[DHCP] Received DHCPOFFER of IP %u.%u.%u.%u from server %u.%u.%u.%u\n",
-                 pkt->yiaddr[0], pkt->yiaddr[1], pkt->yiaddr[2], pkt->yiaddr[3],
-                 opt_server_id[0], opt_server_id[1], opt_server_id[2], opt_server_id[3]);
+        dhcp_lease_t req_lease;
+        memcpy(&req_lease, &g_dhcp_lease, sizeof(dhcp_lease_t));
+        spinlock_unlock(&g_dhcp_lock);
 
-        dhcp_send_request(&g_dhcp_lease);
+        dhcp_send_request(&req_lease);
+        net_buf_free(buf);
+        return;
     } else if (msg_type == DHCPACK && g_dhcp_lease.state == DHCP_STATE_REQUESTING) {
         memcpy(g_dhcp_lease.offered_ip, pkt->yiaddr, 4);
         g_dhcp_lease.state = DHCP_STATE_BOUND;

@@ -220,6 +220,10 @@ int main(int argc, char **argv)
         destroy.type = AZ_WM_DESTROY_WINDOW;
         destroy.wid  = g_splash_win.wid;
         az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&destroy);
+        if (g_splash_win.pixels) {
+            az_shmem_unmap(0, g_splash_win.pixels);
+            g_splash_win.pixels = NULL;
+        }
     }
 
     de_log("[sessiond] Desktop Environment initialized successfully.");

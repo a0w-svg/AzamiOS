@@ -130,6 +130,11 @@ typedef struct process {
     u32             gid;                   /* Real Group ID */
     u32             euid;                  /* Effective User ID */
     u32             egid;                  /* Effective Group ID */
+    u32             suid;                  /* Saved User ID */
+    u32             sgid;                  /* Saved Group ID */
+    u32             groups[32];            /* Supplementary groups */
+    u32             ngroups;               /* Number of supplementary groups */
+    int             pdeath_sig;            /* Signal to receive on parent death */
     sigaction_t     sigactions[_NSIG];     /* Signal handlers */
     sigset_t        sig_pending;           /* Pending signals bitmask */
     sigset_t        sig_blocked;           /* Blocked signals bitmask */

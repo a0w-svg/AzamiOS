@@ -61,6 +61,7 @@ bool security_check_permission(process_t *proc, u32 capability)
 {
     if (!proc) return false;
     if (proc->pid == 1 || proc->pid == 0) return true; /* Kernel/init always allowed */
+    if (proc->euid == 0) return true; /* Superuser (root) allowed */
     (void)capability;
-    return true;
+    return false;
 }

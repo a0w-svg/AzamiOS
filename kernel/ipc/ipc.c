@@ -400,7 +400,7 @@ void ipc_shmem_destroy(ipc_shmem_t *shmem)
 
 s64 ipc_shmem_unmap(ipc_shmem_t *shmem, process_t *target_proc, virt_addr_t virt_addr)
 {
-    if (!shmem || !target_proc || (virt_addr & (PAGE_SIZE - 1))) {
+    if (!target_proc || (virt_addr & (PAGE_SIZE - 1))) {
         return -(s64)EINVAL;
     }
 
@@ -408,20 +408,21 @@ s64 ipc_shmem_unmap(ipc_shmem_t *shmem, process_t *target_proc, virt_addr_t virt
     if (!pml4) return -(s64)EINVAL;
 
     spinlock_lock(&g_ipc_lock);
-    bool found = false;
+    int slot = -1;
     for (int i = 0; i < MAX_SHMEM_PER_PROC; i++) {
-        if (target_proc->shmem_maps[i].shmem_ptr == (void *)shmem &&
-            target_proc->shmem_maps[i].virt_addr == virt_addr) {
+        if (target_proc->shmem_maps[i].virt_addr == virt_addr &&
+            (shmem == NULL || target_proc->shmem_maps[i].shmem_ptr == (void *)shmem)) {
+            slot = i;
+            shmem = (ipc_shmem_t *)target_proc->shmem_maps[i].shmem_ptr;
             target_proc->shmem_maps[i].shmem_id = 0;
             target_proc->shmem_maps[i].virt_addr = 0;
             target_proc->shmem_maps[i].shmem_ptr = NULL;
-            found = true;
             break;
         }
     }
     spinlock_unlock(&g_ipc_lock);
 
-    if (!found) return -(s64)EINVAL;
+    if (slot == -1 || !shmem) return -(s64)EINVAL;
 
     for (size_t i = 0; i < shmem->page_count; i++) {
         vmm_unmap(pml4, virt_addr + i * PAGE_SIZE);
@@ -436,10 +437,19 @@ void ipc_shmem_unmap_all(process_t *proc)
 {
     if (!proc) return;
     for (int i = 0; i < MAX_SHMEM_PER_PROC; i++) {
-        if (proc->shmem_maps[i].shmem_ptr != NULL) {
-            ipc_shmem_t *shmem = (ipc_shmem_t *)proc->shmem_maps[i].shmem_ptr;
-            virt_addr_t vaddr = proc->shmem_maps[i].virt_addr;
-            ipc_shmem_unmap(shmem, proc, vaddr);
+        spinlock_lock(&g_ipc_lock);
+        ipc_shmem_t *shmem = (ipc_shmem_t *)proc->shmem_maps[i].shmem_ptr;
+        virt_addr_t vaddr = proc->shmem_maps[i].virt_addr;
+        proc->shmem_maps[i].shmem_id = 0;
+        proc->shmem_maps[i].virt_addr = 0;
+        proc->shmem_maps[i].shmem_ptr = NULL;
+        spinlock_unlock(&g_ipc_lock);
+
+        if (shmem && proc->pml4_phys) {
+            for (size_t p = 0; p < shmem->page_count; p++) {
+                vmm_unmap(proc->pml4_phys, vaddr + p * PAGE_SIZE);
+            }
+            ipc_shmem_put(shmem);
         }
     }
 }

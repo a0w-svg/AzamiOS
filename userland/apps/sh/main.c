@@ -46,6 +46,36 @@ static int    g_func_count = 0;
 static int execute_command(char *raw_cmd);
 static int execute_single_command(char *cmd_str);
 
+static bool find_in_path(const char *cmd, char *out, size_t out_max)
+{
+    if (strchr(cmd, '/')) {
+        if (access(cmd, X_OK) == 0) {
+            strncpy(out, cmd, out_max - 1);
+            out[out_max - 1] = '\0';
+            return true;
+        }
+        return false;
+    }
+    const char *path = getenv("PATH");
+    if (!path) path = "/bin:/usr/bin:/sbin:/usr/sbin";
+    char pbuf[256];
+    strncpy(pbuf, path, sizeof(pbuf) - 1);
+    pbuf[sizeof(pbuf) - 1] = '\0';
+
+    char *token = strtok(pbuf, ":");
+    while (token) {
+        char candidate[256];
+        snprintf(candidate, sizeof(candidate), "%s/%s", token, cmd);
+        if (access(candidate, X_OK) == 0) {
+            strncpy(out, candidate, out_max - 1);
+            out[out_max - 1] = '\0';
+            return true;
+        }
+        token = strtok(NULL, ":");
+    }
+    return false;
+}
+
 static void update_cwd(void)
 {
     if (getcwd(g_cwd, sizeof(g_cwd)) == NULL) {
@@ -576,14 +606,116 @@ static int execute_single_command(char *cmd_str)
         return 0;
     }
 
+    if (strcmp(argv[0], "true") == 0 || strcmp(argv[0], ":") == 0) {
+        g_last_exit_code = 0;
+        return 0;
+    }
+
+    if (strcmp(argv[0], "false") == 0) {
+        g_last_exit_code = 1;
+        return 1;
+    }
+
+    if (strcmp(argv[0], "echo") == 0) {
+        bool newline = true;
+        int start_arg = 1;
+        if (argc > 1 && strcmp(argv[1], "-n") == 0) {
+            newline = false;
+            start_arg = 2;
+        }
+        for (int i = start_arg; i < argc; i++) {
+            printf("%s%s", argv[i], (i + 1 < argc) ? " " : "");
+        }
+        if (newline) printf("\n");
+        g_last_exit_code = 0;
+        return 0;
+    }
+
+    if (strcmp(argv[0], "type") == 0) {
+        if (argc <= 1) return 0;
+        for (int a = 1; a < argc; a++) {
+            const char *cmd = argv[a];
+            /* Check built-in */
+            if (strcmp(cmd, "cd") == 0 || strcmp(cmd, "pwd") == 0 || strcmp(cmd, "echo") == 0 ||
+                strcmp(cmd, "export") == 0 || strcmp(cmd, "unset") == 0 || strcmp(cmd, "alias") == 0 ||
+                strcmp(cmd, "type") == 0 || strcmp(cmd, "source") == 0 || strcmp(cmd, "exit") == 0 ||
+                strcmp(cmd, "true") == 0 || strcmp(cmd, "false") == 0 || strcmp(cmd, "read") == 0 ||
+                strcmp(cmd, "eval") == 0) {
+                printf("%s is a shell builtin\n", cmd);
+                continue;
+            }
+            /* Check alias */
+            bool is_alias = false;
+            for (int i = 0; i < g_alias_count; i++) {
+                if (strcmp(g_aliases[i].name, cmd) == 0) {
+                    printf("%s is aliased to `%s'\n", cmd, g_aliases[i].value);
+                    is_alias = true;
+                    break;
+                }
+            }
+            if (is_alias) continue;
+
+            /* Check function */
+            bool is_func = false;
+            for (int i = 0; i < g_func_count; i++) {
+                if (strcmp(g_funcs[i].name, cmd) == 0) {
+                    printf("%s is a shell function\n", cmd);
+                    is_func = true;
+                    break;
+                }
+            }
+            if (is_func) continue;
+
+            /* Check PATH executable */
+            char res_path[256];
+            if (find_in_path(cmd, res_path, sizeof(res_path))) {
+                printf("%s is %s\n", cmd, res_path);
+            } else {
+                printf("type: %s: not found\n", cmd);
+            }
+        }
+        g_last_exit_code = 0;
+        return 0;
+    }
+
+    if (strcmp(argv[0], "read") == 0) {
+        const char *varname = (argc > 1) ? argv[1] : "REPLY";
+        char line_in[512] = { 0 };
+        if (fgets(line_in, sizeof(line_in), stdin)) {
+            size_t len = strlen(line_in);
+            if (len > 0 && line_in[len - 1] == '\n') line_in[len - 1] = '\0';
+            setenv(varname, line_in, 1);
+            g_last_exit_code = 0;
+            return 0;
+        }
+        g_last_exit_code = 1;
+        return 1;
+    }
+
+    if (strcmp(argv[0], "eval") == 0) {
+        if (argc > 1) {
+            char eval_cmd[CMD_BUF_SIZE] = { 0 };
+            for (int i = 1; i < argc; i++) {
+                strncat(eval_cmd, argv[i], sizeof(eval_cmd) - strlen(eval_cmd) - 2);
+                if (i + 1 < argc) strncat(eval_cmd, " ", sizeof(eval_cmd) - strlen(eval_cmd) - 1);
+            }
+            return execute_command(eval_cmd);
+        }
+        return 0;
+    }
+
     if (strcmp(argv[0], "help") == 0) {
         puts("AzamiOS POSIX Shell Built-ins & Utilities:");
         puts("  cd <dir>         - Change current working directory");
         puts("  pwd              - Print working directory");
+        puts("  echo [text]      - Print text to stdout");
         puts("  export VAR=VAL   - Set environment variable");
         puts("  unset VAR        - Unset environment variable");
         puts("  alias k='v'      - Define command alias");
         puts("  unalias k        - Remove alias");
+        puts("  type <cmd>       - Describe a command");
+        puts("  read <var>       - Read line from stdin into variable");
+        puts("  eval <cmd>       - Construct command by concatenating arguments");
         puts("  history          - View command history");
         puts("  source <script>  - Run commands from file in current shell");
         puts("  clear            - Clear terminal screen");
@@ -795,8 +927,35 @@ static void do_tab_completion(char *buf, int *idx, int max_len)
     }
 }
 
+static void source_profile(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[CMD_BUF_SIZE];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len > 0 && line[0] != '#') {
+            execute_command(line);
+        }
+    }
+    fclose(f);
+}
+
 int main(int argc, char **argv)
 {
+    /* Initialize default toolchain and library environment */
+    if (!getenv("PATH")) setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/home/a0wsvg/opt/cross-x86_64/bin:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin:/", 1);
+    if (!getenv("COMPILER_PATH")) setenv("COMPILER_PATH", "/home/a0wsvg/opt/cross-x86_64/libexec/gcc/x86_64-elf/14.2.0/:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin/:/usr/bin:/bin", 1);
+    if (!getenv("LIBRARY_PATH")) setenv("LIBRARY_PATH", "/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/:/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64", 1);
+    if (!getenv("C_INCLUDE_PATH")) setenv("C_INCLUDE_PATH", "/usr/include:/usr/local/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/sys-include", 1);
+    if (!getenv("CPATH")) setenv("CPATH", "/usr/include:/usr/local/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include", 1);
+
+    source_profile("/etc/profile");
+    source_profile("/root/.profile");
+
     if (argc > 2 && strcmp(argv[1], "-c") == 0) {
         update_cwd();
         return execute_command(argv[2]);
@@ -814,6 +973,7 @@ int main(int argc, char **argv)
             return g_last_exit_code;
         }
     }
+
 
     puts("\n\033[1;36m===================================================\033[0m");
     puts("\033[1;32m  Welcome to AzamiOS 7.0 (POSIX Standard Shell)    \033[0m");

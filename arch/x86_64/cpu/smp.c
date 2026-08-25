@@ -62,15 +62,24 @@ void ap_c_entry(struct limine_smp_info *info)
     cr0 |=  (1ULL << 1); /* set MP */
     write_cr0(cr0);
 
-    /* Apply OSFXSR / OSXMMEXCPT / SMEP / SMAP on AP */
+    /* Apply OSFXSR / OSXMMEXCPT / SMEP / SMAP / FSGSBASE / OSXSAVE on AP */
     extern u8 g_smep_enabled;
     extern u8 g_smap_enabled;
+    extern u8 g_fsgsbase_enabled;
+    extern u8 g_osxsave_enabled;
     u64 cr4 = read_cr4();
     cr4 |= (1ULL << 9);  /* OSFXSR */
     cr4 |= (1ULL << 10); /* OSXMMEXCPT */
-    if (g_smep_enabled) cr4 |= (1ULL << 20);
-    if (g_smap_enabled) cr4 |= (1ULL << 21);
+    if (g_fsgsbase_enabled) cr4 |= (1ULL << 16);
+    if (g_osxsave_enabled)  cr4 |= (1ULL << 18);
+    if (g_smep_enabled)     cr4 |= (1ULL << 20);
+    if (g_smap_enabled)     cr4 |= (1ULL << 21);
     write_cr4(cr4);
+
+    if (g_osxsave_enabled) {
+        xsetbv(0, 0x7); /* x87 + SSE + AVX */
+    }
+
 
     u64 efer = rdmsr(MSR_EFER);
     efer |= EFER_NXE;

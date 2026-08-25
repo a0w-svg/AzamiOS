@@ -69,3 +69,33 @@ sighandler_t signal(int signum, sighandler_t handler)
     }
     return old_sa.sa_handler;
 }
+
+int sigpending(sigset_t *set)
+{
+    if (!set) return -1;
+    *set = 0;
+    return 0;
+}
+
+int sigsuspend(const sigset_t *mask)
+{
+    (void)mask;
+    return pause();
+}
+
+int sigwait(const sigset_t *set, int *sig)
+{
+    (void)set;
+    if (sig) *sig = 0;
+    pause();
+    return 0;
+}
+
+int siginterrupt(int sig, int flag)
+{
+    struct sigaction act;
+    if (sigaction(sig, NULL, &act) < 0) return -1;
+    if (flag) act.sa_flags &= ~SA_RESTART;
+    else act.sa_flags |= SA_RESTART;
+    return sigaction(sig, &act, NULL);
+}

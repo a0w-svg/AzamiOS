@@ -201,8 +201,8 @@ int rtl8139_init(void)
     memcpy(ndev.mac, g_rtl_mac, 6);
     ndev.send = rtl8139_send_packet;
     ndev.recv = rtl8139_recv_packet;
-    extern int net_register_device(const net_device_t *dev);
     net_register_device(&ndev);
+
 
     extern int devfs_register_device(const char *name, file_operations_t *fops, void *private_data);
     devfs_register_device("net0", &g_rtl_fops, NULL);

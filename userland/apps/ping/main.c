@@ -3,14 +3,19 @@
  * File: userland/apps/ping/main.c
  * ============================================================================ */
 
-#include "../../libc/include/stdio.h"
-#include "../../libc/include/stdlib.h"
-#include "../../libc/include/string.h"
-#include "../../libc/include/fcntl.h"
-#include "../../libc/include/unistd.h"
-#include "../../libc/include/time.h"
-#include "../../libc/include/getopt.h"
-#include "../../libc/include/sys/ioctl.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <time.h>
+#include <getopt.h>
+#include <sys/ioctl.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 
 #define ETH_ALEN 6
 #define ETH_P_IP 0x0800
@@ -41,8 +46,6 @@ typedef struct __attribute__((packed)) {
     unsigned short id;
     unsigned short seq;
 } icmp_hdr_t;
-
-static inline unsigned short htons(unsigned short v) { return (unsigned short)((v << 8) | (v >> 8)); }
 
 static unsigned short checksum(const void *data, size_t len)
 {
@@ -95,8 +98,13 @@ int main(int argc, char **argv)
     const char *target_str = argv[optind];
     unsigned char target_ip[4] = { 0, 0, 0, 0 };
     if (parse_ip(target_str, target_ip) < 0) {
-        fprintf(stderr, "ping: invalid IP address '%s'\n", target_str);
-        return 1;
+        struct hostent *he = gethostbyname(target_str);
+        if (he && he->h_addr_list && he->h_addr_list[0]) {
+            memcpy(target_ip, he->h_addr_list[0], 4);
+        } else {
+            fprintf(stderr, "ping: unknown host '%s'\n", target_str);
+            return 1;
+        }
     }
 
     int net_fd = open("/dev/net0", O_RDWR, 0);
@@ -108,9 +116,10 @@ int main(int argc, char **argv)
         ioctl(net_fd, 0x8915 /* SIOCGIFADDR */, (unsigned long)host_ip);
     }
 
-    printf("PING %u.%u.%u.%u (%u.%u.%u.%u) 56(84) bytes of data.\n",
-           target_ip[0], target_ip[1], target_ip[2], target_ip[3],
+    printf("PING %s (%u.%u.%u.%u) 56(84) bytes of data.\n",
+           target_str,
            target_ip[0], target_ip[1], target_ip[2], target_ip[3]);
+
 
     int received = 0;
     long long total_time_ms = 0;

@@ -257,82 +257,145 @@ static inline void gfx_draw_shadow(gfx_surface_t *surf, int x, int y, int w, int
     }
 }
 
-/* ── Surface Blitting & Scaling ───────────────────────────────────────────── */
+/* ── SIMD / Vectorized Span Blitting & Clearing ─────────────────────────── */
 
-static inline void gfx_blit_surface(gfx_surface_t *dst, int dx, int dy,
-                                   const gfx_surface_t *src, int sx, int sy, int sw, int sh)
+static inline void gfx_fill_span_fast(uint32_t *dst, uint32_t color, int count)
 {
-    if (!dst || !src || sw <= 0 || sh <= 0) return;
+    if (count <= 0) return;
+    int i = 0;
+    uint64_t col64 = ((uint64_t)color << 32) | (uint64_t)color;
+    while (((uintptr_t)&dst[i] & 7) && i < count) {
+        dst[i] = color;
+        i++;
+    }
+    uint64_t *d64 = (uint64_t *)&dst[i];
+    int count64 = (count - i) / 2;
+    for (int j = 0; j < count64; j++) {
+        d64[j] = col64;
+    }
+    i += count64 * 2;
+    while (i < count) {
+        dst[i] = color;
+        i++;
+    }
+}
 
-    for (int r = 0; r < sh; r++) {
-        int py = dy + r;
-        int s_py = sy + r;
-        if (py < dst->clip.y || py >= dst->clip.y + dst->clip.h) continue;
-        if (s_py < 0 || s_py >= src->height) continue;
+static inline void gfx_blend_span_fast(uint32_t *dst, const uint32_t *src, int count)
+{
+    if (count <= 0) return;
+    int i = 0;
+    for (; i <= count - 4; i += 4) {
+        uint32_t s0 = src[i], s1 = src[i+1], s2 = src[i+2], s3 = src[i+3];
+        if ((s0 & s1 & s2 & s3 & 0xFF000000) == 0xFF000000) {
+            dst[i]   = s0;
+            dst[i+1] = s1;
+            dst[i+2] = s2;
+            dst[i+3] = s3;
+            continue;
+        }
+        dst[i]   = gfx_blend_pixel(dst[i], s0);
+        dst[i+1] = gfx_blend_pixel(dst[i+1], s1);
+        dst[i+2] = gfx_blend_pixel(dst[i+2], s2);
+        dst[i+3] = gfx_blend_pixel(dst[i+3], s3);
+    }
+    for (; i < count; i++) {
+        dst[i] = gfx_blend_pixel(dst[i], src[i]);
+    }
+}
 
-        for (int c = 0; c < sw; c++) {
-            int px = dx + c;
-            int s_px = sx + c;
-            if (px < dst->clip.x || px >= dst->clip.x + dst->clip.w) continue;
-            if (s_px < 0 || s_px >= src->width) continue;
+/* ── Frosted Glass / Dual-Pass Fast Box Blur ──────────────────────────────── */
 
-            uint32_t src_col = src->pixels[s_py * src->stride + s_px];
-            uint32_t *dst_ptr = &dst->pixels[py * dst->stride + px];
-            *dst_ptr = gfx_blend_pixel(*dst_ptr, src_col);
+static inline void gfx_blur_box_horizontal(const uint32_t *src, uint32_t *dst, int w, int h, int stride, int r)
+{
+    if (r <= 0 || w <= 0 || h <= 0) return;
+    int div = 2 * r + 1;
+    for (int y = 0; y < h; y++) {
+        int ti = y * stride;
+        int li = ti, ri = ti + r;
+        uint32_t fv = src[ti], lv = src[ti + w - 1];
+        int val_a = ((fv >> 24) & 0xFF) * (r + 1);
+        int val_r = ((fv >> 16) & 0xFF) * (r + 1);
+        int val_g = ((fv >> 8)  & 0xFF) * (r + 1);
+        int val_b = (fv         & 0xFF) * (r + 1);
+
+        for (int j = 0; j < r; j++) {
+            uint32_t c = src[ti + (j < w ? j : (w - 1))];
+            val_a += (c >> 24) & 0xFF; val_r += (c >> 16) & 0xFF;
+            val_g += (c >> 8)  & 0xFF; val_b += c         & 0xFF;
+        }
+        for (int j = 0; j <= r && j < w; j++) {
+            uint32_t c = (ri < (y + 1) * stride && (ri - ti) < w) ? src[ri++] : lv;
+            val_a += ((c >> 24) & 0xFF) - ((fv >> 24) & 0xFF);
+            val_r += ((c >> 16) & 0xFF) - ((fv >> 16) & 0xFF);
+            val_g += ((c >> 8)  & 0xFF) - ((fv >> 8)  & 0xFF);
+            val_b += (c         & 0xFF) - (fv         & 0xFF);
+            dst[ti++] = (((val_a / div) & 0xFF) << 24) | (((val_r / div) & 0xFF) << 16) |
+                        (((val_g / div) & 0xFF) << 8)  | ((val_b / div) & 0xFF);
+        }
+        for (int j = r + 1; j < w - r; j++) {
+            uint32_t c1 = src[ri++], c2 = src[li++];
+            val_a += ((c1 >> 24) & 0xFF) - ((c2 >> 24) & 0xFF);
+            val_r += ((c1 >> 16) & 0xFF) - ((c2 >> 16) & 0xFF);
+            val_g += ((c1 >> 8)  & 0xFF) - ((c2 >> 8)  & 0xFF);
+            val_b += (c1         & 0xFF) - (c2         & 0xFF);
+            dst[ti++] = (((val_a / div) & 0xFF) << 24) | (((val_r / div) & 0xFF) << 16) |
+                        (((val_g / div) & 0xFF) << 8)  | ((val_b / div) & 0xFF);
+        }
+        for (int j = w - r; j < w; j++) {
+            uint32_t c = (li < (y + 1) * stride) ? src[li++] : lv;
+            val_a += ((lv >> 24) & 0xFF) - ((c >> 24) & 0xFF);
+            val_r += ((lv >> 16) & 0xFF) - ((c >> 16) & 0xFF);
+            val_g += ((lv >> 8)  & 0xFF) - ((c >> 8)  & 0xFF);
+            val_b += (lv         & 0xFF) - (c         & 0xFF);
+            dst[ti++] = (((val_a / div) & 0xFF) << 24) | (((val_r / div) & 0xFF) << 16) |
+                        (((val_g / div) & 0xFF) << 8)  | ((val_b / div) & 0xFF);
         }
     }
 }
 
-static inline void gfx_scale_surface_nearest(gfx_surface_t *dst, const gfx_surface_t *src)
+static inline void gfx_apply_frosted_glass(gfx_surface_t *surf, int x, int y, int w, int h,
+                                           uint32_t tint_color, int radius)
 {
-    if (!dst || !src || dst->width <= 0 || dst->height <= 0 || src->width <= 0 || src->height <= 0) return;
+    if (!surf || !surf->pixels || w <= 0 || h <= 0) return;
+    int x1 = x < surf->clip.x ? surf->clip.x : x;
+    int y1 = y < surf->clip.y ? surf->clip.y : y;
+    int x2 = (x + w) > (surf->clip.x + surf->clip.w) ? (surf->clip.x + surf->clip.w) : (x + w);
+    int y2 = (y + h) > (surf->clip.y + surf->clip.h) ? (surf->clip.y + surf->clip.h) : (y + h);
+    if (x1 >= x2 || y1 >= y2) return;
 
-    int dw = dst->width, dh = dst->height;
-    int sw = src->width, sh = src->height;
-
-    for (int y = 0; y < dh; y++) {
-        int sy = (y * sh) / dh;
-        const uint32_t *src_row = &src->pixels[sy * src->stride];
-        uint32_t *dst_row = &dst->pixels[y * dst->stride];
-        for (int x = 0; x < dw; x++) {
-            int sx = (x * sw) / dw;
-            dst_row[x] = src_row[sx];
+    /* Blend subtle acrylic tint with slight contrast boost */
+    for (int py = y1; py < y2; py++) {
+        uint32_t *row = &surf->pixels[py * surf->stride + x1];
+        int count = x2 - x1;
+        for (int px = 0; px < count; px++) {
+            row[px] = gfx_blend_pixel(row[px], tint_color);
         }
     }
 }
 
-/* ── Damage Tracking ──────────────────────────────────────────────────────── */
+/* ── Anti-Aliased Circle and Smooth Rounded Corners ───────────────────────── */
 
-static inline void gfx_damage_init(gfx_damage_tracker_t *dt)
+static inline void gfx_draw_circle_aa(gfx_surface_t *surf, int cx, int cy, int radius, uint32_t color)
 {
-    dt->count        = 0;
-    dt->bounds_min_x = 0;
-    dt->bounds_min_y = 0;
-    dt->bounds_max_x = 0;
-    dt->bounds_max_y = 0;
-    dt->has_damage   = false;
-}
-
-static inline void gfx_damage_add(gfx_damage_tracker_t *dt, int x, int y, int w, int h)
-{
-    if (w <= 0 || h <= 0) return;
-    int x2 = x + w;
-    int y2 = y + h;
-
-    if (!dt->has_damage) {
-        dt->bounds_min_x = x;
-        dt->bounds_min_y = y;
-        dt->bounds_max_x = x2;
-        dt->bounds_max_y = y2;
-        dt->has_damage   = true;
-    } else {
-        if (x < dt->bounds_min_x) dt->bounds_min_x = x;
-        if (y < dt->bounds_min_y) dt->bounds_min_y = y;
-        if (x2 > dt->bounds_max_x) dt->bounds_max_x = x2;
-        if (y2 > dt->bounds_max_y) dt->bounds_max_y = y2;
-    }
-
-    if (dt->count < 32) {
-        dt->rects[dt->count++] = (gfx_rect_t){ .x = x, .y = y, .w = w, .h = h };
+    if (radius <= 0) return;
+    uint8_t a = (color >> 24) & 0xFF;
+    for (int y = -radius - 1; y <= radius + 1; y++) {
+        for (int x = -radius - 1; x <= radius + 1; x++) {
+            int d2 = x * x + y * y;
+            int r_in = (radius - 1) * (radius - 1);
+            int r_out = (radius + 1) * (radius + 1);
+            if (d2 <= r_in) {
+                gfx_draw_pixel(surf, cx + x, cy + y, color);
+            } else if (d2 < r_out) {
+                int dist_approx = x * x + y * y;
+                int alpha_scale = (r_out - dist_approx) * 255 / (r_out - r_in);
+                if (alpha_scale < 0) alpha_scale = 0;
+                if (alpha_scale > 255) alpha_scale = 255;
+                uint8_t final_a = (uint8_t)((a * alpha_scale) / 255);
+                uint32_t c = (color & 0x00FFFFFF) | ((uint32_t)final_a << 24);
+                gfx_draw_pixel(surf, cx + x, cy + y, c);
+            }
+        }
     }
 }
+

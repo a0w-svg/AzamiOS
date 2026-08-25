@@ -52,6 +52,7 @@
 #define ENOSYS      38  /* Function not implemented */
 #define ENOTEMPTY   39  /* Directory not empty */
 #define ELOOP       40  /* Too many symbolic links encountered */
+#define ENODATA     61  /* No data available */
 #define ENOTSOCK    88  /* Socket operation on non-socket */
 #define EDESTADDRREQ 89 /* Destination address required */
 #define EMSGSIZE    90  /* Message too long */

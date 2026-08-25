@@ -61,44 +61,92 @@ typedef struct __attribute__((packed)) {
 #define ICMP_TYPE_ECHO_REPLY   0
 #define ICMP_TYPE_ECHO_REQUEST 8
 
+/* Interface Flags */
+#define IFF_UP          0x0001
+#define IFF_BROADCAST   0x0002
+#define IFF_DEBUG       0x0004
+#define IFF_LOOPBACK    0x0008
+#define IFF_POINTOPOINT 0x0010
+#define IFF_NOTRAILERS  0x0020
+#define IFF_RUNNING     0x0040
+#define IFF_NOARP       0x0080
+#define IFF_PROMISC     0x0100
+#define IFF_ALLMULTI    0x0200
+#define IFF_MULTICAST   0x1000
+
+/* Network Interface Statistics */
+typedef struct {
+    u64 rx_packets;
+    u64 tx_packets;
+    u64 rx_bytes;
+    u64 tx_bytes;
+    u64 rx_errors;
+    u64 tx_errors;
+    u64 rx_dropped;
+    u64 tx_dropped;
+} net_stats_t;
+
 /* Network Interface Device Descriptor */
 typedef struct net_device {
-    char name[16];
-    u8   mac[6];
-    s64  (*send)(const void *data, size_t len);
-    s64  (*recv)(void *buf, size_t max_len);
-    bool (*link_up)(void);
+    char        name[16];
+    u8          mac[6];
+    u8          ip[4];
+    u8          netmask[4];
+    u8          broadcast[4];
+    u8          gateway[4];
+    u32         flags;
+    u32         mtu;
+    net_stats_t stats;
+    s64         (*send)(const void *data, size_t len);
+    s64         (*recv)(void *buf, size_t max_len);
+    bool        (*link_up)(void);
 } net_device_t;
 
 /* Network IOCTL Codes */
 #define SIOCGIFHWADDR   0x8910
+#define SIOCGIFCONF     0x8912
 #define SIOCGIFFLAGS    0x8913
 #define SIOCSIFFLAGS    0x8914
 #define SIOCGIFADDR     0x8915
 #define SIOCSIFADDR     0x8916
 #define SIOCGIFNETMASK  0x891b
 #define SIOCSIFNETMASK  0x891c
+#define SIOCGIFBRDADDR  0x8919
+#define SIOCSIFBRDADDR  0x891a
 #define SIOCGIFGW       0x891d
 #define SIOCSIFGW       0x891e
 #define SIOCGIFDNS      0x891f
 #define SIOCSIFDNS      0x8921
 #define SIOCGIFNAME     0x8920
+#define SIOCGIFMTU      0x8922
+#define SIOCSIFMTU      0x8923
+#define SIOCGIFSTATS    0x8925
+#define SIOCGIFCOUNT    0x8926
+#define SIOCGIFINDEX    0x8933
 #define SIOCGIFPING     0x8930
+#define SIOCSIFDHCP     0x8990
+#define SIOCGIFDHCP     0x8991
 
 /* Public Network API */
-void net_init(void);
-int  net_register_device(const net_device_t *dev);
+void          net_init(void);
+int           net_register_device(const net_device_t *dev);
 net_device_t *net_get_default_device(void);
-void net_process_incoming(const u8 *pkt, size_t len);
-s64  net_send_icmp_ping(const u8 target_ip[4], u16 seq);
-void net_get_ip(u8 ip_out[4]);
-void net_set_ip(const u8 ip_in[4]);
-void net_get_netmask(u8 mask_out[4]);
-void net_set_netmask(const u8 mask_in[4]);
-void net_get_gateway(u8 gw_out[4]);
-void net_set_gateway(const u8 gw_in[4]);
-void net_get_dns(u8 dns_out[4]);
-void net_set_dns(const u8 dns_in[4]);
-int  net_ioctl(u32 cmd, u64 arg);
-u16  net_checksum(const void *data, size_t len);
-s64  net_send_raw(const void *data, size_t len);
+
+net_device_t *net_get_device_by_name(const char *name);
+net_device_t *net_get_device_by_index(int index);
+int           net_get_device_count(void);
+void          net_process_incoming(const u8 *pkt, size_t len);
+void          net_loopback_input(net_buf_t *buf);
+s64           net_send_icmp_ping(const u8 target_ip[4], u16 seq);
+void          net_get_ip(u8 ip_out[4]);
+void          net_set_ip(const u8 ip_in[4]);
+void          net_get_netmask(u8 mask_out[4]);
+void          net_set_netmask(const u8 mask_in[4]);
+void          net_get_gateway(u8 gw_out[4]);
+void          net_set_gateway(const u8 gw_in[4]);
+void          net_get_dns(u8 dns_out[4]);
+void          net_set_dns(const u8 dns_in[4]);
+int           net_ioctl(u32 cmd, u64 arg);
+u16           net_checksum(const void *data, size_t len);
+s64           net_send_raw(const void *data, size_t len);
+

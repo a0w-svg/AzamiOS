@@ -202,7 +202,9 @@ int compositor_create_window(az_compositor_t *comp,
     if (out_shmem_id) *out_shmem_id = (unsigned int)shmem_id;
 
     compositor_focus_window(comp, win);
-    compositor_trigger_open_animation(comp, win);
+    if (win->title[0] != '\0') {
+        compositor_trigger_open_animation(comp, win);
+    }
     return (int)win->wid;
 }
 
@@ -691,7 +693,16 @@ static void render_window(az_compositor_t *comp, az_window_t *win)
                 if (win->shm_bytes == 0 || (offset + copy_w) * sizeof(unsigned int) <= win->shm_bytes) {
                     unsigned int *src_ptr = &win->pixels[offset];
                     unsigned int *dst_ptr = &comp->backbuf[(unsigned int)sy * pitch_px + (unsigned int)dst_x];
-                    memcpy(dst_ptr, src_ptr, (size_t)copy_w * sizeof(unsigned int));
+
+                    for (int px = 0; px < copy_w; px++) {
+                        unsigned int col = src_ptr[px];
+                        unsigned int a = (col >> 24) & 0xFF;
+                        if (a == 255) {
+                            dst_ptr[px] = col;
+                        } else if (a > 0) {
+                            dst_ptr[px] = alpha_blend(dst_ptr[px], col, a);
+                        }
+                    }
                 }
             }
         }
@@ -995,9 +1006,24 @@ void compose_screen(az_compositor_t *comp)
         }
     }
 
-    /* Fallback Double-Buffering: copy back buffer → front buffer */
-    size_t total_bytes = (size_t)pitch_px * comp->fb_height * sizeof(unsigned int);
-    memcpy(comp->frontbuf, comp->backbuf, total_bytes);
+    /* Fallback Double-Buffering: copy damaged rects back buffer → front buffer */
+    int y0 = comp->dirty_min_y < 0 ? 0 : comp->dirty_min_y;
+    int y1 = comp->dirty_max_y > (int)comp->fb_height ? (int)comp->fb_height : comp->dirty_max_y;
+    int x0 = comp->dirty_min_x < 0 ? 0 : comp->dirty_min_x;
+    int x1 = comp->dirty_max_x > (int)comp->fb_width ? (int)comp->fb_width : comp->dirty_max_x;
+
+    if (x0 < x1 && y0 < y1 && (x1 - x0 < (int)comp->fb_width || y1 - y0 < (int)comp->fb_height)) {
+        size_t row_bytes = (size_t)(x1 - x0) * sizeof(unsigned int);
+        for (int y = y0; y < y1; y++) {
+            unsigned int *src_row = &comp->backbuf[y * pitch_px + x0];
+            unsigned int *dst_row = &comp->frontbuf[y * pitch_px + x0];
+            memcpy(dst_row, src_row, row_bytes);
+        }
+    } else {
+        size_t total_bytes = (size_t)pitch_px * comp->fb_height * sizeof(unsigned int);
+        memcpy(comp->frontbuf, comp->backbuf, total_bytes);
+    }
+
     comp->has_damage = 0;
     comp->dirty_min_x = (int)comp->fb_width;
     comp->dirty_min_y = (int)comp->fb_height;
@@ -1009,6 +1035,7 @@ void compose_screen(az_compositor_t *comp)
                         comp->cursor_x, comp->cursor_y);
     comp->old_cursor_x = comp->cursor_x;
     comp->old_cursor_y = comp->cursor_y;
+
 }
 
 void compositor_update_cursor(az_compositor_t *comp)
@@ -1030,7 +1057,7 @@ void compositor_update_cursor(az_compositor_t *comp)
 
 void compositor_trigger_open_animation(az_compositor_t *comp, az_window_t *win)
 {
-    if (!win) return;
+    if (!win || win->title[0] == '\0') return;
     win->anim_state    = AZWM_ANIM_OPEN;
     win->anim_step     = 0;
     win->anim_target_x = win->x;

@@ -196,24 +196,10 @@ int ipv4_send(net_buf_t *buf, const u8 dst_ip[4], u8 protocol)
 {
     if (!buf || !dst_ip) return -1;
 
-    u8 next_hop[4];
-    struct net_device *dev = NULL;
-    int is_bcast = (dst_ip[0] == 255 && dst_ip[1] == 255 && dst_ip[2] == 255 && dst_ip[3] == 255);
-
-    if (is_bcast) {
-        dev = net_get_default_device();
-        if (!dev) {
-            net_buf_free(buf);
-            return -1;
-        }
-    } else if (route_lookup(dst_ip, next_hop, &dev) < 0 || !dev) {
-        pr_debug("[IPv4] No route to %u.%u.%u.%u\n", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
-        net_buf_free(buf);
-        return -1;
-    }
-
     u8 host_ip[4];
     net_get_ip(host_ip);
+
+    bool is_loopback = (dst_ip[0] == 127) || (host_ip[0] != 0 && memcmp(dst_ip, host_ip, 4) == 0);
 
     /* 1. Prepend IPv4 Header */
     ipv4_hdr_t *ip = (ipv4_hdr_t *)net_buf_push(buf, sizeof(ipv4_hdr_t));
@@ -230,11 +216,38 @@ int ipv4_send(net_buf_t *buf, const u8 dst_ip[4], u8 protocol)
     ip->ttl = 64;
     ip->protocol = protocol;
     ip->checksum = 0;
-    memcpy(ip->src_ip, host_ip, 4);
+    if (dst_ip[0] == 127) {
+        static const u8 loop_src[4] = { 127, 0, 0, 1 };
+        memcpy(ip->src_ip, loop_src, 4);
+    } else {
+        memcpy(ip->src_ip, host_ip, 4);
+    }
     memcpy(ip->dst_ip, dst_ip, 4);
     ip->checksum = net_checksum(ip, sizeof(ipv4_hdr_t));
 
-    /* 2. Prepend Ethernet Header */
+    /* 2. Direct Loopback Bypass (No Ethernet / ARP needed) */
+    if (is_loopback) {
+        net_loopback_input(buf);
+        return 0;
+    }
+
+    u8 next_hop[4];
+    struct net_device *dev = NULL;
+    int is_bcast = (dst_ip[0] == 255 && dst_ip[1] == 255 && dst_ip[2] == 255 && dst_ip[3] == 255);
+
+    if (is_bcast) {
+        dev = net_get_default_device();
+        if (!dev) {
+            net_buf_free(buf);
+            return -1;
+        }
+    } else if (route_lookup(dst_ip, next_hop, &dev) < 0 || !dev) {
+        pr_debug("[IPv4] No route to %u.%u.%u.%u\n", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+        net_buf_free(buf);
+        return -1;
+    }
+
+    /* 3. Prepend Ethernet Header */
     eth_hdr_t *eth = (eth_hdr_t *)net_buf_push(buf, sizeof(eth_hdr_t));
     if (!eth) {
         net_buf_free(buf);
@@ -244,7 +257,7 @@ int ipv4_send(net_buf_t *buf, const u8 dst_ip[4], u8 protocol)
     memcpy(eth->src, dev->mac, 6);
     eth->ethertype = htons(ETH_P_IP);
 
-    /* 3. Resolve Next-Hop MAC via Broadcast or ARP */
+    /* 4. Resolve Next-Hop MAC via Broadcast or ARP */
     if (is_bcast) {
         memset(eth->dst, 0xFF, 6);
         dev->send(buf->data, buf->len);
@@ -266,9 +279,10 @@ int ipv4_send(net_buf_t *buf, const u8 dst_ip[4], u8 protocol)
     return 0;
 }
 
-/* Weak hooks for transport layer handlers (implemented in Part 3 & 4) */
+/* Weak hooks for transport layer handlers */
 __attribute__((weak)) void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr) { (void)buf; (void)ip_hdr; }
 __attribute__((weak)) void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr) { (void)buf; (void)ip_hdr; }
+__attribute__((weak)) void raw_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr) { (void)buf; (void)ip_hdr; }
 
 void ipv4_input(net_buf_t *buf)
 {
@@ -301,12 +315,13 @@ void ipv4_input(net_buf_t *buf)
     u8 host_ip[4];
     net_get_ip(host_ip);
 
-    /* Accept packets for our IP, broadcast, subnet broadcast, or during DHCP setup (unconfigured 0.0.0.0) */
+    /* Accept packets for our IP, loopback 127.x.x.x, broadcast, or during DHCP setup */
     bool is_unconfigured = (host_ip[0] == 0 && host_ip[1] == 0 && host_ip[2] == 0 && host_ip[3] == 0);
+    bool is_loop = (ip->dst_ip[0] == 127);
     bool is_bcast = (ip->dst_ip[0] == 255 && ip->dst_ip[1] == 255 && ip->dst_ip[2] == 255 && ip->dst_ip[3] == 255) || (ip->dst_ip[3] == 255);
     bool is_for_us = (memcmp(ip->dst_ip, host_ip, 4) == 0);
 
-    if (!is_unconfigured && !is_bcast && !is_for_us) {
+    if (!is_unconfigured && !is_loop && !is_bcast && !is_for_us) {
         net_buf_free(buf);
         return;
     }
@@ -315,6 +330,9 @@ void ipv4_input(net_buf_t *buf)
     ipv4_hdr_t ip_copy;
     memcpy(&ip_copy, ip, sizeof(ipv4_hdr_t));
     net_buf_pull(buf, ihl_bytes);
+
+    /* Dispatch copy to RAW sockets */
+    raw_input(buf, &ip_copy);
 
     /* Dispatch to Layer 4 transport protocol handlers */
     if (ip_copy.protocol == IP_PROTO_ICMP) {

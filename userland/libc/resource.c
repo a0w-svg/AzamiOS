@@ -39,3 +39,14 @@ int getrusage(int who, struct rusage *usage)
     memset(usage, 0, sizeof(*usage));
     return (int)syscall2(98 /* SYS_getrusage */, who, (long)usage);
 }
+
+int getpriority(int which, id_t who)
+{
+    long ret = syscall2(SYS_getpriority, which, who);
+    return (int)ret;
+}
+
+int setpriority(int which, id_t who, int prio)
+{
+    return (int)syscall3(SYS_setpriority, which, who, prio);
+}

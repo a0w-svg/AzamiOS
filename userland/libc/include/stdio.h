@@ -51,11 +51,13 @@ int fprintf(FILE *stream, const char *fmt, ...) __attribute__((format(printf, 2,
 int sprintf(char *buf, const char *fmt, ...)    __attribute__((format(printf, 2, 3)));
 int snprintf(char *buf, size_t size, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 int dprintf(int fd, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+int asprintf(char **strp, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 int vprintf(const char *fmt, va_list ap);
 int vfprintf(FILE *stream, const char *fmt, va_list ap);
 int vsprintf(char *buf, const char *fmt, va_list ap);
 int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap);
 int vdprintf(int fd, const char *fmt, va_list ap);
+int vasprintf(char **strp, const char *fmt, va_list ap);
 
 /* ── Formatted input ────────────────────────────────────────────────────── */
 int sscanf(const char *str, const char *fmt, ...) __attribute__((format(scanf, 2, 3)));
@@ -81,12 +83,36 @@ void   clearerr(FILE *stream);
 int    fileno(FILE *stream);
 void   rewind(FILE *stream);
 
+#define _IOFBF 0
+#define _IOLBF 1
+#define _IONBF 2
+
+typedef off_t fpos_t;
+
+#define getc(stream) fgetc(stream)
+#define putc(c, stream) fputc(c, stream)
+#define getchar_unlocked() getchar()
+#define putchar_unlocked(c) putchar(c)
+#define getc_unlocked(stream) fgetc(stream)
+#define putc_unlocked(c, stream) fputc(c, stream)
+
 /* ── Temporary files & Line input ────────────────────────────────────────── */
 FILE   *tmpfile(void);
 char   *tmpnam(char *s);
 char   *tempnam(const char *dir, const char *pfx);
 ssize_t getline(char **lineptr, size_t *n, FILE *stream);
 ssize_t getdelim(char **lineptr, size_t *n, int delim, FILE *stream);
+
+/* ── Stream Positioning & Buffering ──────────────────────────────────────── */
+int    fgetpos(FILE *stream, fpos_t *pos);
+int    fsetpos(FILE *stream, const fpos_t *pos);
+int    setvbuf(FILE *stream, char *buf, int mode, size_t size);
+void   setbuf(FILE *stream, char *buf);
+void   setbuffer(FILE *stream, char *buf, size_t size);
+void   setlinebuf(FILE *stream);
+void   flockfile(FILE *stream);
+int    ftrylockfile(FILE *stream);
+void   funlockfile(FILE *stream);
 
 /* ── Misc ───────────────────────────────────────────────────────────────── */
 void   perror(const char *s);

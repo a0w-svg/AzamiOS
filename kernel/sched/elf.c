@@ -194,9 +194,10 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
 
 /* Helper to map and load ELF PT_LOAD segments into a virtual address space */
 static int load_elf_segments(vmm_space_t user_space, file_t *file, const elf64_ehdr_t *ehdr,
-                             u64 load_bias, u64 *out_phdr_vaddr)
+                             u64 load_bias, u64 *out_phdr_vaddr, u64 *out_max_vaddr)
 {
     u64 phdr_user_vaddr = 0;
+    u64 max_vaddr = 0;
 
     for (u16 i = 0; i < ehdr->e_phnum; i++) {
         elf64_phdr_t phdr;
@@ -216,6 +217,10 @@ static int load_elf_segments(vmm_space_t user_space, file_t *file, const elf64_e
         /* Prevent Integer Overflow */
         if (seg_vaddr + phdr.p_memsz < seg_vaddr) {
             return -EINVAL;
+        }
+
+        if (seg_vaddr + phdr.p_memsz > max_vaddr) {
+            max_vaddr = seg_vaddr + phdr.p_memsz;
         }
 
         u64 start_vaddr = ALIGN_DOWN(seg_vaddr, PAGE_SIZE);
@@ -272,8 +277,10 @@ static int load_elf_segments(vmm_space_t user_space, file_t *file, const elf64_e
         phdr_user_vaddr = load_bias + ehdr->e_phoff;
     }
     if (out_phdr_vaddr) *out_phdr_vaddr = phdr_user_vaddr;
+    if (out_max_vaddr) *out_max_vaddr = max_vaddr;
     return 0;
 }
+
 
 /* Recursive ELF / Script loader */
 static int elf_load_exec_internal(process_t *proc, const char *path, const char *const argv[], const char *const envp[],
@@ -410,7 +417,8 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
 
     /* Load main executable segments */
     u64 phdr_user_vaddr = 0;
-    int err = load_elf_segments(user_space, file, &ehdr, load_bias, &phdr_user_vaddr);
+    u64 max_exec_vaddr = 0;
+    int err = load_elf_segments(user_space, file, &ehdr, load_bias, &phdr_user_vaddr, &max_exec_vaddr);
     if (err < 0) {
         vmm_destroy_space(user_space);
         vfs_close(file);
@@ -446,7 +454,8 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
                         if (iehdr.e_ident_magic == ELF_MAGIC && iehdr.e_machine == EM_X86_64) {
                             interp_base = (iehdr.e_type == ET_DYN) ? INTERP_LOAD_BASE : 0;
                             u64 iphdr_vaddr = 0;
-                            if (load_elf_segments(user_space, ifile, &iehdr, interp_base, &iphdr_vaddr) == 0) {
+                            u64 imax_vaddr = 0;
+                            if (load_elf_segments(user_space, ifile, &iehdr, interp_base, &iphdr_vaddr, &imax_vaddr) == 0) {
                                 final_entry = interp_base + iehdr.e_entry;
                                 pr_debug("[ELF] Loaded dynamic linker %s (Base: 0x%016llx, Entry: 0x%016llx)\n",
                                          interp_path, (unsigned long long)interp_base, (unsigned long long)final_entry);
@@ -485,16 +494,19 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
         return -ENOMEM;
     }
 
-    proc->heap_start   = 0x10000000; /* 256 MB base for user heap */
+    proc->heap_start   = ALIGN_UP(max_exec_vaddr, PAGE_SIZE);
+    if (proc->heap_start == 0) proc->heap_start = 0x10000000;
     proc->heap_end     = proc->heap_start;
     proc->mmap_current = 0x0000600000000000ULL;
 
     *out_entry = (uintptr_t)final_entry;
     *out_space = user_space;
-    pr_debug("[ELF] Successfully loaded %s (Entry: 0x%016llx, RSP: 0x%016llx, PML4: 0x%016llx)\n",
-             path, (unsigned long long)*out_entry, (unsigned long long)*out_rsp, (unsigned long long)user_space);
+    pr_debug("[ELF] Successfully loaded %s (Entry: 0x%016llx, RSP: 0x%016llx, PML4: 0x%016llx, Heap: 0x%016llx)\n",
+             path, (unsigned long long)*out_entry, (unsigned long long)*out_rsp, (unsigned long long)user_space,
+             (unsigned long long)proc->heap_start);
     return 0;
 }
+
 
 int elf_load_exec(process_t *proc, const char *path, const char *const argv[], const char *const envp[],
                   uintptr_t *out_entry, phys_addr_t *out_space, u64 *out_rsp)

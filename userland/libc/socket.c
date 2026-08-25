@@ -92,6 +92,26 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *
     return (ssize_t)ret;
 }
 
+ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)
+{
+    if (!msg) { errno = EINVAL; return -1; }
+    if (msg->msg_iov && msg->msg_iovlen > 0) {
+        return sendto(sockfd, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags,
+                      (const struct sockaddr *)msg->msg_name, msg->msg_namelen);
+    }
+    return 0;
+}
+
+ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)
+{
+    if (!msg) { errno = EINVAL; return -1; }
+    if (msg->msg_iov && msg->msg_iovlen > 0) {
+        return recvfrom(sockfd, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags,
+                        (struct sockaddr *)msg->msg_name, &msg->msg_namelen);
+    }
+    return 0;
+}
+
 int shutdown(int sockfd, int how)
 {
     long ret = syscall2(SYS_shutdown, sockfd, how);
@@ -142,15 +162,28 @@ int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optl
     return (int)ret;
 }
 
+/* ── Byte Order Functions ─────────────────────────────────────────────────── */
+
+uint16_t htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
+uint16_t ntohs(uint16_t v) { return htons(v); }
+uint32_t htonl(uint32_t v) { return (((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v & 0xFF0000) >> 8) | ((v >> 24) & 0xFF)); }
+uint32_t ntohl(uint32_t v) { return htonl(v); }
+
 /* ── INET String & Conversion Helpers ─────────────────────────────────────── */
 
 in_addr_t inet_addr(const char *cp)
 {
     struct in_addr in;
-    if (inet_pton(AF_INET, cp, &in) <= 0) {
+    if (inet_aton(cp, &in) == 0) {
         return INADDR_NONE;
     }
     return in.s_addr;
+}
+
+int inet_aton(const char *cp, struct in_addr *inp)
+{
+    if (!cp || !inp) return 0;
+    return inet_pton(AF_INET, cp, inp);
 }
 
 char *inet_ntoa(struct in_addr in)
@@ -199,6 +232,38 @@ const char *inet_ntop(int af, const void *src, char *dst, socklen_t size)
     return dst;
 }
 
+in_addr_t inet_network(const char *cp)
+{
+    in_addr_t addr = inet_addr(cp);
+    if (addr == INADDR_NONE) return INADDR_NONE;
+    return ntohl(addr);
+}
+
+struct in_addr inet_makeaddr(in_addr_t net, in_addr_t host)
+{
+    struct in_addr in;
+    if (net < 128) in.s_addr = htonl((net << 24) | (host & 0xFFFFFF));
+    else if (net < 65536) in.s_addr = htonl((net << 16) | (host & 0xFFFF));
+    else in.s_addr = htonl((net << 8) | (host & 0xFF));
+    return in;
+}
+
+in_addr_t inet_lnaof(struct in_addr in)
+{
+    in_addr_t h = ntohl(in.s_addr);
+    if ((h >> 24) < 128) return h & 0x00FFFFFF;
+    if ((h >> 24) < 192) return h & 0x0000FFFF;
+    return h & 0x000000FF;
+}
+
+in_addr_t inet_netof(struct in_addr in)
+{
+    in_addr_t h = ntohl(in.s_addr);
+    if ((h >> 24) < 128) return (h >> 24) & 0xFF;
+    if ((h >> 24) < 192) return (h >> 16) & 0xFFFF;
+    return (h >> 8) & 0xFFFFFF;
+}
+
 int socketpair(int domain, int type, int protocol, int sv[2])
 {
     long ret = syscall4(SYS_socketpair, domain, type, protocol, (long)sv);
@@ -207,4 +272,20 @@ int socketpair(int domain, int type, int protocol, int sv[2])
         return -1;
     }
     return 0;
+}
+
+unsigned int if_nametoindex(const char *ifname)
+{
+    if (!ifname) return 0;
+    if (strcmp(ifname, "lo") == 0 || strcmp(ifname, "lo0") == 0) return 1;
+    if (strcmp(ifname, "net0") == 0 || strcmp(ifname, "eth0") == 0 || strcmp(ifname, "e1000") == 0) return 2;
+    return 0;
+}
+
+char *if_indextoname(unsigned int ifindex, char *ifname)
+{
+    if (!ifname) return NULL;
+    if (ifindex == 1) { strcpy(ifname, "lo"); return ifname; }
+    if (ifindex == 2) { strcpy(ifname, "net0"); return ifname; }
+    return NULL;
 }

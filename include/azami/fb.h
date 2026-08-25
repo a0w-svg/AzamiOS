@@ -9,8 +9,12 @@
 #define FBIOGET_VSCREENINFO 0x4600
 #define FBIOPUT_VSCREENINFO 0x4601
 #define FBIOGET_FSCREENINFO 0x4602
+#define FBIOGETCMAP         0x4604
+#define FBIOPUTCMAP         0x4605
 #define FBIOPAN_DISPLAY     0x4606
 #define FBIOBLANK           0x4611
+#define FBIOGET_CON2FBMAP   0x460F
+#define FBIOPUT_CON2FBMAP   0x4610
 #define FBIO_WAITFORVSYNC   0x4620
 
 #define FB_TYPE_PACKED_PIXELS      0
@@ -19,6 +23,21 @@
 #define FB_BLANK_UNBLANK           0
 #define FB_BLANK_NORMAL            1
 #define FB_BLANK_POWERDOWN         4
+
+struct fb_cmap {
+    u32 start;          /* First entry */
+    u32 len;            /* Number of entries */
+    u16 *red;           /* Red values */
+    u16 *green;
+    u16 *blue;
+    u16 *transp;        /* transparency, can be NULL */
+};
+
+struct fb_con2fbmap {
+    u32 console;
+    u32 framebuffer;
+};
+
 
 struct fb_bitfield {
     u32 offset;         /* beginning of bitfield */

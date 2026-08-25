@@ -25,6 +25,64 @@ enum az_wm_msg_type {
     AZ_WM_MINIMIZE_WINDOW  = 23,   /* Request: minimize window */
 };
 
+/* ── Standard Keycode Definitions (matches drivers/input/input.h) ────────── */
+#ifndef KEY_ESC
+#define KEY_ESC          27
+#define KEY_BACKSPACE    '\b'
+#define KEY_TAB          '\t'
+#define KEY_ENTER        '\n'
+
+#define KEY_F1           128
+#define KEY_F2           129
+#define KEY_F3           130
+#define KEY_F4           131
+#define KEY_F5           132
+#define KEY_F6           133
+#define KEY_F7           134
+#define KEY_F8           135
+#define KEY_F9           136
+#define KEY_F10          137
+#define KEY_F11          138
+#define KEY_F12          139
+
+#define KEY_UP           140
+#define KEY_DOWN         141
+#define KEY_LEFT         142
+#define KEY_RIGHT        143
+
+#define KEY_INSERT       144
+#define KEY_DELETE       145
+#define KEY_HOME         146
+#define KEY_END          147
+#define KEY_PAGEUP       148
+#define KEY_PAGEDOWN     149
+
+#define KEY_CAPSLOCK     150
+#define KEY_NUMLOCK      151
+#define KEY_SCROLLLOCK   152
+
+#define KEY_LSHIFT       153
+#define KEY_RSHIFT       154
+#define KEY_LCTRL        155
+#define KEY_RCTRL        156
+#define KEY_LALT         157
+#define KEY_RALT         158
+
+#define KEY_LSUPER       159
+#define KEY_RSUPER       160
+#define KEY_APPS         161
+
+#define KEY_PRINTSCREEN  162
+#define KEY_PAUSE        163
+#endif
+
+/* ── Key Modifier Flags (msg.key.modifiers) ──────────────────────────────── */
+#define AZ_MOD_SHIFT     0x0001
+#define AZ_MOD_CTRL      0x0002
+#define AZ_MOD_ALT       0x0004
+#define AZ_MOD_CAPS      0x0008
+#define AZ_MOD_NUM       0x0010
+
 /* ── Window Server Message (fits in ipc_msg_t.data[256]) ──────────────────── */
 typedef struct {
     unsigned int type;         /* az_wm_msg_type */

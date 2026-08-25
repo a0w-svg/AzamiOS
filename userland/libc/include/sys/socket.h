@@ -4,7 +4,7 @@
  * ============================================================================ */
 #pragma once
 
-#include <sys/types.h>
+#include "types.h"
 
 typedef unsigned int socklen_t;
 typedef unsigned short sa_family_t;
@@ -65,6 +65,44 @@ struct sockaddr_storage {
     char        __ss_pad2[112];
 };
 
+#include "uio.h"
+
+/* Message Flags */
+#define MSG_OOB          0x01
+#define MSG_PEEK         0x02
+#define MSG_DONTROUTE    0x04
+#define MSG_CTRUNC       0x08
+#define MSG_TRUNC        0x20
+#define MSG_DONTWAIT     0x40
+#define MSG_EOR          0x80
+#define MSG_WAITALL      0x100
+#define MSG_FIN          0x200
+#define MSG_SYN          0x400
+#define MSG_CONFIRM      0x800
+#define MSG_RST          0x1000
+#define MSG_ERRQUEUE     0x2000
+#define MSG_NOSIGNAL     0x4000
+#define MSG_MORE         0x8000
+#define MSG_WAITFORONE   0x10000
+#define MSG_CMSG_CLOEXEC 0x40000000
+
+/* Scatter-gather message header */
+struct msghdr {
+    void         *msg_name;
+    socklen_t     msg_namelen;
+    struct iovec *msg_iov;
+    size_t        msg_iovlen;
+    void         *msg_control;
+    size_t        msg_controllen;
+    int           msg_flags;
+};
+
+struct cmsghdr {
+    size_t cmsg_len;
+    int    cmsg_level;
+    int    cmsg_type;
+};
+
 /* Socket Syscall Wrappers */
 int     socket(int domain, int type, int protocol);
 int     bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
@@ -75,6 +113,8 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags);
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen);
 ssize_t recv(int sockfd, void *buf, size_t len, int flags);
 ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen);
+ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags);
+ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
 int     shutdown(int sockfd, int how);
 int     getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 int     getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen);

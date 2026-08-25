@@ -686,8 +686,11 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   if (!pressed)
     return;
 
+  bool ctrl  = (modifiers & AZ_MOD_CTRL) != 0;
+  bool shift = (modifiers & AZ_MOD_SHIFT) != 0;
+
   /* Enter */
-  if (keycode == '\n' || keycode == '\r' || scancode == 28) {
+  if (keycode == '\n' || keycode == '\r' || keycode == KEY_ENTER || scancode == 28 || scancode == 0x1C) {
     g_input[g_input_len] = '\0';
     execute_command(g_input);
     g_input_len = 0;
@@ -696,16 +699,14 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   }
 
   /* Ctrl+L: Clear screen */
-  if (keycode == 12 || ((modifiers & 2) &&
-                        (keycode == 'l' || keycode == 'L' || scancode == 38))) {
+  if (keycode == 12 || (ctrl && (keycode == 'l' || keycode == 'L' || scancode == 38))) {
     g_line_count = 0;
     g_scroll = 0;
     return;
   }
 
   /* Ctrl+C: Cancel current line */
-  if (keycode == 3 || ((modifiers & 2) &&
-                       (keycode == 'c' || keycode == 'C' || scancode == 46))) {
+  if (keycode == 3 || (ctrl && (keycode == 'c' || keycode == 'C' || scancode == 46))) {
     char prompt[128];
     snprintf(prompt, sizeof(prompt), "root@azamios:%s$ %s^C", g_cwd, g_input);
     term_print(prompt, UK_OVERLAY0);
@@ -715,24 +716,27 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   }
 
   /* Ctrl+U: Clear entire input line */
-  if (keycode == 21 || ((modifiers & 2) &&
-                        (keycode == 'u' || keycode == 'U' || scancode == 22))) {
+  if (keycode == 21 || (ctrl && (keycode == 'u' || keycode == 'U' || scancode == 22))) {
     g_input_len = 0;
     g_input[0] = '\0';
     return;
   }
 
   /* Ctrl+D: Exit if line is empty */
-  if (keycode == 4 || ((modifiers & 2) &&
-                       (keycode == 'd' || keycode == 'D' || scancode == 32))) {
+  if (keycode == 4 || (ctrl && (keycode == 'd' || keycode == 'D' || scancode == 32))) {
     if (g_input_len == 0) {
       sys_exit(0);
     }
     return;
   }
 
+  /* Do not type control characters when Ctrl is held */
+  if (ctrl) {
+    return;
+  }
+
   /* Backspace */
-  if (keycode == '\b' || keycode == 127 || scancode == 14) {
+  if (keycode == '\b' || keycode == 127 || keycode == KEY_BACKSPACE || scancode == 14 || scancode == 0x0E) {
     if (g_input_len > 0) {
       g_input[--g_input_len] = '\0';
     }
@@ -740,13 +744,13 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   }
 
   /* Tab: Auto-complete */
-  if (keycode == '\t' || scancode == 15) {
+  if (keycode == '\t' || keycode == KEY_TAB || scancode == 15 || scancode == 0x0F) {
     do_tab_completion();
     return;
   }
 
-  /* Up Arrow: History backward (WARN-1: 0x48 == 72, removed duplicate) */
-  if (scancode == 72) {
+  /* Up Arrow: History backward */
+  if (keycode == KEY_UP || scancode == 72 || scancode == 0x48) {
     if (g_hist_idx > 0 && g_hist_count > 0) {
       g_hist_idx--;
       strncpy(g_input, g_history[g_hist_idx], MAX_CMD);
@@ -756,8 +760,8 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
     return;
   }
 
-  /* Down Arrow: History forward (WARN-1: 0x50 == 80, removed duplicate) */
-  if (scancode == 80) {
+  /* Down Arrow: History forward */
+  if (keycode == KEY_DOWN || scancode == 80 || scancode == 0x50) {
     if (g_hist_idx < g_hist_count - 1) {
       g_hist_idx++;
       strncpy(g_input, g_history[g_hist_idx], MAX_CMD);
@@ -772,7 +776,7 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   }
 
   /* Page Up: Scroll back */
-  if (scancode == 73 || scancode == 0x49) {
+  if (keycode == KEY_PAGEUP || scancode == 73 || scancode == 0x49) {
     if (g_scroll > 5)
       g_scroll -= 5;
     else
@@ -781,8 +785,7 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   }
 
   /* Page Down: Scroll forward */
-  if (scancode == 81) {
-    /* BUG-9 fix: clamp so we never scroll past the last visible line */
+  if (keycode == KEY_PAGEDOWN || scancode == 81 || scancode == 0x51) {
     int max_vis = ((int)g_win.height > 80) ? ((int)g_win.height - 80) / FONT_H
                                            : (TERM_ROWS - 2);
     if (max_vis < 1)
@@ -796,13 +799,17 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
     return;
   }
 
+  /* Ignore non-character modifier / special keys */
+  if (keycode >= 128) {
+    return;
+  }
+
   /* Direct ASCII printable */
   char c = 0;
   if (keycode >= 32 && keycode <= 126) {
     c = (char)keycode;
   } else {
     /* Fallback scancode translation */
-    int shift = (modifiers & 1) != 0;
     if (scancode >= 2 && scancode <= 13) {
       const char r1_off[] = "1234567890-=";
       const char r1_on[] = "!@#$%^&*()_+";
@@ -828,7 +835,7 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
     }
   }
 
-  if (c && g_input_len < MAX_CMD) {
+  if (c && g_input_len < MAX_CMD - 1) {
     g_input[g_input_len++] = c;
     g_input[g_input_len] = '\0';
   }

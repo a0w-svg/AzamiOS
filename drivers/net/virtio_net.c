@@ -180,8 +180,8 @@ int virtio_net_init(device_t *pci_dev)
     strcpy(ndev.name, "virtio-net");
     memcpy(ndev.mac, g_vnet.mac, 6);
     ndev.send = virtio_net_send_packet;
-    extern int net_register_device(const net_device_t *dev);
     net_register_device(&ndev);
+
 
     devfs_register_device("net0", &g_vnet_fops, &g_vnet);
 

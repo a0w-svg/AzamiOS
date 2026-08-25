@@ -252,7 +252,12 @@ s64 udp_sendto(udp_sock_t *sock, const void *data, size_t len, const u8 dst_ip[4
     u8 host_ip[4];
     net_get_ip(host_ip);
     ipv4_hdr_t pseudo_ip;
-    memcpy(pseudo_ip.src_ip, host_ip, 4);
+    if (target_ip[0] == 127) {
+        static const u8 loop_src[4] = { 127, 0, 0, 1 };
+        memcpy(pseudo_ip.src_ip, loop_src, 4);
+    } else {
+        memcpy(pseudo_ip.src_ip, host_ip, 4);
+    }
     memcpy(pseudo_ip.dst_ip, target_ip, 4);
     udp->checksum = udp_checksum(udp, &pseudo_ip, payload, len);
 
@@ -337,21 +342,27 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     size_t payload_len = udp_len - sizeof(udp_hdr_t);
     const u8 *payload = buf->data + sizeof(udp_hdr_t);
 
-    /* Verify UDP Checksum if non-zero */
-    if (udp->checksum != 0) {
-        u16 calc = udp_checksum(udp, ip_hdr, payload, payload_len);
-        if (calc != 0 && calc != udp->checksum) {
+    /* Verify UDP Checksum if non-zero and not on loopback interface */
+    if (ip_hdr->dst_ip[0] != 127 && udp->checksum != 0) {
+        udp_hdr_t udp_zero = *udp;
+        udp_zero.checksum = 0;
+        u16 calc = udp_checksum(&udp_zero, ip_hdr, payload, payload_len);
+        if (calc != udp->checksum) {
             pr_debug("[UDP] Bad checksum (0x%04x != 0x%04x), dropping.\n", udp->checksum, calc);
             net_buf_free(buf);
             return;
         }
     }
 
+
+
     /* Check for kernel DHCP client dispatch */
     if (dst_port == DHCP_CLIENT_PORT) {
-        net_buf_pull(buf, sizeof(udp_hdr_t));
-        dhcp_input(buf, ip_hdr);
-        return;
+        net_buf_t *dhcp_clone = net_buf_clone(buf);
+        if (dhcp_clone) {
+            net_buf_pull(dhcp_clone, sizeof(udp_hdr_t));
+            dhcp_input(dhcp_clone, ip_hdr);
+        }
     }
 
     /* Find matching socket */
@@ -387,7 +398,7 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             }
             spinlock_unlock(&target_sock->lock);
         }
-    } else {
+    } else if (dst_port != DHCP_CLIENT_PORT) {
         /* Port Unreachable */
         icmp_send_dest_unreach(ip_hdr, buf->data, ICMP_CODE_PORT_UNREACH);
     }

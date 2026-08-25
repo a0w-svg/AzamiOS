@@ -509,6 +509,30 @@ int dprintf(int fd, const char *fmt, ...)
     return r;
 }
 
+int vasprintf(char **strp, const char *fmt, va_list ap)
+{
+    if (!strp) return -1;
+    va_list ap_copy;
+    va_copy(ap_copy, ap);
+    int len = vsnprintf(NULL, 0, fmt, ap_copy);
+    va_end(ap_copy);
+    if (len < 0) return -1;
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) return -1;
+    vsnprintf(buf, (size_t)len + 1, fmt, ap);
+    *strp = buf;
+    return len;
+}
+
+int asprintf(char **strp, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vasprintf(strp, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
 void perror(const char *s)
 {
     if (s && *s) {
@@ -915,6 +939,58 @@ int remove(const char *pathname)
     int r = sys_unlink(pathname);
     if (r == 0) return 0;
     return sys_rmdir(pathname);
+}
+
+int fgetpos(FILE *stream, fpos_t *pos)
+{
+    if (!stream || !pos) { errno = EINVAL; return -1; }
+    off_t offset = ftello(stream);
+    if (offset < 0) return -1;
+    *pos = offset;
+    return 0;
+}
+
+int fsetpos(FILE *stream, const fpos_t *pos)
+{
+    if (!stream || !pos) { errno = EINVAL; return -1; }
+    return fseeko(stream, *pos, SEEK_SET);
+}
+
+int setvbuf(FILE *stream, char *buf, int mode, size_t size)
+{
+    (void)stream; (void)buf; (void)mode; (void)size;
+    return 0;
+}
+
+void setbuf(FILE *stream, char *buf)
+{
+    (void)stream; (void)buf;
+}
+
+void setbuffer(FILE *stream, char *buf, size_t size)
+{
+    (void)stream; (void)buf; (void)size;
+}
+
+void setlinebuf(FILE *stream)
+{
+    (void)stream;
+}
+
+void flockfile(FILE *stream)
+{
+    (void)stream;
+}
+
+int ftrylockfile(FILE *stream)
+{
+    (void)stream;
+    return 0;
+}
+
+void funlockfile(FILE *stream)
+{
+    (void)stream;
 }
 
 

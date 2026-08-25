@@ -245,5 +245,4 @@ void memdevs_init(void)
     devfs_register_device("tty", &g_console_dev_fops, NULL);
     devfs_register_device("tty0", &g_console_dev_fops, NULL);
     devfs_register_device("tty1", &g_console_dev_fops, NULL);
-    devfs_register_device("ptmx", &g_console_dev_fops, NULL);
 }

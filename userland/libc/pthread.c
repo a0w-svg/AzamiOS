@@ -34,8 +34,10 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_
     void *stack = malloc(stack_size);
     if (!stack) return -1;
 
-    /* Top of stack (aligned to 16 bytes for System V AMD64 ABI) */
-    uintptr_t stack_top = ((uintptr_t)stack + stack_size - 16) & ~0xFULL;
+    /* Top of stack (aligned to 16 bytes for System V AMD64 ABI with 8-byte entry offset) */
+    uintptr_t aligned_top = ((uintptr_t)stack + stack_size) & ~0xFULL;
+    uintptr_t stack_top = aligned_top - 8;
+    *(uint64_t *)stack_top = 0; /* Zero return address to terminate unwinding */
 
     thread_startup_ctx_t *ctx = (thread_startup_ctx_t *)malloc(sizeof(thread_startup_ctx_t));
     if (!ctx) {

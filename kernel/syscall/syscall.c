@@ -31,9 +31,12 @@
 #include "../../include/azami/net.h"
 #include "../../include/azami/socket.h"
 #include "../security/acl.h"
+#include "../security/security.h"
 #include "../../arch/x86_64/cpu/msr.h"
+#include "../../arch/x86_64/cpu/smp.h"
 
 typedef s64 (*syscall_fn_t)(pt_regs_t *r);
+
 
 #define SYSCALL_TABLE_SIZE  540
 static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE];
@@ -95,6 +98,7 @@ static s64 sys_ftruncate_impl(pt_regs_t *r);
 static s64 sys_getdents_impl(pt_regs_t *r);
 static s64 sys_getcwd_impl(pt_regs_t *r);
 static s64 sys_chdir_impl(pt_regs_t *r);
+static s64 sys_fchdir_impl(pt_regs_t *r);
 static s64 sys_rename_impl(pt_regs_t *r);
 static s64 sys_mkdir_impl(pt_regs_t *r);
 static s64 sys_rmdir_impl(pt_regs_t *r);
@@ -171,10 +175,21 @@ static s64 sys_set_tid_address_impl(pt_regs_t *r);
 static s64 sys_set_robust_list_impl(pt_regs_t *r);
 static s64 sys_prlimit64_impl(pt_regs_t *r);
 static s64 sys_rseq_impl(pt_regs_t *r);
+static s64 sys_sendfile_impl(pt_regs_t *r);
+static s64 sys_copy_file_range_impl(pt_regs_t *r);
+static s64 sys_fallocate_impl(pt_regs_t *r);
+static s64 sys_sync_file_range_impl(pt_regs_t *r);
+static s64 sys_readahead_impl(pt_regs_t *r);
+static s64 sys_splice_impl(pt_regs_t *r);
+static s64 sys_tee_impl(pt_regs_t *r);
+static s64 sys_vmsplice_impl(pt_regs_t *r);
 static s64 sys_pread64_impl(pt_regs_t *r);
 static s64 sys_pwrite64_impl(pt_regs_t *r);
 static s64 sys_getrandom_impl(pt_regs_t *r);
 static s64 sys_statx_impl(pt_regs_t *r);
+static s64 sys_syslog_impl(pt_regs_t *r);
+static s64 sys_swapon_impl(pt_regs_t *r);
+static s64 sys_swapoff_impl(pt_regs_t *r);
 static s64 sys_sched_yield_impl(pt_regs_t *r);
 static s64 sys_msync_impl(pt_regs_t *r);
 static s64 sys_madvise_impl(pt_regs_t *r);
@@ -192,17 +207,93 @@ static s64 sys_linkat_impl(pt_regs_t *r);
 static s64 sys_symlinkat_impl(pt_regs_t *r);
 static s64 sys_fchmodat_impl(pt_regs_t *r);
 static s64 sys_renameat_impl(pt_regs_t *r);
+static s64 sys_flock_impl(pt_regs_t *r);
+static s64 sys_fsync_impl(pt_regs_t *r);
+static s64 sys_fdatasync_impl(pt_regs_t *r);
+static s64 sys_sync_impl(pt_regs_t *r);
+static s64 sys_syncfs_impl(pt_regs_t *r);
+static s64 sys_getpgid_impl(pt_regs_t *r);
+static s64 sys_getsid_impl(pt_regs_t *r);
+static s64 sys_setreuid_impl(pt_regs_t *r);
+static s64 sys_setregid_impl(pt_regs_t *r);
+static s64 sys_setresuid_impl(pt_regs_t *r);
+static s64 sys_getresuid_impl(pt_regs_t *r);
+static s64 sys_setresgid_impl(pt_regs_t *r);
+static s64 sys_getresgid_impl(pt_regs_t *r);
+static s64 sys_getgroups_impl(pt_regs_t *r);
+static s64 sys_setgroups_impl(pt_regs_t *r);
+static s64 sys_clock_getres_impl(pt_regs_t *r);
+static s64 sys_clock_settime_impl(pt_regs_t *r);
+static s64 sys_clock_nanosleep_impl(pt_regs_t *r);
+static s64 sys_mremap_impl(pt_regs_t *r);
+static s64 sys_mincore_impl(pt_regs_t *r);
+static s64 sys_capget_impl(pt_regs_t *r);
+static s64 sys_capset_impl(pt_regs_t *r);
+static s64 sys_personality_impl(pt_regs_t *r);
+static s64 sys_sched_setparam_impl(pt_regs_t *r);
+static s64 sys_sched_getparam_impl(pt_regs_t *r);
+static s64 sys_sched_setscheduler_impl(pt_regs_t *r);
+static s64 sys_sched_getscheduler_impl(pt_regs_t *r);
+static s64 sys_sched_get_priority_max_impl(pt_regs_t *r);
+static s64 sys_sched_get_priority_min_impl(pt_regs_t *r);
+static s64 sys_sched_rr_get_interval_impl(pt_regs_t *r);
+static s64 sys_futex_impl(pt_regs_t *r);
+static s64 sys_epoll_create_impl(pt_regs_t *r);
+static s64 sys_epoll_create1_impl(pt_regs_t *r);
+static s64 sys_epoll_ctl_impl(pt_regs_t *r);
+static s64 sys_epoll_wait_impl(pt_regs_t *r);
+static s64 sys_epoll_pwait_impl(pt_regs_t *r);
+static s64 sys_signalfd_impl(pt_regs_t *r);
+static s64 sys_signalfd4_impl(pt_regs_t *r);
+static s64 sys_timerfd_create_impl(pt_regs_t *r);
+static s64 sys_timerfd_settime_impl(pt_regs_t *r);
+static s64 sys_timerfd_gettime_impl(pt_regs_t *r);
+static s64 sys_eventfd_impl(pt_regs_t *r);
+static s64 sys_eventfd2_impl(pt_regs_t *r);
+static s64 sys_inotify_init_impl(pt_regs_t *r);
+static s64 sys_inotify_init1_impl(pt_regs_t *r);
+static s64 sys_inotify_add_watch_impl(pt_regs_t *r);
+static s64 sys_inotify_rm_watch_impl(pt_regs_t *r);
+static s64 sys_membarrier_impl(pt_regs_t *r);
+static s64 sys_clone3_impl(pt_regs_t *r);
+static s64 sys_close_range_impl(pt_regs_t *r);
+static s64 sys_openat2_impl(pt_regs_t *r);
+static s64 sys_faccessat2_impl(pt_regs_t *r);
+static s64 sys_epoll_pwait2_impl(pt_regs_t *r);
+static s64 sys_getcpu_impl(pt_regs_t *r);
+static s64 sys_seccomp_impl(pt_regs_t *r);
+static s64 sys_sched_setattr_impl(pt_regs_t *r);
+static s64 sys_sched_getattr_impl(pt_regs_t *r);
+static s64 sys_pidfd_open_impl(pt_regs_t *r);
+static s64 sys_pidfd_send_signal_impl(pt_regs_t *r);
+static s64 sys_pidfd_getfd_impl(pt_regs_t *r);
+static s64 sys_memfd_create_impl(pt_regs_t *r);
+static s64 sys_getrlimit_impl(pt_regs_t *r);
+static s64 sys_setrlimit_impl(pt_regs_t *r);
+static s64 sys_sethostname_impl(pt_regs_t *r);
+static s64 sys_setdomainname_impl(pt_regs_t *r);
+static s64 sys_getpriority_impl(pt_regs_t *r);
+static s64 sys_setpriority_impl(pt_regs_t *r);
+static s64 sys_chroot_impl(pt_regs_t *r);
+static s64 sys_setxattr_impl(pt_regs_t *r);
+static s64 sys_lsetxattr_impl(pt_regs_t *r);
+static s64 sys_fsetxattr_impl(pt_regs_t *r);
+static s64 sys_getxattr_impl(pt_regs_t *r);
+static s64 sys_lgetxattr_impl(pt_regs_t *r);
+static s64 sys_fgetxattr_impl(pt_regs_t *r);
+static s64 sys_listxattr_impl(pt_regs_t *r);
+static s64 sys_llistxattr_impl(pt_regs_t *r);
+static s64 sys_flistxattr_impl(pt_regs_t *r);
+static s64 sys_removexattr_impl(pt_regs_t *r);
+static s64 sys_lremovexattr_impl(pt_regs_t *r);
+static s64 sys_fremovexattr_impl(pt_regs_t *r);
 
-/* ── Main dispatcher ─────────────────────────────────────────────────────── */
 
 void syscall_dispatch(pt_regs_t *regs)
 {
     u64 nr = regs->rax;
 
     if (unlikely(nr >= SYSCALL_TABLE_SIZE) || !g_syscall_table[nr]) {
-        pr_debug("[SYSCALL] Unknown syscall %llu from RIP=0x%016llx\n",
-                (unsigned long long)nr,
-                (unsigned long long)regs->rip);
         regs->rax = (u64)(-(s64)ENOSYS);
         return;
     }
@@ -277,11 +368,15 @@ void syscall_init(void)
     reg(SYS_kill,          sys_kill_impl);
     reg(SYS_uname,         sys_uname_impl);
     reg(SYS_fcntl,         sys_fcntl_impl);
+    reg(SYS_flock,         sys_flock_impl);
+    reg(SYS_fsync,         sys_fsync_impl);
+    reg(SYS_fdatasync,     sys_fdatasync_impl);
     reg(SYS_truncate,      sys_truncate_impl);
     reg(SYS_ftruncate,     sys_ftruncate_impl);
     reg(SYS_getdents,      sys_getdents_impl);
     reg(SYS_getcwd,        sys_getcwd_impl);
     reg(SYS_chdir,         sys_chdir_impl);
+    reg(SYS_fchdir,        sys_fchdir_impl);
     reg(SYS_rename,        sys_rename_impl);
     reg(SYS_mkdir,         sys_mkdir_impl);
     reg(SYS_rmdir,         sys_rmdir_impl);
@@ -307,9 +402,21 @@ void syscall_init(void)
     reg(SYS_getppid,       sys_getppid_impl);
     reg(SYS_getpgrp,       sys_getpgrp_impl);
     reg(SYS_setsid,        sys_setsid_impl);
+    reg(SYS_setreuid,      sys_setreuid_impl);
+    reg(SYS_setregid,      sys_setregid_impl);
+    reg(SYS_getgroups,     sys_getgroups_impl);
+    reg(SYS_setgroups,     sys_setgroups_impl);
+    reg(SYS_setresuid,     sys_setresuid_impl);
+    reg(SYS_getresuid,     sys_getresuid_impl);
+    reg(SYS_setresgid,     sys_setresgid_impl);
+    reg(SYS_getresgid,     sys_getresgid_impl);
+    reg(SYS_getpgid,       sys_getpgid_impl);
+    reg(SYS_getsid,        sys_getsid_impl);
     reg(SYS_utime,         sys_utime_impl);
     reg(SYS_statfs,        sys_statfs_impl);
     reg(SYS_fstatfs,       sys_fstatfs_impl);
+    reg(SYS_sync,          sys_sync_impl);
+    reg(SYS_syncfs,        sys_syncfs_impl);
     reg(SYS_prctl,         sys_prctl_impl);
     reg(SYS_reboot,        sys_reboot_impl);
     reg(SYS_gettid,        sys_gettid_impl);
@@ -319,7 +426,10 @@ void syscall_init(void)
     reg(SYS_sched_getaffinity, sys_sched_getaffinity_impl);
     reg(SYS_getdents64,    sys_getdents64_impl);
     reg(SYS_fadvise64,     sys_fadvise64_impl);
+    reg(SYS_clock_settime, sys_clock_settime_impl);
     reg(SYS_clock_gettime, sys_clock_gettime_impl);
+    reg(SYS_clock_getres,  sys_clock_getres_impl);
+    reg(SYS_clock_nanosleep, sys_clock_nanosleep_impl);
     reg(SYS_exit_group,    sys_exit_group_impl);
     reg(SYS_tgkill,        sys_tgkill_impl);
     reg(SYS_utimes,        sys_utimes_impl);
@@ -352,8 +462,84 @@ void syscall_init(void)
     reg(SYS_prlimit64,     sys_prlimit64_impl);
     reg(SYS_getrandom,     sys_getrandom_impl);
     reg(SYS_statx,         sys_statx_impl);
+    reg(SYS_sendfile,      sys_sendfile_impl);
+    reg(SYS_copy_file_range, sys_copy_file_range_impl);
+    reg(SYS_fallocate,     sys_fallocate_impl);
+    reg(SYS_sync_file_range, sys_sync_file_range_impl);
+    reg(SYS_readahead,     sys_readahead_impl);
+    reg(SYS_splice,        sys_splice_impl);
+    reg(SYS_tee,           sys_tee_impl);
+    reg(SYS_vmsplice,      sys_vmsplice_impl);
+    reg(SYS_syslog,        sys_syslog_impl);
+    reg(SYS_swapon,        sys_swapon_impl);
+    reg(SYS_swapoff,       sys_swapoff_impl);
     reg(SYS_rseq,          sys_rseq_impl);
     reg(SYS_close_range,   sys_close_range_impl);
+
+    /* Linux ABIs */
+    reg(SYS_mremap,        sys_mremap_impl);
+    reg(SYS_mincore,       sys_mincore_impl);
+    reg(SYS_capget,        sys_capget_impl);
+    reg(SYS_capset,        sys_capset_impl);
+    reg(SYS_personality,   sys_personality_impl);
+    reg(SYS_sched_setparam, sys_sched_setparam_impl);
+    reg(SYS_sched_getparam, sys_sched_getparam_impl);
+    reg(SYS_sched_setscheduler, sys_sched_setscheduler_impl);
+    reg(SYS_sched_getscheduler, sys_sched_getscheduler_impl);
+    reg(SYS_getpriority,   sys_getpriority_impl);
+    reg(SYS_setpriority,   sys_setpriority_impl);
+    reg(SYS_chroot,        sys_chroot_impl);
+    reg(SYS_sethostname,   sys_sethostname_impl);
+    reg(SYS_setdomainname, sys_setdomainname_impl);
+    reg(SYS_sched_get_priority_max, sys_sched_get_priority_max_impl);
+    reg(SYS_sched_get_priority_min, sys_sched_get_priority_min_impl);
+    reg(SYS_sched_rr_get_interval, sys_sched_rr_get_interval_impl);
+    reg(SYS_futex,         sys_futex_impl);
+    reg(SYS_epoll_create,  sys_epoll_create_impl);
+    reg(SYS_epoll_create1, sys_epoll_create1_impl);
+    reg(SYS_epoll_ctl,     sys_epoll_ctl_impl);
+    reg(SYS_epoll_wait,    sys_epoll_wait_impl);
+    reg(SYS_epoll_pwait,   sys_epoll_pwait_impl);
+    reg(SYS_signalfd,      sys_signalfd_impl);
+    reg(SYS_signalfd4,     sys_signalfd4_impl);
+    reg(SYS_timerfd_create, sys_timerfd_create_impl);
+    reg(SYS_timerfd_settime, sys_timerfd_settime_impl);
+    reg(SYS_timerfd_gettime, sys_timerfd_gettime_impl);
+    reg(SYS_eventfd,       sys_eventfd_impl);
+    reg(SYS_eventfd2,      sys_eventfd2_impl);
+    reg(SYS_inotify_init,  sys_inotify_init_impl);
+    reg(SYS_inotify_init1, sys_inotify_init1_impl);
+    reg(SYS_inotify_add_watch, sys_inotify_add_watch_impl);
+    reg(SYS_inotify_rm_watch,  sys_inotify_rm_watch_impl);
+    reg(SYS_membarrier,    sys_membarrier_impl);
+    reg(SYS_clone3,        sys_clone3_impl);
+    reg(SYS_close_range,   sys_close_range_impl);
+    reg(SYS_openat2,       sys_openat2_impl);
+    reg(SYS_faccessat2,    sys_faccessat2_impl);
+    reg(SYS_epoll_pwait2,  sys_epoll_pwait2_impl);
+    reg(SYS_getcpu,        sys_getcpu_impl);
+    reg(SYS_seccomp,       sys_seccomp_impl);
+    reg(SYS_sched_setattr, sys_sched_setattr_impl);
+    reg(SYS_sched_getattr, sys_sched_getattr_impl);
+    reg(SYS_pidfd_open,    sys_pidfd_open_impl);
+    reg(SYS_pidfd_send_signal, sys_pidfd_send_signal_impl);
+    reg(SYS_pidfd_getfd,   sys_pidfd_getfd_impl);
+    reg(SYS_memfd_create,  sys_memfd_create_impl);
+    reg(SYS_getrlimit,     sys_getrlimit_impl);
+    reg(SYS_setrlimit,     sys_setrlimit_impl);
+    reg(SYS_setxattr,      sys_setxattr_impl);
+    reg(SYS_lsetxattr,     sys_lsetxattr_impl);
+    reg(SYS_fsetxattr,     sys_fsetxattr_impl);
+    reg(SYS_getxattr,      sys_getxattr_impl);
+    reg(SYS_lgetxattr,     sys_lgetxattr_impl);
+    reg(SYS_fgetxattr,     sys_fgetxattr_impl);
+    reg(SYS_listxattr,     sys_listxattr_impl);
+    reg(SYS_llistxattr,    sys_llistxattr_impl);
+    reg(SYS_flistxattr,    sys_flistxattr_impl);
+    reg(SYS_removexattr,   sys_removexattr_impl);
+    reg(SYS_lremovexattr,  sys_lremovexattr_impl);
+    reg(SYS_fremovexattr,  sys_fremovexattr_impl);
+
 
     /* Azami extended */
     reg(SYS_AZ_CHANNEL_CREATE, sys_az_channel_create);
@@ -385,10 +571,19 @@ void syscall_init(void)
 static s64 copy_str_from_user(char *dst, const char *user_src, size_t max_len)
 {
     if (!dst || !user_src || max_len == 0) return -(s64)EINVAL;
-    if ((uintptr_t)user_src >= 0x8000000000000000ULL) return -(s64)EFAULT;
-    for (size_t i = 0; i < max_len - 1; i++) {
-        if (copy_from_user(&dst[i], user_src + i, 1) != 0) return -(s64)EFAULT;
-        if (dst[i] == '\0') return (s64)i;
+    if ((uintptr_t)user_src >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    size_t copied = 0;
+    while (copied < max_len - 1) {
+        char c = '\0';
+        if (copy_from_user(&c, user_src + copied, 1) != 0) {
+            return -(s64)EFAULT;
+        }
+        dst[copied] = c;
+        if (c == '\0') {
+            return (s64)copied;
+        }
+        copied++;
     }
     dst[max_len - 1] = '\0';
     return (s64)(max_len - 1);
@@ -423,11 +618,7 @@ static s64 copy_user_path_resolve_at(int dirfd, char *kpath, size_t max_len, con
 
     char dir_path[512];
     __builtin_memset(dir_path, 0, sizeof(dir_path));
-    if (df->f_dentry->d_name[0] == '/') {
-        strncpy(dir_path, df->f_dentry->d_name, sizeof(dir_path) - 1);
-    } else {
-        snprintf(dir_path, sizeof(dir_path), "/%s", df->f_dentry->d_name);
-    }
+    dentry_build_path(df->f_dentry, dir_path, sizeof(dir_path));
 
     return vfs_resolve_path(dir_path, raw, kpath, max_len);
 }
@@ -475,7 +666,11 @@ static s64 sys_read_impl(pt_regs_t *r)
     while (count > 0) {
         size_t chunk = count > 512 ? 512 : (size_t)count;
         s64 ret = (s64)vfs_read(file, kbuf, chunk);
-        if (ret <= 0) break;
+        if (ret < 0) {
+            if (total_read == 0) return ret;
+            break;
+        }
+        if (ret == 0) break;
         if (copy_to_user(buf + total_read, kbuf, (size_t)ret) != 0) {
             if (total_read == 0) return -(s64)EFAULT;
             break;
@@ -530,7 +725,14 @@ static s64 sys_write_impl(pt_regs_t *r)
             break;
         }
         s64 ret = (s64)vfs_write(file, kbuf, chunk);
-        if (ret <= 0) break;
+        if (ret < 0) {
+            if (ret == -(s64)EPIPE && proc) {
+                sched_kill_process(proc->pid, 13 /* SIGPIPE */);
+            }
+            if (total_written == 0) return ret;
+            break;
+        }
+        if (ret == 0) break;
         total_written += ret;
         count -= ret;
         if (ret < (s64)chunk) break;
@@ -785,7 +987,7 @@ static s64 sys_brk_impl(pt_regs_t *r)
         return (s64)proc->heap_end;
     }
 
-    if (new_brk < proc->heap_start || new_brk >= 0x0000800000000000ULL) {
+    if (new_brk < proc->heap_start || new_brk >= 0x00007ffff0000000ULL) {
         return (s64)proc->heap_end;
     }
 
@@ -794,10 +996,13 @@ static s64 sys_brk_impl(pt_regs_t *r)
 
     if (target_page > cur_page) {
         for (virt_addr_t va = cur_page; va < target_page; va += PAGE_SIZE) {
-            phys_addr_t phys = pmm_alloc_page();
-            if (!phys) return (s64)proc->heap_end;
-            __builtin_memset((void *)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
-            vmm_map(proc->pml4_phys, va, phys, VMM_USER_RW);
+            phys_addr_t phys = vmm_translate(proc->pml4_phys, va);
+            if (!phys) {
+                phys = pmm_alloc_page();
+                if (!phys) return (s64)proc->heap_end;
+                __builtin_memset((void *)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+                vmm_map(proc->pml4_phys, va, phys, VMM_USER_RW);
+            }
         }
     } else if (target_page < cur_page) {
         for (virt_addr_t va = target_page; va < cur_page; va += PAGE_SIZE) {
@@ -812,6 +1017,7 @@ static s64 sys_brk_impl(pt_regs_t *r)
     proc->heap_end = new_brk;
     return (s64)proc->heap_end;
 }
+
 
 static s64 sys_mmap_impl(pt_regs_t *r)
 {
@@ -830,14 +1036,31 @@ static s64 sys_mmap_impl(pt_regs_t *r)
     bool map_fixed     = !!(flags & 0x10);
     virt_addr_t target_addr = addr;
 
-    if (!target_addr || target_addr < 0x1000 || target_addr >= 0x0000800000000000ULL) {
-        if (map_fixed) return -(s64)EINVAL;
-        if (!proc->mmap_current || proc->mmap_current < 0x0000600000000000ULL || proc->mmap_current >= 0x00007ffff0000000ULL) {
-            proc->mmap_current = 0x0000700000000000ULL;
+    if (!map_fixed) {
+        bool need_alloc = false;
+        if (!target_addr || target_addr < 0x1000 || target_addr + aligned_len >= 0x0000800000000000ULL) {
+            need_alloc = true;
+        } else {
+            /* Check collision with existing mappings */
+            for (size_t offset = 0; offset < aligned_len; offset += PAGE_SIZE) {
+                if (vmm_translate(proc->pml4_phys, target_addr + offset)) {
+                    need_alloc = true;
+                    break;
+                }
+            }
         }
-        target_addr = proc->mmap_current;
-        proc->mmap_current += aligned_len;
-    } else if (map_fixed) {
+
+        if (need_alloc) {
+            if (!proc->mmap_current || proc->mmap_current < 0x0000600000000000ULL || proc->mmap_current >= 0x00007ffff0000000ULL) {
+                proc->mmap_current = 0x0000700000000000ULL;
+            }
+            target_addr = proc->mmap_current;
+            proc->mmap_current += aligned_len;
+        }
+    } else {
+        if (!target_addr || target_addr < 0x1000 || target_addr + aligned_len >= 0x0000800000000000ULL) {
+            return -(s64)EINVAL;
+        }
         for (size_t offset = 0; offset < aligned_len; offset += PAGE_SIZE) {
             virt_addr_t va = target_addr + offset;
             phys_addr_t phys = vmm_translate(proc->pml4_phys, va);
@@ -937,19 +1160,8 @@ static s64 sys_mprotect_impl(pt_regs_t *r)
     if (prot & PROT_WRITE) vmm_flags |= VMM_F_WRITE;
     if (!(prot & PROT_EXEC)) vmm_flags |= VMM_F_NX;
 
-    for (size_t offset = 0; offset < aligned_len; offset += PAGE_SIZE) {
-        virt_addr_t va = addr + offset;
-        phys_addr_t phys = vmm_translate(proc->pml4_phys, va);
-        if (phys) {
-            vmm_map(proc->pml4_phys, va, phys & VMM_PHYS_MASK, vmm_flags);
-        } else {
-            phys_addr_t new_phys = pmm_alloc_page();
-            if (new_phys) {
-                __builtin_memset((void *)PHYS_TO_VIRT(new_phys), 0, PAGE_SIZE);
-                vmm_map(proc->pml4_phys, va, new_phys, vmm_flags);
-            }
-        }
-    }
+    size_t page_count = aligned_len / PAGE_SIZE;
+    vmm_set_flags(proc->pml4_phys, addr, page_count, vmm_flags);
     return 0;
 }
 
@@ -973,45 +1185,62 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
     
     file_t *file = (file_t *)proc->handle_table[fd];
 
-    /* Standard POSIX TTY ioctl fallbacks for terminal control */
-    if (cmd == 0x5413 /* TIOCGWINSZ */) {
-        if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
-            struct winsize ws;
-            ws.ws_row = 24;
-            ws.ws_col = 80;
-            ws.ws_xpixel = 640;
-            ws.ws_ypixel = 480;
-            if (copy_to_user((void *)arg, &ws, sizeof(ws)) == 0) return 0;
-            return -(s64)EFAULT;
+    /* TTY ioctl commands: only valid for character devices / TTYs */
+    if (cmd == 0x5401 /* TCGETS */ || cmd == 0x5402 /* TCSETS */ || cmd == 0x5403 /* TCSETSW */ ||
+        cmd == 0x5404 /* TCSETSF */ || cmd == 0x5413 /* TIOCGWINSZ */ || cmd == 0x5414 /* TIOCSWINSZ */ ||
+        cmd == 0x540F /* TIOCGPGRP */ || cmd == 0x5410 /* TIOCSPGRP */ || cmd == 0x540B /* TIOCSCTTY */) {
+        if (file->f_inode && !S_ISCHR(file->f_inode->i_mode)) {
+            return -(s64)ENOTTY;
         }
-        return -(s64)EINVAL;
-    }
-    if (cmd == 0x5414 /* TIOCSWINSZ */) return 0;
-    if (cmd == 0x5401 /* TCGETS */) {
-        if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
-            char termios_buf[64];
-            __builtin_memset(termios_buf, 0, sizeof(termios_buf));
-            *(u32 *)&termios_buf[0]  = 0x0100; /* ICRNL */
-            *(u32 *)&termios_buf[4]  = 0x0005; /* OPOST | ONLCR */
-            *(u32 *)&termios_buf[8]  = 0x00BF; /* CS8 | CREAD | B38400 */
-            *(u32 *)&termios_buf[12] = 0x0A3B; /* ISIG | ICANON | ECHO | ECHOE | ECHOK */
-            if (copy_to_user((void *)arg, termios_buf, 44) == 0) return 0;
-            return -(s64)EFAULT;
+        if (cmd == 0x5413 /* TIOCGWINSZ */) {
+            if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
+                struct winsize ws;
+                ws.ws_row = 24;
+                ws.ws_col = 80;
+                ws.ws_xpixel = 640;
+                ws.ws_ypixel = 480;
+                if (copy_to_user((void *)arg, &ws, sizeof(ws)) == 0) return 0;
+                return -(s64)EFAULT;
+            }
+            return -(s64)EINVAL;
         }
-        return -(s64)EINVAL;
-    }
-    if (cmd == 0x5402 /* TCSETS */ || cmd == 0x5403 /* TCSETSW */ || cmd == 0x5404 /* TCSETSF */) return 0;
-    if (cmd == 0x540F /* TIOCGPGRP */) {
-        if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
-            int pgid = (int)proc->pid;
-            if (copy_to_user((void *)arg, &pgid, sizeof(int)) == 0) return 0;
-            return -(s64)EFAULT;
+        if (cmd == 0x5414 /* TIOCSWINSZ */) return 0;
+        if (cmd == 0x5401 /* TCGETS */) {
+            if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
+                char termios_buf[64];
+                __builtin_memset(termios_buf, 0, sizeof(termios_buf));
+                *(u32 *)&termios_buf[0]  = 0x0100; /* ICRNL */
+                *(u32 *)&termios_buf[4]  = 0x0005; /* OPOST | ONLCR */
+                *(u32 *)&termios_buf[8]  = 0x00BF; /* CS8 | CREAD | B38400 */
+                *(u32 *)&termios_buf[12] = 0x0A3B; /* ISIG | ICANON | ECHO | ECHOE | ECHOK */
+                if (copy_to_user((void *)arg, termios_buf, 44) == 0) return 0;
+                return -(s64)EFAULT;
+            }
+            return -(s64)EINVAL;
         }
-        return -(s64)EINVAL;
+        if (cmd == 0x5402 /* TCSETS */ || cmd == 0x5403 /* TCSETSW */ || cmd == 0x5404 /* TCSETSF */) return 0;
+        if (cmd == 0x540F /* TIOCGPGRP */) {
+            if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
+                int pgid = (int)proc->pid;
+                if (copy_to_user((void *)arg, &pgid, sizeof(int)) == 0) return 0;
+                return -(s64)EFAULT;
+            }
+            return -(s64)EINVAL;
+        }
+        if (cmd == 0x5410 /* TIOCSPGRP */ || cmd == 0x540B /* TIOCSCTTY */) return 0;
     }
-    if (cmd == 0x5410 /* TIOCSPGRP */ || cmd == 0x540B /* TIOCSCTTY */) return 0;
+
+    /* Network configuration ioctl privilege checks */
+    if (cmd == 0x8916 /* SIOCSIFADDR */ || cmd == 0x891C /* SIOCSIFNETMASK */ ||
+        cmd == 0x892A /* SIOCSIFGW */   || cmd == 0x892B /* SIOCSIFDNS */ ||
+        cmd == 0x8914 /* SIOCSIFFLAGS */ || cmd == 0x8990 /* SIOCSIFDHCP */) {
+        if (!security_check_permission(proc, CAP_NET_ADMIN)) {
+            return -(s64)EPERM;
+        }
+    }
 
     return vfs_ioctl(file, cmd, arg);
+
 }
 
 static s64 sys_lseek_impl(pt_regs_t *r)
@@ -1208,6 +1437,20 @@ static s64 sys_readlink_impl(pt_regs_t *r)
     s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), user_path);
     if (perr < 0) return perr;
 
+    process_t *proc = sched_current_process();
+    if (proc && (strcmp(kpath, "/proc/self/exe") == 0 || strcmp(kpath, "/proc/thread-self/exe") == 0)) {
+        size_t nlen = strlen(proc->name);
+        size_t copylen = nlen > bufsiz ? bufsiz : nlen;
+        if (copy_to_user(user_buf, proc->name, copylen) != 0) return -(s64)EFAULT;
+        return (s64)copylen;
+    }
+    if (proc && strcmp(kpath, "/proc/self/cwd") == 0) {
+        size_t clen = strlen(proc->cwd);
+        size_t copylen = clen > bufsiz ? bufsiz : clen;
+        if (copy_to_user(user_buf, proc->cwd, copylen) != 0) return -(s64)EFAULT;
+        return (s64)copylen;
+    }
+
     char kbuf[256];
     s64 ret = vfs_readlink(kpath, kbuf, sizeof(kbuf) - 1);
     if (ret > 0) {
@@ -1217,6 +1460,7 @@ static s64 sys_readlink_impl(pt_regs_t *r)
     }
     return ret;
 }
+
 
 /* ── Polling & Multiplexing Syscalls ─────────────────────────────────────── */
 
@@ -1750,10 +1994,41 @@ static s64 sys_execve_impl(pt_regs_t *r)
         vmm_destroy_space(old_space);
     }
 
+    proc->fs_base = 0;
+    wrmsr(MSR_FS_BASE, 0);
+    proc->gs_base = 0;
+    wrmsr(MSR_KERNEL_GS_BASE, 0);
+
+    /* Reset custom signal handlers to default (SIG_DFL) per POSIX execve spec */
+    for (int i = 0; i < _NSIG; i++) {
+        if (proc->sigactions[i].sa_handler != SIG_IGN) {
+            proc->sigactions[i].sa_handler = SIG_DFL;
+            proc->sigactions[i].sa_flags = 0;
+            proc->sigactions[i].sa_mask = 0;
+        }
+    }
+    /* Reset all user registers to clean state per System V AMD64 ABI specification */
     r->rip = (u64)new_entry;
     r->rsp = (u64)new_rsp;
+    r->rax = 0;
+    r->rbx = 0;
+    r->rcx = 0;
+    r->rdx = 0;
+    r->rsi = 0;
+    r->rdi = 0;
+    r->rbp = 0;
+    r->r8  = 0;
+    r->r9  = 0;
+    r->r10 = 0;
+    r->r11 = 0;
+    r->r12 = 0;
+    r->r13 = 0;
+    r->r14 = 0;
+    r->r15 = 0;
+    r->rflags = 0x202;
     return 0;
 }
+
 
 s64 sys_exit_impl(pt_regs_t *r)
 {
@@ -1979,6 +2254,13 @@ static s64 sys_socket_impl(pt_regs_t *r)
     /* Strip non-standard flags like SOCK_CLOEXEC or SOCK_NONBLOCK */
     int base_type = type & 0x0F;
 
+    /* Privilege check for RAW sockets */
+    if (base_type == SOCK_RAW) {
+        if (!security_check_permission(proc, CAP_NET_RAW)) {
+            return -(s64)EPERM;
+        }
+    }
+
     socket_t *sock = sock_alloc(domain, base_type, protocol);
     if (!sock) return -(s64)ENOMEM;
 
@@ -1995,6 +2277,9 @@ static s64 sys_socket_impl(pt_regs_t *r)
     for (int i = 0; i < 64; i++) {
         if (!proc->handle_table[i]) {
             proc->handle_table[i] = f;
+            if (type & 02000000) { /* SOCK_CLOEXEC */
+                proc->fd_flags[i] = FD_CLOEXEC;
+            }
             return i;
         }
     }
@@ -2254,11 +2539,55 @@ static s64 sys_setsockopt_impl(pt_regs_t *r)
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
 
+    if (!optval || (uintptr_t)optval >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
     if (level == SOL_SOCKET) {
-        if (optname == SO_REUSEADDR && optval && optlen >= sizeof(int)) {
+        if (optname == SO_REUSEADDR && optlen >= sizeof(int)) {
             int val = 0;
             copy_from_user(&val, optval, sizeof(int));
             sock->so_reuseaddr = val;
+            return 0;
+        } else if (optname == SO_REUSEPORT && optlen >= sizeof(int)) {
+            int val = 0;
+            copy_from_user(&val, optval, sizeof(int));
+            sock->so_reuseport = val;
+            return 0;
+        } else if (optname == SO_BROADCAST && optlen >= sizeof(int)) {
+            int val = 0;
+            copy_from_user(&val, optval, sizeof(int));
+            sock->so_broadcast = val;
+            return 0;
+        } else if (optname == SO_RCVTIMEO) {
+            if (optlen >= sizeof(struct linux_timeval)) {
+                struct linux_timeval tv;
+                copy_from_user(&tv, optval, sizeof(tv));
+                sock->so_rcvtimeo = (u32)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+            } else if (optlen >= sizeof(int)) {
+                int ms = 0;
+                copy_from_user(&ms, optval, sizeof(int));
+                sock->so_rcvtimeo = (u32)ms;
+            }
+            return 0;
+        } else if (optname == SO_SNDTIMEO) {
+            if (optlen >= sizeof(struct linux_timeval)) {
+                struct linux_timeval tv;
+                copy_from_user(&tv, optval, sizeof(tv));
+                sock->so_sndtimeo = (u32)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+            } else if (optlen >= sizeof(int)) {
+                int ms = 0;
+                copy_from_user(&ms, optval, sizeof(int));
+                sock->so_sndtimeo = (u32)ms;
+            }
+            return 0;
+        } else if (optname == SO_KEEPALIVE || optname == SO_SNDBUF || optname == SO_RCVBUF) {
+            return 0;
+        }
+    } else if (level == IPPROTO_TCP) {
+        if (optname == TCP_NODELAY) {
+            return 0;
+        }
+    } else if (level == IPPROTO_IP) {
+        if (optname == 1 /* IP_TOS */ || optname == 2 /* IP_TTL */) {
             return 0;
         }
     }
@@ -2277,12 +2606,48 @@ static s64 sys_getsockopt_impl(pt_regs_t *r)
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
 
-    if (level == SOL_SOCKET && optname == SO_REUSEADDR && optval && optlen) {
-        int val = sock->so_reuseaddr;
-        copy_to_user(optval, &val, sizeof(int));
-        socklen_t l = sizeof(int);
-        copy_to_user(optlen, &l, sizeof(socklen_t));
-        return 0;
+    if (!optval || !optlen) return -(s64)EINVAL;
+    if ((uintptr_t)optval >= 0x8000000000000000ULL || (uintptr_t)optlen >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    if (level == SOL_SOCKET) {
+        if (optname == SO_REUSEADDR) {
+            int val = sock->so_reuseaddr;
+            copy_to_user(optval, &val, sizeof(int));
+            socklen_t l = sizeof(int);
+            copy_to_user(optlen, &l, sizeof(socklen_t));
+            return 0;
+        } else if (optname == SO_REUSEPORT) {
+            int val = sock->so_reuseport;
+            copy_to_user(optval, &val, sizeof(int));
+            socklen_t l = sizeof(int);
+            copy_to_user(optlen, &l, sizeof(socklen_t));
+            return 0;
+        } else if (optname == SO_BROADCAST) {
+            int val = sock->so_broadcast;
+            copy_to_user(optval, &val, sizeof(int));
+            socklen_t l = sizeof(int);
+            copy_to_user(optlen, &l, sizeof(socklen_t));
+            return 0;
+        } else if (optname == SO_TYPE) {
+            int val = sock->type;
+            copy_to_user(optval, &val, sizeof(int));
+            socklen_t l = sizeof(int);
+            copy_to_user(optlen, &l, sizeof(socklen_t));
+            return 0;
+        } else if (optname == SO_ERROR) {
+            int val = sock->so_error;
+            sock->so_error = 0;
+            copy_to_user(optval, &val, sizeof(int));
+            socklen_t l = sizeof(int);
+            copy_to_user(optlen, &l, sizeof(socklen_t));
+            return 0;
+        } else if (optname == SO_RCVBUF || optname == SO_SNDBUF) {
+            int val = 65536;
+            copy_to_user(optval, &val, sizeof(int));
+            socklen_t l = sizeof(int);
+            copy_to_user(optlen, &l, sizeof(socklen_t));
+            return 0;
+        }
     }
     return 0;
 }
@@ -2294,8 +2659,8 @@ static s64 sys_sendto_impl(pt_regs_t *r)
     size_t len = (size_t)r->rdx;
     int flags = (int)r->r10;
     const struct sockaddr *uaddr = (const struct sockaddr *)r->r8;
-    socklen_t addrlen = (socklen_t)r->r9;
-    (void)addrlen;
+    socklen_t uaddrlen = (socklen_t)r->r9;
+    (void)uaddrlen;
 
     if (!ubuf || len == 0) return 0;
     if ((uintptr_t)ubuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
@@ -2304,19 +2669,57 @@ static s64 sys_sendto_impl(pt_regs_t *r)
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
 
+    void *kbuf = kmalloc(len);
+    if (!kbuf) return -(s64)ENOMEM;
+    if (copy_from_user(kbuf, ubuf, len) != 0) {
+        kfree(kbuf);
+        return -(s64)EFAULT;
+    }
+
+    s64 res = -(s64)EOPNOTSUPP;
+
     if (sock->type == SOCK_STREAM && sock->tcp) {
-        return tcp_send(sock->tcp, ubuf, len, flags);
+        res = tcp_send(sock->tcp, kbuf, len, flags);
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
         if (uaddr) {
             struct sockaddr_in sin;
-            if (copy_from_user(&sin, uaddr, sizeof(sin)) != 0) return -(s64)EFAULT;
-            return udp_sendto(sock->udp, ubuf, len, (const u8 *)&sin.sin_addr.s_addr, ntohs(sin.sin_port));
+            if (copy_from_user(&sin, uaddr, sizeof(sin)) != 0) {
+                kfree(kbuf);
+                return -(s64)EFAULT;
+            }
+            res = udp_sendto(sock->udp, kbuf, len, (const u8 *)&sin.sin_addr.s_addr, ntohs(sin.sin_port));
         } else {
-            return udp_sendto(sock->udp, ubuf, len, NULL, 0);
+            res = udp_sendto(sock->udp, kbuf, len, NULL, 0);
+        }
+    } else if (sock->type == SOCK_RAW && sock->raw) {
+        if (uaddr) {
+            struct sockaddr_in sin;
+            if (copy_from_user(&sin, uaddr, sizeof(sin)) != 0) {
+                kfree(kbuf);
+                return -(s64)EFAULT;
+            }
+            net_buf_t *buf = net_buf_alloc(NET_BUF_HEADROOM + len);
+            if (!buf) {
+                kfree(kbuf);
+                return -(s64)ENOMEM;
+            }
+            net_buf_reserve(buf, NET_BUF_HEADROOM);
+            void *p = net_buf_put(buf, len);
+            memcpy(p, kbuf, len);
+            int err = ipv4_send(buf, (const u8 *)&sin.sin_addr.s_addr, (u8)sock->raw->protocol);
+            if (err < 0) res = (s64)err;
+            else res = (s64)len;
         }
     }
 
-    return -(s64)EOPNOTSUPP;
+    kfree(kbuf);
+    if (res < 0 && res == -(s64)EPIPE && !(flags & 0x4000 /* MSG_NOSIGNAL */)) {
+        process_t *proc = sched_current_process();
+        if (proc) {
+            sched_kill_process(proc->pid, 13 /* SIGPIPE */);
+        }
+    }
+    return res;
 }
 
 static s64 sys_recvfrom_impl(pt_regs_t *r)
@@ -2338,30 +2741,86 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
 
     process_t *proc = sched_current_process();
     file_t *f = (file_t *)proc->handle_table[fd];
-    bool nonblock = f ? ((f->f_flags & O_NONBLOCK) != 0) : false;
+    bool nonblock = (f ? ((f->f_flags & O_NONBLOCK) != 0) : false) || ((flags & 0x40 /* MSG_DONTWAIT */) != 0);
+
+    void *kbuf = kmalloc(len);
+    if (!kbuf) return -(s64)ENOMEM;
 
     if (sock->type == SOCK_STREAM && sock->tcp) {
-        return tcp_recv(sock->tcp, ubuf, len, nonblock);
+        s64 res = tcp_recv(sock->tcp, kbuf, len, nonblock);
+        if (res > 0) {
+            if (copy_to_user(ubuf, kbuf, (size_t)res) != 0) {
+                kfree(kbuf);
+                return -(s64)EFAULT;
+            }
+        }
+        kfree(kbuf);
+        return res;
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
         u8 src_ip[4];
         u16 src_port = 0;
-        s64 res = udp_recvfrom(sock->udp, ubuf, len, src_ip, &src_port, nonblock);
-        if (res > 0 && uaddr && uaddrlen) {
-            struct sockaddr_in sin;
-            memset(&sin, 0, sizeof(sin));
-            sin.sin_family = AF_INET;
-            sin.sin_port = htons(src_port);
-            memcpy(&sin.sin_addr.s_addr, src_ip, 4);
+        s64 res = udp_recvfrom(sock->udp, kbuf, len, src_ip, &src_port, nonblock);
+        if (res > 0) {
+            if (copy_to_user(ubuf, kbuf, (size_t)res) != 0) {
+                kfree(kbuf);
+                return -(s64)EFAULT;
+            }
+            if (uaddr && uaddrlen) {
+                struct sockaddr_in sin;
+                memset(&sin, 0, sizeof(sin));
+                sin.sin_family = AF_INET;
+                sin.sin_port = htons(src_port);
+                memcpy(&sin.sin_addr.s_addr, src_ip, 4);
 
-            copy_to_user(uaddr, &sin, sizeof(sin));
-            socklen_t slen = sizeof(sin);
-            copy_to_user(uaddrlen, &slen, sizeof(socklen_t));
+                copy_to_user(uaddr, &sin, sizeof(sin));
+                socklen_t slen = sizeof(sin);
+                copy_to_user(uaddrlen, &slen, sizeof(socklen_t));
+            }
         }
+        kfree(kbuf);
         return res;
+    } else if (sock->type == SOCK_RAW && sock->raw) {
+        kfree(kbuf);
+        for (;;) {
+            net_buf_t *pkt = net_buf_queue_pop(&sock->raw->rx_queue);
+            if (pkt) {
+                if (pkt->len < 6) {
+                    net_buf_free(pkt);
+                    continue;
+                }
+                size_t psize = pkt->len - 6;
+                size_t clen = (psize < len) ? psize : len;
+                if (copy_to_user(ubuf, pkt->data + 6, clen) != 0) {
+                    net_buf_free(pkt);
+                    return -(s64)EFAULT;
+                }
+                if (uaddr && uaddrlen) {
+                    struct sockaddr_in sin;
+                    memset(&sin, 0, sizeof(sin));
+                    sin.sin_family = AF_INET;
+                    memcpy(&sin.sin_addr.s_addr, pkt->data, 4);
+                    copy_to_user(uaddr, &sin, sizeof(sin));
+                    socklen_t slen = sizeof(sin);
+                    copy_to_user(uaddrlen, &slen, sizeof(socklen_t));
+                }
+                net_buf_free(pkt);
+                return (s64)clen;
+            }
+            if (nonblock) return -(s64)EAGAIN;
+            spinlock_lock(&sock->raw->lock);
+            if (net_buf_queue_len(&sock->raw->rx_queue) == 0) {
+                sock->raw->wait_thread = sched_current_thread();
+                sched_block(THREAD_BLOCKED);
+            }
+            spinlock_unlock(&sock->raw->lock);
+            sched_yield();
+        }
     }
 
+    kfree(kbuf);
     return -(s64)EOPNOTSUPP;
 }
+
 
 /* ── Pipes & File Descriptors ────────────────────────────────────────────── */
 
@@ -2545,6 +3004,25 @@ static s64 sys_fcntl_impl(pt_regs_t *r)
         /* POSIX: Only status flags (O_APPEND, O_NONBLOCK) can be modified */
         f->f_flags = (f->f_flags & ~(O_APPEND | O_NONBLOCK)) | ((u32)arg & (O_APPEND | O_NONBLOCK));
         return 0;
+    case 5: { /* F_GETLK */
+        if (arg && arg < 0x8000000000000000ULL) {
+            struct {
+                short l_type;
+                short l_whence;
+                s64   l_start;
+                s64   l_len;
+                s32   l_pid;
+            } fl;
+            if (copy_from_user(&fl, (const void *)arg, sizeof(fl)) == 0) {
+                fl.l_type = 2; /* F_UNLCK */
+                copy_to_user((void *)arg, &fl, sizeof(fl));
+            }
+        }
+        return 0;
+    }
+    case 6:   /* F_SETLK */
+    case 7:   /* F_SETLKW */
+        return 0;
     default:
         return -(s64)EINVAL;
     }
@@ -2588,6 +3066,22 @@ static s64 sys_chdir_impl(pt_regs_t *r)
     process_t *proc = sched_current_process();
     if (proc) {
         strncpy(proc->cwd, kpath, sizeof(proc->cwd) - 1);
+    }
+    return 0;
+}
+
+static s64 sys_fchdir_impl(pt_regs_t *r)
+{
+    int fd = (int)(s32)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    file_t *f = (file_t *)proc->handle_table[fd];
+    if (!f || !f->f_dentry || !f->f_dentry->d_inode) return -(s64)EBADF;
+    if (!S_ISDIR(f->f_dentry->d_inode->i_mode)) return -(s64)ENOTDIR;
+
+    if (f->f_dentry->d_name[0] == '/') {
+        strncpy(proc->cwd, f->f_dentry->d_name, sizeof(proc->cwd) - 1);
     }
     return 0;
 }
@@ -2926,6 +3420,9 @@ struct utsname {
     char domainname[65];
 };
 
+static char g_kernel_nodename[65] = "azamios";
+static char g_kernel_domainname[65] = "local";
+
 static s64 sys_uname_impl(pt_regs_t *r)
 {
     struct utsname *u = (struct utsname *)r->rdi;
@@ -2934,11 +3431,11 @@ static s64 sys_uname_impl(pt_regs_t *r)
     struct utsname info;
     memset(&info, 0, sizeof(info));
     strncpy(info.sysname, "AzamiOS", sizeof(info.sysname) - 1);
-    strncpy(info.nodename, "azami", sizeof(info.nodename) - 1);
+    strncpy(info.nodename, g_kernel_nodename, sizeof(info.nodename) - 1);
     strncpy(info.release, "7.0.0-posix", sizeof(info.release) - 1);
     strncpy(info.version, "AzamiOS Modular Microkernel v7.0 x86_64 SMP", sizeof(info.version) - 1);
     strncpy(info.machine, "x86_64", sizeof(info.machine) - 1);
-    strncpy(info.domainname, "local", sizeof(info.domainname) - 1);
+    strncpy(info.domainname, g_kernel_domainname, sizeof(info.domainname) - 1);
 
     if (copy_to_user(u, &info, sizeof(info)) != 0) return -(s64)EFAULT;
     return 0;
@@ -2946,6 +3443,10 @@ static s64 sys_uname_impl(pt_regs_t *r)
 
 static s64 sys_reboot_impl(pt_regs_t *r)
 {
+    process_t *proc = sched_current_process();
+    if (!security_check_permission(proc, CAP_SYS_BOOT)) {
+        return -(s64)EPERM;
+    }
     u32 cmd = (u32)r->rdx;
     if (cmd == 0x01234567 /* LINUX_REBOOT_CMD_RESTART */) {
         power_reboot();
@@ -3062,17 +3563,26 @@ static s64 sys_getrusage_impl(pt_regs_t *r)
 {
     int who = (int)r->rdi;
     struct rusage *usage = (struct rusage *)r->rsi;
-    (void)who;
-    if (!usage || (uintptr_t)usage >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!usage || (uintptr_t)usage >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (who != 0 /* RUSAGE_SELF */ && who != -1 /* RUSAGE_CHILDREN */ && who != 1 /* RUSAGE_THREAD */) {
+        return -(s64)EINVAL;
+    }
 
+    process_t *proc = sched_current_process();
     u64 ticks = sched_get_ticks();
     struct rusage ru;
     __builtin_memset(&ru, 0, sizeof(ru));
     ru.ru_utime.tv_sec = (long)(ticks / 100);
     ru.ru_utime.tv_usec = (long)((ticks % 100) * 10000L);
-    ru.ru_stime.tv_sec = 0;
-    ru.ru_stime.tv_usec = 0;
-    ru.ru_maxrss = 4096; /* 4 MB */
+    ru.ru_stime.tv_sec = (long)(ticks / 200);
+    ru.ru_stime.tv_usec = (long)((ticks % 200) * 5000L);
+    ru.ru_maxrss = (proc && proc->pml4_phys) ? 4096 : 1024;
+    ru.ru_minflt = 128;
+    ru.ru_majflt = 0;
+    ru.ru_inblock = 64;
+    ru.ru_oublock = 32;
+    ru.ru_nvcsw = 16;
+    ru.ru_nivcsw = 4;
 
     if (copy_to_user(usage, &ru, sizeof(struct rusage)) != 0) return -(s64)EFAULT;
     return 0;
@@ -3282,6 +3792,20 @@ static s64 sys_readlinkat_impl(pt_regs_t *r)
     s64 perr = copy_user_path_resolve_at(dirfd, kpath, sizeof(kpath), user_path);
     if (perr < 0) return perr;
 
+    process_t *proc = sched_current_process();
+    if (proc && (strcmp(kpath, "/proc/self/exe") == 0 || strcmp(kpath, "/proc/thread-self/exe") == 0)) {
+        size_t nlen = strlen(proc->name);
+        size_t copylen = nlen > bufsiz ? bufsiz : nlen;
+        if (copy_to_user(buf, proc->name, copylen) != 0) return -(s64)EFAULT;
+        return (s64)copylen;
+    }
+    if (proc && strcmp(kpath, "/proc/self/cwd") == 0) {
+        size_t clen = strlen(proc->cwd);
+        size_t copylen = clen > bufsiz ? bufsiz : clen;
+        if (copy_to_user(buf, proc->cwd, copylen) != 0) return -(s64)EFAULT;
+        return (s64)copylen;
+    }
+
     char kbuf[256];
     s64 ret = vfs_readlink(kpath, kbuf, sizeof(kbuf));
     if (ret < 0) return ret;
@@ -3290,6 +3814,7 @@ static s64 sys_readlinkat_impl(pt_regs_t *r)
     if (copy_to_user(buf, kbuf, copylen) != 0) return -(s64)EFAULT;
     return (s64)copylen;
 }
+
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Azami Extended Syscalls
@@ -3408,18 +3933,13 @@ static s64 sys_az_shmem_destroy(pt_regs_t *r)
 
 static s64 sys_az_shmem_unmap(pt_regs_t *r)
 {
-    u32 shmem_id = (u32)r->rdi;
+    (void)r->rdi; /* shmem_id not needed if unmapping by VA */
     virt_addr_t virt = (virt_addr_t)r->rsi;
     
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EINVAL;
     
-    ipc_shmem_t *shmem = ipc_shmem_find(shmem_id);
-    if (!shmem) return -(s64)EINVAL;
-
-    s64 ret = ipc_shmem_unmap(shmem, proc, virt);
-    ipc_shmem_put(shmem);
-    return ret;
+    return ipc_shmem_unmap(NULL, proc, virt);
 }
 
 static s64 sys_az_fb_info(pt_regs_t *r)
@@ -3627,7 +4147,7 @@ static void az_timer_thread(void *arg)
 
     ipc_msg_t kmsg;
     __builtin_memset(&kmsg, 0, sizeof(kmsg));
-    kmsg.sender_pid = 0;
+    kmsg.sender_pid = 51; /* AZ_WM_TIMER_TICK (offset 0 -> msg.type) */
     kmsg.msg_type   = 51; /* AZ_WM_TIMER_TICK */
     kmsg.length     = 0;
 
@@ -3783,6 +4303,25 @@ static s64 sys_set_robust_list_impl(pt_regs_t *r)
     return 0;
 }
 
+#define RLIM64_INFINITY (~0ULL)
+
+#define RLIMIT_CPU        0
+#define RLIMIT_FSIZE      1
+#define RLIMIT_DATA       2
+#define RLIMIT_STACK      3
+#define RLIMIT_CORE       4
+#define RLIMIT_RSS        5
+#define RLIMIT_NPROC      6
+#define RLIMIT_NOFILE     7
+#define RLIMIT_MEMLOCK    8
+#define RLIMIT_AS         9
+#define RLIMIT_LOCKS      10
+#define RLIMIT_SIGPENDING 11
+#define RLIMIT_MSGQUEUE   12
+#define RLIMIT_NICE       13
+#define RLIMIT_RTPRIO     14
+#define RLIMIT_RTTIME     15
+
 struct kernel_rlimit64 {
     u64 rlim_cur;
     u64 rlim_max;
@@ -3790,18 +4329,223 @@ struct kernel_rlimit64 {
 
 static s64 sys_prlimit64_impl(pt_regs_t *r)
 {
+    u32 pid = (u32)(s32)r->rdi;
+    int resource = (int)(s32)r->rsi;
+    const struct kernel_rlimit64 *new_rlim = (const struct kernel_rlimit64 *)r->rdx;
     struct kernel_rlimit64 *old_rlim = (struct kernel_rlimit64 *)r->r10;
+
+    (void)pid;
+    (void)new_rlim;
+
+    if (resource < 0 || resource > 15) return -(s64)EINVAL;
+
     if (old_rlim && (uintptr_t)old_rlim < 0x8000000000000000ULL) {
-        struct kernel_rlimit64 def = { 1024 * 1024 * 1024ULL, 1024 * 1024 * 1024ULL };
-        copy_to_user(old_rlim, &def, sizeof(struct kernel_rlimit64));
+        struct kernel_rlimit64 cur;
+        cur.rlim_cur = RLIM64_INFINITY;
+        cur.rlim_max = RLIM64_INFINITY;
+
+        switch (resource) {
+        case RLIMIT_STACK:
+            cur.rlim_cur = 8 * 1024 * 1024ULL;  /* 8 MB */
+            cur.rlim_max = 64 * 1024 * 1024ULL; /* 64 MB */
+            break;
+        case RLIMIT_NOFILE:
+            cur.rlim_cur = 1024;
+            cur.rlim_max = 65536;
+            break;
+        case RLIMIT_NPROC:
+            cur.rlim_cur = 1024;
+            cur.rlim_max = 4096;
+            break;
+        case RLIMIT_CORE:
+            cur.rlim_cur = 0;
+            cur.rlim_max = RLIM64_INFINITY;
+            break;
+        case RLIMIT_MEMLOCK:
+            cur.rlim_cur = 64 * 1024ULL;
+            cur.rlim_max = 64 * 1024ULL;
+            break;
+        default:
+            cur.rlim_cur = RLIM64_INFINITY;
+            cur.rlim_max = RLIM64_INFINITY;
+            break;
+        }
+
+        if (copy_to_user(old_rlim, &cur, sizeof(struct kernel_rlimit64)) != 0) {
+            return -(s64)EFAULT;
+        }
     }
     return 0;
+}
+
+static s64 sys_clone3_impl(pt_regs_t *r)
+{
+    (void)r;
+    return -(s64)ENOSYS;
+}
+
+struct kernel_open_how {
+    u64 flags;
+    u64 mode;
+    u64 resolve;
+};
+
+static s64 sys_openat2_impl(pt_regs_t *r)
+{
+    int dirfd = (int)(s32)r->rdi;
+    const char *user_path = (const char *)r->rsi;
+    const struct kernel_open_how *user_how = (const struct kernel_open_how *)r->rdx;
+    size_t size = (size_t)r->r10;
+
+    if (!user_path || !user_how || size < sizeof(struct kernel_open_how)) return -(s64)EINVAL;
+    struct kernel_open_how how;
+    if (copy_from_user(&how, user_how, sizeof(how)) != 0) return -(s64)EFAULT;
+
+    pt_regs_t fake_r;
+    fake_r.rdi = (u64)dirfd;
+    fake_r.rsi = (u64)user_path;
+    fake_r.rdx = how.flags;
+    fake_r.r10 = how.mode;
+    return sys_openat_impl(&fake_r);
+}
+
+static s64 sys_faccessat2_impl(pt_regs_t *r)
+{
+    return sys_faccessat_impl(r);
+}
+
+static s64 sys_epoll_pwait2_impl(pt_regs_t *r)
+{
+    int epfd = (int)(s32)r->rdi;
+    void *events = (void *)r->rsi;
+    int maxevents = (int)(s32)r->rdx;
+    const struct linux_timespec *ts = (const struct linux_timespec *)r->r10;
+    const void *sigmask = (const void *)r->r8;
+    (void)sigmask;
+
+    int timeout = -1;
+    if (ts && (uintptr_t)ts < 0x8000000000000000ULL) {
+        struct linux_timespec kts;
+        if (copy_from_user(&kts, ts, sizeof(kts)) == 0) {
+            timeout = (int)(kts.tv_sec * 1000 + kts.tv_nsec / 1000000);
+        }
+    }
+
+    pt_regs_t fake_r;
+    fake_r.rdi = (u64)epfd;
+    fake_r.rsi = (u64)events;
+    fake_r.rdx = (u64)maxevents;
+    fake_r.r10 = (u64)timeout;
+    return sys_epoll_wait_impl(&fake_r);
+}
+
+static s64 sys_getcpu_impl(pt_regs_t *r)
+{
+    unsigned int *user_cpu = (unsigned int *)r->rdi;
+    unsigned int *user_node = (unsigned int *)r->rsi;
+    void *tcache = (void *)r->rdx;
+    (void)tcache;
+
+    unsigned int cpu_id = smp_current_cpu_id();
+    unsigned int node_id = 0;
+
+    if (user_cpu && (uintptr_t)user_cpu < 0x8000000000000000ULL) {
+        if (copy_to_user(user_cpu, &cpu_id, sizeof(unsigned int)) != 0) return -(s64)EFAULT;
+    }
+    if (user_node && (uintptr_t)user_node < 0x8000000000000000ULL) {
+        if (copy_to_user(user_node, &node_id, sizeof(unsigned int)) != 0) return -(s64)EFAULT;
+    }
+    return 0;
+}
+
+static s64 sys_seccomp_impl(pt_regs_t *r)
+{
+    (void)r;
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_sched_setattr_impl(pt_regs_t *r)
+{
+    (void)r;
+    return 0;
+}
+
+static s64 sys_sched_getattr_impl(pt_regs_t *r)
+{
+    (void)r;
+    return 0;
+}
+
+static s64 sys_pidfd_open_impl(pt_regs_t *r)
+{
+    (void)r;
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_pidfd_send_signal_impl(pt_regs_t *r)
+{
+    (void)r;
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_pidfd_getfd_impl(pt_regs_t *r)
+{
+    (void)r;
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_memfd_create_impl(pt_regs_t *r)
+{
+    const char *uname = (const char *)r->rdi;
+    unsigned int flags = (unsigned int)r->rsi;
+    (void)uname;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    file_t *rf = NULL;
+    file_t *wf = NULL;
+    if (pipe_create(&rf, &wf) < 0) return -(s64)ENOMEM;
+
+    int fd = -1;
+    for (int i = 0; i < 64; i++) {
+        if (!proc->handle_table[i]) {
+            fd = i;
+            break;
+        }
+    }
+    if (fd < 0) {
+        vfs_close(rf);
+        vfs_close(wf);
+        return -(s64)EMFILE;
+    }
+    proc->handle_table[fd] = wf;
+    proc->fd_flags[fd] = (flags & 0x0001 /* MFD_CLOEXEC */) ? 1 : 0;
+    vfs_close(rf);
+    return (s64)fd;
+
 }
 
 static s64 sys_rseq_impl(pt_regs_t *r)
 {
     (void)r;
     return -(s64)ENOSYS;
+}
+
+
+
+static u64 get_entropy64(void)
+{
+    static u64 s_rand_state = 0x853c49e6748fea9bULL;
+    u32 lo = 0, hi = 0;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    u64 tsc = ((u64)hi << 32) | lo;
+    extern u64 g_system_ticks;
+    s_rand_state ^= tsc ^ (g_system_ticks << 17) ^ ((u64)(uintptr_t)sched_current_thread() << 3);
+    s_rand_state ^= s_rand_state >> 12;
+    s_rand_state ^= s_rand_state << 25;
+    s_rand_state ^= s_rand_state >> 27;
+    return s_rand_state * 0x2545F4914F6CDD1DULL;
 }
 
 static s64 sys_getrandom_impl(pt_regs_t *r)
@@ -3813,17 +4557,11 @@ static s64 sys_getrandom_impl(pt_regs_t *r)
 
     u8 kbuf[256];
     size_t written = 0;
-    extern u64 g_system_ticks;
     while (written < buflen) {
         size_t chunk = buflen - written;
         if (chunk > sizeof(kbuf)) chunk = sizeof(kbuf);
         for (size_t i = 0; i < chunk; i += 8) {
-            rtc_time_t tm;
-            rtc_read_time(&tm);
-            u64 val = rtc_to_unix_time(&tm) ^ ((u64)(uintptr_t)sched_current_thread() << 16) ^ (g_system_ticks << 32);
-            #if defined(__x86_64__)
-            __asm__ volatile("rdrand %0" : "=r"(val) : : "cc");
-            #endif
+            u64 val = get_entropy64();
             size_t copy_sub = (chunk - i > 8) ? 8 : (chunk - i);
             __builtin_memcpy(&kbuf[i], &val, copy_sub);
         }
@@ -3833,12 +4571,381 @@ static s64 sys_getrandom_impl(pt_regs_t *r)
     return (s64)buflen;
 }
 
-/* statx(332) — modern glibc uses this for stat(). Return ENOSYS so that
- * glibc falls back to fstatat(262) which we implement fully. */
+
+/* ── Linux sendfile, copy_file_range, fallocate, statx, splice ──────────── */
+
+static s64 sys_sendfile_impl(pt_regs_t *r)
+{
+    int out_fd = (int)(s32)r->rdi;
+    int in_fd = (int)(s32)r->rsi;
+    s64 *user_offset = (s64 *)r->rdx;
+    size_t count = (size_t)r->r10;
+
+    if (count == 0) return 0;
+    if (out_fd < 0 || out_fd >= 64 || in_fd < 0 || in_fd >= 64) return -(s64)EBADF;
+
+    process_t *proc = sched_current_process();
+    if (!proc || !proc->handle_table[out_fd] || !proc->handle_table[in_fd]) return -(s64)EBADF;
+
+    file_t *out_file = (file_t *)proc->handle_table[out_fd];
+    file_t *in_file = (file_t *)proc->handle_table[in_fd];
+    if (!out_file || !in_file) return -(s64)EBADF;
+
+    s64 current_off = 0;
+    bool use_off = false;
+    if (user_offset) {
+        if ((uintptr_t)user_offset >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (copy_from_user(&current_off, user_offset, sizeof(s64)) != 0) return -(s64)EFAULT;
+        if (current_off < 0) return -(s64)EINVAL;
+        use_off = true;
+    }
+
+    size_t total_transferred = 0;
+    char kbuf[4096];
+
+    while (total_transferred < count) {
+        size_t to_read = count - total_transferred;
+        if (to_read > sizeof(kbuf)) to_read = sizeof(kbuf);
+
+        s64 nread = 0;
+        if (use_off) {
+            u64 saved_pos = in_file->f_pos;
+            in_file->f_pos = (u64)current_off;
+            nread = (s64)vfs_read(in_file, kbuf, to_read);
+            in_file->f_pos = saved_pos;
+            if (nread > 0) current_off += nread;
+        } else {
+            nread = (s64)vfs_read(in_file, kbuf, to_read);
+        }
+
+        if (nread <= 0) break;
+
+        s64 nwritten = (s64)vfs_write(out_file, kbuf, (size_t)nread);
+        if (nwritten <= 0) {
+            if (total_transferred == 0) return (nwritten < 0) ? nwritten : -(s64)EIO;
+            break;
+        }
+
+        total_transferred += (size_t)nwritten;
+        if (nwritten < (s64)to_read) break;
+    }
+
+    if (use_off && user_offset) {
+        copy_to_user(user_offset, &current_off, sizeof(s64));
+    }
+
+    return (s64)total_transferred;
+}
+
+static s64 sys_copy_file_range_impl(pt_regs_t *r)
+{
+    int fd_in = (int)(s32)r->rdi;
+    s64 *off_in = (s64 *)r->rsi;
+    int fd_out = (int)(s32)r->rdx;
+    s64 *off_out = (s64 *)r->r10;
+    size_t len = (size_t)r->r8;
+    unsigned int flags = (unsigned int)r->r9;
+    (void)flags;
+
+    if (len == 0) return 0;
+    if (fd_in < 0 || fd_in >= 64 || fd_out < 0 || fd_out >= 64) return -(s64)EBADF;
+
+    process_t *proc = sched_current_process();
+    if (!proc || !proc->handle_table[fd_in] || !proc->handle_table[fd_out]) return -(s64)EBADF;
+
+    file_t *in_file = (file_t *)proc->handle_table[fd_in];
+    file_t *out_file = (file_t *)proc->handle_table[fd_out];
+    if (!in_file || !out_file) return -(s64)EBADF;
+
+    s64 cur_in = 0, cur_out = 0;
+    bool has_in = false, has_out = false;
+    if (off_in) {
+        if ((uintptr_t)off_in >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (copy_from_user(&cur_in, off_in, sizeof(s64)) != 0) return -(s64)EFAULT;
+        if (cur_in < 0) return -(s64)EINVAL;
+        has_in = true;
+    }
+    if (off_out) {
+        if ((uintptr_t)off_out >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (copy_from_user(&cur_out, off_out, sizeof(s64)) != 0) return -(s64)EFAULT;
+        if (cur_out < 0) return -(s64)EINVAL;
+        has_out = true;
+    }
+
+    size_t total_copied = 0;
+    char kbuf[4096];
+
+    while (total_copied < len) {
+        size_t to_copy = len - total_copied;
+        if (to_copy > sizeof(kbuf)) to_copy = sizeof(kbuf);
+
+        s64 nread = 0;
+        if (has_in) {
+            u64 saved_in = in_file->f_pos;
+            in_file->f_pos = (u64)cur_in;
+            nread = (s64)vfs_read(in_file, kbuf, to_copy);
+            in_file->f_pos = saved_in;
+            if (nread > 0) cur_in += nread;
+        } else {
+            nread = (s64)vfs_read(in_file, kbuf, to_copy);
+        }
+
+        if (nread <= 0) break;
+
+        s64 nwritten = 0;
+        if (has_out) {
+            u64 saved_out = out_file->f_pos;
+            out_file->f_pos = (u64)cur_out;
+            nwritten = (s64)vfs_write(out_file, kbuf, (size_t)nread);
+            out_file->f_pos = saved_out;
+            if (nwritten > 0) cur_out += nwritten;
+        } else {
+            nwritten = (s64)vfs_write(out_file, kbuf, (size_t)nread);
+        }
+
+        if (nwritten <= 0) {
+            if (total_copied == 0) return (nwritten < 0) ? nwritten : -(s64)EIO;
+            break;
+        }
+
+        total_copied += (size_t)nwritten;
+        if (nwritten < (s64)to_copy) break;
+    }
+
+    if (has_in && off_in) copy_to_user(off_in, &cur_in, sizeof(s64));
+    if (has_out && off_out) copy_to_user(off_out, &cur_out, sizeof(s64));
+
+    return (s64)total_copied;
+}
+
+#define FALLOC_FL_KEEP_SIZE      0x01
+#define FALLOC_FL_PUNCH_HOLE     0x02
+#define FALLOC_FL_NO_HIDE_STALES 0x04
+#define FALLOC_FL_COLLAPSE_RANGE 0x08
+#define FALLOC_FL_ZERO_RANGE     0x10
+#define FALLOC_FL_INSERT_RANGE   0x20
+#define FALLOC_FL_UNSHARE_RANGE  0x40
+
+static s64 sys_fallocate_impl(pt_regs_t *r)
+{
+    int fd = (int)(s32)r->rdi;
+    int mode = (int)r->rsi;
+    s64 offset = (s64)r->rdx;
+    s64 len = (s64)r->r10;
+
+    if (offset < 0 || len <= 0) return -(s64)EINVAL;
+    if (fd < 0 || fd >= 64) return -(s64)EBADF;
+
+    process_t *proc = sched_current_process();
+    if (!proc || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    file_t *file = (file_t *)proc->handle_table[fd];
+    if (!file || !file->f_inode) return -(s64)EBADF;
+
+    s64 req_size = offset + len;
+    if (!(mode & FALLOC_FL_KEEP_SIZE)) {
+        if ((s64)file->f_inode->i_size < req_size) {
+            file->f_inode->i_size = (u64)req_size;
+        }
+    }
+    return 0;
+}
+
+static s64 sys_sync_file_range_impl(pt_regs_t *r)
+{
+    int fd = (int)(s32)r->rdi;
+    if (fd < 0 || fd >= 64) return -(s64)EBADF;
+    process_t *proc = sched_current_process();
+    if (!proc || !proc->handle_table[fd]) return -(s64)EBADF;
+    return 0;
+}
+
+static s64 sys_readahead_impl(pt_regs_t *r)
+{
+    int fd = (int)(s32)r->rdi;
+    if (fd < 0 || fd >= 64) return -(s64)EBADF;
+    process_t *proc = sched_current_process();
+    if (!proc || !proc->handle_table[fd]) return -(s64)EBADF;
+    return 0;
+}
+
+static s64 sys_splice_impl(pt_regs_t *r)
+{
+    return sys_copy_file_range_impl(r);
+}
+
+static s64 sys_tee_impl(pt_regs_t *r)
+{
+    return sys_copy_file_range_impl(r);
+}
+
+static s64 sys_vmsplice_impl(pt_regs_t *r)
+{
+    int fd = (int)(s32)r->rdi;
+    const struct iovec *iov = (const struct iovec *)r->rsi;
+    size_t nr_segs = (size_t)r->rdx;
+
+    if (fd < 0 || fd >= 64) return -(s64)EBADF;
+    if (!iov || nr_segs == 0) return 0;
+    pt_regs_t sub = *r;
+    sub.rdi = (u64)fd;
+    sub.rsi = (u64)(uintptr_t)iov;
+    sub.rdx = nr_segs;
+    return sys_writev_impl(&sub);
+}
+
 static s64 sys_statx_impl(pt_regs_t *r)
 {
-    (void)r;
-    return -(s64)ENOSYS;
+    int dirfd = (int)(s32)r->rdi;
+    const char *user_path = (const char *)r->rsi;
+    int flags = (int)r->rdx;
+    unsigned int mask = (unsigned int)r->r10;
+    struct statx *statxbuf = (struct statx *)r->r8;
+    (void)mask;
+
+    if (!statxbuf) return -(s64)EINVAL;
+    if ((uintptr_t)statxbuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    struct stat kst;
+    __builtin_memset(&kst, 0, sizeof(kst));
+
+    bool empty_path = false;
+    char raw[256];
+    __builtin_memset(raw, 0, sizeof(raw));
+    if (!user_path || (flags & AT_EMPTY_PATH)) {
+        empty_path = true;
+    } else {
+        s64 slen = copy_str_from_user(raw, user_path, sizeof(raw));
+        if (slen < 0) return slen;
+        if (raw[0] == '\0') empty_path = true;
+    }
+
+    if (empty_path) {
+        if (dirfd < 0 || dirfd >= 64) return -(s64)EBADF;
+        process_t *proc = sched_current_process();
+        if (!proc || !proc->handle_table[dirfd]) return -(s64)EBADF;
+        file_t *file = (file_t *)proc->handle_table[dirfd];
+        if (!file || !file->f_inode) return -(s64)EBADF;
+        s64 ret = vfs_fstat(file, &kst);
+        if (ret < 0) return ret;
+    } else {
+        char kpath[512];
+        s64 perr = copy_user_path_resolve_at(dirfd, kpath, sizeof(kpath), user_path);
+        if (perr < 0) return perr;
+
+        s64 ret;
+        if (flags & AT_SYMLINK_NOFOLLOW) {
+            ret = vfs_lstat(kpath, &kst);
+        } else {
+            ret = vfs_stat(kpath, &kst);
+        }
+        if (ret < 0) return ret;
+    }
+
+    struct statx sx;
+    __builtin_memset(&sx, 0, sizeof(sx));
+    sx.stx_mask = STATX_BASIC_STATS;
+    sx.stx_blksize = (u32)(kst.st_blksize ? kst.st_blksize : 4096);
+    sx.stx_attributes = 0;
+    sx.stx_nlink = (u32)kst.st_nlink;
+    sx.stx_uid = kst.st_uid;
+    sx.stx_gid = kst.st_gid;
+    sx.stx_mode = (u16)kst.st_mode;
+    sx.stx_ino = kst.st_ino;
+    sx.stx_size = (u64)kst.st_size;
+    sx.stx_blocks = (u64)kst.st_blocks;
+    sx.stx_attributes_mask = 0;
+
+    sx.stx_atime.tv_sec = (s64)kst.st_atime;
+    sx.stx_atime.tv_nsec = (u32)kst.st_atime_nsec;
+    sx.stx_mtime.tv_sec = (s64)kst.st_mtime;
+    sx.stx_mtime.tv_nsec = (u32)kst.st_mtime_nsec;
+    sx.stx_ctime.tv_sec = (s64)kst.st_ctime;
+    sx.stx_ctime.tv_nsec = (u32)kst.st_ctime_nsec;
+    sx.stx_btime.tv_sec = (s64)kst.st_ctime;
+    sx.stx_btime.tv_nsec = (u32)kst.st_ctime_nsec;
+
+    sx.stx_dev_major = (u32)(kst.st_dev >> 8);
+    sx.stx_dev_minor = (u32)(kst.st_dev & 0xFF);
+    sx.stx_rdev_major = (u32)(kst.st_rdev >> 8);
+    sx.stx_rdev_minor = (u32)(kst.st_rdev & 0xFF);
+
+    if (copy_to_user(statxbuf, &sx, sizeof(struct statx)) != 0) {
+        return -(s64)EFAULT;
+    }
+    return 0;
+}
+
+static s64 sys_syslog_impl(pt_regs_t *r)
+{
+    int type = (int)r->rdi;
+    char *user_buf = (char *)r->rsi;
+    int len = (int)r->rdx;
+
+    extern s64 console_read_klog(void *buf, size_t max_len, u64 *offset);
+    extern u64 console_get_klog_size(void);
+
+    switch (type) {
+    case 0:
+    case 1:
+    case 5:
+    case 6:
+    case 7:
+    case 8:
+        return 0;
+    case 2:
+    case 3:
+    case 4: {
+        if (!user_buf || len <= 0) return -(s64)EINVAL;
+        char *kbuf = (char *)kmalloc((size_t)len);
+        if (!kbuf) return -(s64)ENOMEM;
+        u64 offset = 0;
+        s64 n = console_read_klog(kbuf, (size_t)len, &offset);
+        if (n > 0) {
+            if (copy_to_user(user_buf, kbuf, (size_t)n) != 0) {
+                kfree(kbuf);
+                return -(s64)EFAULT;
+            }
+        }
+        kfree(kbuf);
+        return n;
+    }
+    case 9: {
+        u64 sz = console_get_klog_size();
+        return (s64)(sz > 65536 ? 65536 : sz);
+    }
+    case 10:
+        return 65536;
+    default:
+        return -(s64)EINVAL;
+    }
+}
+
+static s64 sys_swapon_impl(pt_regs_t *r)
+{
+    const char *user_path = (const char *)r->rdi;
+    (void)r->rsi;
+
+    if (!user_path) return -(s64)EINVAL;
+    char path[256];
+    s64 slen = copy_str_from_user(path, user_path, sizeof(path));
+    if (slen < 0) return slen;
+
+    struct stat st;
+    s64 ret = vfs_stat(path, &st);
+    if (ret < 0) return ret;
+
+    return 0;
+}
+
+static s64 sys_swapoff_impl(pt_regs_t *r)
+{
+    const char *user_path = (const char *)r->rdi;
+    if (!user_path) return -(s64)EINVAL;
+    char path[256];
+    s64 slen = copy_str_from_user(path, user_path, sizeof(path));
+    if (slen < 0) return slen;
+    return 0;
 }
 
 static s64 sys_sched_yield_impl(pt_regs_t *r)
@@ -3890,7 +4997,7 @@ static s64 sys_socketpair_impl(pt_regs_t *r)
     if (fd0 == -1 || fd1 == -1) return -(s64)EMFILE;
 
     file_t *rf = NULL, *wf = NULL;
-    int err = pipe_create(&rf, &wf);
+    int err = sockpair_create(&rf, &wf);
     if (err < 0) return (s64)err;
 
     proc->handle_table[fd0] = rf;
@@ -3925,8 +5032,18 @@ static s64 sys_prctl_impl(pt_regs_t *r)
     process_t *p = sched_current_process();
     if (!p) return -(s64)EPERM;
 
+    if (option == 1 /* PR_SET_PDEATHSIG */) {
+        p->pdeath_sig = (int)arg2;
+        return 0;
+    }
+    if (option == 2 /* PR_GET_PDEATHSIG */) {
+        if (!arg2 || arg2 >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        int sig = p->pdeath_sig;
+        if (copy_to_user((void *)arg2, &sig, sizeof(int)) != 0) return -(s64)EFAULT;
+        return 0;
+    }
     if (option == 15 /* PR_SET_NAME */) {
-        if (!arg2 || arg2 >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg2 || arg2 >= 0x0000800000000000ULL) return -(s64)EFAULT;
         char name[16];
         if (copy_from_user(name, (const void *)arg2, 15) != 0) return -(s64)EFAULT;
         name[15] = '\0';
@@ -3935,10 +5052,16 @@ static s64 sys_prctl_impl(pt_regs_t *r)
         return 0;
     }
     if (option == 16 /* PR_GET_NAME */) {
-        if (!arg2 || arg2 >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg2 || arg2 >= 0x0000800000000000ULL) return -(s64)EFAULT;
         if (copy_to_user((void *)arg2, p->name, strlen(p->name) + 1) != 0) return -(s64)EFAULT;
         return 0;
     }
+    if (option == 3 /* PR_GET_DUMPABLE */) return 1;
+    if (option == 4 /* PR_SET_DUMPABLE */) return 0;
+    if (option == 7 /* PR_GET_KEEPCAPS */) return 0;
+    if (option == 8 /* PR_SET_KEEPCAPS */) return 0;
+    if (option == 38 /* PR_SET_NO_NEW_PRIVS */) return 0;
+    if (option == 39 /* PR_GET_NO_NEW_PRIVS */) return 0;
     return 0;
 }
 
@@ -4058,4 +5181,1816 @@ static s64 sys_renameat_impl(pt_regs_t *r)
     err = copy_user_path_resolve_at(newdfd, knew, sizeof(knew), newpath);
     if (err < 0) return err;
     return vfs_rename(kold, knew);
+}
+
+static s64 sys_flock_impl(pt_regs_t *r)
+{
+    (void)r;
+    return 0;
+}
+
+static s64 sys_fsync_impl(pt_regs_t *r)
+{
+    int fd = (int)(s32)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    return 0;
+}
+
+static s64 sys_fdatasync_impl(pt_regs_t *r)
+{
+    return sys_fsync_impl(r);
+}
+
+static s64 sys_sync_impl(pt_regs_t *r)
+{
+    (void)r;
+    return 0;
+}
+
+static s64 sys_syncfs_impl(pt_regs_t *r)
+{
+    (void)r;
+    return 0;
+}
+
+static s64 sys_getpgid_impl(pt_regs_t *r)
+{
+    s32 pid = (s32)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (pid == 0) return (s64)proc->pid;
+    return (s64)pid;
+}
+
+static s64 sys_getsid_impl(pt_regs_t *r)
+{
+    s32 pid = (s32)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (pid == 0) return (s64)proc->pid;
+    return (s64)pid;
+}
+
+static s64 sys_setreuid_impl(pt_regs_t *r)
+{
+    u32 ruid = (u32)r->rdi;
+    u32 euid = (u32)r->rsi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (proc->euid != 0) {
+        if (ruid != (u32)-1 && ruid != proc->uid && ruid != proc->euid) return -(s64)EPERM;
+        if (euid != (u32)-1 && euid != proc->uid && euid != proc->euid) return -(s64)EPERM;
+    }
+    if (ruid != (u32)-1) proc->uid = ruid;
+    if (euid != (u32)-1) proc->euid = euid;
+    return 0;
+}
+
+static s64 sys_setresuid_impl(pt_regs_t *r)
+{
+    u32 ruid = (u32)r->rdi;
+    u32 euid = (u32)r->rsi;
+    u32 suid = (u32)r->rdx;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (proc->euid != 0) {
+        if (ruid != (u32)-1 && ruid != proc->uid && ruid != proc->euid && ruid != proc->suid) return -(s64)EPERM;
+        if (euid != (u32)-1 && euid != proc->uid && euid != proc->euid && euid != proc->suid) return -(s64)EPERM;
+        if (suid != (u32)-1 && suid != proc->uid && suid != proc->euid && suid != proc->suid) return -(s64)EPERM;
+    }
+    if (ruid != (u32)-1) proc->uid = ruid;
+    if (euid != (u32)-1) proc->euid = euid;
+    if (suid != (u32)-1) proc->suid = suid;
+    return 0;
+}
+
+static s64 sys_getresuid_impl(pt_regs_t *r)
+{
+    u32 *ruid = (u32 *)r->rdi;
+    u32 *euid = (u32 *)r->rsi;
+    u32 *suid = (u32 *)r->rdx;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (ruid && (uintptr_t)ruid < 0x0000800000000000ULL) copy_to_user(ruid, &proc->uid, sizeof(u32));
+    if (euid && (uintptr_t)euid < 0x0000800000000000ULL) copy_to_user(euid, &proc->euid, sizeof(u32));
+    if (suid && (uintptr_t)suid < 0x0000800000000000ULL) copy_to_user(suid, &proc->suid, sizeof(u32));
+    return 0;
+}
+
+static s64 sys_setregid_impl(pt_regs_t *r)
+{
+    u32 rgid = (u32)r->rdi;
+    u32 egid = (u32)r->rsi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (proc->euid != 0) {
+        if (rgid != (u32)-1 && rgid != proc->gid && rgid != proc->egid) return -(s64)EPERM;
+        if (egid != (u32)-1 && egid != proc->gid && egid != proc->egid) return -(s64)EPERM;
+    }
+    if (rgid != (u32)-1) proc->gid = rgid;
+    if (egid != (u32)-1) proc->egid = egid;
+    return 0;
+}
+
+static s64 sys_setresgid_impl(pt_regs_t *r)
+{
+    u32 rgid = (u32)r->rdi;
+    u32 egid = (u32)r->rsi;
+    u32 sgid = (u32)r->rdx;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (proc->euid != 0) {
+        if (rgid != (u32)-1 && rgid != proc->gid && rgid != proc->egid && rgid != proc->sgid) return -(s64)EPERM;
+        if (egid != (u32)-1 && egid != proc->gid && egid != proc->egid && egid != proc->sgid) return -(s64)EPERM;
+        if (sgid != (u32)-1 && sgid != proc->gid && sgid != proc->egid && sgid != proc->sgid) return -(s64)EPERM;
+    }
+    if (rgid != (u32)-1) proc->gid = rgid;
+    if (egid != (u32)-1) proc->egid = egid;
+    if (sgid != (u32)-1) proc->sgid = sgid;
+    return 0;
+}
+
+static s64 sys_getresgid_impl(pt_regs_t *r)
+{
+    u32 *rgid = (u32 *)r->rdi;
+    u32 *egid = (u32 *)r->rsi;
+    u32 *sgid = (u32 *)r->rdx;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (rgid && (uintptr_t)rgid < 0x0000800000000000ULL) copy_to_user(rgid, &proc->gid, sizeof(u32));
+    if (egid && (uintptr_t)egid < 0x0000800000000000ULL) copy_to_user(egid, &proc->egid, sizeof(u32));
+    if (sgid && (uintptr_t)sgid < 0x0000800000000000ULL) copy_to_user(sgid, &proc->sgid, sizeof(u32));
+    return 0;
+}
+
+static s64 sys_getgroups_impl(pt_regs_t *r)
+{
+    int size = (int)(s32)r->rdi;
+    u32 *list = (u32 *)r->rsi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (size == 0) return proc->ngroups > 0 ? (s64)proc->ngroups : 1;
+    if (size < 0) return -(s64)EINVAL;
+    if (!list || (uintptr_t)list >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    if (proc->ngroups > 0) {
+        if (size < (int)proc->ngroups) return -(s64)EINVAL;
+        if (copy_to_user(list, proc->groups, proc->ngroups * sizeof(u32)) != 0) return -(s64)EFAULT;
+        return (s64)proc->ngroups;
+    }
+    u32 gid = proc->gid;
+    if (copy_to_user(list, &gid, sizeof(u32)) != 0) return -(s64)EFAULT;
+    return 1;
+}
+
+static s64 sys_setgroups_impl(pt_regs_t *r)
+{
+    size_t size = (size_t)r->rdi;
+    const u32 *list = (const u32 *)r->rsi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!security_check_permission(proc, CAP_SETGID)) return -(s64)EPERM;
+    if (size > 32) return -(s64)EINVAL;
+    if (size > 0) {
+        if (!list || (uintptr_t)list >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (copy_from_user(proc->groups, list, size * sizeof(u32)) != 0) return -(s64)EFAULT;
+    }
+    proc->ngroups = (u32)size;
+    return 0;
+}
+
+static s64 sys_clock_getres_impl(pt_regs_t *r)
+{
+    struct linux_timespec *res = (struct linux_timespec *)r->rsi;
+    if (res && (uintptr_t)res < 0x8000000000000000ULL) {
+        struct linux_timespec ts = { .tv_sec = 0, .tv_nsec = 10000000L /* 10ms (100 Hz timer) */ };
+        copy_to_user(res, &ts, sizeof(ts));
+    }
+    return 0;
+}
+
+static s64 sys_clock_settime_impl(pt_regs_t *r)
+{
+    process_t *proc = sched_current_process();
+    if (!security_check_permission(proc, CAP_SYS_TIME)) {
+        return -(s64)EPERM;
+    }
+    (void)r;
+    return 0;
+}
+
+static s64 sys_clock_nanosleep_impl(pt_regs_t *r)
+{
+    const struct linux_timespec *req = (const struct linux_timespec *)r->rdx;
+    struct linux_timespec *rem = (struct linux_timespec *)r->r10;
+    pt_regs_t sub = *r;
+    sub.rdi = (u64)(uintptr_t)req;
+    sub.rsi = (u64)(uintptr_t)rem;
+    return sys_nanosleep_impl(&sub);
+}
+
+/* ── Linux Memory Management ABIs (mremap, mincore) ────────────────────────── */
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED   2
+
+static s64 sys_mremap_impl(pt_regs_t *r)
+{
+    uintptr_t old_addr = (uintptr_t)r->rdi;
+    size_t old_size = (size_t)r->rsi;
+    size_t new_size = (size_t)r->rdx;
+    int flags = (int)r->r10;
+
+    (void)flags;
+    if (old_addr >= 0x0000800000000000ULL || (old_addr & 0xFFF) != 0) return -(s64)EINVAL;
+    if (new_size == 0) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    size_t old_pages = (old_size + 4095) / 4096;
+    size_t new_pages = (new_size + 4095) / 4096;
+
+    if (new_pages == old_pages) return (s64)old_addr;
+
+    if (new_pages > old_pages) {
+        for (size_t i = old_pages; i < new_pages; i++) {
+            phys_addr_t p = pmm_alloc_page();
+            if (!p) return -(s64)ENOMEM;
+            memset((void *)(HHDM_BASE + p), 0, 4096);
+            vmm_map(proc->pml4_phys, old_addr + i * 4096, p, VMM_F_PRESENT | VMM_F_WRITE | VMM_F_USER | VMM_F_NX);
+        }
+        return (s64)old_addr;
+    } else {
+        for (size_t i = new_pages; i < old_pages; i++) {
+            vmm_unmap(proc->pml4_phys, old_addr + i * 4096);
+        }
+        return (s64)old_addr;
+    }
+}
+
+static s64 sys_mincore_impl(pt_regs_t *r)
+{
+    uintptr_t start = (uintptr_t)r->rdi;
+    size_t length = (size_t)r->rsi;
+    unsigned char *vec = (unsigned char *)r->rdx;
+
+    if (start >= 0x0000800000000000ULL || (start & 0xFFF) != 0) return -(s64)EINVAL;
+    if (!vec || (uintptr_t)vec >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    size_t pages = (length + 4095) / 4096;
+    for (size_t i = 0; i < pages; i++) {
+        unsigned char status = 1;
+        if (copy_to_user(&vec[i], &status, 1) != 0) return -(s64)EFAULT;
+    }
+    return 0;
+}
+
+/* ── Linux Fast Userspace Mutex (futex) ──────────────────────────────────── */
+#define FUTEX_WAIT            0
+#define FUTEX_WAKE            1
+#define FUTEX_FD              2
+#define FUTEX_REQUEUE         3
+#define FUTEX_CMP_REQUEUE     4
+#define FUTEX_WAKE_OP         5
+#define FUTEX_LOCK_PI         6
+#define FUTEX_UNLOCK_PI       7
+#define FUTEX_TRYLOCK_PI      8
+#define FUTEX_WAIT_BITSET     9
+#define FUTEX_WAKE_BITSET     10
+#define FUTEX_PRIVATE_FLAG    128
+#define FUTEX_CLOCK_REALTIME  256
+#define FUTEX_BITSET_MATCH_ANY 0xFFFFFFFF
+
+typedef struct futex_q {
+    thread_t        *thread;
+    process_t       *proc;
+    uintptr_t        uaddr;
+    u32              bitset;
+    struct futex_q  *next;
+} futex_q_t;
+
+#define FUTEX_HASH_SIZE 64
+static futex_q_t *g_futex_table[FUTEX_HASH_SIZE];
+static spinlock_t g_futex_lock = SPINLOCK_INIT;
+
+static inline u32 futex_hash(uintptr_t uaddr) {
+    return (u32)((uaddr >> 2) ^ (uaddr >> 8)) % FUTEX_HASH_SIZE;
+}
+
+static s64 sys_futex_impl(pt_regs_t *r)
+{
+    uintptr_t uaddr = (uintptr_t)r->rdi;
+    int op = (int)r->rsi;
+    u32 val = (u32)r->rdx;
+    const struct linux_timespec *timeout = (const struct linux_timespec *)r->r10;
+    uintptr_t uaddr2 = (uintptr_t)r->r8;
+    u32 val3 = (u32)r->r9;
+
+    if (uaddr >= 0x0000800000000000ULL || (uaddr & 3) != 0) return -(s64)EFAULT;
+
+    int cmd = op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    process_t *proc = sched_current_process();
+    thread_t *curr = sched_current_thread();
+    if (!proc || !curr) return -(s64)EPERM;
+
+    switch (cmd) {
+    case FUTEX_WAIT:
+    case FUTEX_WAIT_BITSET: {
+        u32 bitset = (cmd == FUTEX_WAIT_BITSET) ? val3 : FUTEX_BITSET_MATCH_ANY;
+        if (bitset == 0) return -(s64)EINVAL;
+
+        u32 cur_val = 0;
+        if (copy_from_user(&cur_val, (const void *)uaddr, sizeof(u32)) != 0) return -(s64)EFAULT;
+        if (cur_val != val) return -(s64)11; /* -EAGAIN / -EWOULDBLOCK */
+
+        u64 timeout_ticks = 0;
+        if (timeout && (uintptr_t)timeout < 0x0000800000000000ULL) {
+            struct linux_timespec ts;
+            if (copy_from_user(&ts, timeout, sizeof(ts)) == 0) {
+                u64 ms = (u64)ts.tv_sec * 1000 + (u64)ts.tv_nsec / 1000000;
+                timeout_ticks = (ms + 9) / 10;
+            }
+        }
+
+        futex_q_t q;
+        q.thread = curr;
+        q.proc = proc;
+        q.uaddr = uaddr;
+        q.bitset = bitset;
+        q.next = NULL;
+
+        u32 b = futex_hash(uaddr);
+        spinlock_lock(&g_futex_lock);
+        q.next = g_futex_table[b];
+        g_futex_table[b] = &q;
+        spinlock_unlock(&g_futex_lock);
+
+        if (timeout_ticks > 0) {
+            sched_sleep(timeout_ticks);
+        } else {
+            sched_block(THREAD_BLOCKED);
+        }
+
+        spinlock_lock(&g_futex_lock);
+        futex_q_t **curr_q = &g_futex_table[b];
+        while (*curr_q) {
+            if (*curr_q == &q) {
+                *curr_q = q.next;
+                break;
+            }
+            curr_q = &(*curr_q)->next;
+        }
+        spinlock_unlock(&g_futex_lock);
+
+        return 0;
+    }
+    case FUTEX_WAKE:
+    case FUTEX_WAKE_BITSET: {
+        u32 bitset = (cmd == FUTEX_WAKE_BITSET) ? val3 : FUTEX_BITSET_MATCH_ANY;
+        if (bitset == 0) return -(s64)EINVAL;
+
+        u32 b = futex_hash(uaddr);
+        int woken = 0;
+
+        spinlock_lock(&g_futex_lock);
+        futex_q_t *curr_q = g_futex_table[b];
+        while (curr_q && (u32)woken < val) {
+            if (curr_q->proc == proc && curr_q->uaddr == uaddr && (curr_q->bitset & bitset)) {
+                sched_unblock(curr_q->thread);
+                woken++;
+            }
+            curr_q = curr_q->next;
+        }
+        spinlock_unlock(&g_futex_lock);
+
+        return woken;
+    }
+    case FUTEX_REQUEUE:
+    case FUTEX_CMP_REQUEUE: {
+        if (cmd == FUTEX_CMP_REQUEUE) {
+            u32 cur_val = 0;
+            if (copy_from_user(&cur_val, (const void *)uaddr, sizeof(u32)) != 0) return -(s64)EFAULT;
+            if (cur_val != val3) return -(s64)11; /* -EAGAIN */
+        }
+
+        u32 b1 = futex_hash(uaddr);
+        int woken = 0;
+        int requeued = 0;
+        u32 val2_max = timeout ? (u32)(uintptr_t)timeout : 0;
+
+        spinlock_lock(&g_futex_lock);
+        futex_q_t *curr_q = g_futex_table[b1];
+        while (curr_q) {
+            if (curr_q->proc == proc && curr_q->uaddr == uaddr) {
+                if ((u32)woken < val) {
+                    sched_unblock(curr_q->thread);
+                    woken++;
+                } else if ((u32)requeued < val2_max) {
+                    curr_q->uaddr = uaddr2;
+                    requeued++;
+                }
+            }
+            curr_q = curr_q->next;
+        }
+        spinlock_unlock(&g_futex_lock);
+
+        return woken + requeued;
+    }
+    default:
+        return -(s64)ENOSYS;
+    }
+}
+
+/* ── Linux eventfd / eventfd2 ────────────────────────────────────────────── */
+#define EFD_SEMAPHORE 1
+#define EFD_CLOEXEC   02000000
+#define EFD_NONBLOCK  00004000
+
+#ifndef POLLRDNORM
+#define POLLRDNORM 0x0040
+#endif
+#ifndef POLLWRNORM
+#define POLLWRNORM 0x0100
+#endif
+
+typedef struct {
+    u64 counter;
+    u32 flags;
+    spinlock_t lock;
+} eventfd_ctx_t;
+
+static s64 eventfd_read_op(file_t *filp, void *buf, size_t len, u64 *offset)
+{
+    (void)offset;
+    if (len < sizeof(u64)) return -(s64)EINVAL;
+    if (!buf) return -(s64)EFAULT;
+    eventfd_ctx_t *ctx = (eventfd_ctx_t *)filp->private_data;
+    if (!ctx) return -(s64)EBADF;
+
+    for (;;) {
+        spinlock_lock(&ctx->lock);
+        if (ctx->counter > 0) {
+            u64 val;
+            if (ctx->flags & EFD_SEMAPHORE) {
+                val = 1;
+                ctx->counter--;
+            } else {
+                val = ctx->counter;
+                ctx->counter = 0;
+            }
+            spinlock_unlock(&ctx->lock);
+            memcpy(buf, &val, sizeof(u64));
+            return sizeof(u64);
+        }
+        spinlock_unlock(&ctx->lock);
+
+        if (filp->f_flags & O_NONBLOCK) return -(s64)11; /* -EAGAIN */
+        sched_sleep(1);
+    }
+}
+
+static s64 eventfd_write_op(file_t *filp, const void *buf, size_t len, u64 *offset)
+{
+    (void)offset;
+    if (len < sizeof(u64)) return -(s64)EINVAL;
+    if (!buf) return -(s64)EFAULT;
+    eventfd_ctx_t *ctx = (eventfd_ctx_t *)filp->private_data;
+    if (!ctx) return -(s64)EBADF;
+
+    u64 val = 0;
+    memcpy(&val, buf, sizeof(u64));
+    if (val == 0xFFFFFFFFFFFFFFFFULL) return -(s64)EINVAL;
+
+    for (;;) {
+        spinlock_lock(&ctx->lock);
+        if (0xFFFFFFFFFFFFFFFEULL - ctx->counter >= val) {
+            ctx->counter += val;
+            spinlock_unlock(&ctx->lock);
+            return sizeof(u64);
+        }
+        spinlock_unlock(&ctx->lock);
+
+        if (filp->f_flags & O_NONBLOCK) return -(s64)11; /* -EAGAIN */
+        sched_sleep(1);
+    }
+}
+
+static int eventfd_poll_op(file_t *filp)
+{
+    eventfd_ctx_t *ctx = (eventfd_ctx_t *)filp->private_data;
+    if (!ctx) return POLLNVAL;
+    int rev = 0;
+    spinlock_lock(&ctx->lock);
+    if (ctx->counter > 0) rev |= (POLLIN | POLLRDNORM);
+    if (ctx->counter < 0xFFFFFFFFFFFFFFFEULL) rev |= (POLLOUT | POLLWRNORM);
+    spinlock_unlock(&ctx->lock);
+    return rev;
+}
+
+static s64 eventfd_release_op(inode_t *inode, file_t *filp)
+{
+    (void)inode;
+    if (filp && filp->private_data) {
+        kfree(filp->private_data);
+        filp->private_data = NULL;
+    }
+    return 0;
+}
+
+static file_operations_t g_eventfd_fops = {
+    .read = eventfd_read_op,
+    .write = eventfd_write_op,
+    .poll = eventfd_poll_op,
+    .release = eventfd_release_op,
+};
+
+static s64 sys_eventfd2_impl(pt_regs_t *r)
+{
+    u32 initval = (u32)r->rdi;
+    int flags = (int)r->rsi;
+
+    if (flags & ~(EFD_SEMAPHORE | EFD_CLOEXEC | EFD_NONBLOCK)) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    eventfd_ctx_t *ctx = (eventfd_ctx_t *)kzalloc(sizeof(eventfd_ctx_t));
+    if (!ctx) return -(s64)ENOMEM;
+    ctx->counter = initval;
+    ctx->flags = (u32)flags;
+    spinlock_init(&ctx->lock);
+
+    file_t *f = (file_t *)kzalloc(sizeof(file_t));
+    if (!f) {
+        kfree(ctx);
+        return -(s64)ENOMEM;
+    }
+
+    f->f_op = &g_eventfd_fops;
+    f->private_data = ctx;
+    f->f_flags = (flags & EFD_NONBLOCK) ? O_NONBLOCK : 0;
+    f->f_fd_flags = (flags & EFD_CLOEXEC) ? FD_CLOEXEC : 0;
+    f->f_mode = 0600;
+    f->f_count = 1;
+
+    for (int i = 3; i < 64; i++) {
+        if (!proc->handle_table[i]) {
+            proc->handle_table[i] = f;
+            proc->fd_flags[i] = f->f_fd_flags;
+            return i;
+        }
+    }
+    kfree(ctx);
+    kfree(f);
+    return -(s64)EMFILE;
+}
+
+static s64 sys_eventfd_impl(pt_regs_t *r)
+{
+    pt_regs_t sub = *r;
+    sub.rsi = 0;
+    return sys_eventfd2_impl(&sub);
+}
+
+/* ── Linux epoll subsystem ────────────────────────────────────────────────── */
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+#define EPOLL_CLOEXEC 02000000
+
+typedef struct {
+    int fd;
+    u32 events;
+    u64 data;
+} epoll_item_t;
+
+#define EPOLL_MAX_ITEMS 64
+typedef struct {
+    int count;
+    epoll_item_t items[EPOLL_MAX_ITEMS];
+    spinlock_t lock;
+} epoll_ctx_t;
+
+static s64 epoll_release_op(inode_t *inode, file_t *filp)
+{
+    (void)inode;
+    if (filp && filp->private_data) {
+        kfree(filp->private_data);
+        filp->private_data = NULL;
+    }
+    return 0;
+}
+
+static file_operations_t g_epoll_fops = {
+    .release = epoll_release_op,
+};
+
+static s64 sys_epoll_create1_impl(pt_regs_t *r)
+{
+    int flags = (int)r->rdi;
+    if (flags & ~EPOLL_CLOEXEC) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    epoll_ctx_t *ctx = (epoll_ctx_t *)kzalloc(sizeof(epoll_ctx_t));
+    if (!ctx) return -(s64)ENOMEM;
+    spinlock_init(&ctx->lock);
+
+    file_t *f = (file_t *)kzalloc(sizeof(file_t));
+    if (!f) {
+        kfree(ctx);
+        return -(s64)ENOMEM;
+    }
+
+    f->f_op = &g_epoll_fops;
+    f->private_data = ctx;
+    f->f_fd_flags = (flags & EPOLL_CLOEXEC) ? FD_CLOEXEC : 0;
+    f->f_count = 1;
+
+    for (int i = 3; i < 64; i++) {
+        if (!proc->handle_table[i]) {
+            proc->handle_table[i] = f;
+            proc->fd_flags[i] = f->f_fd_flags;
+            return i;
+        }
+    }
+    kfree(ctx);
+    kfree(f);
+    return -(s64)EMFILE;
+}
+
+static s64 sys_epoll_create_impl(pt_regs_t *r)
+{
+    int size = (int)r->rdi;
+    if (size <= 0) return -(s64)EINVAL;
+    pt_regs_t sub = *r;
+    sub.rdi = 0;
+    return sys_epoll_create1_impl(&sub);
+}
+
+typedef struct {
+    u32 events;
+    u64 data;
+} __attribute__((packed)) linux_epoll_event_t;
+
+static s64 sys_epoll_ctl_impl(pt_regs_t *r)
+{
+    int epfd = (int)r->rdi;
+    int op = (int)r->rsi;
+    int fd = (int)r->rdx;
+    const linux_epoll_event_t *event = (const linux_epoll_event_t *)r->r10;
+
+    process_t *proc = sched_current_process();
+    if (!proc || epfd < 0 || epfd >= 64 || !proc->handle_table[epfd]) return -(s64)EBADF;
+    if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (epfd == fd) return -(s64)EINVAL;
+
+    file_t *epfile = (file_t *)proc->handle_table[epfd];
+    if (epfile->f_op != &g_epoll_fops || !epfile->private_data) return -(s64)EINVAL;
+    epoll_ctx_t *ctx = (epoll_ctx_t *)epfile->private_data;
+
+    linux_epoll_event_t kevent;
+    if (op != EPOLL_CTL_DEL) {
+        if (!event || (uintptr_t)event >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (copy_from_user(&kevent, event, sizeof(linux_epoll_event_t)) != 0) return -(s64)EFAULT;
+    }
+
+    spinlock_lock(&ctx->lock);
+    if (op == EPOLL_CTL_ADD) {
+        for (int i = 0; i < ctx->count; i++) {
+            if (ctx->items[i].fd == fd) {
+                spinlock_unlock(&ctx->lock);
+                return -(s64)EEXIST;
+            }
+        }
+        if (ctx->count >= EPOLL_MAX_ITEMS) {
+            spinlock_unlock(&ctx->lock);
+            return -(s64)ENOSPC;
+        }
+        ctx->items[ctx->count].fd = fd;
+        ctx->items[ctx->count].events = kevent.events;
+        ctx->items[ctx->count].data = kevent.data;
+        ctx->count++;
+        spinlock_unlock(&ctx->lock);
+        return 0;
+    } else if (op == EPOLL_CTL_MOD) {
+        for (int i = 0; i < ctx->count; i++) {
+            if (ctx->items[i].fd == fd) {
+                ctx->items[i].events = kevent.events;
+                ctx->items[i].data = kevent.data;
+                spinlock_unlock(&ctx->lock);
+                return 0;
+            }
+        }
+        spinlock_unlock(&ctx->lock);
+        return -(s64)ENOENT;
+    } else if (op == EPOLL_CTL_DEL) {
+        for (int i = 0; i < ctx->count; i++) {
+            if (ctx->items[i].fd == fd) {
+                ctx->items[i] = ctx->items[ctx->count - 1];
+                ctx->count--;
+                spinlock_unlock(&ctx->lock);
+                return 0;
+            }
+        }
+        spinlock_unlock(&ctx->lock);
+        return -(s64)ENOENT;
+    }
+    spinlock_unlock(&ctx->lock);
+    return -(s64)EINVAL;
+}
+
+static s64 sys_epoll_wait_impl(pt_regs_t *r)
+{
+    int epfd = (int)r->rdi;
+    linux_epoll_event_t *events = (linux_epoll_event_t *)r->rsi;
+    int maxevents = (int)r->rdx;
+    int timeout_ms = (int)r->r10;
+
+    if (maxevents <= 0 || maxevents > 1024) return -(s64)EINVAL;
+    if (!events || (uintptr_t)events >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    process_t *proc = sched_current_process();
+    if (!proc || epfd < 0 || epfd >= 64 || !proc->handle_table[epfd]) return -(s64)EBADF;
+
+    file_t *epfile = (file_t *)proc->handle_table[epfd];
+    if (epfile->f_op != &g_epoll_fops || !epfile->private_data) return -(s64)EINVAL;
+    epoll_ctx_t *ctx = (epoll_ctx_t *)epfile->private_data;
+
+    u64 start_ticks = sched_get_ticks();
+    u64 end_ticks = (timeout_ms > 0) ? (start_ticks + (timeout_ms + 9) / 10) : 0;
+
+    for (;;) {
+        int ready_count = 0;
+        spinlock_lock(&ctx->lock);
+        for (int i = 0; i < ctx->count && ready_count < maxevents; i++) {
+            int tfd = ctx->items[i].fd;
+            if (tfd >= 0 && tfd < 64 && proc->handle_table[tfd]) {
+                file_t *tf = (file_t *)proc->handle_table[tfd];
+                short rev = check_file_readiness(tf, (short)ctx->items[i].events);
+                if (rev & ctx->items[i].events) {
+                    linux_epoll_event_t ev;
+                    ev.events = (u32)(rev & ctx->items[i].events);
+                    ev.data = ctx->items[i].data;
+                    copy_to_user(&events[ready_count], &ev, sizeof(linux_epoll_event_t));
+                    ready_count++;
+                }
+            }
+        }
+        spinlock_unlock(&ctx->lock);
+
+        if (ready_count > 0) return ready_count;
+        if (timeout_ms == 0) return 0;
+        if (timeout_ms > 0 && sched_get_ticks() >= end_ticks) return 0;
+
+        sched_sleep(1);
+    }
+}
+
+static s64 sys_epoll_pwait_impl(pt_regs_t *r)
+{
+    return sys_epoll_wait_impl(r);
+}
+
+/* ── Linux timerfd subsystem ──────────────────────────────────────────────── */
+#define TFD_CLOEXEC  02000000
+#define TFD_NONBLOCK 00004000
+
+typedef struct {
+    int clockid;
+    u32 flags;
+    u64 interval_ms;
+    u64 expire_tick;
+    u64 expirations;
+    spinlock_t lock;
+} timerfd_ctx_t;
+
+static s64 timerfd_read_op(file_t *filp, void *buf, size_t len, u64 *offset)
+{
+    (void)offset;
+    if (len < sizeof(u64)) return -(s64)EINVAL;
+    if (!buf || (uintptr_t)buf >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    timerfd_ctx_t *ctx = (timerfd_ctx_t *)filp->private_data;
+    if (!ctx) return -(s64)EBADF;
+
+    for (;;) {
+        spinlock_lock(&ctx->lock);
+        u64 ticks = sched_get_ticks();
+        if (ctx->expire_tick > 0 && ticks >= ctx->expire_tick) {
+            ctx->expirations++;
+            if (ctx->interval_ms > 0) {
+                ctx->expire_tick = ticks + (ctx->interval_ms + 9) / 10;
+            } else {
+                ctx->expire_tick = 0;
+            }
+        }
+        if (ctx->expirations > 0) {
+            u64 exp = ctx->expirations;
+            ctx->expirations = 0;
+            spinlock_unlock(&ctx->lock);
+            if (copy_to_user(buf, &exp, sizeof(u64)) != 0) return -(s64)EFAULT;
+            return sizeof(u64);
+        }
+        spinlock_unlock(&ctx->lock);
+
+        if (filp->f_flags & O_NONBLOCK) return -(s64)11; /* -EAGAIN */
+        sched_sleep(1);
+    }
+}
+
+static int timerfd_poll_op(file_t *filp)
+{
+    timerfd_ctx_t *ctx = (timerfd_ctx_t *)filp->private_data;
+    if (!ctx) return POLLNVAL;
+    int rev = 0;
+    spinlock_lock(&ctx->lock);
+    u64 ticks = sched_get_ticks();
+    if (ctx->expirations > 0 || (ctx->expire_tick > 0 && ticks >= ctx->expire_tick)) {
+        rev |= (POLLIN | POLLRDNORM);
+    }
+    spinlock_unlock(&ctx->lock);
+    return rev;
+}
+
+static s64 timerfd_release_op(inode_t *inode, file_t *filp)
+{
+    (void)inode;
+    if (filp && filp->private_data) {
+        kfree(filp->private_data);
+        filp->private_data = NULL;
+    }
+    return 0;
+}
+
+static file_operations_t g_timerfd_fops = {
+    .read = timerfd_read_op,
+    .poll = timerfd_poll_op,
+    .release = timerfd_release_op,
+};
+
+static s64 sys_timerfd_create_impl(pt_regs_t *r)
+{
+    int clockid = (int)r->rdi;
+    int flags = (int)r->rsi;
+
+    if (flags & ~(TFD_CLOEXEC | TFD_NONBLOCK)) return -(s64)EINVAL;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    timerfd_ctx_t *ctx = (timerfd_ctx_t *)kzalloc(sizeof(timerfd_ctx_t));
+    if (!ctx) return -(s64)ENOMEM;
+    ctx->clockid = clockid;
+    ctx->flags = (u32)flags;
+    spinlock_init(&ctx->lock);
+
+    file_t *f = (file_t *)kzalloc(sizeof(file_t));
+    if (!f) {
+        kfree(ctx);
+        return -(s64)ENOMEM;
+    }
+    f->f_op = &g_timerfd_fops;
+    f->private_data = ctx;
+    f->f_flags = (flags & TFD_NONBLOCK) ? O_NONBLOCK : 0;
+    f->f_fd_flags = (flags & TFD_CLOEXEC) ? FD_CLOEXEC : 0;
+    f->f_count = 1;
+
+    for (int i = 3; i < 64; i++) {
+        if (!proc->handle_table[i]) {
+            proc->handle_table[i] = f;
+            proc->fd_flags[i] = f->f_fd_flags;
+            return i;
+        }
+    }
+    kfree(ctx);
+    kfree(f);
+    return -(s64)EMFILE;
+}
+
+struct itimerspec {
+    struct linux_timespec it_interval;
+    struct linux_timespec it_value;
+};
+
+static s64 sys_timerfd_settime_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    int flags = (int)r->rsi;
+    const struct itimerspec *new_value = (const struct itimerspec *)r->rdx;
+    struct itimerspec *old_value = (struct itimerspec *)r->r10;
+
+    (void)flags;
+    process_t *proc = sched_current_process();
+    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    file_t *f = (file_t *)proc->handle_table[fd];
+    if (f->f_op != &g_timerfd_fops || !f->private_data) return -(s64)EINVAL;
+    timerfd_ctx_t *ctx = (timerfd_ctx_t *)f->private_data;
+
+    struct itimerspec new_val;
+    if (!new_value || copy_from_user(&new_val, new_value, sizeof(struct itimerspec)) != 0) return -(s64)EFAULT;
+
+    spinlock_lock(&ctx->lock);
+    if (old_value && (uintptr_t)old_value < 0x0000800000000000ULL) {
+        struct itimerspec old_val;
+        memset(&old_val, 0, sizeof(old_val));
+        old_val.it_interval.tv_sec = (long)(ctx->interval_ms / 1000);
+        old_val.it_interval.tv_nsec = (long)((ctx->interval_ms % 1000) * 1000000);
+        copy_to_user(old_value, &old_val, sizeof(struct itimerspec));
+    }
+
+    u64 val_ms = (u64)new_val.it_value.tv_sec * 1000 + (u64)new_val.it_value.tv_nsec / 1000000;
+    ctx->interval_ms = (u64)new_val.it_interval.tv_sec * 1000 + (u64)new_val.it_interval.tv_nsec / 1000000;
+    if (val_ms > 0) {
+        ctx->expire_tick = sched_get_ticks() + (val_ms + 9) / 10;
+    } else {
+        ctx->expire_tick = 0;
+    }
+    ctx->expirations = 0;
+    spinlock_unlock(&ctx->lock);
+
+    return 0;
+}
+
+static s64 sys_timerfd_gettime_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    struct itimerspec *curr_value = (struct itimerspec *)r->rsi;
+
+    process_t *proc = sched_current_process();
+    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    file_t *f = (file_t *)proc->handle_table[fd];
+    if (f->f_op != &g_timerfd_fops || !f->private_data) return -(s64)EINVAL;
+    timerfd_ctx_t *ctx = (timerfd_ctx_t *)f->private_data;
+
+    if (!curr_value || (uintptr_t)curr_value >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    struct itimerspec val;
+    memset(&val, 0, sizeof(val));
+    spinlock_lock(&ctx->lock);
+    val.it_interval.tv_sec = (long)(ctx->interval_ms / 1000);
+    val.it_interval.tv_nsec = (long)((ctx->interval_ms % 1000) * 1000000);
+    if (ctx->expire_tick > 0) {
+        u64 ticks = sched_get_ticks();
+        if (ctx->expire_tick > ticks) {
+            u64 rem_ms = (ctx->expire_tick - ticks) * 10;
+            val.it_value.tv_sec = (long)(rem_ms / 1000);
+            val.it_value.tv_nsec = (long)((rem_ms % 1000) * 1000000);
+        }
+    }
+    spinlock_unlock(&ctx->lock);
+
+    copy_to_user(curr_value, &val, sizeof(struct itimerspec));
+    return 0;
+}
+
+/* ── Linux signalfd subsystem ─────────────────────────────────────────────── */
+#define SFD_CLOEXEC  02000000
+#define SFD_NONBLOCK 00004000
+
+typedef struct {
+    sigset_t mask;
+    u32 flags;
+} signalfd_ctx_t;
+
+static s64 signalfd_release_op(inode_t *inode, file_t *filp)
+{
+    (void)inode;
+    if (filp && filp->private_data) {
+        kfree(filp->private_data);
+        filp->private_data = NULL;
+    }
+    return 0;
+}
+
+static file_operations_t g_signalfd_fops = {
+    .release = signalfd_release_op,
+};
+
+static s64 sys_signalfd4_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    const sigset_t *mask = (const sigset_t *)r->rsi;
+    size_t sizemask = (size_t)r->rdx;
+    int flags = (int)r->r10;
+
+    (void)sizemask;
+    if (flags & ~(SFD_CLOEXEC | SFD_NONBLOCK)) return -(s64)EINVAL;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    sigset_t smask = 0;
+    if (mask && copy_from_user(&smask, mask, sizeof(sigset_t)) != 0) return -(s64)EFAULT;
+
+    if (fd != -1) {
+        if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+        file_t *f = (file_t *)proc->handle_table[fd];
+        if (f->f_op != &g_signalfd_fops || !f->private_data) return -(s64)EINVAL;
+        signalfd_ctx_t *ctx = (signalfd_ctx_t *)f->private_data;
+        ctx->mask = smask;
+        return fd;
+    }
+
+    signalfd_ctx_t *ctx = (signalfd_ctx_t *)kzalloc(sizeof(signalfd_ctx_t));
+    if (!ctx) return -(s64)ENOMEM;
+    ctx->mask = smask;
+    ctx->flags = (u32)flags;
+
+    file_t *f = (file_t *)kzalloc(sizeof(file_t));
+    if (!f) {
+        kfree(ctx);
+        return -(s64)ENOMEM;
+    }
+    f->f_op = &g_signalfd_fops;
+    f->private_data = ctx;
+    f->f_flags = (flags & SFD_NONBLOCK) ? O_NONBLOCK : 0;
+    f->f_fd_flags = (flags & SFD_CLOEXEC) ? FD_CLOEXEC : 0;
+    f->f_count = 1;
+
+    for (int i = 3; i < 64; i++) {
+        if (!proc->handle_table[i]) {
+            proc->handle_table[i] = f;
+            proc->fd_flags[i] = f->f_fd_flags;
+            return i;
+        }
+    }
+    kfree(ctx);
+    kfree(f);
+    return -(s64)EMFILE;
+}
+
+static s64 sys_signalfd_impl(pt_regs_t *r)
+{
+    pt_regs_t sub = *r;
+    sub.r10 = 0;
+    return sys_signalfd4_impl(&sub);
+}
+
+/* ── Linux Scheduling & Personality ABIs ──────────────────────────────────── */
+static s64 sys_sched_setscheduler_impl(pt_regs_t *r)
+{
+    (void)r;
+    return 0;
+}
+
+static s64 sys_sched_getscheduler_impl(pt_regs_t *r)
+{
+    (void)r;
+    return 0; /* SCHED_OTHER */
+}
+
+static s64 sys_sched_setparam_impl(pt_regs_t *r)
+{
+    (void)r;
+    return 0;
+}
+
+static s64 sys_sched_getparam_impl(pt_regs_t *r)
+{
+    int *param = (int *)r->rsi;
+    if (param && (uintptr_t)param < 0x0000800000000000ULL) {
+        int priority = 0;
+        copy_to_user(param, &priority, sizeof(int));
+    }
+    return 0;
+}
+
+static s64 sys_sched_get_priority_max_impl(pt_regs_t *r)
+{
+    int policy = (int)r->rdi;
+    if (policy == 1 || policy == 2) return 99;
+    return 0;
+}
+
+static s64 sys_sched_get_priority_min_impl(pt_regs_t *r)
+{
+    int policy = (int)r->rdi;
+    if (policy == 1 || policy == 2) return 1;
+    return 0;
+}
+
+static s64 sys_sched_rr_get_interval_impl(pt_regs_t *r)
+{
+    struct linux_timespec *tp = (struct linux_timespec *)r->rsi;
+    if (tp && (uintptr_t)tp < 0x0000800000000000ULL) {
+        struct linux_timespec ts = { .tv_sec = 0, .tv_nsec = 10000000L /* 10ms */ };
+        copy_to_user(tp, &ts, sizeof(ts));
+    }
+    return 0;
+}
+
+static s64 sys_personality_impl(pt_regs_t *r)
+{
+    (void)r;
+    return 0; /* PER_LINUX */
+}
+
+static s64 sys_membarrier_impl(pt_regs_t *r)
+{
+    int cmd = (int)r->rdi;
+    if (cmd == 0 /* MEMBARRIER_CMD_QUERY */) {
+        return 1 | 2; /* MEMBARRIER_CMD_GLOBAL | MEMBARRIER_CMD_GLOBAL_EXPEDITED */
+    }
+    __sync_synchronize();
+    return 0;
+}
+
+static s64 sys_capget_impl(pt_regs_t *r)
+{
+    void *datap = (void *)r->rsi;
+    process_t *proc = sched_current_process();
+    if (datap && (uintptr_t)datap < 0x0000800000000000ULL) {
+        u32 caps[6] = { 0 };
+        if (proc && proc->euid == 0) {
+            caps[0] = 0xFFFFFFFF;
+            caps[1] = 0xFFFFFFFF;
+            caps[2] = 0xFFFFFFFF;
+            caps[3] = 0xFFFFFFFF;
+            caps[4] = 0xFFFFFFFF;
+            caps[5] = 0xFFFFFFFF;
+        }
+        copy_to_user(datap, caps, sizeof(caps));
+    }
+    return 0;
+}
+
+static s64 sys_capset_impl(pt_regs_t *r)
+{
+    (void)r;
+    return 0;
+}
+
+static s64 sys_sethostname_impl(pt_regs_t *r)
+{
+    const char *name = (const char *)r->rdi;
+    size_t len = (size_t)r->rsi;
+    process_t *proc = sched_current_process();
+    if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
+    if (!name || (uintptr_t)name >= 0x8000000000000000ULL || len >= sizeof(g_kernel_nodename)) return -(s64)EINVAL;
+    char buf[65];
+    memset(buf, 0, sizeof(buf));
+    if (copy_from_user(buf, name, len) != 0) return -(s64)EFAULT;
+    buf[len] = '\0';
+    strncpy(g_kernel_nodename, buf, sizeof(g_kernel_nodename) - 1);
+    g_kernel_nodename[sizeof(g_kernel_nodename) - 1] = '\0';
+    return 0;
+}
+
+static s64 sys_setdomainname_impl(pt_regs_t *r)
+{
+    const char *name = (const char *)r->rdi;
+    size_t len = (size_t)r->rsi;
+    process_t *proc = sched_current_process();
+    if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
+    if (!name || (uintptr_t)name >= 0x8000000000000000ULL || len >= sizeof(g_kernel_domainname)) return -(s64)EINVAL;
+    char buf[65];
+    memset(buf, 0, sizeof(buf));
+    if (copy_from_user(buf, name, len) != 0) return -(s64)EFAULT;
+    buf[len] = '\0';
+    strncpy(g_kernel_domainname, buf, sizeof(g_kernel_domainname) - 1);
+    g_kernel_domainname[sizeof(g_kernel_domainname) - 1] = '\0';
+    return 0;
+}
+
+static s64 sys_getpriority_impl(pt_regs_t *r)
+{
+    int which = (int)r->rdi;
+    int who = (int)r->rsi;
+    (void)which; (void)who;
+    return 0;
+}
+
+static s64 sys_setpriority_impl(pt_regs_t *r)
+{
+    int which = (int)r->rdi;
+    int who = (int)r->rsi;
+    int prio = (int)r->rdx;
+    (void)which; (void)who; (void)prio;
+    return 0;
+}
+
+static s64 sys_chroot_impl(pt_regs_t *r)
+{
+    const char *user_path = (const char *)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!security_check_permission(proc, CAP_SYS_CHROOT) && !security_check_permission(proc, CAP_SYS_ADMIN)) {
+        return -(s64)EPERM;
+    }
+    char kpath[512];
+    s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), user_path);
+    if (perr < 0) return perr;
+
+    dentry_t *dentry = NULL;
+    s64 err = vfs_path_lookup(kpath, &dentry);
+    if (err < 0 || !dentry || !dentry->d_inode) {
+        if (dentry && !dentry->d_inode) kfree(dentry);
+        return -(s64)ENOENT;
+    }
+    if (!S_ISDIR(dentry->d_inode->i_mode)) {
+        return -(s64)ENOTDIR;
+    }
+
+    if (proc) {
+        strncpy(proc->cwd, kpath, sizeof(proc->cwd) - 1);
+        proc->cwd[sizeof(proc->cwd) - 1] = '\0';
+    }
+    return 0;
+}
+
+/* ── Linux Inotify Subsystem ──────────────────────────────────────────────── */
+#define INOTIFY_MAX_WATCHES 32
+#define INOTIFY_MAX_EVENTS  64
+
+#define IN_ACCESS        0x00000001
+#define IN_MODIFY        0x00000002
+#define IN_ATTRIB        0x00000004
+#define IN_CLOSE_WRITE   0x00000008
+#define IN_CLOSE_NOWRITE 0x00000010
+#define IN_OPEN          0x00000020
+#define IN_MOVED_FROM    0x00000040
+#define IN_MOVED_TO      0x00000080
+#define IN_CREATE        0x00000100
+#define IN_DELETE        0x00000200
+#define IN_DELETE_SELF   0x00000400
+#define IN_MOVE_SELF     0x00000800
+#define IN_IGNORED       0x00008000
+#define IN_ISDIR         0x40000000
+#define IN_ONESHOT       0x80000000
+
+#define IN_CLOEXEC       02000000
+#define IN_NONBLOCK      00004000
+
+typedef struct {
+    int      wd;
+    char     path[128];
+    uint32_t mask;
+    int      active;
+} inotify_watch_entry_t;
+
+typedef struct inotify_raw_event {
+    int      wd;
+    uint32_t mask;
+    uint32_t cookie;
+    uint32_t len;
+    char     name[32];
+} inotify_raw_event_t;
+
+typedef struct inotify_ctx {
+    spinlock_t lock;
+    int next_wd;
+    int watch_count;
+    inotify_watch_entry_t watches[INOTIFY_MAX_WATCHES];
+    int event_head;
+    int event_tail;
+    int event_count;
+    inotify_raw_event_t events[INOTIFY_MAX_EVENTS];
+    int flags;
+} inotify_ctx_t;
+
+struct user_inotify_event {
+    int      wd;
+    uint32_t mask;
+    uint32_t cookie;
+    uint32_t len;
+};
+
+static s64 inotify_read_op(file_t *filp, void *buf, size_t len, u64 *offset)
+{
+    (void)offset;
+    if (!filp || !filp->private_data) return -(s64)EBADF;
+    if (!buf || len < sizeof(struct user_inotify_event)) return -(s64)EINVAL;
+
+    inotify_ctx_t *ctx = (inotify_ctx_t *)filp->private_data;
+    spinlock_lock(&ctx->lock);
+
+    if (ctx->event_count == 0) {
+        spinlock_unlock(&ctx->lock);
+        if (filp->f_flags & O_NONBLOCK) return -(s64)EAGAIN;
+        return 0;
+    }
+
+    size_t bytes_written = 0;
+    u8 *out = (u8 *)buf;
+
+    while (ctx->event_count > 0) {
+        inotify_raw_event_t *ev = &ctx->events[ctx->event_head];
+        size_t event_wire_size = sizeof(struct user_inotify_event) + ev->len;
+        if (bytes_written + event_wire_size > len) {
+            if (bytes_written == 0) {
+                spinlock_unlock(&ctx->lock);
+                return -(s64)EINVAL;
+            }
+            break;
+        }
+
+        struct user_inotify_event hdr;
+        hdr.wd = ev->wd;
+        hdr.mask = ev->mask;
+        hdr.cookie = ev->cookie;
+        hdr.len = ev->len;
+
+        memcpy(out + bytes_written, &hdr, sizeof(hdr));
+        if (ev->len > 0) {
+            memcpy(out + bytes_written + sizeof(hdr), ev->name, ev->len);
+        }
+
+        bytes_written += event_wire_size;
+        ctx->event_head = (ctx->event_head + 1) % INOTIFY_MAX_EVENTS;
+        ctx->event_count--;
+    }
+
+    spinlock_unlock(&ctx->lock);
+    return (s64)bytes_written;
+}
+
+static int inotify_poll_op(file_t *filp)
+{
+    if (!filp || !filp->private_data) return 0;
+    inotify_ctx_t *ctx = (inotify_ctx_t *)filp->private_data;
+    int mask = 0;
+    spinlock_lock(&ctx->lock);
+    if (ctx->event_count > 0) mask |= (POLLIN | POLLRDNORM);
+    mask |= (POLLOUT | POLLWRNORM);
+    spinlock_unlock(&ctx->lock);
+    return mask;
+}
+
+static s64 inotify_release_op(inode_t *inode, file_t *filp)
+{
+    (void)inode;
+    if (filp && filp->private_data) {
+        kfree(filp->private_data);
+        filp->private_data = NULL;
+    }
+    return 0;
+}
+
+static file_operations_t g_inotify_fops = {
+    .read = inotify_read_op,
+    .poll = inotify_poll_op,
+    .release = inotify_release_op,
+};
+
+static s64 sys_inotify_init1_impl(pt_regs_t *r)
+{
+    int flags = (int)r->rdi;
+    if (flags & ~(IN_CLOEXEC | IN_NONBLOCK)) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    inotify_ctx_t *ctx = (inotify_ctx_t *)kzalloc(sizeof(inotify_ctx_t));
+    if (!ctx) return -(s64)ENOMEM;
+    ctx->next_wd = 1;
+    ctx->flags = flags;
+    spinlock_init(&ctx->lock);
+
+    file_t *f = (file_t *)kzalloc(sizeof(file_t));
+    if (!f) {
+        kfree(ctx);
+        return -(s64)ENOMEM;
+    }
+
+    f->f_op = &g_inotify_fops;
+    f->private_data = ctx;
+    f->f_flags = (flags & IN_NONBLOCK) ? O_NONBLOCK : 0;
+    f->f_fd_flags = (flags & IN_CLOEXEC) ? FD_CLOEXEC : 0;
+    f->f_mode = 0600;
+    f->f_count = 1;
+
+    for (int i = 3; i < 64; i++) {
+        if (!proc->handle_table[i]) {
+            proc->handle_table[i] = f;
+            proc->fd_flags[i] = f->f_fd_flags;
+            return i;
+        }
+    }
+    kfree(ctx);
+    kfree(f);
+    return -(s64)EMFILE;
+}
+
+static s64 sys_inotify_init_impl(pt_regs_t *r)
+{
+    pt_regs_t sub = *r;
+    sub.rdi = 0;
+    return sys_inotify_init1_impl(&sub);
+}
+
+static s64 sys_inotify_add_watch_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    const char *user_path = (const char *)r->rsi;
+    u32 mask = (u32)r->rdx;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    file_t *f = proc->handle_table[fd];
+    if (f->f_op != &g_inotify_fops || !f->private_data) return -(s64)EINVAL;
+
+    char kpath[256];
+    s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), user_path);
+    if (perr < 0) return perr;
+
+    dentry_t *dentry = NULL;
+    s64 err = vfs_path_lookup(kpath, &dentry);
+    if (err < 0 || !dentry || !dentry->d_inode) {
+        if (dentry && !dentry->d_inode) kfree(dentry);
+        return -(s64)ENOENT;
+    }
+
+    inotify_ctx_t *ctx = (inotify_ctx_t *)f->private_data;
+    spinlock_lock(&ctx->lock);
+
+    /* Check if already watched */
+    for (int i = 0; i < INOTIFY_MAX_WATCHES; i++) {
+        if (ctx->watches[i].active && strcmp(ctx->watches[i].path, kpath) == 0) {
+            ctx->watches[i].mask = mask;
+            int existing_wd = ctx->watches[i].wd;
+            spinlock_unlock(&ctx->lock);
+            return existing_wd;
+        }
+    }
+
+    /* Allocate new watch */
+    for (int i = 0; i < INOTIFY_MAX_WATCHES; i++) {
+        if (!ctx->watches[i].active) {
+            ctx->watches[i].active = 1;
+            ctx->watches[i].wd = ctx->next_wd++;
+            ctx->watches[i].mask = mask;
+            strncpy(ctx->watches[i].path, kpath, sizeof(ctx->watches[i].path) - 1);
+            ctx->watches[i].path[sizeof(ctx->watches[i].path) - 1] = '\0';
+            ctx->watch_count++;
+            int assigned_wd = ctx->watches[i].wd;
+
+            /* Post initial access event */
+            if (ctx->event_count < INOTIFY_MAX_EVENTS) {
+                inotify_raw_event_t *ev = &ctx->events[ctx->event_tail];
+                ev->wd = assigned_wd;
+                ev->mask = mask & (IN_OPEN | IN_ACCESS | IN_ATTRIB | IN_ISDIR);
+                ev->cookie = 0;
+                ev->len = 0;
+                ev->name[0] = '\0';
+                ctx->event_tail = (ctx->event_tail + 1) % INOTIFY_MAX_EVENTS;
+                ctx->event_count++;
+            }
+
+            spinlock_unlock(&ctx->lock);
+            return assigned_wd;
+        }
+    }
+
+    spinlock_unlock(&ctx->lock);
+    return -(s64)ENOSPC;
+}
+
+static s64 sys_inotify_rm_watch_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    int wd = (int)r->rsi;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    file_t *f = proc->handle_table[fd];
+    if (f->f_op != &g_inotify_fops || !f->private_data) return -(s64)EINVAL;
+
+    inotify_ctx_t *ctx = (inotify_ctx_t *)f->private_data;
+    spinlock_lock(&ctx->lock);
+
+    for (int i = 0; i < INOTIFY_MAX_WATCHES; i++) {
+        if (ctx->watches[i].active && ctx->watches[i].wd == wd) {
+            ctx->watches[i].active = 0;
+            ctx->watch_count--;
+
+            /* Post IN_IGNORED event */
+            if (ctx->event_count < INOTIFY_MAX_EVENTS) {
+                inotify_raw_event_t *ev = &ctx->events[ctx->event_tail];
+                ev->wd = wd;
+                ev->mask = IN_IGNORED;
+                ev->cookie = 0;
+                ev->len = 0;
+                ev->name[0] = '\0';
+                ctx->event_tail = (ctx->event_tail + 1) % INOTIFY_MAX_EVENTS;
+                ctx->event_count++;
+            }
+
+            spinlock_unlock(&ctx->lock);
+            return 0;
+        }
+    }
+
+    spinlock_unlock(&ctx->lock);
+    return -(s64)EINVAL;
+}
+
+/* ── Linux Extended Attributes (xattr) Subsystem ─────────────────────────── */
+#define MAX_XATTR_ENTRIES 128
+#define XATTR_CREATE  0x1
+#define XATTR_REPLACE 0x2
+
+typedef struct {
+    char   path[128];
+    char   name[64];
+    char   value[256];
+    size_t val_len;
+    int    active;
+} xattr_entry_t;
+
+static xattr_entry_t g_xattrs[MAX_XATTR_ENTRIES];
+static spinlock_t    g_xattr_lock = SPINLOCK_INIT;
+
+static s64 do_setxattr(const char *path, const char *name, const void *value, size_t size, int flags)
+{
+    if (!path || !name || (size > 0 && !value) || size > 256) return -(s64)EINVAL;
+    if (strlen(name) >= 64) return -(s64)ERANGE;
+
+    spinlock_lock(&g_xattr_lock);
+
+    int existing_slot = -1;
+    int free_slot = -1;
+
+    for (int i = 0; i < MAX_XATTR_ENTRIES; i++) {
+        if (g_xattrs[i].active) {
+            if (strcmp(g_xattrs[i].path, path) == 0 && strcmp(g_xattrs[i].name, name) == 0) {
+                existing_slot = i;
+                break;
+            }
+        } else if (free_slot < 0) {
+            free_slot = i;
+        }
+    }
+
+    if ((flags & XATTR_CREATE) && existing_slot >= 0) {
+        spinlock_unlock(&g_xattr_lock);
+        return -(s64)EEXIST;
+    }
+    if ((flags & XATTR_REPLACE) && existing_slot < 0) {
+        spinlock_unlock(&g_xattr_lock);
+        return -(s64)ENODATA;
+    }
+
+    int slot = (existing_slot >= 0) ? existing_slot : free_slot;
+    if (slot < 0) {
+        spinlock_unlock(&g_xattr_lock);
+        return -(s64)ENOSPC;
+    }
+
+    strncpy(g_xattrs[slot].path, path, sizeof(g_xattrs[slot].path) - 1);
+    g_xattrs[slot].path[sizeof(g_xattrs[slot].path) - 1] = '\0';
+
+    strncpy(g_xattrs[slot].name, name, sizeof(g_xattrs[slot].name) - 1);
+    g_xattrs[slot].name[sizeof(g_xattrs[slot].name) - 1] = '\0';
+
+    if (size > 0 && value) {
+        if (copy_from_user(g_xattrs[slot].value, value, size) != 0) {
+            spinlock_unlock(&g_xattr_lock);
+            return -(s64)EFAULT;
+        }
+    }
+    g_xattrs[slot].val_len = size;
+    g_xattrs[slot].active = 1;
+
+    spinlock_unlock(&g_xattr_lock);
+    return 0;
+}
+
+static s64 do_getxattr(const char *path, const char *name, void *value, size_t size)
+{
+    if (!path || !name) return -(s64)EINVAL;
+
+    spinlock_lock(&g_xattr_lock);
+    for (int i = 0; i < MAX_XATTR_ENTRIES; i++) {
+        if (g_xattrs[i].active && strcmp(g_xattrs[i].path, path) == 0 && strcmp(g_xattrs[i].name, name) == 0) {
+            size_t val_len = g_xattrs[i].val_len;
+            if (size == 0 || !value) {
+                spinlock_unlock(&g_xattr_lock);
+                return (s64)val_len;
+            }
+            if (size < val_len) {
+                spinlock_unlock(&g_xattr_lock);
+                return -(s64)ERANGE;
+            }
+            if (copy_to_user(value, g_xattrs[i].value, val_len) != 0) {
+                spinlock_unlock(&g_xattr_lock);
+                return -(s64)EFAULT;
+            }
+            spinlock_unlock(&g_xattr_lock);
+            return (s64)val_len;
+        }
+    }
+    spinlock_unlock(&g_xattr_lock);
+    return -(s64)ENODATA;
+}
+
+static s64 do_listxattr(const char *path, char *list, size_t size)
+{
+    if (!path) return -(s64)EINVAL;
+
+    spinlock_lock(&g_xattr_lock);
+    size_t total_len = 0;
+    for (int i = 0; i < MAX_XATTR_ENTRIES; i++) {
+        if (g_xattrs[i].active && strcmp(g_xattrs[i].path, path) == 0) {
+            total_len += strlen(g_xattrs[i].name) + 1;
+        }
+    }
+
+    if (size == 0 || !list) {
+        spinlock_unlock(&g_xattr_lock);
+        return (s64)total_len;
+    }
+    if (size < total_len) {
+        spinlock_unlock(&g_xattr_lock);
+        return -(s64)ERANGE;
+    }
+
+    size_t off = 0;
+    for (int i = 0; i < MAX_XATTR_ENTRIES; i++) {
+        if (g_xattrs[i].active && strcmp(g_xattrs[i].path, path) == 0) {
+            size_t nlen = strlen(g_xattrs[i].name) + 1;
+            if (copy_to_user(list + off, g_xattrs[i].name, nlen) != 0) {
+                spinlock_unlock(&g_xattr_lock);
+                return -(s64)EFAULT;
+            }
+            off += nlen;
+        }
+    }
+    spinlock_unlock(&g_xattr_lock);
+    return (s64)total_len;
+}
+
+static s64 do_removexattr(const char *path, const char *name)
+{
+    if (!path || !name) return -(s64)EINVAL;
+
+    spinlock_lock(&g_xattr_lock);
+    for (int i = 0; i < MAX_XATTR_ENTRIES; i++) {
+        if (g_xattrs[i].active && strcmp(g_xattrs[i].path, path) == 0 && strcmp(g_xattrs[i].name, name) == 0) {
+            g_xattrs[i].active = 0;
+            spinlock_unlock(&g_xattr_lock);
+            return 0;
+        }
+    }
+    spinlock_unlock(&g_xattr_lock);
+    return -(s64)ENODATA;
+}
+
+static s64 sys_setxattr_impl(pt_regs_t *r)
+{
+    const char *upath = (const char *)r->rdi;
+    const char *uname = (const char *)r->rsi;
+    const void *uval = (const void *)r->rdx;
+    size_t size = (size_t)r->r10;
+    int flags = (int)r->r8;
+
+    char kpath[256];
+    char kname[64];
+    s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), upath);
+    if (perr < 0) return perr;
+    if (copy_from_user(kname, uname, sizeof(kname) - 1) != 0) return -(s64)EFAULT;
+    kname[sizeof(kname) - 1] = '\0';
+
+    return do_setxattr(kpath, kname, uval, size, flags);
+}
+
+static s64 sys_lsetxattr_impl(pt_regs_t *r)
+{
+    return sys_setxattr_impl(r);
+}
+
+static s64 sys_fsetxattr_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    const char *uname = (const char *)r->rsi;
+    const void *uval = (const void *)r->rdx;
+    size_t size = (size_t)r->r10;
+    int flags = (int)r->r8;
+
+    process_t *proc = sched_current_process();
+    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    char kpath[32];
+    snprintf(kpath, sizeof(kpath), "fd:%d", fd);
+    char kname[64];
+    if (copy_from_user(kname, uname, sizeof(kname) - 1) != 0) return -(s64)EFAULT;
+    kname[sizeof(kname) - 1] = '\0';
+
+    return do_setxattr(kpath, kname, uval, size, flags);
+}
+
+static s64 sys_getxattr_impl(pt_regs_t *r)
+{
+    const char *upath = (const char *)r->rdi;
+    const char *uname = (const char *)r->rsi;
+    void *uval = (void *)r->rdx;
+    size_t size = (size_t)r->r10;
+
+    char kpath[256];
+    char kname[64];
+    s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), upath);
+    if (perr < 0) return perr;
+    if (copy_from_user(kname, uname, sizeof(kname) - 1) != 0) return -(s64)EFAULT;
+    kname[sizeof(kname) - 1] = '\0';
+
+    return do_getxattr(kpath, kname, uval, size);
+}
+
+static s64 sys_lgetxattr_impl(pt_regs_t *r)
+{
+    return sys_getxattr_impl(r);
+}
+
+static s64 sys_fgetxattr_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    const char *uname = (const char *)r->rsi;
+    void *uval = (void *)r->rdx;
+    size_t size = (size_t)r->r10;
+
+    process_t *proc = sched_current_process();
+    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    char kpath[32];
+    snprintf(kpath, sizeof(kpath), "fd:%d", fd);
+    char kname[64];
+    if (copy_from_user(kname, uname, sizeof(kname) - 1) != 0) return -(s64)EFAULT;
+    kname[sizeof(kname) - 1] = '\0';
+
+    return do_getxattr(kpath, kname, uval, size);
+}
+
+static s64 sys_listxattr_impl(pt_regs_t *r)
+{
+    const char *upath = (const char *)r->rdi;
+    char *ulist = (char *)r->rsi;
+    size_t size = (size_t)r->rdx;
+
+    char kpath[256];
+    s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), upath);
+    if (perr < 0) return perr;
+
+    return do_listxattr(kpath, ulist, size);
+}
+
+static s64 sys_llistxattr_impl(pt_regs_t *r)
+{
+    return sys_listxattr_impl(r);
+}
+
+static s64 sys_flistxattr_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    char *ulist = (char *)r->rsi;
+    size_t size = (size_t)r->rdx;
+
+    process_t *proc = sched_current_process();
+    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    char kpath[32];
+    snprintf(kpath, sizeof(kpath), "fd:%d", fd);
+
+    return do_listxattr(kpath, ulist, size);
+}
+
+static s64 sys_removexattr_impl(pt_regs_t *r)
+{
+    const char *upath = (const char *)r->rdi;
+    const char *uname = (const char *)r->rsi;
+
+    char kpath[256];
+    char kname[64];
+    s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), upath);
+    if (perr < 0) return perr;
+    if (copy_from_user(kname, uname, sizeof(kname) - 1) != 0) return -(s64)EFAULT;
+    kname[sizeof(kname) - 1] = '\0';
+
+    return do_removexattr(kpath, kname);
+}
+
+static s64 sys_lremovexattr_impl(pt_regs_t *r)
+{
+    return sys_removexattr_impl(r);
+}
+
+static s64 sys_fremovexattr_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    const char *uname = (const char *)r->rsi;
+
+    process_t *proc = sched_current_process();
+    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    char kpath[32];
+    snprintf(kpath, sizeof(kpath), "fd:%d", fd);
+    char kname[64];
+    if (copy_from_user(kname, uname, sizeof(kname) - 1) != 0) return -(s64)EFAULT;
+    kname[sizeof(kname) - 1] = '\0';
+
+    return do_removexattr(kpath, kname);
 }

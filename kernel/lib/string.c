@@ -87,9 +87,21 @@ int memcmp(const void *ptr1, const void *ptr2, size_t n)
 {
     const unsigned char *p1 = (const unsigned char *)ptr1;
     const unsigned char *p2 = (const unsigned char *)ptr2;
+
+    while (n >= 8) {
+        u64 v1 = *(const u64 *)p1;
+        u64 v2 = *(const u64 *)p2;
+        if (v1 != v2) {
+            break;
+        }
+        p1 += 8;
+        p2 += 8;
+        n -= 8;
+    }
+
     while (n--) {
         if (*p1 != *p2) {
-            return *p1 - *p2;
+            return (int)*p1 - (int)*p2;
         }
         p1++;
         p2++;
@@ -99,9 +111,23 @@ int memcmp(const void *ptr1, const void *ptr2, size_t n)
 
 size_t strlen(const char *str)
 {
-    size_t len = 0;
-    while (str && *str++) len++;
-    return len;
+    if (!str) return 0;
+    const char *s = str;
+    while ((uintptr_t)s & 7) {
+        if (*s == '\0') return (size_t)(s - str);
+        s++;
+    }
+    const u64 *w = (const u64 *)s;
+    for (;;) {
+        u64 val = *w;
+        if (((val - 0x0101010101010101ULL) & ~val & 0x8080808080808080ULL) != 0) {
+            break;
+        }
+        w++;
+    }
+    s = (const char *)w;
+    while (*s) s++;
+    return (size_t)(s - str);
 }
 
 char *strcpy(char *dest, const char *src)

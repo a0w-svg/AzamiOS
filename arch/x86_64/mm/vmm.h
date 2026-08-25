@@ -50,6 +50,8 @@
 #define VMM_USER_RO     (VMM_F_PRESENT | VMM_F_USER)
 #define VMM_USER_RW     (VMM_F_PRESENT | VMM_F_WRITE  | VMM_F_USER   | VMM_F_NX)
 #define VMM_USER_RX     (VMM_F_PRESENT | VMM_F_USER)
+#define VMM_F_WC        (VMM_F_PWT) /* Write-Combining caching via PAT PA1/PA5 */
+#define VMM_USER_WC     (VMM_F_PRESENT | VMM_F_WRITE  | VMM_F_USER   | VMM_F_NX | VMM_F_WC)
 #define VMM_MMIO        (VMM_F_PRESENT | VMM_F_WRITE  | VMM_F_NX | VMM_F_PCD | VMM_F_PWT)
 
 /* ── PML4 index extraction from a virtual address ───────────────────────────── */
@@ -138,3 +140,9 @@ vmm_space_t vmm_kernel_space(void);
 
 /** vmm_map_io(phys, size) — Map physical MMIO/IO range and return virtual address. */
 void *vmm_map_io(phys_addr_t phys, size_t size);
+
+/**
+ * vmm_set_flags(space, virt, count, flags) — Update PTE protection flags for a page range.
+ * Used by sys_mprotect.
+ */
+int vmm_set_flags(vmm_space_t space, virt_addr_t virt, size_t count, u64 flags);

@@ -124,7 +124,51 @@ BIN_APPS = \
     $(BIN_DIR)/unexpand.elf \
     $(BIN_DIR)/expr.elf \
     $(BIN_DIR)/printenv.elf \
-    $(BIN_DIR)/split.elf
+    $(BIN_DIR)/split.elf \
+    $(BIN_DIR)/tty.elf \
+    $(BIN_DIR)/logname.elf \
+    $(BIN_DIR)/nl.elf \
+    $(BIN_DIR)/cksum.elf \
+    $(BIN_DIR)/pathchk.elf \
+    $(BIN_DIR)/nohup.elf \
+    $(BIN_DIR)/groups.elf \
+    $(BIN_DIR)/users.elf \
+    $(BIN_DIR)/nslookup.elf \
+    $(BIN_DIR)/who.elf \
+    $(BIN_DIR)/hostname.elf \
+    $(BIN_DIR)/sync.elf \
+    $(BIN_DIR)/readlink.elf \
+    $(BIN_DIR)/realpath.elf \
+    $(BIN_DIR)/tsort.elf \
+    $(BIN_DIR)/pr.elf \
+    $(BIN_DIR)/od.elf \
+    $(BIN_DIR)/timeout.elf \
+    $(BIN_DIR)/truncate.elf \
+    $(BIN_DIR)/mktemp.elf \
+    $(BIN_DIR)/chroot.elf \
+    $(BIN_DIR)/nice.elf \
+    $(BIN_DIR)/renice.elf \
+    $(BIN_DIR)/killall.elf \
+    $(BIN_DIR)/pgrep.elf \
+    $(BIN_DIR)/losetup.elf \
+    $(BIN_DIR)/diff.elf \
+    $(BIN_DIR)/patch.elf \
+    $(BIN_DIR)/sha256sum.elf \
+    $(BIN_DIR)/sha1sum.elf \
+    $(BIN_DIR)/gzip.elf \
+    $(BIN_DIR)/file.elf \
+    $(BIN_DIR)/pstree.elf \
+    $(BIN_DIR)/lsof.elf \
+    $(BIN_DIR)/taskset.elf \
+    $(BIN_DIR)/iostat.elf \
+    $(BIN_DIR)/lsblk.elf \
+    $(BIN_DIR)/ip.elf \
+    $(BIN_DIR)/sysctl.elf \
+    $(BIN_DIR)/inotifywait.elf \
+    $(BIN_DIR)/vmstat.elf \
+    $(BIN_DIR)/getfattr.elf \
+    $(BIN_DIR)/setfattr.elf
+
 
 .PHONY: all clean libc apps skeleton etc icons toolchain
 
@@ -139,14 +183,15 @@ libc/libc.a libc/crt0.o:
 	$(MAKE) -C libc
 
 toolchain: skeleton libc
-	@mkdir -p $(BUILD_DIR)/lib64 $(BUILD_DIR)/lib/x86_64-linux-gnu $(BUILD_DIR)/lib $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/bin $(BUILD_DIR)/bin
+	@rm -rf $(BUILD_DIR)/home/a0wsvg $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 2>/dev/null || true
+	@mkdir -p $(BUILD_DIR)/lib64 $(BUILD_DIR)/lib/x86_64-linux-gnu $(BUILD_DIR)/lib $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/bin $(BUILD_DIR)/bin $(BUILD_DIR)/usr/local/lib $(BUILD_DIR)/usr/local/bin
 	@mkdir -p $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0
 	@mkdir -p $(BUILD_DIR)/usr/lib/ldscripts $(BUILD_DIR)/lib/ldscripts $(BUILD_DIR)/usr/lib/bfd-plugins
 	@mkdir -p $(BUILD_DIR)/usr/include $(BUILD_DIR)/usr/local/include
 	@for tool in gcc g++ c++ cpp as ld ar ranlib nm objdump objcopy strip strings readelf size addr2line c++filt gcov gcov-dump gcov-tool elfedit; do \
 		src="/home/a0wsvg/opt/cross-x86_64/bin/x86_64-elf-$$tool"; \
 		if [ -f "$$src" ]; then \
-			strip -s "$$src" -o $(BUILD_DIR)/usr/bin/$$tool 2>/dev/null || cp "$$src" $(BUILD_DIR)/usr/bin/$$tool; \
+			strip --strip-debug "$$src" -o $(BUILD_DIR)/usr/bin/$$tool 2>/dev/null || cp "$$src" $(BUILD_DIR)/usr/bin/$$tool; \
 			ln -sf /usr/bin/$$tool $(BUILD_DIR)/bin/$$tool 2>/dev/null || cp $(BUILD_DIR)/usr/bin/$$tool $(BUILD_DIR)/bin/$$tool; \
 		fi; \
 	done
@@ -157,48 +202,62 @@ toolchain: skeleton libc
 	@for pass in cc1 collect2 lto-wrapper liblto_plugin.so; do \
 		src="/home/a0wsvg/opt/cross-x86_64/libexec/gcc/x86_64-elf/14.2.0/$$pass"; \
 		if [ -f "$$src" ]; then \
-			strip -s "$$src" -o $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/$$pass 2>/dev/null || cp "$$src" $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/$$pass; \
+			strip --strip-debug "$$src" -o $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/$$pass 2>/dev/null || cp "$$src" $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/$$pass; \
 		fi; \
 	done
+
+
 	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/liblto_plugin.so $(BUILD_DIR)/usr/lib/bfd-plugins/liblto_plugin.so 2>/dev/null || true
 	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/liblto_plugin.so $(BUILD_DIR)/usr/lib/liblto_plugin.so 2>/dev/null || true
 	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/liblto_plugin.so $(BUILD_DIR)/lib/liblto_plugin.so 2>/dev/null || true
 	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/lto-wrapper $(BUILD_DIR)/usr/bin/lto-wrapper 2>/dev/null || true
 	@cp -r /home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/ldscripts/* $(BUILD_DIR)/usr/lib/ldscripts/ 2>/dev/null || true
-	@ln -sf /usr/lib/ldscripts $(BUILD_DIR)/lib/ldscripts 2>/dev/null || true
+	@cp -r /home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/ldscripts/* $(BUILD_DIR)/lib/ldscripts/ 2>/dev/null || true
 	@cp -r /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include/* $(BUILD_DIR)/usr/include/ 2>/dev/null || true
-	@cp -r /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include-fixed/* $(BUILD_DIR)/usr/include/ 2>/dev/null || true
-	@cp -r /home/a0wsvg/opt/cross-x86_64/x86_64-elf/include/* $(BUILD_DIR)/usr/include/ 2>/dev/null || true
 	@cp -r libc/include/* $(BUILD_DIR)/usr/include/ 2>/dev/null || true
 	@cp -r libc/include/* $(BUILD_DIR)/usr/local/include/ 2>/dev/null || true
-	@cp /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/crtbegin*.o $(BUILD_DIR)/usr/lib/ 2>/dev/null || true
-	@cp /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/crtend*.o $(BUILD_DIR)/usr/lib/ 2>/dev/null || true
-	@cp /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/libgcc*.a $(BUILD_DIR)/usr/lib/ 2>/dev/null || true
-	@cp libc/crt0.o $(BUILD_DIR)/usr/lib/crt0.o 2>/dev/null || true
-	@cp libc/libc.a $(BUILD_DIR)/usr/lib/libc.a 2>/dev/null || true
-	@cp libc/libc.a $(BUILD_DIR)/usr/lib/libm.a 2>/dev/null || true
-	@cp libc/libc.a $(BUILD_DIR)/usr/lib/libg.a 2>/dev/null || true
-	@cp libc/libc.a $(BUILD_DIR)/usr/lib/libnosys.a 2>/dev/null || true
-	@mkdir -p $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64
+	@mkdir -p $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf
+	@mkdir -p $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0
+	@mkdir -p $(BUILD_DIR)/x86_64-elf $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0
 	@ln -sf /usr/bin $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/bin 2>/dev/null || true
 	@ln -sf /usr/libexec $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/libexec 2>/dev/null || true
 	@ln -sf /usr/lib $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib 2>/dev/null || true
 	@ln -sf /usr/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/include 2>/dev/null || true
-	@mkdir -p $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf
 	@ln -sf /usr/bin $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin 2>/dev/null || true
 	@ln -sf /usr/lib $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib 2>/dev/null || true
 	@ln -sf /usr/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include 2>/dev/null || true
 	@ln -sf /usr/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/sys-include 2>/dev/null || true
-	@ln -sf /usr/lib $(BUILD_DIR)/lib 2>/dev/null || true
-	@ln -sf /usr/lib $(BUILD_DIR)/lib64 2>/dev/null || true
-	@cp /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 $(BUILD_DIR)/lib64/ld-linux-x86-64.so.2 2>/dev/null || true
-	@cp /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 $(BUILD_DIR)/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 2>/dev/null || true
-	@cp /lib/x86_64-linux-gnu/libc.so.6 $(BUILD_DIR)/lib/x86_64-linux-gnu/libc.so.6 2>/dev/null || true
-	@cp /lib/x86_64-linux-gnu/libm.so.6 $(BUILD_DIR)/lib/x86_64-linux-gnu/libm.so.6 2>/dev/null || true
-	@cp /lib/x86_64-linux-gnu/libc.so.6 $(BUILD_DIR)/lib64/libc.so.6 2>/dev/null || true
-	@cp /lib/x86_64-linux-gnu/libm.so.6 $(BUILD_DIR)/lib64/libm.so.6 2>/dev/null || true
-	@cp /lib/x86_64-linux-gnu/libc.so.6 $(BUILD_DIR)/lib/libc.so.6 2>/dev/null || true
-	@cp /lib/x86_64-linux-gnu/libm.so.6 $(BUILD_DIR)/lib/libm.so.6 2>/dev/null || true
+	@ln -sf /usr/bin $(BUILD_DIR)/x86_64-elf/bin 2>/dev/null || true
+	@ln -sf /usr/lib $(BUILD_DIR)/x86_64-elf/lib 2>/dev/null || true
+	@ln -sf /usr/include $(BUILD_DIR)/x86_64-elf/include 2>/dev/null || true
+	@ln -sf /usr/include $(BUILD_DIR)/x86_64-elf/sys-include 2>/dev/null || true
+	@ln -sf /usr/libexec $(BUILD_DIR)/x86_64-elf/libexec 2>/dev/null || true
+	@for d in $(BUILD_DIR)/usr/lib $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/usr/local/lib $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0 $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0 $(BUILD_DIR)/x86_64-elf/lib; do \
+		mkdir -p "$$d" 2>/dev/null || true; \
+		cp /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/crtbegin*.o "$$d"/ 2>/dev/null || true; \
+		cp /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/crtend*.o "$$d"/ 2>/dev/null || true; \
+		cp /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/libgcc*.a "$$d"/ 2>/dev/null || true; \
+		cp libc/crt0.o "$$d"/crt0.o 2>/dev/null || true; \
+		cp libc/libc.a "$$d"/libc.a 2>/dev/null || true; \
+		cp libc/libc.a "$$d"/libm.a 2>/dev/null || true; \
+		cp libc/libc.a "$$d"/libg.a 2>/dev/null || true; \
+		cp libc/libc.a "$$d"/libnosys.a 2>/dev/null || true; \
+	done
+	@mkdir -p $(BUILD_DIR)/lib64 $(BUILD_DIR)/lib/x86_64-linux-gnu $(BUILD_DIR)/lib $(BUILD_DIR)/usr/lib
+	@cp -L /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 $(BUILD_DIR)/lib64/ld-linux-x86-64.so.2 2>/dev/null || true
+	@cp -L /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 $(BUILD_DIR)/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 2>/dev/null || true
+	@cp -L /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 $(BUILD_DIR)/lib/ld-linux-x86-64.so.2 2>/dev/null || true
+	@cp -L /lib/x86_64-linux-gnu/libc.so.6 $(BUILD_DIR)/lib64/libc.so.6 2>/dev/null || true
+	@cp -L /lib/x86_64-linux-gnu/libc.so.6 $(BUILD_DIR)/lib/x86_64-linux-gnu/libc.so.6 2>/dev/null || true
+	@cp -L /lib/x86_64-linux-gnu/libc.so.6 $(BUILD_DIR)/lib/libc.so.6 2>/dev/null || true
+	@cp -L /lib/x86_64-linux-gnu/libc.so.6 $(BUILD_DIR)/usr/lib/libc.so.6 2>/dev/null || true
+	@cp -L /lib/x86_64-linux-gnu/libm.so.6 $(BUILD_DIR)/lib64/libm.so.6 2>/dev/null || true
+	@cp -L /lib/x86_64-linux-gnu/libm.so.6 $(BUILD_DIR)/lib/x86_64-linux-gnu/libm.so.6 2>/dev/null || true
+	@cp -L /lib/x86_64-linux-gnu/libm.so.6 $(BUILD_DIR)/lib/libm.so.6 2>/dev/null || true
+	@cp -L /lib/x86_64-linux-gnu/libm.so.6 $(BUILD_DIR)/usr/lib/libm.so.6 2>/dev/null || true
+
+
+
 
 apps: $(SBIN_APPS) $(BIN_APPS)
 	@for f in $(BIN_DIR)/*.elf; do \
@@ -216,6 +275,16 @@ apps: $(SBIN_APPS) $(BIN_APPS)
 	@ln -sf test.elf $(BIN_DIR)/[ 2>/dev/null || true
 	@ln -sf /bin/test.elf $(BUILD_DIR)/usr/bin/[ 2>/dev/null || true
 	@ln -sf /bin/env.elf $(BUILD_DIR)/usr/bin/env 2>/dev/null || true
+	@ln -sf pgrep.elf $(BIN_DIR)/pkill 2>/dev/null || true
+	@ln -sf /bin/pgrep.elf $(BUILD_DIR)/usr/bin/pkill 2>/dev/null || true
+	@ln -sf gzip.elf $(BIN_DIR)/gunzip 2>/dev/null || true
+	@ln -sf /bin/gzip.elf $(BUILD_DIR)/usr/bin/gunzip 2>/dev/null || true
+	@ln -sf sha256sum.elf $(BIN_DIR)/sha224sum 2>/dev/null || true
+	@ln -sf sha256sum.elf $(BIN_DIR)/sha384sum 2>/dev/null || true
+	@ln -sf sha256sum.elf $(BIN_DIR)/sha512sum 2>/dev/null || true
+	@ln -sf /bin/sha256sum.elf $(BUILD_DIR)/usr/bin/sha224sum 2>/dev/null || true
+	@ln -sf /bin/sha256sum.elf $(BUILD_DIR)/usr/bin/sha384sum 2>/dev/null || true
+	@ln -sf /bin/sha256sum.elf $(BUILD_DIR)/usr/bin/sha512sum 2>/dev/null || true
 
 etc: skeleton
 	@echo "root:x:0:0:root:/root:/bin/sh.elf" > $(BUILD_DIR)/etc/passwd
@@ -245,6 +314,7 @@ etc: skeleton
 	@cp $(BUILD_DIR)/etc/profile $(BUILD_DIR)/root/.profile
 	@cp $(BUILD_DIR)/etc/profile $(BUILD_DIR)/home/azami/.profile
 	@mkdir -p $(BUILD_DIR)/tmp $(BUILD_DIR)/var/tmp $(BUILD_DIR)/var/log $(BUILD_DIR)/var/run
+	@touch $(BUILD_DIR)/var/run/utmp $(BUILD_DIR)/var/log/wtmp 2>/dev/null || true
 	@mkdir -p $(BUILD_DIR)/examples
 	@mkdir -p $(BUILD_DIR)/usr/src/examples
 	@mkdir -p $(BUILD_DIR)/usr/src/libc
@@ -742,6 +812,178 @@ $(BIN_DIR)/printenv.elf: apps/printenv/main.c libc/libc.a libc/crt0.o | skeleton
 $(BIN_DIR)/split.elf: apps/split/main.c libc/libc.a libc/crt0.o | skeleton
 	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/split.o
 	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/split.o libc/libc.a -o $@
+
+$(BIN_DIR)/tty.elf: apps/tty/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/tty.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/tty.o libc/libc.a -o $@
+
+$(BIN_DIR)/logname.elf: apps/logname/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/logname.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/logname.o libc/libc.a -o $@
+
+$(BIN_DIR)/nl.elf: apps/nl/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/nl.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/nl.o libc/libc.a -o $@
+
+$(BIN_DIR)/cksum.elf: apps/cksum/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/cksum.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/cksum.o libc/libc.a -o $@
+
+$(BIN_DIR)/pathchk.elf: apps/pathchk/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/pathchk.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/pathchk.o libc/libc.a -o $@
+
+$(BIN_DIR)/nohup.elf: apps/nohup/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/nohup.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/nohup.o libc/libc.a -o $@
+
+$(BIN_DIR)/groups.elf: apps/groups/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/groups.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/groups.o libc/libc.a -o $@
+
+$(BIN_DIR)/users.elf: apps/users/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/users.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/users.o libc/libc.a -o $@
+
+$(BIN_DIR)/nslookup.elf: apps/nslookup/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/nslookup.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/nslookup.o libc/libc.a -o $@
+
+$(BIN_DIR)/who.elf: apps/who/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/who.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/who.o libc/libc.a -o $@
+
+$(BIN_DIR)/hostname.elf: apps/hostname/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/hostname.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/hostname.o libc/libc.a -o $@
+
+$(BIN_DIR)/sync.elf: apps/sync/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sync.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sync.o libc/libc.a -o $@
+
+$(BIN_DIR)/readlink.elf: apps/readlink/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/readlink.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/readlink.o libc/libc.a -o $@
+
+$(BIN_DIR)/realpath.elf: apps/realpath/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/realpath.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/realpath.o libc/libc.a -o $@
+
+$(BIN_DIR)/tsort.elf: apps/tsort/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/tsort.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/tsort.o libc/libc.a -o $@
+
+$(BIN_DIR)/pr.elf: apps/pr/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/pr.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/pr.o libc/libc.a -o $@
+
+$(BIN_DIR)/od.elf: apps/od/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/od.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/od.o libc/libc.a -o $@
+
+$(BIN_DIR)/timeout.elf: apps/timeout/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/timeout.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/timeout.o libc/libc.a -o $@
+
+$(BIN_DIR)/truncate.elf: apps/truncate/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/truncate.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/truncate.o libc/libc.a -o $@
+
+$(BIN_DIR)/mktemp.elf: apps/mktemp/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/mktemp.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/mktemp.o libc/libc.a -o $@
+
+$(BIN_DIR)/chroot.elf: apps/chroot/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/chroot.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/chroot.o libc/libc.a -o $@
+
+$(BIN_DIR)/nice.elf: apps/nice/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/nice.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/nice.o libc/libc.a -o $@
+
+$(BIN_DIR)/renice.elf: apps/renice/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/renice.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/renice.o libc/libc.a -o $@
+
+$(BIN_DIR)/killall.elf: apps/killall/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/killall.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/killall.o libc/libc.a -o $@
+
+$(BIN_DIR)/pgrep.elf: apps/pgrep/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/pgrep.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/pgrep.o libc/libc.a -o $@
+
+$(BIN_DIR)/losetup.elf: apps/losetup/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/losetup.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/losetup.o libc/libc.a -o $@
+
+$(BIN_DIR)/diff.elf: apps/diff/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/diff.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/diff.o libc/libc.a -o $@
+
+$(BIN_DIR)/patch.elf: apps/patch/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/patch.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/patch.o libc/libc.a -o $@
+
+$(BIN_DIR)/sha256sum.elf: apps/sha256sum/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sha256sum.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sha256sum.o libc/libc.a -o $@
+
+$(BIN_DIR)/sha1sum.elf: apps/sha1sum/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sha1sum.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sha1sum.o libc/libc.a -o $@
+
+$(BIN_DIR)/gzip.elf: apps/gzip/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/gzip.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/gzip.o libc/libc.a -o $@
+
+$(BIN_DIR)/file.elf: apps/file/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/file.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/file.o libc/libc.a -o $@
+
+$(BIN_DIR)/pstree.elf: apps/pstree/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/pstree.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/pstree.o libc/libc.a -o $@
+
+$(BIN_DIR)/lsof.elf: apps/lsof/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/lsof.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/lsof.o libc/libc.a -o $@
+
+$(BIN_DIR)/taskset.elf: apps/taskset/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/taskset.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/taskset.o libc/libc.a -o $@
+
+$(BIN_DIR)/iostat.elf: apps/iostat/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/iostat.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/iostat.o libc/libc.a -o $@
+
+$(BIN_DIR)/lsblk.elf: apps/lsblk/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/lsblk.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/lsblk.o libc/libc.a -o $@
+
+$(BIN_DIR)/ip.elf: apps/ip/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ip.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ip.o libc/libc.a -o $@
+
+$(BIN_DIR)/sysctl.elf: apps/sysctl/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sysctl.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sysctl.o libc/libc.a -o $@
+
+$(BIN_DIR)/inotifywait.elf: apps/inotifywait/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/inotifywait.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/inotifywait.o libc/libc.a -o $@
+
+$(BIN_DIR)/vmstat.elf: apps/vmstat/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/vmstat.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/vmstat.o libc/libc.a -o $@
+
+$(BIN_DIR)/getfattr.elf: apps/getfattr/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/getfattr.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/getfattr.o libc/libc.a -o $@
+
+$(BIN_DIR)/setfattr.elf: apps/setfattr/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/setfattr.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/setfattr.o libc/libc.a -o $@
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 

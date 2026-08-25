@@ -6,6 +6,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <stdint.h>
 
 typedef unsigned short in_port_t;
 typedef unsigned int   in_addr_t;
@@ -35,3 +36,9 @@ struct sockaddr_in {
     struct in_addr sin_addr;
     unsigned char  sin_zero[8];
 };
+
+uint32_t htonl(uint32_t hostlong);
+uint16_t htons(uint16_t hostshort);
+uint32_t ntohl(uint32_t netlong);
+uint16_t ntohs(uint16_t netshort);
+

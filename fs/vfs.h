@@ -161,6 +161,7 @@ typedef struct dentry {
     inode_t *d_inode;     /* NULL if negative dentry */
     struct dentry *d_subdirs; /* Child list head */
     struct dentry *d_sibling; /* Next child of our parent */
+    struct dentry *d_hash_next; /* Hash bucket collision chain */
     super_block_t *d_sb;
 } dentry_t;
 
@@ -226,6 +227,7 @@ s64 vfs_resolve_path(const char *cwd, const char *path, char *out_buf, size_t ou
 s64 vfs_path_lookup(const char *path, dentry_t **out_dentry);
 
 /* System Call Implementations (Internal to fs/vfs.c but exposed to syscall.c) */
+void dentry_build_path(dentry_t *d, char *buf, size_t max);
 file_t *vfs_open(const char *path, u32 flags, u32 mode);
 file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno);
 s64 vfs_close(file_t *file);

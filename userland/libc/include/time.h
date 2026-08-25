@@ -13,6 +13,12 @@ struct timespec {
     long   tv_nsec;
 };
 
+struct itimerspec {
+    struct timespec it_interval;
+    struct timespec it_value;
+};
+
+
 struct tm {
     int         tm_sec;    /* seconds [0, 60] */
     int         tm_min;    /* minutes [0, 59] */
@@ -39,6 +45,9 @@ extern int   daylight;
 void       tzset(void);
 time_t     time(time_t *tloc);
 int        clock_gettime(int clk_id, struct timespec *tp);
+int        clock_getres(int clk_id, struct timespec *res);
+int        clock_settime(int clk_id, const struct timespec *tp);
+int        clock_nanosleep(int clock_id, int flags, const struct timespec *request, struct timespec *remain);
 int        nanosleep(const struct timespec *req, struct timespec *rem);
 double     difftime(time_t time1, time_t time0);
 time_t     mktime(struct tm *timeptr);

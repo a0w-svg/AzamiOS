@@ -193,6 +193,15 @@ void kernel_main(void)
     extern void procfs_init(void);
     procfs_init();
 
+    extern void sysfs_init(void);
+    sysfs_init();
+
+    extern void pty_init(void);
+    pty_init();
+
+    extern void devpts_init(void);
+    devpts_init();
+
     ext2_init();
 
     /* ── Step 15: NT-Style Object Manager Namespace ──────────────────────── */
@@ -240,6 +249,10 @@ void kernel_main(void)
     extern void drm_init(void);
     drm_init();
     ac97_init();
+    extern void sb16_init(void);
+    sb16_init();
+    extern void loop_init(void);
+    loop_init();
 
     /* Initialize Network Interface Drivers & Stack */
     if (e1000_init() == 0 || rtl8139_init() == 0) {
@@ -266,6 +279,14 @@ void kernel_main(void)
                 vfs_mkdir("/proc", 0755);
                 if (vfs_mount("procfs", "/proc", "procfs", NULL) == 0) {
                     pr_debug("[PROCFS] Mounted procfs at /proc\n");
+                }
+                vfs_mkdir("/sys", 0755);
+                if (vfs_mount("sysfs", "/sys", "sysfs", NULL) == 0) {
+                    pr_debug("[SYSFS] Mounted sysfs at /sys\n");
+                }
+                vfs_mkdir("/dev/pts", 0755);
+                if (vfs_mount("devpts", "/dev/pts", "devpts", NULL) == 0) {
+                    pr_debug("[DEVPTS] Mounted devpts at /dev/pts\n");
                 }
                 file_t *f = vfs_open("/sbin/init.elf", 0, 0);
                 if (!f) f = vfs_open("/init.elf", 0, 0);

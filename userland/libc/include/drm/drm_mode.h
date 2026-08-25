@@ -18,6 +18,40 @@
 #define DRM_MODE_TYPE_USERDEF   (1<<5)
 #define DRM_MODE_TYPE_DRIVER    (1<<6)
 
+#define DRM_MODE_CONNECTED      1
+#define DRM_MODE_DISCONNECTED   2
+#define DRM_MODE_UNKNOWNCONNECTION 3
+
+#define DRM_MODE_CONNECTOR_Unknown      0
+#define DRM_MODE_CONNECTOR_VGA          1
+#define DRM_MODE_CONNECTOR_DVII         2
+#define DRM_MODE_CONNECTOR_DVID         3
+#define DRM_MODE_CONNECTOR_DVIA         4
+#define DRM_MODE_CONNECTOR_Composite    5
+#define DRM_MODE_CONNECTOR_SVIDEO       6
+#define DRM_MODE_CONNECTOR_LVDS         7
+#define DRM_MODE_CONNECTOR_Component    8
+#define DRM_MODE_CONNECTOR_9PinDIN      9
+#define DRM_MODE_CONNECTOR_DisplayPort  10
+#define DRM_MODE_CONNECTOR_HDMIA        11
+#define DRM_MODE_CONNECTOR_HDMIB        12
+#define DRM_MODE_CONNECTOR_TV           13
+#define DRM_MODE_CONNECTOR_eDP          14
+#define DRM_MODE_CONNECTOR_VIRTUAL      15
+#define DRM_MODE_CONNECTOR_DSI          16
+#define DRM_MODE_CONNECTOR_DPI          17
+
+#define DRM_MODE_PAGE_FLIP_EVENT        0x01
+#define DRM_MODE_PAGE_FLIP_ASYNC        0x02
+
+#define DRM_MODE_CURSOR_BO      0x01
+#define DRM_MODE_CURSOR_MOVE    0x02
+#define DRM_MODE_CURSOR_FLAGS   0x03
+
+#define DRM_PLANE_TYPE_OVERLAY  0
+#define DRM_PLANE_TYPE_PRIMARY  1
+#define DRM_PLANE_TYPE_CURSOR   2
+
 struct drm_mode_modeinfo {
     uint32_t clock;
     uint16_t hdisplay;
@@ -82,6 +116,14 @@ struct drm_mode_get_connector {
     uint32_t pad;
 };
 
+struct drm_mode_get_encoder {
+    uint32_t encoder_id;
+    uint32_t encoder_type;
+    uint32_t crtc_id;
+    uint32_t possible_crtcs;
+    uint32_t possible_clones;
+};
+
 struct drm_mode_create_dumb {
     uint32_t height;
     uint32_t width;
@@ -112,12 +154,76 @@ struct drm_mode_fb_cmd {
     uint32_t handle;
 };
 
+struct drm_mode_fb_cmd2 {
+    uint32_t fb_id;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pixel_format;
+    uint32_t flags;
+    uint32_t handles[4];
+    uint32_t pitches[4];
+    uint32_t offsets[4];
+    uint64_t modifier[4];
+};
+
 struct drm_mode_crtc_page_flip {
     uint32_t crtc_id;
     uint32_t fb_id;
     uint32_t flags;
     uint32_t reserved;
     uint64_t user_data;
+};
+
+struct drm_mode_cursor {
+    uint32_t flags;
+    uint32_t crtc_id;
+    int32_t  x;
+    int32_t  y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t handle;
+};
+
+struct drm_mode_cursor2 {
+    uint32_t flags;
+    uint32_t crtc_id;
+    int32_t  x;
+    int32_t  y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t handle;
+    int32_t  hot_x;
+    int32_t  hot_y;
+};
+
+struct drm_mode_get_plane_res {
+    uint64_t plane_id_ptr;
+    uint32_t count_planes;
+};
+
+struct drm_mode_get_plane {
+    uint64_t format_type_ptr;
+    uint32_t plane_id;
+    uint32_t crtc_id;
+    uint32_t fb_id;
+    uint32_t possible_crtcs;
+    uint32_t gamma_size;
+    uint32_t count_format_types;
+};
+
+struct drm_mode_set_plane {
+    uint32_t plane_id;
+    uint32_t crtc_id;
+    uint32_t fb_id;
+    uint32_t flags;
+    int32_t  crtc_x;
+    int32_t  crtc_y;
+    uint32_t crtc_w;
+    uint32_t crtc_h;
+    uint32_t src_x;
+    uint32_t src_y;
+    uint32_t src_h;
+    uint32_t src_w;
 };
 
 #endif /* _DRM_MODE_H */

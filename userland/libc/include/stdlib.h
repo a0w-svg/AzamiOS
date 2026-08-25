@@ -15,10 +15,14 @@
 #define EXIT_FAILURE 1
 #define RAND_MAX     0x7FFFFFFF
 
+#ifndef INT_MAX
 #define INT_MAX   2147483647
 #define INT_MIN   (-2147483647 - 1)
+#endif
+#ifndef LONG_MAX
 #define LONG_MAX  9223372036854775807L
-#define LONG_MIN  (-9223372036854775807L - 1)
+#define LONG_MIN  (-9223372036854775807L - 1L)
+#endif
 
 typedef struct {
     int quot;
@@ -54,6 +58,7 @@ unsigned long long strtoull(const char *nptr, char **endptr, int base);
 double             atof(const char *nptr);
 double             strtod(const char *nptr, char **endptr);
 float              strtof(const char *nptr, char **endptr);
+long double        strtold(const char *nptr, char **endptr);
 char              *itoa(int value, char *str, int base);
 
 /* Absolute value and division */
@@ -64,9 +69,17 @@ div_t     div(int numer, int denom);
 ldiv_t    ldiv(long numer, long denom);
 lldiv_t   lldiv(long long numer, long long denom);
 
+/* Memory extras */
+void *reallocarray(void *ptr, size_t nmemb, size_t size);
+void *valloc(size_t size);
+void *pvalloc(size_t size);
+
 /* Pseudo-random */
 int             rand(void);
 void            srand(unsigned int seed);
+int             rand_r(unsigned int *seedp);
+long            random(void);
+void            srandom(unsigned int seed);
 double          drand48(void);
 double          erand48(unsigned short xsubi[3]);
 long            lrand48(void);

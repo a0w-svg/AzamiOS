@@ -30,7 +30,22 @@
 #define F_SETFD         2
 #define F_GETFL         3
 #define F_SETFL         4
+#define F_GETLK         5
+#define F_SETLK         6
+#define F_SETLKW        7
 #define F_DUPFD_CLOEXEC 1030
+
+#define F_RDLCK         0
+#define F_WRLCK         1
+#define F_UNLCK         2
+
+struct flock {
+    short l_type;
+    short l_whence;
+    off_t l_start;
+    off_t l_len;
+    pid_t l_pid;
+};
 
 /* POSIX *at flags */
 #define AT_FDCWD            (-100)
@@ -48,9 +63,18 @@
 #define POSIX_FADV_DONTNEED   4
 #define POSIX_FADV_NOREUSE    5
 
+#define FALLOC_FL_KEEP_SIZE      0x01
+#define FALLOC_FL_PUNCH_HOLE     0x02
+#define FALLOC_FL_NO_HIDE_STALES 0x04
+#define FALLOC_FL_COLLAPSE_RANGE 0x08
+#define FALLOC_FL_ZERO_RANGE     0x10
+#define FALLOC_FL_INSERT_RANGE   0x20
+#define FALLOC_FL_UNSHARE_RANGE  0x40
+
 int open(const char *path, int flags, ...);
 int openat(int dirfd, const char *path, int flags, ...);
 int creat(const char *path, mode_t mode);
 int fcntl(int fd, int cmd, ...);
 int posix_fadvise(int fd, off_t offset, off_t len, int advice);
 int posix_fallocate(int fd, off_t offset, off_t len);
+int fallocate(int fd, int mode, off_t offset, off_t len);

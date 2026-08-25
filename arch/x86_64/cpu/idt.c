@@ -208,15 +208,32 @@ void isr_dispatch(pt_regs_t *r)
             if (vec == 14) {
                 __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
 
-                /* Demand-paged User Stack Expansion (Linux-standard 8MB user stack region) */
-                if ((r->err_code & 1) == 0 && fault_addr >= 0x00007ff000000000ULL && fault_addr < 0x00007fffffffe000ULL && proc) {
-                    phys_addr_t new_page = pmm_alloc_page();
-                    if (new_page) {
-                        __builtin_memset((void *)PHYS_TO_VIRT(new_page), 0, PAGE_SIZE);
-                        vmm_map(proc->pml4_phys, ALIGN_DOWN(fault_addr, PAGE_SIZE), new_page, VMM_USER_RW);
-                        return; /* Resumed user thread with expanded stack */
+                /* Demand-paged User Stack & Heap/BSS Expansion */
+                if ((r->err_code & 1) == 0 && proc) {
+                    bool valid_fault = false;
+                    /* User Stack (8MB stack region) */
+                    if (fault_addr >= 0x00007ff000000000ULL && fault_addr < 0x00007fffffffe000ULL) {
+                        valid_fault = true;
+                    }
+                    /* User Heap (within proc->heap_start to proc->heap_end) */
+                    else if (proc->heap_start > 0 && fault_addr >= proc->heap_start && fault_addr < proc->heap_end) {
+                        valid_fault = true;
+                    }
+                    /* User Data / BSS / Heap / mmap user space */
+                    else if (fault_addr >= 0x10000ULL && fault_addr < 0x00007ffff0000000ULL) {
+                        valid_fault = true;
+                    }
+
+                    if (valid_fault) {
+                        phys_addr_t new_page = pmm_alloc_page();
+                        if (new_page) {
+                            __builtin_memset((void *)PHYS_TO_VIRT(new_page), 0, PAGE_SIZE);
+                            vmm_map(proc->pml4_phys, ALIGN_DOWN(fault_addr, PAGE_SIZE), new_page, VMM_USER_RW);
+                            return; /* Resumed user thread */
+                        }
                     }
                 }
+
 
                 u64 ucr3;
                 __asm__ volatile("mov %%cr3, %0" : "=r"(ucr3));
@@ -226,10 +243,10 @@ void isr_dispatch(pt_regs_t *r)
                 if (upml4e & 1) {
                     u64 *updpt = (u64 *)PHYS_TO_VIRT(upml4e & 0x000FFFFFFFFFF000ULL);
                     updpte = updpt[(fault_addr >> 30) & 0x1FF];
-                    if (updpte & 1) {
+                    if ((updpte & 1) && !(updpte & 0x80)) {
                         u64 *upd = (u64 *)PHYS_TO_VIRT(updpte & 0x000FFFFFFFFFF000ULL);
                         upde = upd[(fault_addr >> 21) & 0x1FF];
-                        if (upde & 1) {
+                        if ((upde & 1) && !(upde & 0x80)) {
                             u64 *upt = (u64 *)PHYS_TO_VIRT(upde & 0x000FFFFFFFFFF000ULL);
                             upte = upt[(fault_addr >> 12) & 0x1FF];
                         }
@@ -248,13 +265,35 @@ void isr_dispatch(pt_regs_t *r)
                         (unsigned long long)upde,
                         (unsigned long long)upte);
             } else {
-                kprintf("[FAULT] User process '%s' (PID %u) terminated due to %s (vec=%llu) at RIP=0x%016llx (err=0x%llx)\n",
+                kprintf("[FAULT] User process '%s' (PID %u) terminated due to %s (vec=%llu) at RIP=0x%016llx (err=0x%llx)\n"
+                        "  RAX=0x%016llx  RBX=0x%016llx  RCX=0x%016llx  RDX=0x%016llx\n"
+                        "  RSI=0x%016llx  RDI=0x%016llx  RBP=0x%016llx  RSP=0x%016llx\n"
+                        "  R8 =0x%016llx  R9 =0x%016llx  R10=0x%016llx  R11=0x%016llx\n"
+                        "  R12=0x%016llx  R13=0x%016llx  R14=0x%016llx  R15=0x%016llx\n",
                         proc ? proc->name : "unknown",
                         proc ? proc->pid : 0,
                         name, (unsigned long long)vec,
                         (unsigned long long)r->rip,
-                        (unsigned long long)r->err_code);
+                        (unsigned long long)r->err_code,
+                        (unsigned long long)r->rax,  (unsigned long long)r->rbx,
+                        (unsigned long long)r->rcx,  (unsigned long long)r->rdx,
+                        (unsigned long long)r->rsi,  (unsigned long long)r->rdi,
+                        (unsigned long long)r->rbp,  (unsigned long long)r->rsp,
+                        (unsigned long long)r->r8,   (unsigned long long)r->r9,
+                        (unsigned long long)r->r10,  (unsigned long long)r->r11,
+                        (unsigned long long)r->r12,  (unsigned long long)r->r13,
+                        (unsigned long long)r->r14,  (unsigned long long)r->r15);
+
+                u8 code_bytes[16];
+                if (r->rip < 0x8000000000000000ULL && copy_from_user(code_bytes, (const void *)r->rip, sizeof(code_bytes)) == 0) {
+                    kprintf("  Code at RIP: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                            code_bytes[0], code_bytes[1], code_bytes[2], code_bytes[3],
+                            code_bytes[4], code_bytes[5], code_bytes[6], code_bytes[7],
+                            code_bytes[8], code_bytes[9], code_bytes[10], code_bytes[11],
+                            code_bytes[12], code_bytes[13], code_bytes[14], code_bytes[15]);
+                }
             }
+
             sys_exit_impl(r);
             return;
         }
@@ -292,10 +331,10 @@ void isr_dispatch(pt_regs_t *r)
             if (pml4e & 1) {
                 u64 *pdpt = (u64 *)PHYS_TO_VIRT(pml4e & 0x000FFFFFFFFFF000ULL);
                 pdpte = pdpt[(fault_addr >> 30) & 0x1FF];
-                if (pdpte & 1) {
+                if ((pdpte & 1) && !(pdpte & 0x80)) {
                     u64 *pd = (u64 *)PHYS_TO_VIRT(pdpte & 0x000FFFFFFFFFF000ULL);
                     pde = pd[(fault_addr >> 21) & 0x1FF];
-                    if (pde & 1) {
+                    if ((pde & 1) && !(pde & 0x80)) {
                         u64 *pt = (u64 *)PHYS_TO_VIRT(pde & 0x000FFFFFFFFFF000ULL);
                         pte = pt[(fault_addr >> 12) & 0x1FF];
                     }

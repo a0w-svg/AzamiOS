@@ -664,4 +664,41 @@ int wctomb(char *s, wchar_t wc)
     return (int)wcrtomb(s, wc, NULL);
 }
 
+void *rawmemchr(const void *s, int c)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned char uc = (unsigned char)c;
+    while (*p != uc) p++;
+    return (void *)p;
+}
+
+char *strchrnul(const char *s, int c)
+{
+    char ch = (char)c;
+    while (*s && *s != ch) s++;
+    return (char *)s;
+}
+
+int strverscmp(const char *s1, const char *s2)
+{
+    return strcmp(s1, s2);
+}
+
+void explicit_bzero(void *s, size_t n)
+{
+    volatile unsigned char *p = (volatile unsigned char *)s;
+    while (n--) *p++ = 0;
+}
+
+int timingsafe_bcmp(const void *b1, const void *b2, size_t n)
+{
+    const unsigned char *p1 = (const unsigned char *)b1;
+    const unsigned char *p2 = (const unsigned char *)b2;
+    int res = 0;
+    for (size_t i = 0; i < n; i++) {
+        res |= p1[i] ^ p2[i];
+    }
+    return res;
+}
+
 

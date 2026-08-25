@@ -189,137 +189,133 @@ static void keyboard_irq_handler(pt_regs_t *r, void *ctx)
     /* NOTE: EOI is sent by isr_dispatch() via hal_irq_eoi() after this
      * handler returns.  Do NOT call lapic_eoi() here. */
 
-    irqflags_t irqf = spinlock_lock_irqsave(&g_ps2_lock);
-    u8 status = inb(0x64);
-    if (!(status & 0x01) || (status & 0x20)) {
+    while (1) {
+        irqflags_t irqf = spinlock_lock_irqsave(&g_ps2_lock);
+        u8 status = inb(0x64);
+        if (!(status & 0x01) || (status & 0x20)) {
+            spinlock_unlock_irqrestore(&g_ps2_lock, irqf);
+            break;
+        }
+        u8 scancode = inb(0x60);
         spinlock_unlock_irqrestore(&g_ps2_lock, irqf);
-        return;
-    }
-    u8 scancode = inb(0x60);
-    spinlock_unlock_irqrestore(&g_ps2_lock, irqf);
 
-    /* Handle E1 (Pause) state machine */
-    if (g_e1_state > 0) {
-        g_e1_state++;
-        if (g_e1_state == 6) {
-            g_e1_state = 0;
+        /* Handle E1 (Pause) state machine */
+        if (g_e1_state > 0) {
+            g_e1_state++;
+            if (g_e1_state == 6) {
+                g_e1_state = 0;
 
-            input_event_t evt;
-            __builtin_memset(&evt, 0, sizeof(evt));
-            evt.type     = INPUT_EVENT_KEY;
-            evt.scancode = 0xE1; /* Virtual scancode for pause */
-            evt.flags    = KEY_FLAG_PRESSED;
-            evt.keycode  = KEY_PAUSE;
+                input_event_t evt;
+                __builtin_memset(&evt, 0, sizeof(evt));
+                evt.type     = INPUT_EVENT_KEY;
+                evt.scancode = 0xE1; /* Virtual scancode for pause */
+                evt.flags    = KEY_FLAG_PRESSED;
+                evt.keycode  = KEY_PAUSE;
 
-            cpu_info_t *cpu = smp_get_cpu();
-            evt.timestamp = cpu ? (u32)cpu->ticks : 0;
+                cpu_info_t *cpu = smp_get_cpu();
+                evt.timestamp = cpu ? (u32)cpu->ticks : 0;
 
-            queue_push(&evt);
-        }
-        return;
-    }
-
-    if (scancode == 0xE1) {
-        g_e1_state = 1;
-        return;
-    }
-
-    /* Handle E0 prefix */
-    if (scancode == 0xE0) {
-        g_e0_state = 1;
-        return;
-    }
-
-    bool released = (scancode & 0x80) != 0;
-    u8   code     = scancode & 0x7F;
-    u16  keycode  = 0;
-
-    if (g_e0_state) {
-        g_e0_state = 0;
-        keycode = g_scancode_e0[code];
-        if (!keycode) return; /* Ignore unmapped or fake shifts */
-
-        /* Map specific extended modifiers */
-        if (keycode == KEY_RCTRL) {
-            g_ctrl_held = !released;
-        } else if (keycode == KEY_RALT) {
-            g_alt_held = !released;
-        }
-    } else {
-        /* Base scancode processing */
-        keycode = g_shift_held ? g_scancode_shift[code] : g_scancode_base[code];
-
-        /* Update standard modifiers */
-        if (keycode == KEY_LSHIFT || keycode == KEY_RSHIFT) {
-            g_shift_held = !released;
-            return;
-        }
-        if (keycode == KEY_LCTRL) {
-            g_ctrl_held = !released;
-            return;
-        }
-        if (keycode == KEY_LALT) {
-            g_alt_held = !released;
-            return;
+                queue_push(&evt);
+            }
+            continue;
         }
 
-        /* Update toggles on PRESSED */
-        if (!released) {
-            bool leds_changed = false;
-            if (keycode == KEY_CAPSLOCK)   { g_capslock   = !g_capslock;   leds_changed = true; }
-            if (keycode == KEY_NUMLOCK)    { g_numlock    = !g_numlock;    leds_changed = true; }
-            if (keycode == KEY_SCROLLLOCK) { g_scrolllock = !g_scrolllock; leds_changed = true; }
-            if (leds_changed) keyboard_update_leds_unlocked();
+        if (scancode == 0xE1) {
+            g_e1_state = 1;
+            continue;
         }
 
-        /* Apply Caps Lock on alphabetic characters */
-        bool is_alpha = (keycode >= 'a' && keycode <= 'z') || (keycode >= 'A' && keycode <= 'Z');
-        if (is_alpha) {
-            bool upper = g_capslock ^ g_shift_held;
-            keycode = upper ? (g_scancode_base[code] - 'a' + 'A') : g_scancode_base[code];
+        /* Handle E0 prefix */
+        if (scancode == 0xE0) {
+            g_e0_state = 1;
+            continue;
         }
 
-        /* Apply Num Lock on Numpad keys */
-        if (code >= 0x47 && code <= 0x53 && code != 0x4A && code != 0x4E) {
-            bool use_num = g_numlock ^ g_shift_held;
-            if (use_num) {
-                if      (code == 0x47) keycode = '7';
-                else if (code == 0x48) keycode = '8';
-                else if (code == 0x49) keycode = '9';
-                else if (code == 0x4B) keycode = '4';
-                else if (code == 0x4C) keycode = '5';
-                else if (code == 0x4D) keycode = '6';
-                else if (code == 0x4F) keycode = '1';
-                else if (code == 0x50) keycode = '2';
-                else if (code == 0x51) keycode = '3';
-                else if (code == 0x52) keycode = '0';
-                else if (code == 0x53) keycode = '.';
+        bool released = (scancode & 0x80) != 0;
+        u8   code     = scancode & 0x7F;
+        u16  keycode  = 0;
+
+        if (g_e0_state) {
+            g_e0_state = 0;
+            keycode = g_scancode_e0[code];
+            if (!keycode) continue; /* Ignore unmapped or fake shifts */
+
+            /* Map specific extended modifiers */
+            if (keycode == KEY_RCTRL) {
+                g_ctrl_held = !released;
+            } else if (keycode == KEY_RALT) {
+                g_alt_held = !released;
+            }
+        } else {
+            /* Base scancode processing */
+            keycode = g_shift_held ? g_scancode_shift[code] : g_scancode_base[code];
+
+            /* Update standard modifiers */
+            if (keycode == KEY_LSHIFT || keycode == KEY_RSHIFT) {
+                g_shift_held = !released;
+            } else if (keycode == KEY_LCTRL) {
+                g_ctrl_held = !released;
+            } else if (keycode == KEY_LALT) {
+                g_alt_held = !released;
+            }
+
+            /* Update toggles on PRESSED */
+            if (!released) {
+                bool leds_changed = false;
+                if (keycode == KEY_CAPSLOCK)   { g_capslock   = !g_capslock;   leds_changed = true; }
+                if (keycode == KEY_NUMLOCK)    { g_numlock    = !g_numlock;    leds_changed = true; }
+                if (keycode == KEY_SCROLLLOCK) { g_scrolllock = !g_scrolllock; leds_changed = true; }
+                if (leds_changed) keyboard_update_leds_unlocked();
+            }
+
+            /* Apply Caps Lock on alphabetic characters */
+            bool is_alpha = (keycode >= 'a' && keycode <= 'z') || (keycode >= 'A' && keycode <= 'Z');
+            if (is_alpha) {
+                bool upper = g_capslock ^ g_shift_held;
+                keycode = upper ? (g_scancode_base[code] - 'a' + 'A') : g_scancode_base[code];
+            }
+
+            /* Apply Num Lock on Numpad keys */
+            if (code >= 0x47 && code <= 0x53 && code != 0x4A && code != 0x4E) {
+                bool use_num = g_numlock ^ g_shift_held;
+                if (use_num) {
+                    if      (code == 0x47) keycode = '7';
+                    else if (code == 0x48) keycode = '8';
+                    else if (code == 0x49) keycode = '9';
+                    else if (code == 0x4B) keycode = '4';
+                    else if (code == 0x4C) keycode = '5';
+                    else if (code == 0x4D) keycode = '6';
+                    else if (code == 0x4F) keycode = '1';
+                    else if (code == 0x50) keycode = '2';
+                    else if (code == 0x51) keycode = '3';
+                    else if (code == 0x52) keycode = '0';
+                    else if (code == 0x53) keycode = '.';
+                }
             }
         }
+
+        if (!keycode) continue;
+
+        /* Build event */
+        input_event_t evt;
+        __builtin_memset(&evt, 0, sizeof(evt));
+        evt.type     = INPUT_EVENT_KEY;
+        evt.scancode = scancode;
+        evt.keycode  = keycode;
+        evt.flags    = released ? KEY_FLAG_RELEASED : KEY_FLAG_PRESSED;
+
+        if (g_shift_held)  evt.flags |= KEY_FLAG_SHIFT;
+        if (g_ctrl_held)   evt.flags |= KEY_FLAG_CTRL;
+        if (g_alt_held)    evt.flags |= KEY_FLAG_ALT;
+        if (g_capslock)    evt.flags |= KEY_FLAG_CAPS_LOCK;
+        if (g_numlock)     evt.flags |= KEY_FLAG_NUM_LOCK;
+        if (g_scrolllock)  evt.flags |= KEY_FLAG_SCROLL_LOCK;
+
+        cpu_info_t *cpu = smp_get_cpu();
+        evt.timestamp = cpu ? (u32)cpu->ticks : 0;
+
+        queue_push(&evt);
     }
-
-    if (!keycode) return;
-
-    /* Build event */
-    input_event_t evt;
-    __builtin_memset(&evt, 0, sizeof(evt));
-    evt.type     = INPUT_EVENT_KEY;
-    evt.scancode = scancode;
-    evt.keycode  = keycode;
-    evt.flags    = released ? KEY_FLAG_RELEASED : KEY_FLAG_PRESSED;
-
-    if (g_shift_held)  evt.flags |= KEY_FLAG_SHIFT;
-    if (g_ctrl_held)   evt.flags |= KEY_FLAG_CTRL;
-    if (g_alt_held)    evt.flags |= KEY_FLAG_ALT;
-    if (g_capslock)    evt.flags |= KEY_FLAG_CAPS_LOCK;
-    if (g_numlock)     evt.flags |= KEY_FLAG_NUM_LOCK;
-    if (g_scrolllock)  evt.flags |= KEY_FLAG_SCROLL_LOCK;
-
-    cpu_info_t *cpu = smp_get_cpu();
-    evt.timestamp = cpu ? (u32)cpu->ticks : 0;
-
-    queue_push(&evt);
-    /* EOI is handled by isr_dispatch() after this function returns */
 }
 
 /* ── Mouse state machine ─────────────────────────────────────────────────── */
@@ -361,14 +357,14 @@ static void mouse_irq_handler(pt_regs_t *r, void *ctx)
         cpu_info_t *cpu = smp_get_cpu();
         u32 now_ticks = cpu ? (u32)cpu->ticks : 0;
 
-        /* If > 10 ticks (100ms) elapsed mid-packet, reset to byte 0 to prevent permanent desync */
+        /* If > 10 ticks (100ms) elapsed mid-packet, reset to byte 0 to recover from dropped bytes */
         if (g_mouse_cycle != 0 && (now_ticks - g_last_mouse_tick) > 10) {
             g_mouse_cycle = 0;
         }
         g_last_mouse_tick = now_ticks;
 
-        /* Discard out-of-sync packets (bit 3 must be 1, and overflow bits 6/7 must be 0 for byte 0) */
-        if (g_mouse_cycle == 0 && (!(data & 0x08) || (data & 0xC0))) {
+        /* Discard out-of-sync packets: Byte 0 must have bit 3 set to 1 */
+        if (g_mouse_cycle == 0 && !(data & 0x08)) {
             continue;
         }
 
@@ -383,25 +379,21 @@ static void mouse_irq_handler(pt_regs_t *r, void *ctx)
             s8  dz      = 0;
             u8  buttons = flags & 0x07;
 
-            /* Sign extend 9-bit delta values */
-            if (!(flags & 0x40)) { /* Not X overflow */
-                if (flags & 0x10) {
-                    dx = (s16)((u16)g_mouse_bytes[1] | 0xFF00);
-                } else {
-                    dx = (s16)(g_mouse_bytes[1] & 0x00FF);
-                }
-            }
+            /* Sign extend 9-bit delta values with overflow clamping */
+            int raw_x = (int)(int8_t)g_mouse_bytes[1];
+            int raw_y = (int)(int8_t)g_mouse_bytes[2];
 
-            if (!(flags & 0x80)) { /* Not Y overflow */
-                if (flags & 0x20) {
-                    dy = (s16)((u16)g_mouse_bytes[2] | 0xFF00);
-                } else {
-                    dy = (s16)(g_mouse_bytes[2] & 0x00FF);
-                }
-            }
+            if (flags & 0x10) raw_x |= ~0xFF;
+            else raw_x &= 0xFF;
 
-            /* PS/2 mouse Y is inverted (moving up is positive in PS/2, negative in screen space) */
-            dy = -dy;
+            if (flags & 0x20) raw_y |= ~0xFF;
+            else raw_y &= 0xFF;
+
+            if (flags & 0x40) raw_x = (flags & 0x10) ? -255 : 255;
+            if (flags & 0x80) raw_y = (flags & 0x20) ? -255 : 255;
+
+            dx = (s16)raw_x;
+            dy = -(s16)raw_y; /* PS/2 Y is inverted (up is positive in PS/2, negative on screen) */
 
             /* Handle 4th byte for IntelliMouse / Explorer extensions */
             if (g_mouse_packet_size == 4) {
@@ -455,7 +447,7 @@ static void mouse_init(void)
     ps2_write_cmd(0x60);         /* Write config back */
     ps2_write_data(config);
 
-    /* Flush any stale bytes */
+    /* Flush any stale bytes before initialization */
     for (int i = 0; i < 32; i++) {
         if (inb(0x64) & 0x01) { inb(0x60); }
         else { break; }
@@ -488,16 +480,18 @@ static void mouse_init(void)
         g_mouse_packet_size = 3;
     }
 
+    /* Flush any leftover bytes before enabling data reporting */
+    for (int i = 0; i < 32; i++) {
+        if (inb(0x64) & 0x01) { inb(0x60); }
+        else { break; }
+    }
+
     /* Set sample rate (200 Hz for ultra-smooth tracking), resolution, and enable data reporting */
     ps2_mouse_write(0xF3); ps2_mouse_write(200); /* 200 Hz Sample rate */
     ps2_mouse_write(0xE8); ps2_mouse_write(3);   /* Resolution */
     ps2_mouse_write(0xF4);                       /* Enable data reporting */
 
-    /* Flush output buffer to start with clean state */
-    for (int i = 0; i < 32; i++) {
-        if (inb(0x64) & 0x01) { inb(0x60); }
-        else { break; }
-    }
+    g_mouse_cycle = 0;
 }
 
 /* ── Extern: IRQ handler registration from idt.c ─────────────────────────── */
@@ -510,7 +504,7 @@ int input_poll(input_event_t *out);
 static s64 input_fops_read(struct file *filp, void *buf, size_t len, u64 *offset)
 {
     (void)filp; (void)offset;
-    if (len < sizeof(input_event_t)) return -(s64)EINVAL;
+    if (!buf || len < sizeof(input_event_t)) return -(s64)EINVAL;
     
     input_event_t evt;
     if (input_poll(&evt) == 0) {
@@ -550,13 +544,30 @@ static file_operations_t mouse_fops = {
     .read = mouse_fops_read,
 };
 
+static void keyboard_init(void)
+{
+    /* Enable first PS/2 port (keyboard) */
+    ps2_write_cmd(0xAE);
+
+    /* Tell keyboard to enable scanning (0xF4) */
+    ps2_wait_write();
+    outb(0x60, 0xF4);
+    ps2_wait_read();
+    if ((inb(0x64) & 0x01) && !(inb(0x64) & 0x20)) {
+        inb(0x60); /* Consume ACK 0xFA */
+    }
+}
+
 void input_init(void)
 {
+    /* Initialize PS/2 keyboard and mouse hardware */
+    keyboard_init();
+    mouse_init();
+
     /* Register keyboard handler on IRQ1 (vector 33) */
     idt_register_irq(33, keyboard_irq_handler, NULL);
 
-    /* Initialize PS/2 mouse and register handler on IRQ12 (vector 44) */
-    mouse_init();
+    /* Register mouse handler on IRQ12 (vector 44) */
     idt_register_irq(44, mouse_irq_handler, NULL);
 
     /* Unmask IRQ1 (keyboard) and IRQ12 (mouse) on the PIC */

@@ -22,7 +22,8 @@
 #include "../../fs/vfs.h"
 
 static e1000_device_t g_e1000_dev;
-static spinlock_t     g_e1000_lock = SPINLOCK_INIT;
+static spinlock_t     g_e1000_rx_lock = SPINLOCK_INIT;
+static spinlock_t     g_e1000_tx_lock = SPINLOCK_INIT;
 static bool           g_e1000_ready = false;
 static void e1000_irq_handler(pt_regs_t *r, void *ctx);
 
@@ -121,8 +122,16 @@ static int e1000_init_rx(void)
     e1000_write32(E1000_RDT, E1000_NUM_RX_DESC - 1);
     g_e1000_dev.rx_cur = 0;
 
-    /* Enable receiver */
-    e1000_write32(E1000_RCTL, E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_SECRC | E1000_RCTL_BSIZE_2048);
+    /* Program Receive Address 0 (RAL0 / RAH0) with Address Valid bit (AV = bit 31) */
+    u32 ral = (u32)g_e1000_dev.mac[0] | ((u32)g_e1000_dev.mac[1] << 8) |
+              ((u32)g_e1000_dev.mac[2] << 16) | ((u32)g_e1000_dev.mac[3] << 24);
+    u32 rah = (u32)g_e1000_dev.mac[4] | ((u32)g_e1000_dev.mac[5] << 8) | (1U << 31);
+    e1000_write32(E1000_RAL, ral);
+    e1000_write32(E1000_RAH, rah);
+
+    /* Enable receiver with Broadcast, Multicast, and Unicast Accept Modes */
+    e1000_write32(E1000_RCTL, E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_UPE |
+                              E1000_RCTL_MPE | E1000_RCTL_SECRC | E1000_RCTL_BSIZE_2048);
     return 0;
 }
 
@@ -302,8 +311,8 @@ int e1000_init(void)
     ndev.send = e1000_send_packet;
     ndev.recv = e1000_recv_packet;
     ndev.link_up = e1000_is_link_up;
-    extern int net_register_device(const net_device_t *dev);
     net_register_device(&ndev);
+
 
     /* Register device file /dev/net0 */
     devfs_register_device("net0", &g_net_fops, &g_e1000_dev);
@@ -316,22 +325,30 @@ void e1000_poll_rx(void)
 {
     if (!g_e1000_ready) return;
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_e1000_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_e1000_rx_lock);
     while (g_e1000_dev.rx_descs[g_e1000_dev.rx_cur].status & E1000_RXD_STAT_DD) {
         u32 cur = g_e1000_dev.rx_cur;
         u16 len = g_e1000_dev.rx_descs[cur].length;
         u8 *pkt = g_e1000_dev.rx_buffers[cur];
 
-        if (len > 0) {
-            extern void net_process_incoming(const u8 *pkt, size_t len);
-            net_process_incoming(pkt, len);
+        u8 local_buf[2048];
+        size_t copy_len = (len < sizeof(local_buf)) ? len : sizeof(local_buf);
+        if (copy_len > 0) {
+            memcpy(local_buf, pkt, copy_len);
         }
 
         g_e1000_dev.rx_descs[cur].status = 0;
         e1000_write32(E1000_RDT, cur);
         g_e1000_dev.rx_cur = (cur + 1) % E1000_NUM_RX_DESC;
+
+        if (copy_len > 0) {
+            spinlock_unlock_irqrestore(&g_e1000_rx_lock, flags);
+            extern void net_process_incoming(const u8 *pkt, size_t len);
+            net_process_incoming(local_buf, copy_len);
+            flags = spinlock_lock_irqsave(&g_e1000_rx_lock);
+        }
     }
-    spinlock_unlock_irqrestore(&g_e1000_lock, flags);
+    spinlock_unlock_irqrestore(&g_e1000_rx_lock, flags);
 }
 
 static void e1000_irq_handler(pt_regs_t *r, void *ctx)
@@ -349,7 +366,7 @@ s64 e1000_send_packet(const void *data, size_t len)
 {
     if (!g_e1000_ready || !data || len == 0 || len > E1000_PKT_BUF_SIZE) return -(s64)EINVAL;
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_e1000_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_e1000_tx_lock);
     u32 cur = g_e1000_dev.tx_cur;
 
     /* Wait for descriptor to be free */
@@ -365,7 +382,7 @@ s64 e1000_send_packet(const void *data, size_t len)
     g_e1000_dev.tx_cur = (cur + 1) % E1000_NUM_TX_DESC;
     e1000_write32(E1000_TDT, g_e1000_dev.tx_cur);
 
-    spinlock_unlock_irqrestore(&g_e1000_lock, flags);
+    spinlock_unlock_irqrestore(&g_e1000_tx_lock, flags);
     return (s64)len;
 }
 
@@ -373,11 +390,11 @@ s64 e1000_recv_packet(void *buf, size_t max_len)
 {
     if (!g_e1000_ready || !buf || max_len == 0) return -(s64)EINVAL;
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_e1000_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_e1000_rx_lock);
     u32 cur = g_e1000_dev.rx_cur;
 
     if (!(g_e1000_dev.rx_descs[cur].status & E1000_RXD_STAT_DD)) {
-        spinlock_unlock_irqrestore(&g_e1000_lock, flags);
+        spinlock_unlock_irqrestore(&g_e1000_rx_lock, flags);
         return -(s64)EAGAIN; /* No packet ready */
     }
 
@@ -389,7 +406,7 @@ s64 e1000_recv_packet(void *buf, size_t max_len)
     e1000_write32(E1000_RDT, cur);
 
     g_e1000_dev.rx_cur = (cur + 1) % E1000_NUM_RX_DESC;
-    spinlock_unlock_irqrestore(&g_e1000_lock, flags);
+    spinlock_unlock_irqrestore(&g_e1000_rx_lock, flags);
 
     return (s64)copy_len;
 }

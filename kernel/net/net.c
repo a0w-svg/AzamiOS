@@ -20,13 +20,29 @@ static u8 g_host_gateway[4] = { 0, 0, 0, 0 };
 static u8 g_host_dns[4] = { 0, 0, 0, 0 };
 static u8 g_host_mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
 
-#define MAX_NET_DEVS 4
+#define MAX_NET_DEVS 8
 static net_device_t g_net_devs[MAX_NET_DEVS];
 static int          g_net_dev_count = 0;
 static net_device_t *g_primary_dev = NULL;
+static net_device_t  g_loopback_dev;
 
 static inline u16 htons(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 static inline u16 ntohs(u16 v) { return htons(v); }
+
+static s64 loopback_send(const void *data, size_t len)
+{
+    if (!data || len == 0) return 0;
+    net_buf_t *buf = net_buf_alloc(len + 32);
+    if (!buf) return -ENOMEM;
+    void *p = net_buf_put(buf, len);
+    memcpy(p, data, len);
+    ipv4_input(buf);
+    g_loopback_dev.stats.tx_packets++;
+    g_loopback_dev.stats.tx_bytes += len;
+    g_loopback_dev.stats.rx_packets++;
+    g_loopback_dev.stats.rx_bytes += len;
+    return (s64)len;
+}
 
 u16 net_checksum(const void *data, size_t len)
 {
@@ -49,8 +65,9 @@ int net_register_device(const net_device_t *dev)
 {
     if (!dev || g_net_dev_count >= MAX_NET_DEVS) return -1;
 
+
     memcpy(&g_net_devs[g_net_dev_count], dev, sizeof(net_device_t));
-    if (!g_primary_dev) {
+    if (!g_primary_dev && !(dev->flags & IFF_LOOPBACK)) {
         g_primary_dev = &g_net_devs[g_net_dev_count];
         memcpy(g_host_mac, dev->mac, 6);
     }
@@ -60,7 +77,40 @@ int net_register_device(const net_device_t *dev)
 
 net_device_t *net_get_default_device(void)
 {
-    return g_primary_dev;
+    return g_primary_dev ? g_primary_dev : &g_loopback_dev;
+}
+
+net_device_t *net_get_device_by_name(const char *name)
+{
+    if (!name) return NULL;
+    if (strcmp(name, "lo") == 0 || strcmp(name, "lo0") == 0) return &g_loopback_dev;
+
+    for (int i = 0; i < g_net_dev_count; i++) {
+        if (strcmp(g_net_devs[i].name, name) == 0) {
+            return &g_net_devs[i];
+        }
+    }
+    return NULL;
+}
+
+net_device_t *net_get_device_by_index(int index)
+{
+    if (index == 0) return &g_loopback_dev;
+    if (index > 0 && index <= g_net_dev_count) return &g_net_devs[index - 1];
+    return NULL;
+}
+
+int net_get_device_count(void)
+{
+    return g_net_dev_count + 1; /* +1 for lo0 */
+}
+
+void net_loopback_input(net_buf_t *buf)
+{
+    if (!buf) return;
+    g_loopback_dev.stats.rx_packets++;
+    g_loopback_dev.stats.rx_bytes += buf->len;
+    ipv4_input(buf);
 }
 
 #include "../../include/azami/udp.h"
@@ -69,6 +119,17 @@ net_device_t *net_get_default_device(void)
 
 void net_init(void)
 {
+    /* 1. Initialize Loopback Interface (lo0) */
+    memset(&g_loopback_dev, 0, sizeof(net_device_t));
+    strcpy(g_loopback_dev.name, "lo0");
+    g_loopback_dev.ip[0] = 127; g_loopback_dev.ip[1] = 0; g_loopback_dev.ip[2] = 0; g_loopback_dev.ip[3] = 1;
+    g_loopback_dev.netmask[0] = 255; g_loopback_dev.netmask[1] = 0; g_loopback_dev.netmask[2] = 0; g_loopback_dev.netmask[3] = 0;
+    g_loopback_dev.broadcast[0] = 127; g_loopback_dev.broadcast[1] = 255; g_loopback_dev.broadcast[2] = 255; g_loopback_dev.broadcast[3] = 255;
+    g_loopback_dev.flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+    g_loopback_dev.mtu = 65536;
+    g_loopback_dev.send = loopback_send;
+    g_loopback_dev.link_up = NULL;
+
     if (g_primary_dev) {
         memcpy(g_host_mac, g_primary_dev->mac, 6);
     }
@@ -88,7 +149,7 @@ void net_init(void)
     /* Initialize RFC 2131 DHCP Client and start discovery */
     dhcp_init();
 
-    pr_debug("[NET] Network subsystem active. MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    pr_debug("[NET] Network subsystem active. Loopback: 127.0.0.1, MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
              g_host_mac[0], g_host_mac[1], g_host_mac[2],
              g_host_mac[3], g_host_mac[4], g_host_mac[5]);
 
@@ -158,8 +219,8 @@ void net_set_dns(const u8 dns_in[4])
 
 int net_ioctl(u32 cmd, u64 arg)
 {
-    if (!arg && cmd != SIOCGIFFLAGS) return -1;
-    if (cmd != SIOCGIFFLAGS && (uintptr_t)arg >= 0x8000000000000000ULL) return -1;
+    if (!arg && cmd != SIOCGIFFLAGS && cmd != SIOCSIFDHCP) return -1;
+    if (cmd != SIOCGIFFLAGS && cmd != SIOCSIFDHCP && (uintptr_t)arg >= 0x8000000000000000ULL) return -1;
 
     switch (cmd) {
     case SIOCGIFHWADDR:
@@ -202,11 +263,63 @@ int net_ioctl(u32 cmd, u64 arg)
         return 0;
     }
     case SIOCGIFFLAGS:
-        return 0x1043; /* IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST */
+        return (int)(g_primary_dev ? g_primary_dev->flags : (IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST));
+    case SIOCSIFFLAGS: {
+        u32 flg = 0;
+        if (copy_from_user(&flg, (const void *)(uintptr_t)arg, sizeof(u32)) == 0) {
+            if (g_primary_dev) g_primary_dev->flags = flg;
+            return 0;
+        }
+        return -1;
+    }
     case SIOCGIFNAME: {
         const char *name = g_primary_dev ? g_primary_dev->name : "net0";
         size_t nlen = strlen(name) + 1;
         if (copy_to_user((void *)(uintptr_t)arg, name, nlen) != 0) return -1;
+        return 0;
+    }
+    case SIOCGIFMTU: {
+        u32 mtu = g_primary_dev ? g_primary_dev->mtu : 1500;
+        if (copy_to_user((void *)(uintptr_t)arg, &mtu, sizeof(u32)) != 0) return -1;
+        return 0;
+    }
+    case SIOCGIFBRDADDR: {
+        u8 brd[4] = {
+            (u8)(g_host_ip[0] | ~g_host_netmask[0]),
+            (u8)(g_host_ip[1] | ~g_host_netmask[1]),
+            (u8)(g_host_ip[2] | ~g_host_netmask[2]),
+            (u8)(g_host_ip[3] | ~g_host_netmask[3])
+        };
+        if (copy_to_user((void *)(uintptr_t)arg, brd, 4) != 0) return -1;
+        return 0;
+    }
+    case SIOCGIFSTATS: {
+        net_stats_t st = g_primary_dev ? g_primary_dev->stats : g_loopback_dev.stats;
+        if (copy_to_user((void *)(uintptr_t)arg, &st, sizeof(net_stats_t)) != 0) return -1;
+        return 0;
+    }
+    case SIOCGIFCOUNT: {
+        int count = net_get_device_count();
+        if (copy_to_user((void *)(uintptr_t)arg, &count, sizeof(int)) != 0) return -1;
+        return 0;
+    }
+    case SIOCGIFINDEX: {
+        int idx = 0;
+        if (copy_from_user(&idx, (const void *)(uintptr_t)arg, sizeof(int)) != 0) return -1;
+        net_device_t *dev = net_get_device_by_index(idx);
+        if (!dev) return -1;
+        if (copy_to_user((void *)(uintptr_t)arg, dev, sizeof(net_device_t)) != 0) return -1;
+        return 0;
+    }
+    case SIOCSIFDHCP: {
+        extern int dhcp_trigger_renew(void);
+        return dhcp_trigger_renew();
+    }
+    case SIOCGIFDHCP: {
+        extern void dhcp_get_lease(dhcp_lease_t *out_lease);
+        dhcp_lease_t lease;
+        dhcp_get_lease(&lease);
+        if (copy_to_user((void *)(uintptr_t)arg, &lease, sizeof(dhcp_lease_t)) != 0) return -1;
         return 0;
     }
     default:
@@ -241,10 +354,13 @@ void net_process_incoming(const u8 *pkt, size_t len)
     }
 }
 
+__attribute__((weak)) void e1000_poll_rx(void) {}
+__attribute__((weak)) void virtio_net_poll(void) {}
+
 void net_poll(void)
 {
-    extern void e1000_poll_rx(void);
     e1000_poll_rx();
+    virtio_net_poll();
 }
 
 s64 net_send_icmp_ping(const u8 target_ip[4], u16 seq)

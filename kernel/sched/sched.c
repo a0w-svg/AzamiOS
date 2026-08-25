@@ -46,12 +46,11 @@ void sched_post_switch(void)
     if (!cpu) return;
 
     if (cpu->current_thread && cpu->current_thread->proc) {
-        if (cpu->current_thread->proc->fs_base) {
-            wrmsr(MSR_FS_BASE, cpu->current_thread->proc->fs_base);
-        }
-        if (cpu->current_thread->proc->gs_base) {
-            wrmsr(MSR_KERNEL_GS_BASE, cpu->current_thread->proc->gs_base);
-        }
+        wrmsr(MSR_FS_BASE, cpu->current_thread->proc->fs_base);
+        wrmsr(MSR_KERNEL_GS_BASE, cpu->current_thread->proc->gs_base);
+    } else {
+        wrmsr(MSR_FS_BASE, 0);
+        wrmsr(MSR_KERNEL_GS_BASE, 0);
     }
 
     if (cpu->prev_thread) {
@@ -572,8 +571,12 @@ void sched_yield(void)
     if (next->proc && next->proc->pml4_phys && (read_cr3() & VMM_PHYS_MASK) != next->proc->pml4_phys) {
         vmm_switch(next->proc->pml4_phys);
     }
-    if (next->proc && next->proc->fs_base) {
+    if (next->proc) {
         wrmsr(MSR_FS_BASE, next->proc->fs_base);
+        wrmsr(MSR_KERNEL_GS_BASE, next->proc->gs_base);
+    } else {
+        wrmsr(MSR_FS_BASE, 0);
+        wrmsr(MSR_KERNEL_GS_BASE, 0);
     }
 
     cpu->prev_thread = prev;

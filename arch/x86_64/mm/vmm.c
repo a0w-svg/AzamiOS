@@ -29,14 +29,17 @@
 /* ── Kernel PML4 physical address ─────────────────────────────────────────── */
 static vmm_space_t g_kernel_pml4 = 0;
 
-/* Global hardware protection flags */
+/* Global hardware protection and capability flags */
 u8 g_smep_enabled = 0;
 u8 g_smap_enabled = 0;
+u8 g_fsgsbase_enabled = 0;
+u8 g_osxsave_enabled = 0;
 
 /* ── Global VMM lock (protects kernel page table modifications) ─────────────── */
 static spinlock_t g_vmm_lock = SPINLOCK_INIT;
 
 /* ── Internal helpers ─────────────────────────────────────────────────────── */
+
 
 /* Return a pointer to a PTE table given its physical address via HHDM. */
 static inline u64 *phys_to_table(phys_addr_t p) {
@@ -75,9 +78,16 @@ int vmm_map(vmm_space_t space, virt_addr_t virt, phys_addr_t phys, u64 flags)
 {
     if (!space) space = g_kernel_pml4;
 
-    /* Intermediate tables need PRESENT+WRITE+USER so user processes can
-     * traverse them (actual access control is enforced at the leaf PTE). */
-    const u64 table_flags = VMM_F_PRESENT | VMM_F_WRITE | VMM_F_USER;
+    /* Security check: User-accessible pages cannot be placed in kernel space */
+    if (virt >= 0x0000800000000000ULL && (flags & VMM_F_USER)) {
+        return -1;
+    }
+
+    /* Intermediate tables need PRESENT+WRITE. If user space, add USER so ring 3 can traverse */
+    u64 table_flags = VMM_F_PRESENT | VMM_F_WRITE;
+    if (virt < 0x0000800000000000ULL) {
+        table_flags |= VMM_F_USER;
+    }
 
     irqflags_t irqf = spinlock_lock_irqsave(&g_vmm_lock);
 
@@ -96,6 +106,37 @@ int vmm_map(vmm_space_t space, virt_addr_t virt, phys_addr_t phys, u64 flags)
 
     /* Invalidate the TLB entry for this VA on the current CPU. */
     invlpg(virt);
+
+    spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
+    return 0;
+}
+
+int vmm_set_flags(vmm_space_t space, virt_addr_t virt, size_t count, u64 flags)
+{
+    if (!space) space = g_kernel_pml4;
+    if (count == 0) return 0;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_vmm_lock);
+
+    for (size_t i = 0; i < count; i++) {
+        virt_addr_t va = virt + (i * PAGE_SIZE);
+        u64 *pml4 = phys_to_table(space);
+        if (!(pml4[VMM_PML4_IDX(va)] & VMM_F_PRESENT)) continue;
+
+        u64 *pdpt = phys_to_table(pml4[VMM_PML4_IDX(va)] & VMM_PHYS_MASK);
+        if (!(pdpt[VMM_PDPT_IDX(va)] & VMM_F_PRESENT)) continue;
+
+        u64 *pd = phys_to_table(pdpt[VMM_PDPT_IDX(va)] & VMM_PHYS_MASK);
+        if (!(pd[VMM_PD_IDX(va)] & VMM_F_PRESENT)) continue;
+
+        u64 *pt = phys_to_table(pd[VMM_PD_IDX(va)] & VMM_PHYS_MASK);
+        if (!(pt[VMM_PT_IDX(va)] & VMM_F_PRESENT)) continue;
+
+        phys_addr_t phys = pt[VMM_PT_IDX(va)] & VMM_PHYS_MASK;
+        u64 preserved = pt[VMM_PT_IDX(va)] & (VMM_F_GLOBAL | VMM_F_SHARED);
+        pt[VMM_PT_IDX(va)] = phys | flags | preserved;
+        invlpg(va);
+    }
 
     spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
     return 0;
@@ -348,29 +389,58 @@ void vmm_init(u64 hhdm_base, u64 phys_base, u64 virt_base, void *memmap_raw)
     kprintf("[VMM] Kernel PML4 at physical 0x%016llx\n",
             (unsigned long long)g_kernel_pml4);
 
-    /* Enable SMEP (bit 20) and SMAP (bit 21) in CR4 if the CPU supports them. */
+    /* Check CPUID leaf 7 for SMEP, SMAP, FSGSBASE */
     u32 eax, ebx, ecx, edx;
     __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
                              : "a"(7), "c"(0));
     u64 cr4 = read_cr4();
+    if (ebx & (1U << 0)) {
+        cr4 |= (1ULL << 16); /* FSGSBASE */
+        g_fsgsbase_enabled = 1;
+        kprintf("[VMM] FSGSBASE enabled\n");
+    }
     if (ebx & (1U << 7))  {
-        cr4 |= (1ULL << 20);
+        cr4 |= (1ULL << 20); /* SMEP */
         g_smep_enabled = 1;
         kprintf("[VMM] SMEP enabled\n");
     }
     if (ebx & (1U << 20)) {
-        cr4 |= (1ULL << 21);
+        cr4 |= (1ULL << 21); /* SMAP */
         g_smap_enabled = 1;
         kprintf("[VMM] SMAP enabled\n");
     }
+
+    /* Check CPUID leaf 1 for XSAVE / AVX */
+    u32 eax1, ebx1, ecx1, edx1;
+    __asm__ volatile("cpuid" : "=a"(eax1), "=b"(ebx1), "=c"(ecx1), "=d"(edx1)
+                             : "a"(1), "c"(0));
+    if (ecx1 & (1U << 26)) {
+        cr4 |= (1ULL << 18); /* OSXSAVE */
+        g_osxsave_enabled = 1;
+        kprintf("[VMM] OSXSAVE enabled\n");
+    }
     write_cr4(cr4);
+
+    /* If OSXSAVE is enabled, initialize XCR0 to enable x87 (bit 0), SSE (bit 1), and AVX (bit 2) */
+    if (g_osxsave_enabled) {
+        u64 xcr0 = 0x7; /* x87 + SSE + AVX */
+        xsetbv(0, xcr0);
+        kprintf("[VMM] XCR0 initialized (0x%llx)\n", (unsigned long long)xcr0);
+    }
+
 
     /* Enable NXE in EFER so the NX bit in PTEs is honoured. */
     u64 efer = rdmsr(MSR_EFER);
     efer |= EFER_NXE;
     wrmsr(MSR_EFER, efer);
 
-    kprintf("[VMM] 4-level paging, HHDM=0x%016llx, NXE enabled\n",
+    /* Configure Page Attribute Table (PAT MSR 0x277):
+     * PA0: WB (0x06), PA1: WC (0x01), PA2: UC- (0x07), PA3: UC (0x00),
+     * PA4: WB (0x06), PA5: WC (0x01), PA6: UC- (0x07), PA7: UC (0x00)
+     * Value: 0x0007010600070106ULL */
+    wrmsr(MSR_PAT, 0x0007010600070106ULL);
+
+    kprintf("[VMM] 4-level paging, HHDM=0x%016llx, NXE & PAT (WC) enabled\n",
             (unsigned long long)HHDM_BASE);
 
     struct limine_memmap_response *memmap = memmap_raw;

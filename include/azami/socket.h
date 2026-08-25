@@ -84,6 +84,14 @@ struct sockaddr_in {
     u8             sin_zero[8];
 };
 
+typedef struct raw_sock {
+    int             protocol;
+    net_buf_queue_t rx_queue;
+    struct thread  *wait_thread;
+    spinlock_t      lock;
+    struct raw_sock *next;
+} raw_sock_t;
+
 typedef struct socket {
     int         domain;
     int         type;
@@ -91,15 +99,22 @@ typedef struct socket {
     union {
         tcp_sock_t *tcp;
         udp_sock_t *udp;
+        raw_sock_t *raw;
     };
     int         so_reuseaddr;
+    int         so_reuseport;
+    int         so_broadcast;
+    int         so_error;
     u32         so_rcvtimeo;
     u32         so_sndtimeo;
     file_t     *file;
 } socket_t;
 
 /* Public Socket API */
-socket_t *sock_alloc(int domain, int type, int protocol);
-file_t   *sock_create_file(socket_t *sock);
-void      sock_free(socket_t *sock);
-int       sock_get_from_fd(int fd, socket_t **sock_out);
+socket_t   *sock_alloc(int domain, int type, int protocol);
+file_t     *sock_create_file(socket_t *sock);
+void        sock_free(socket_t *sock);
+int         sock_get_from_fd(int fd, socket_t **sock_out);
+raw_sock_t *raw_socket_create(int protocol);
+void        raw_socket_close(raw_sock_t *raw);
+void        raw_input(net_buf_t *buf, const ipv4_hdr_t *ip);

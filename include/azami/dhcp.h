@@ -9,6 +9,7 @@
 
 #include "types.h"
 #include "net_buf.h"
+#include "net.h"
 #include "ipv4.h"
 
 #define DHCP_CLIENT_PORT 68
@@ -90,5 +91,6 @@ typedef struct {
 /* Public Kernel DHCP API */
 void dhcp_init(void);
 int  dhcp_start_discovery(void);
+int  dhcp_trigger_renew(void);
 void dhcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr);
 void dhcp_get_lease(dhcp_lease_t *out_lease);

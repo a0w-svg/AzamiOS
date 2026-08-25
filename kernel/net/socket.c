@@ -23,6 +23,81 @@
 #define POLLNVAL 0x0020
 #endif
 
+static raw_sock_t *g_raw_sockets = NULL;
+static spinlock_t  g_raw_lock = SPINLOCK_INIT;
+
+raw_sock_t *raw_socket_create(int protocol)
+{
+    raw_sock_t *r = (raw_sock_t *)kzalloc(sizeof(raw_sock_t));
+    if (!r) return NULL;
+    r->protocol = protocol;
+    net_buf_queue_init(&r->rx_queue);
+    spinlock_init(&r->lock);
+    r->wait_thread = NULL;
+
+    spinlock_lock(&g_raw_lock);
+    r->next = g_raw_sockets;
+    g_raw_sockets = r;
+    spinlock_unlock(&g_raw_lock);
+    return r;
+}
+
+void raw_socket_close(raw_sock_t *raw)
+{
+    if (!raw) return;
+    spinlock_lock(&g_raw_lock);
+    raw_sock_t **curr = &g_raw_sockets;
+    while (*curr) {
+        if (*curr == raw) {
+            *curr = raw->next;
+            break;
+        }
+        curr = &(*curr)->next;
+    }
+    spinlock_unlock(&g_raw_lock);
+
+    spinlock_lock(&raw->lock);
+    net_buf_queue_purge(&raw->rx_queue);
+    if (raw->wait_thread) {
+        sched_unblock(raw->wait_thread);
+        raw->wait_thread = NULL;
+    }
+    spinlock_unlock(&raw->lock);
+    kfree(raw);
+}
+
+void raw_input(net_buf_t *buf, const ipv4_hdr_t *ip)
+{
+    if (!buf || !ip) return;
+    spinlock_lock(&g_raw_lock);
+    raw_sock_t *curr = g_raw_sockets;
+    while (curr) {
+        if (curr->protocol == 0 || curr->protocol == ip->protocol) {
+            net_buf_t *clone = net_buf_clone(buf);
+            if (clone) {
+                /* Prepend 6-byte header containing [src_ip 4B][protocol 2B] */
+                u8 *hdr = (u8 *)net_buf_push(clone, 6);
+                if (hdr) {
+                    memcpy(hdr, ip->src_ip, 4);
+                    hdr[4] = (u8)(ip->protocol & 0xFF);
+                    hdr[5] = 0;
+                    net_buf_queue_push(&curr->rx_queue, clone);
+                    spinlock_lock(&curr->lock);
+                    if (curr->wait_thread) {
+                        sched_unblock(curr->wait_thread);
+                        curr->wait_thread = NULL;
+                    }
+                    spinlock_unlock(&curr->lock);
+                } else {
+                    net_buf_free(clone);
+                }
+            }
+        }
+        curr = curr->next;
+    }
+    spinlock_unlock(&g_raw_lock);
+}
+
 static s64 sock_fop_read(struct file *filp, void *buf, size_t len, u64 *offset)
 {
     (void)offset;
@@ -34,6 +109,25 @@ static s64 sock_fop_read(struct file *filp, void *buf, size_t len, u64 *offset)
         return tcp_recv(sock->tcp, buf, len, nonblock);
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
         return udp_recvfrom(sock->udp, buf, len, NULL, NULL, nonblock);
+    } else if (sock->type == SOCK_RAW && sock->raw) {
+        for (;;) {
+            net_buf_t *pkt = net_buf_queue_pop(&sock->raw->rx_queue);
+            if (pkt) {
+                size_t psize = pkt->len > 6 ? (pkt->len - 6) : pkt->len;
+                size_t clen = (psize < len) ? psize : len;
+                memcpy(buf, pkt->data + 6, clen);
+                net_buf_free(pkt);
+                return (s64)clen;
+            }
+            if (nonblock) return -(s64)EAGAIN;
+            spinlock_lock(&sock->raw->lock);
+            if (net_buf_queue_len(&sock->raw->rx_queue) == 0) {
+                sock->raw->wait_thread = sched_current_thread();
+                sched_block(THREAD_BLOCKED);
+            }
+            spinlock_unlock(&sock->raw->lock);
+            sched_yield();
+        }
     }
     return -EINVAL;
 }
@@ -65,6 +159,9 @@ static int sock_fop_poll(struct file *filp)
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
         if (udp_poll(sock->udp)) mask |= (POLLIN | POLLPRI);
         mask |= POLLOUT;
+    } else if (sock->type == SOCK_RAW && sock->raw) {
+        if (net_buf_queue_len(&sock->raw->rx_queue) > 0) mask |= (POLLIN | POLLPRI);
+        mask |= POLLOUT;
     }
     return mask;
 }
@@ -79,11 +176,45 @@ static s64 sock_fop_release(struct inode *inode, struct file *filp)
     return 0;
 }
 
+#include "../../kernel/uaccess.h"
+
+static s64 sock_fop_ioctl(struct file *filp, u32 cmd, u64 arg)
+{
+    if (!filp || !filp->private_data) return -(s64)EBADF;
+    socket_t *sock = (socket_t *)filp->private_data;
+
+    if (cmd == 0x5421 /* FIONBIO */) {
+        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        int val = 0;
+        if (copy_from_user(&val, (const void *)(uintptr_t)arg, sizeof(int)) != 0) return -(s64)EFAULT;
+        if (val) filp->f_flags |= O_NONBLOCK;
+        else filp->f_flags &= ~O_NONBLOCK;
+        return 0;
+    }
+
+    if (cmd == 0x541B /* FIONREAD */) {
+        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        int bytes = 0;
+        if (sock->type == SOCK_STREAM && sock->tcp) {
+            bytes = (int)sock->tcp->rx_len;
+        } else if (sock->type == SOCK_DGRAM && sock->udp) {
+            bytes = (int)net_buf_queue_len(&sock->udp->rx_queue);
+        } else if (sock->type == SOCK_RAW && sock->raw) {
+            bytes = (int)net_buf_queue_len(&sock->raw->rx_queue);
+        }
+        if (copy_to_user((void *)(uintptr_t)arg, &bytes, sizeof(int)) != 0) return -(s64)EFAULT;
+        return 0;
+    }
+
+    extern int net_ioctl(u32 cmd, u64 arg);
+    return (s64)net_ioctl(cmd, arg);
+}
+
 static file_operations_t g_socket_fops = {
     .read = sock_fop_read,
     .write = sock_fop_write,
     .readdir = NULL,
-    .ioctl = NULL,
+    .ioctl = sock_fop_ioctl,
     .mmap = NULL,
     .open = NULL,
     .release = sock_fop_release,
@@ -111,6 +242,12 @@ socket_t *sock_alloc(int domain, int type, int protocol)
             kfree(sock);
             return NULL;
         }
+    } else if (type == SOCK_RAW) {
+        sock->raw = raw_socket_create(protocol);
+        if (!sock->raw) {
+            kfree(sock);
+            return NULL;
+        }
     }
 
     return sock;
@@ -126,6 +263,9 @@ void sock_free(socket_t *sock)
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
         udp_socket_close(sock->udp);
         sock->udp = NULL;
+    } else if (sock->type == SOCK_RAW && sock->raw) {
+        raw_socket_close(sock->raw);
+        sock->raw = NULL;
     }
 
     kfree(sock);

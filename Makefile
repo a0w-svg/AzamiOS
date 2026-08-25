@@ -144,7 +144,12 @@ KERNEL_C_SRCS := \
     drivers/misc/virtio_rng.c \
     drivers/net/pcnet.c \
     drivers/block/fdc.c \
-    drivers/sound/hda.c
+    drivers/sound/hda.c \
+    drivers/sound/sb16.c \
+    drivers/block/loop.c \
+    fs/sysfs.c \
+    fs/devpts.c \
+    drivers/char/pty.c
 
 # ── Object file lists ─────────────────────────────────────────────────────────
 BOOT_OBJS   := $(patsubst %.asm, $(OBJ_DIR)/%.o, $(BOOT_ASM_SRCS))
@@ -249,7 +254,11 @@ iso: $(KERNEL_ELF) | tools/limine
 	@mkdir -p $(BUILD_DIR)/iso_root/boot/limine
 	@mkdir -p $(BUILD_DIR)/iso_root/EFI/BOOT
 	@$(MAKE) -C userland ARCH=x86_64 >/dev/null
-	@mke2fs -F -t ext2 -b 4096 -d userland/build $(BUILD_DIR)/initrd.ext2 120M
+	@mke2fs -F -t ext2 -b 4096 -d userland/build $(BUILD_DIR)/initrd.ext2 200M
+
+
+
+
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso_root/boot/kernel.elf
 	cp $(BUILD_DIR)/initrd.ext2 $(BUILD_DIR)/iso_root/boot/initrd.ext2 2>/dev/null || true
 	cp limine.conf   $(BUILD_DIR)/iso_root/boot/limine/limine.conf

@@ -50,7 +50,8 @@
 static int map_shared_memory(void **frontbuf, void **backbuf,
                               unsigned int screen_w, unsigned int screen_h)
 {
-    /* 1. Try opening and mmapping Linux framebuffer device /dev/fb0 */
+    /* 1. Map physical hardware VRAM into frontbuf */
+    int mapped_front = 0;
     int fb_fd = open("/dev/fb0", O_RDWR);
     if (fb_fd >= 0) {
         struct fb_var_screeninfo var;
@@ -62,26 +63,23 @@ static int map_shared_memory(void **frontbuf, void **backbuf,
             void *mapped = mmap(*frontbuf, total_vram, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
             if (mapped != MAP_FAILED) {
                 *frontbuf = mapped;
-            } else {
-                int fb_ret = az_fb_map(*frontbuf);
-                if (fb_ret < 0) {
-                    puts("[azwm] FATAL: az_fb_map failed — cannot reach display hardware!");
-                    close(fb_fd);
-                    return -1;
-                }
+                mapped_front = 1;
             }
         }
         close(fb_fd);
-    } else {
-        /* Fallback: direct syscall map */
+    }
+
+    if (!mapped_front) {
+        /* Direct microkernel framebuffer mapping */
         int fb_ret = az_fb_map(*frontbuf);
         if (fb_ret < 0) {
             puts("[azwm] FATAL: az_fb_map failed — cannot reach display hardware!");
             return -1;
         }
+        mapped_front = 1;
     }
 
-    /* Allocate a back buffer sized to the actual screen (+ 1 spare page) */
+    /* 2. Allocate an offscreen back buffer sized to the screen (+ 1 spare page) */
     unsigned long buf_bytes  = (unsigned long)screen_w * screen_h * 4;
     int           page_count = (int)((buf_bytes + 4095UL) / 4096UL) + 1;
 
@@ -96,6 +94,8 @@ static int map_shared_memory(void **frontbuf, void **backbuf,
         puts("[azwm] WARNING: az_shmem_create failed — using front buffer as back buffer");
         *backbuf = *frontbuf;
     }
+
+    puts("[azwm] Hardware Framebuffer & Shared Memory Compositor initialized.");
     return 0;
 }
 
@@ -558,9 +558,9 @@ int main(int argc, char **argv)
                                     redraw_needed = true;
                                 }
                             } else {
-                                /* Focus the window (raise to top) */
+                                /* Focus the window (raise to top) if it's an application window */
                                 unsigned int new_wid = hit->wid;
-                                if (!hit->focused) {
+                                if (!hit->focused && hit->title[0] != '\0') {
                                     prev_focus_wid = comp.focused_window ? comp.focused_window->wid : 0;
                                     compositor_focus_window(&comp, hit);
                                     de_comp_enforce_zorder(&comp, &de_state);
@@ -889,21 +889,33 @@ int main(int argc, char **argv)
                     }
                 }
 
-                /* Forward normal key event to focused window */
-                if (comp.focused_window) {
+                /* Forward normal key event to focused application window */
+                az_window_t *kw = comp.focused_window;
+                if (!kw || kw->title[0] == '\0' || !kw->visible) {
+                    az_window_t *curr = comp.list_head;
+                    while (curr) {
+                        if (curr->wid != 0 && curr->visible && curr->title[0] != '\0') {
+                            kw = curr;
+                            break;
+                        }
+                        curr = curr->next;
+                    }
+                }
+
+                if (kw) {
                     az_wm_msg_t fwd;
                     int j;
                     for (j = 0; j < (int)sizeof(fwd); j++)
                         ((char*)&fwd)[j] = 0;
                     fwd.type = AZ_WM_KEY_EVENT;
-                    fwd.wid  = comp.focused_window->wid;
+                    fwd.wid  = kw->wid;
                     fwd.key.keycode   = ev.keycode;
                     fwd.key.scancode  = ev.scancode;
                     fwd.key.pressed   = (ev.flags & AZ_KEY_FLAG_PRESSED) ? 1 : 0;
                     fwd.key.modifiers = (unsigned short)(ev.flags >> 2);
-                    int send_ret = az_channel_send_nb(comp.focused_window->client_chan, (az_ipc_msg_t *)&fwd);
+                    int send_ret = az_channel_send_nb(kw->client_chan, (az_ipc_msg_t *)&fwd);
                     if (send_ret == -32) {
-                        unsigned int dead_wid = comp.focused_window->wid;
+                        unsigned int dead_wid = kw->wid;
                         unsigned int prev_focus = comp.focused_window ? comp.focused_window->wid : 0;
                         compositor_destroy_window(&comp, dead_wid);
                         unsigned int new_focus = comp.focused_window ? comp.focused_window->wid : 0;

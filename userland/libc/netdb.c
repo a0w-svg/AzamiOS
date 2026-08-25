@@ -103,6 +103,32 @@ static int dns_format_qname(const char *domain, unsigned char *out, size_t out_m
     return (int)out_idx;
 }
 
+static int dns_check_hosts_file(const char *hostname, struct in_addr *out_addr)
+{
+    int fd = open("/etc/hosts", O_RDONLY, 0);
+    if (fd < 0) return -1;
+    char buf[1024];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+
+    char *line = strtok(buf, "\r\n");
+    while (line) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line != '#' && *line != '\0') {
+            char ip_str[64], host_str[128];
+            if (sscanf(line, "%63s %127s", ip_str, host_str) == 2) {
+                if (strcmp(host_str, hostname) == 0) {
+                    if (inet_aton(ip_str, out_addr) == 1) return 0;
+                }
+            }
+        }
+        line = strtok(NULL, "\r\n");
+    }
+    return -1;
+}
+
 static int dns_resolve_ipv4(const char *hostname, struct in_addr *out_addr)
 {
     if (!hostname || !out_addr) return -1;
@@ -118,7 +144,12 @@ static int dns_resolve_ipv4(const char *hostname, struct in_addr *out_addr)
         return 0;
     }
 
-    /* 3. Dynamic DNS server lookup from system configuration */
+    /* 3. Static /etc/hosts file check */
+    if (dns_check_hosts_file(hostname, out_addr) == 0) {
+        return 0;
+    }
+
+    /* 4. Dynamic DNS server lookup from system configuration */
     char dns_ip_str[64];
     dns_get_nameserver(dns_ip_str, sizeof(dns_ip_str));
 
@@ -238,6 +269,101 @@ struct hostent *gethostbyname(const char *name)
     g_hostent.h_addr_list = g_host_addrs;
 
     return &g_hostent;
+}
+
+struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type)
+{
+    if (!addr || len < sizeof(struct in_addr) || type != AF_INET) return NULL;
+
+    const struct in_addr *in = (const struct in_addr *)addr;
+    g_host_addr = *in;
+    inet_ntop(AF_INET, in, g_host_name, sizeof(g_host_name));
+
+    g_host_addrs[0] = (char *)&g_host_addr;
+    g_host_addrs[1] = NULL;
+
+    g_hostent.h_name = g_host_name;
+    g_hostent.h_aliases = g_host_aliases;
+    g_hostent.h_addrtype = AF_INET;
+    g_hostent.h_length = sizeof(struct in_addr);
+    g_hostent.h_addr_list = g_host_addrs;
+
+    return &g_hostent;
+}
+
+static struct protoent g_proto;
+static char *g_proto_aliases[1] = { NULL };
+
+struct protoent *getprotobyname(const char *name)
+{
+    if (!name) return NULL;
+    if (strcmp(name, "ip") == 0) { g_proto.p_name = "ip"; g_proto.p_proto = 0; }
+    else if (strcmp(name, "icmp") == 0) { g_proto.p_name = "icmp"; g_proto.p_proto = 1; }
+    else if (strcmp(name, "tcp") == 0) { g_proto.p_name = "tcp"; g_proto.p_proto = 6; }
+    else if (strcmp(name, "udp") == 0) { g_proto.p_name = "udp"; g_proto.p_proto = 17; }
+    else if (strcmp(name, "raw") == 0) { g_proto.p_name = "raw"; g_proto.p_proto = 255; }
+    else return NULL;
+
+    g_proto.p_aliases = g_proto_aliases;
+    return &g_proto;
+}
+
+struct protoent *getprotobynumber(int proto)
+{
+    if (proto == 0) { g_proto.p_name = "ip"; g_proto.p_proto = 0; }
+    else if (proto == 1) { g_proto.p_name = "icmp"; g_proto.p_proto = 1; }
+    else if (proto == 6) { g_proto.p_name = "tcp"; g_proto.p_proto = 6; }
+    else if (proto == 17) { g_proto.p_name = "udp"; g_proto.p_proto = 17; }
+    else if (proto == 255) { g_proto.p_name = "raw"; g_proto.p_proto = 255; }
+    else return NULL;
+
+    g_proto.p_aliases = g_proto_aliases;
+    return &g_proto;
+}
+
+static struct servent g_serv;
+static char *g_serv_aliases[1] = { NULL };
+
+struct servent *getservbyname(const char *name, const char *proto)
+{
+    if (!name) return NULL;
+    int port = 0;
+    const char *p = proto ? proto : "tcp";
+
+    if (strcmp(name, "http") == 0) port = 80;
+    else if (strcmp(name, "https") == 0) port = 443;
+    else if (strcmp(name, "domain") == 0 || strcmp(name, "dns") == 0) { port = 53; p = proto ? proto : "udp"; }
+    else if (strcmp(name, "ssh") == 0) port = 22;
+    else if (strcmp(name, "telnet") == 0) port = 23;
+    else if (strcmp(name, "ftp") == 0) port = 21;
+    else return NULL;
+
+    g_serv.s_name = (char *)name;
+    g_serv.s_aliases = g_serv_aliases;
+    g_serv.s_port = htons((uint16_t)port);
+    g_serv.s_proto = (char *)p;
+    return &g_serv;
+}
+
+struct servent *getservbyport(int port, const char *proto)
+{
+    uint16_t p = ntohs((uint16_t)port);
+    const char *name = NULL;
+    const char *pr = proto ? proto : "tcp";
+
+    if (p == 80) name = "http";
+    else if (p == 443) name = "https";
+    else if (p == 53) { name = "domain"; pr = proto ? proto : "udp"; }
+    else if (p == 22) name = "ssh";
+    else if (p == 23) name = "telnet";
+    else if (p == 21) name = "ftp";
+    else return NULL;
+
+    g_serv.s_name = (char *)name;
+    g_serv.s_aliases = g_serv_aliases;
+    g_serv.s_port = (int)port;
+    g_serv.s_proto = (char *)pr;
+    return &g_serv;
 }
 
 int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res)

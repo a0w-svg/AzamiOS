@@ -537,7 +537,7 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
     /* Start button hover */
     unsigned char was_hot = g_sb_hot;
     g_sb_hot = (lx >= SB_X && lx < SB_X + SB_W && ly >= SB_Y && ly < SB_Y + SB_H) ? 1 : 0;
-    if (g_sb_hot != was_hot) { taskbar_draw(); return; }
+    if (g_sb_hot != was_hot) { taskbar_draw(); }
 
     /* Left-click on Start → toggle launcher */
     if (lclick && g_sb_hot) {

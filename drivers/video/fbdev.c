@@ -223,6 +223,23 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
             return 0;
         }
 
+        case FBIOGETCMAP:
+        case FBIOPUTCMAP:
+            /* Truecolor / 32-bit direct color visual - colormap is identity */
+            return 0;
+
+        case FBIOGET_CON2FBMAP: {
+            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            struct fb_con2fbmap c2f;
+            c2f.console = 0;
+            c2f.framebuffer = 0;
+            if (copy_to_user((void *)(uintptr_t)arg, &c2f, sizeof(c2f)) != 0) return -(s64)EFAULT;
+            return 0;
+        }
+
+        case FBIOPUT_CON2FBMAP:
+            return 0;
+
         case FBIOBLANK:
         case FBIO_WAITFORVSYNC:
             return 0;
@@ -231,6 +248,7 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
             return -(s64)EINVAL;
     }
 }
+
 
 static s64 fbdev_mmap(struct file *filp, virt_addr_t vaddr, size_t len, u32 prot, u32 flags, u64 offset)
 {

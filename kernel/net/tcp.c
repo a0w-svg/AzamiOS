@@ -22,7 +22,7 @@
 static tcp_sock_t *g_tcp_sockets = NULL;
 static spinlock_t  g_tcp_lock = SPINLOCK_INIT;
 static u16         g_tcp_ephemeral_port = TCP_PORT_EPHEMERAL_START;
-static _Atomic u32 g_isn_seed = 0x12345678;
+static u32         g_isn_seed = 0x12345678;
 
 static inline u16 htons(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 static inline u16 ntohs(u16 v) { return htons(v); }
@@ -121,7 +121,12 @@ static s64 tcp_send_packet(tcp_sock_t *sock, u8 flags, const void *payload, size
     u8 host_ip[4];
     net_get_ip(host_ip);
     ipv4_hdr_t pseudo_ip;
-    memcpy(pseudo_ip.src_ip, host_ip, 4);
+    if (sock->remote_ip[0] == 127) {
+        static const u8 loop_ip[4] = { 127, 0, 0, 1 };
+        memcpy(pseudo_ip.src_ip, loop_ip, 4);
+    } else {
+        memcpy(pseudo_ip.src_ip, host_ip, 4);
+    }
     memcpy(pseudo_ip.dst_ip, sock->remote_ip, 4);
     tcp->checksum = tcp_checksum(tcp, &pseudo_ip, payload, payload_len);
 
@@ -291,17 +296,26 @@ tcp_sock_t *tcp_accept(tcp_sock_t *listener, u8 client_ip_out[4], u16 *client_po
     for (;;) {
         spinlock_lock(&listener->lock);
         if (listener->backlog_count > 0) {
-            tcp_sock_t *client = listener->backlog[0];
-            for (int i = 0; i < listener->backlog_count - 1; i++) {
-                listener->backlog[i] = listener->backlog[i + 1];
+            int ready_idx = -1;
+            for (int i = 0; i < listener->backlog_count; i++) {
+                if (listener->backlog[i] && (listener->backlog[i]->state == TCP_STATE_ESTABLISHED || listener->backlog[i]->state == TCP_STATE_CLOSE_WAIT)) {
+                    ready_idx = i;
+                    break;
+                }
             }
-            listener->backlog_count--;
+            if (ready_idx >= 0) {
+                tcp_sock_t *client = listener->backlog[ready_idx];
+                for (int i = ready_idx; i < listener->backlog_count - 1; i++) {
+                    listener->backlog[i] = listener->backlog[i + 1];
+                }
+                listener->backlog_count--;
 
-            if (client_ip_out) memcpy(client_ip_out, client->remote_ip, 4);
-            if (client_port_out) *client_port_out = client->remote_port;
+                if (client_ip_out) memcpy(client_ip_out, client->remote_ip, 4);
+                if (client_port_out) *client_port_out = client->remote_port;
 
-            spinlock_unlock(&listener->lock);
-            return client;
+                spinlock_unlock(&listener->lock);
+                return client;
+            }
         }
 
         if (nonblock) {
@@ -591,7 +605,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             /* Copy into reception circular buffer */
             for (size_t i = 0; i < payload_len; i++) {
                 if (sock->rx_len < TCP_RX_BUF_SIZE) {
-                    sock->rx_buf[(sock->rx_tail + sock->rx_len) % TCP_RX_BUF_SIZE] = payload[i];
+                    sock->rx_buf[(sock->rx_head + sock->rx_len) % TCP_RX_BUF_SIZE] = payload[i];
                     sock->rx_len++;
                 }
             }

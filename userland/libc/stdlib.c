@@ -234,6 +234,26 @@ int posix_memalign(void **memptr, size_t alignment, size_t size)
     return 0;
 }
 
+void *reallocarray(void *ptr, size_t nmemb, size_t size)
+{
+    if (nmemb > 0 && size > (size_t)-1 / nmemb) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return realloc(ptr, nmemb * size);
+}
+
+void *valloc(size_t size)
+{
+    return aligned_alloc(4096, size);
+}
+
+void *pvalloc(size_t size)
+{
+    size_t rounded = (size + 4095) & ~4095UL;
+    return aligned_alloc(4096, rounded);
+}
+
 
 /* ── Numeric conversion ──────────────────────────────────────────────────── */
 
@@ -366,6 +386,11 @@ float strtof(const char *nptr, char **endptr)
     return (float)strtod(nptr, endptr);
 }
 
+long double strtold(const char *nptr, char **endptr)
+{
+    return (long double)strtod(nptr, endptr);
+}
+
 char *itoa(int value, char *str, int base)
 {
     if (!str) return (char *)0;
@@ -378,38 +403,49 @@ char *itoa(int value, char *str, int base)
 
     if (value < 0 && base == 10) {
         *ptr++ = '-';
-        uval = (unsigned int)(0 - value);
+        rc++;
+        uval = (unsigned int)-value;
     } else {
         uval = (unsigned int)value;
     }
 
-    low = ptr;
     do {
-        int rem = (int)(uval % (unsigned int)base);
-        *ptr++ = (char)(rem < 10 ? '0' + rem : 'a' + rem - 10);
+        *ptr++ = "0123456789abcdefghijklmnopqrstuvwxyz"[uval % (unsigned int)base];
         uval /= (unsigned int)base;
     } while (uval);
 
     *ptr-- = '\0';
+    low = rc;
     while (low < ptr) {
         char tmp = *low;
         *low++ = *ptr;
         *ptr-- = tmp;
     }
-    return rc;
+    return str;
 }
 
 /* ── Absolute value and division ─────────────────────────────────────────── */
 
-int abs(int x) { return (x < 0) ? -x : x; }
-long labs(long x) { return (x < 0) ? -x : x; }
-long long llabs(long long x) { return (x < 0) ? -x : x; }
+int abs(int x)
+{
+    return x < 0 ? -x : x;
+}
+
+long labs(long x)
+{
+    return x < 0 ? -x : x;
+}
+
+long long llabs(long long x)
+{
+    return x < 0 ? -x : x;
+}
 
 div_t div(int numer, int denom)
 {
     div_t r;
     r.quot = numer / denom;
-    r.rem = numer % denom;
+    r.rem  = numer % denom;
     return r;
 }
 
@@ -417,7 +453,7 @@ ldiv_t ldiv(long numer, long denom)
 {
     ldiv_t r;
     r.quot = numer / denom;
-    r.rem = numer % denom;
+    r.rem  = numer % denom;
     return r;
 }
 
@@ -425,7 +461,7 @@ lldiv_t lldiv(long long numer, long long denom)
 {
     lldiv_t r;
     r.quot = numer / denom;
-    r.rem = numer % denom;
+    r.rem  = numer % denom;
     return r;
 }
 
@@ -439,6 +475,23 @@ int rand(void)
 {
     g_rand_state = g_rand_state * 1103515245 + 12345;
     return (int)((g_rand_state / 65536) % (RAND_MAX + 1U));
+}
+
+int rand_r(unsigned int *seedp)
+{
+    if (!seedp) return rand();
+    *seedp = *seedp * 1103515245 + 12345;
+    return (int)((*seedp / 65536) % (RAND_MAX + 1U));
+}
+
+long random(void)
+{
+    return (long)rand();
+}
+
+void srandom(unsigned int seed)
+{
+    srand(seed);
 }
 
 static unsigned short s_rand48_seed[3] = { 0x330e, 0xabcd, 0x1234 };

@@ -42,6 +42,12 @@ int setuid(uid_t uid);
 int setgid(gid_t gid);
 int seteuid(uid_t euid);
 int setegid(gid_t egid);
+int setreuid(uid_t ruid, uid_t euid);
+int setregid(gid_t rgid, gid_t egid);
+int setresuid(uid_t ruid, uid_t euid, uid_t suid);
+int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid);
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid);
+int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid);
 int setpgid(int pid, int pgid);
 int getpgid(int pid);
 int setsid(void);
@@ -66,6 +72,14 @@ int isatty(int fd);
 int fsync(int fd);
 int fdatasync(int fd);
 void sync(void);
+int syncfs(int fd);
+ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out, off_t *off_out, size_t len, unsigned int flags);
+ssize_t readahead(int fd, off_t offset, size_t count);
+int sync_file_range(int fd, off_t offset, off_t nbytes, unsigned int flags);
+ssize_t splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out, size_t len, unsigned int flags);
+ssize_t tee(int fd_in, int fd_out, size_t len, unsigned int flags);
+struct iovec;
+ssize_t vmsplice(int fd, const struct iovec *iov, size_t nr_segs, unsigned int flags);
 
 /* Filesystem */
 int unlink(const char *pathname);
@@ -104,6 +118,7 @@ int getentropy(void *buffer, size_t length);
 char *getlogin(void);
 int getlogin_r(char *buf, size_t bufsize);
 void swab(const void *from, void *to, ssize_t n);
+int nice(int inc);
 
 /* Timing / Sleeping */
 unsigned int sleep(unsigned int seconds);

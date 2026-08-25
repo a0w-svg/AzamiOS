@@ -15,6 +15,11 @@ int isalpha(int c)
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
+int isblank(int c)
+{
+    return (c == ' ' || c == '\t');
+}
+
 int iscntrl(int c)
 {
     return (c >= 0 && c <= 0x1F) || (c == 0x7F);
@@ -60,6 +65,16 @@ int isxdigit(int c)
     return isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
+int isascii(int c)
+{
+    return (c >= 0 && c <= 0x7F);
+}
+
+int toascii(int c)
+{
+    return c & 0x7F;
+}
+
 int tolower(int c)
 {
     return isupper(c) ? (c + ('a' - 'A')) : c;
@@ -68,4 +83,14 @@ int tolower(int c)
 int toupper(int c)
 {
     return islower(c) ? (c - ('a' - 'A')) : c;
+}
+
+int _tolower(int c)
+{
+    return c + ('a' - 'A');
+}
+
+int _toupper(int c)
+{
+    return c - ('a' - 'A');
 }

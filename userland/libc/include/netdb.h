@@ -45,7 +45,26 @@ struct addrinfo {
 #define EAI_MEMORY     -10
 #define EAI_SYSTEM     -11
 
-struct hostent *gethostbyname(const char *name);
-int             getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res);
-void            freeaddrinfo(struct addrinfo *res);
-const char     *gai_strerror(int errcode);
+struct protoent {
+    char  *p_name;
+    char **p_aliases;
+    int    p_proto;
+};
+
+struct servent {
+    char  *s_name;
+    char **s_aliases;
+    int    s_port;
+    char  *s_proto;
+};
+
+struct hostent  *gethostbyname(const char *name);
+struct hostent  *gethostbyaddr(const void *addr, socklen_t len, int type);
+struct protoent *getprotobyname(const char *name);
+struct protoent *getprotobynumber(int proto);
+struct servent  *getservbyname(const char *name, const char *proto);
+struct servent  *getservbyport(int port, const char *proto);
+int              getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res);
+void             freeaddrinfo(struct addrinfo *res);
+const char      *gai_strerror(int errcode);
+

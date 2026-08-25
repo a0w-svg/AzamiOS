@@ -16,6 +16,7 @@
 #define MSR_GS_BASE       0xC0000101UL  /* GS segment base (kernel per-CPU) */
 #define MSR_KERNEL_GS_BASE 0xC0000102UL /* GS base after SWAPGS */
 #define MSR_APIC_BASE     0x0000001BUL  /* APIC base address */
+#define MSR_PAT           0x00000277UL  /* Page Attribute Table */
 
 /* EFER bit definitions */
 #define EFER_SCE  (1ULL << 0)   /* SYSCALL Enable */
@@ -80,6 +81,19 @@ static __attribute__((always_inline)) inline u64 read_cr4(void) {
 static __attribute__((always_inline)) inline void write_cr4(u64 v) {
     __asm__ volatile("mov %0, %%cr4" : : "r"(v) : "memory");
 }
+
+/* ── Extended Control Register (XCR) ──────────────────────────────────────── */
+static __attribute__((always_inline)) inline u64 xgetbv(u32 index) {
+    u32 eax, edx;
+    __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(index));
+    return ((u64)edx << 32) | eax;
+}
+static __attribute__((always_inline)) inline void xsetbv(u32 index, u64 value) {
+    u32 eax = (u32)(value & 0xFFFFFFFF);
+    u32 edx = (u32)(value >> 32);
+    __asm__ volatile("xsetbv" : : "a"(eax), "d"(edx), "c"(index) : "memory");
+}
+
 
 /* ── TLB invalidation ─────────────────────────────────────────────────────── */
 static __attribute__((always_inline)) inline void invlpg(uintptr_t va) {
