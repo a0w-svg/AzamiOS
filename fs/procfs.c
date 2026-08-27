@@ -14,6 +14,7 @@
 #include "vfs.h"
 #include "../kernel/mm/kmalloc.h"
 #include "../kernel/mm/pmm.h"
+#include "../kernel/mm/vma.h"
 #include "../kernel/sched/sched.h"
 #include "../kernel/lib/string.h"
 #include "../drivers/char/console.h"
@@ -434,10 +435,43 @@ static size_t format_proc_swaps(char *buf, size_t max)
         "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n");
 }
 
+struct maps_ctx {
+    char       *buf;
+    size_t      max;
+    size_t      off;
+    const char *name;
+};
+
+static void maps_emit_line(struct maps_ctx *c, u64 start, u64 end,
+                           char rd, char wr, char ex, char sh, const char *tag)
+{
+    if (c->off >= c->max) return;
+    c->off += (size_t)snprintf(c->buf + c->off, c->max - c->off,
+        "%012llx-%012llx %c%c%c%c 00000000 00:00 0 %s\n",
+        (unsigned long long)start, (unsigned long long)end,
+        rd, wr, ex, sh, tag ? tag : "");
+}
+
+static void maps_emit_vma(const vm_area_t *v, void *pv)
+{
+    struct maps_ctx *c = (struct maps_ctx *)pv;
+    const char *tag = "";
+    if (v->flags & VMA_F_STACK)      tag = "[stack]";
+    else if (v->flags & VMA_F_FILE)  tag = c->name;
+    maps_emit_line(c,
+        v->start, v->end,
+        (v->prot & VMA_PROT_READ)  ? 'r' : '-',
+        (v->prot & VMA_PROT_WRITE) ? 'w' : '-',
+        (v->prot & VMA_PROT_EXEC)  ? 'x' : '-',
+        (v->flags & VMA_F_SHARED)  ? 's' : 'p',
+        tag);
+}
+
 static size_t format_pid_maps(u32 pid, char *buf, size_t max)
 {
     char name[64] = "/bin/app.elf";
-    u64 heap_s = 0x10000000, heap_e = 0x10040000;
+    struct maps_ctx c = { buf, max, 0, name };
+
     sched_lock();
     process_t *p = find_proc_by_pid(pid);
     if (p) {
@@ -445,18 +479,15 @@ static size_t format_pid_maps(u32 pid, char *buf, size_t max)
             strncpy(name, p->name, sizeof(name) - 1);
             name[sizeof(name) - 1] = '\0';
         }
-        if (p->heap_start) heap_s = p->heap_start;
-        if (p->heap_end > p->heap_start) heap_e = p->heap_end;
+        u64 heap_s = p->heap_start, heap_e = p->heap_end;
+        vma_for_each(p, maps_emit_vma, &c);      /* p stays valid under sched_lock */
+        if (heap_e > heap_s)
+            maps_emit_line(&c, heap_s, heap_e, 'r', 'w', '-', 'p', "[heap]");
     }
     sched_unlock();
 
-    return (size_t)snprintf(buf, max,
-        "00400000-00450000 r-xp 00000000 08:00 1001                       %s\n"
-        "00450000-00460000 rw-p 00050000 08:00 1001                       %s\n"
-        "%08llx-%08llx rw-p 00000000 00:00 0                              [heap]\n"
-        "600000000000-600000100000 r--p 00000000 00:00 0                  [mmap]\n"
-        "7ffffffde000-7fffffffe000 rwxp 00000000 00:00 0                  [stack]\n",
-        name, name, (unsigned long long)heap_s, (unsigned long long)heap_e);
+    if (c.off == 0) c.off = (size_t)snprintf(buf, max, "\n");
+    return c.off;
 }
 
 static size_t format_pid_status(u32 pid, char *buf, size_t max)

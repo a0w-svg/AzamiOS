@@ -103,6 +103,12 @@ void vmm_unmap(vmm_space_t space, virt_addr_t virt);
 phys_addr_t vmm_translate(vmm_space_t space, virt_addr_t virt);
 
 /**
+ * vmm_query_flags(space, virt) → leaf PTE flag bits (VMM_F_*), or 0 if the
+ * page is not present. The physical address bits are masked out.
+ */
+u64 vmm_query_flags(vmm_space_t space, virt_addr_t virt);
+
+/**
  * vmm_create_space() — Allocate a new page table and copy the kernel half.
  *
  * PML4 indices 256–511 (kernel half) are shared with the kernel's PML4.

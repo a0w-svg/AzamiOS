@@ -19,6 +19,7 @@
 #define O_APPEND    0x0400
 #define O_NONBLOCK  0x0800
 #define O_DIRECTORY 0x10000
+#define O_NOFOLLOW  0x20000
 #define O_CLOEXEC   0x80000
 
 /* File descriptor flags */
@@ -225,6 +226,9 @@ dentry_t *dcache_lookup(dentry_t *parent, const char *name);
 /* Path lookup & resolution */
 s64 vfs_resolve_path(const char *cwd, const char *path, char *out_buf, size_t out_len);
 s64 vfs_path_lookup(const char *path, dentry_t **out_dentry);
+/* Like vfs_path_lookup(), but a symlink as the *final* path component is
+ * returned as-is instead of being resolved (lstat / readlink / O_NOFOLLOW). */
+s64 vfs_path_lookup_nofollow(const char *path, dentry_t **out_dentry);
 
 /* System Call Implementations (Internal to fs/vfs.c but exposed to syscall.c) */
 void dentry_build_path(dentry_t *d, char *buf, size_t max);
@@ -248,6 +252,7 @@ s64 vfs_readlink(const char *path, char *buf, size_t bufsiz);
 s64 vfs_chmod(const char *path, u32 mode);
 s64 vfs_fchmod(file_t *file, u32 mode);
 s64 vfs_chown(const char *path, u32 uid, u32 gid);
+s64 vfs_lchown(const char *path, u32 uid, u32 gid);
 s64 vfs_fchown(file_t *file, u32 uid, u32 gid);
 s64 vfs_statfs(const char *path, struct statfs *buf);
 s64 vfs_fstatfs(file_t *file, struct statfs *buf);

@@ -86,7 +86,7 @@ int open(const char *path, int flags, ...)
 
 int creat(const char *path, mode_t mode)
 {
-    return sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, (int)mode);
+    return (int)__syscall_ret(syscall2(SYS_creat, (long)path, (long)mode));
 }
 
 /* ── Process Lifecycle ───────────────────────────────────────────────────── */
@@ -418,6 +418,21 @@ int sys_chown(const char *path, uint32_t uid, uint32_t gid)
 int chown(const char *path, uint32_t uid, uint32_t gid)
 {
     return sys_chown(path, uid, gid);
+}
+
+int lchown(const char *path, uint32_t uid, uint32_t gid)
+{
+    return (int)__syscall_ret(syscall3(SYS_lchown, (long)path, uid, gid));
+}
+
+ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+    return (ssize_t)__syscall_ret(syscall4(SYS_preadv, fd, (long)iov, iovcnt, (long)offset));
+}
+
+ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+    return (ssize_t)__syscall_ret(syscall4(SYS_pwritev, fd, (long)iov, iovcnt, (long)offset));
 }
 
 int sys_fchown(int fd, uint32_t uid, uint32_t gid)

@@ -240,6 +240,82 @@
 #define SYS_faccessat2    439
 #define SYS_epoll_pwait2  441
 
+/* ── Remaining Linux x86_64 syscall numbers (kept in sync with the C
+ *    library's <sys/syscall.h>). Those with a real handler are wired up in
+ *    syscall_init(); the rest resolve to -ENOSYS through the dispatcher's
+ *    default path. Defining every number here lets userland reference and
+ *    probe them by name. ─────────────────────────────────────────────────── */
+#define SYS_shmget               29
+#define SYS_shmat                30
+#define SYS_shmctl               31
+#define SYS_getitimer            36
+#define SYS_setitimer            38
+#define SYS_semget               64
+#define SYS_semop                65
+#define SYS_semctl               66
+#define SYS_shmdt                67
+#define SYS_msgget               68
+#define SYS_msgsnd               69
+#define SYS_msgrcv               70
+#define SYS_msgctl               71
+#define SYS_creat                85
+#define SYS_lchown               94
+#define SYS_ptrace               101
+#define SYS_setfsuid             122
+#define SYS_setfsgid             123
+#define SYS_rt_sigpending        127
+#define SYS_rt_sigtimedwait      128
+#define SYS_rt_sigqueueinfo      129
+#define SYS_rt_sigsuspend        130
+#define SYS_sigaltstack          131
+#define SYS_mknod                133
+#define SYS_mlock                149
+#define SYS_munlock              150
+#define SYS_mlockall             151
+#define SYS_munlockall           152
+#define SYS_adjtimex             159
+#define SYS_acct                 163
+#define SYS_settimeofday         164
+#define SYS_mount                165
+#define SYS_umount2              166
+#define SYS_iopl                 172
+#define SYS_ioperm               173
+#define SYS_init_module          175
+#define SYS_delete_module        176
+#define SYS_io_setup             206
+#define SYS_io_destroy           207
+#define SYS_io_getevents         208
+#define SYS_io_submit            209
+#define SYS_io_cancel            210
+#define SYS_timer_create         222
+#define SYS_timer_settime        223
+#define SYS_timer_gettime        224
+#define SYS_timer_getoverrun     225
+#define SYS_timer_delete         226
+#define SYS_mknodat              259
+#define SYS_futimesat            261
+#define SYS_unshare              272
+#define SYS_get_robust_list      274
+#define SYS_move_pages           279
+#define SYS_preadv               295
+#define SYS_pwritev              296
+#define SYS_rt_tgsigqueueinfo    297
+#define SYS_perf_event_open      298
+#define SYS_recvmmsg             299
+#define SYS_fanotify_init        300
+#define SYS_fanotify_mark        301
+#define SYS_name_to_handle_at    303
+#define SYS_open_by_handle_at    304
+#define SYS_clock_adjtime        305
+#define SYS_sendmmsg             307
+#define SYS_setns                308
+#define SYS_process_vm_readv     310
+#define SYS_process_vm_writev    311
+#define SYS_kexec_file_load      320
+#define SYS_mlock2               325
+#define SYS_preadv2              327
+#define SYS_pwritev2             328
+
 /* Linux statx timestamp and structure */
 struct statx_timestamp {
     s64 tv_sec;

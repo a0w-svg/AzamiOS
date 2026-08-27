@@ -13,6 +13,8 @@
 #include "../../../kernel/uaccess.h"
 #include "../../../kernel/sched/sched.h"
 #include "../../../kernel/mm/pmm.h"
+#include "../../../kernel/mm/vma.h"
+#include "../../../kernel/signal.h"
 #include "../mm/vmm.h"
 
 /* ── IDT storage (256 entries × 16 bytes = 4 KB, page-aligned) ───────────── */
@@ -161,7 +163,17 @@ void idt_register_irq(u8 vector, irq_handler_fn_t fn, void *ctx)
 }
 
 /* ── Main C dispatcher (called from isr_common_stub) ────────────────────── */
+static void isr_dispatch_inner(pt_regs_t *r);
+
 void isr_dispatch(pt_regs_t *r)
+{
+    isr_dispatch_inner(r);
+    /* On the way back to ring 3 (this frame, or a frame reactivated by a
+     * context switch inside the handler), run any pending user signal. */
+    signal_deliver_pending(r, -1);
+}
+
+static void isr_dispatch_inner(pt_regs_t *r)
 {
     u64 vec = r->int_no;
 
@@ -208,20 +220,42 @@ void isr_dispatch(pt_regs_t *r)
             if (vec == 14) {
                 __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
 
-                /* Demand-paged User Stack & Heap/BSS Expansion */
+                /* Demand paging: only grow regions the kernel actually manages
+                 * lazily. Everything else (ELF segments, brk, mmap) is mapped
+                 * eagerly, so a fault outside these windows is a genuine SIGSEGV
+                 * (POSIX/Linux semantics) rather than a wild pointer we silently
+                 * paper over. */
                 if ((r->err_code & 1) == 0 && proc) {
                     bool valid_fault = false;
-                    /* User Stack (8MB stack region) */
-                    if (fault_addr >= 0x00007ff000000000ULL && fault_addr < 0x00007fffffffe000ULL) {
+                    /* User stack auto-growth window (grows down from the initial
+                     * stack top; ~512 MB of headroom). */
+                    if (fault_addr >= 0x00007fe000000000ULL && fault_addr < 0x00007fffffffe000ULL) {
                         valid_fault = true;
                     }
-                    /* User Heap (within proc->heap_start to proc->heap_end) */
+                    /* Heap [heap_start, heap_end): brk maps eagerly, this is a
+                     * defensive backstop for partially-populated ranges. */
                     else if (proc->heap_start > 0 && fault_addr >= proc->heap_start && fault_addr < proc->heap_end) {
                         valid_fault = true;
                     }
-                    /* User Data / BSS / Heap / mmap user space */
-                    else if (fault_addr >= 0x10000ULL && fault_addr < 0x00007ffff0000000ULL) {
+                    /* Anonymous mmap arena [0x6000_0000_0000, mmap_current). */
+                    else if (proc->mmap_current > 0x0000600000000000ULL &&
+                             fault_addr >= 0x0000600000000000ULL && fault_addr < proc->mmap_current) {
                         valid_fault = true;
+                    }
+                    /* Any writable/readable region the VMA registry knows about
+                     * (mmap regions survive here even after mmap_current moves). */
+                    else {
+                        u32 prot = 0;
+                        if (vma_probe(proc, fault_addr, &prot) &&
+                            (prot & (VMA_PROT_READ | VMA_PROT_WRITE)))
+                            valid_fault = true;
+                    }
+
+                    /* Refuse to service demand faults when physical memory is
+                     * nearly exhausted: a runaway process gets SIGSEGV instead of
+                     * taking the whole kernel out of memory. */
+                    if (valid_fault && pmm_get_free_pages() < 512) {
+                        valid_fault = false;
                     }
 
                     if (valid_fault) {
@@ -292,6 +326,24 @@ void isr_dispatch(pt_regs_t *r)
                             code_bytes[8], code_bytes[9], code_bytes[10], code_bytes[11],
                             code_bytes[12], code_bytes[13], code_bytes[14], code_bytes[15]);
                 }
+            }
+
+            /* Report the fault as a POSIX termination signal so waitpid()
+             * observes WIFSIGNALED / WTERMSIG rather than a bogus exit code. */
+            if (proc) {
+                int term_sig;
+                switch (vec) {
+                    case 6:  term_sig = SIGILL;  break;  /* #UD */
+                    case 0:  term_sig = SIGFPE;  break;  /* #DE */
+                    case 16:
+                    case 19: term_sig = SIGFPE;  break;  /* x87 / SIMD FP */
+                    case 3:  term_sig = SIGTRAP; break;  /* #BP */
+                    case 1:  term_sig = SIGTRAP; break;  /* #DB */
+                    case 17: term_sig = SIGBUS;  break;  /* #AC */
+                    default: term_sig = SIGSEGV; break;  /* #PF, #GP, #SS, ... */
+                }
+                proc->term_signal = term_sig;
+                proc->exit_code = 128 + term_sig;
             }
 
             sys_exit_impl(r);

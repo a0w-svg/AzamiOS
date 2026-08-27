@@ -193,6 +193,11 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     proc->pid = g_next_pid++;
     spinlock_unlock_irqrestore(&g_sched_lock, irqf);
 
+    /* New process starts as the sole member and leader of its own process
+     * group and session; fork() overrides this by inheriting from the parent. */
+    proc->pgid = proc->pid;
+    proc->sid  = proc->pid;
+
     proc->pml4_phys = pml4_phys ? pml4_phys : vmm_kernel_space();
     for (int i = 0; name && name[i] && i < 31; i++) {
         proc->name[i] = name[i];
@@ -250,6 +255,9 @@ void proc_destroy(process_t *proc)
         }
     }
 
+    extern void vma_reset(process_t *p);
+    vma_reset(proc);
+
     if (proc->pml4_phys && proc->pml4_phys != vmm_kernel_space()) {
         vmm_destroy_space(proc->pml4_phys);
         proc->pml4_phys = 0;
@@ -259,6 +267,87 @@ void proc_destroy(process_t *proc)
 
 static void idle_loop(void *arg);
 extern void thread_entry_trampoline(void);
+
+/* ── Guarded kernel stacks ──────────────────────────────────────────────────
+ * Each thread's 16 KB ring-0 stack is carved from a dedicated kernel VA window
+ * with one unmapped guard page directly below it, so a stack overflow takes an
+ * immediate #PF (CR2 landing in the guard range) instead of silently
+ * corrupting whatever the HHDM aliased underneath. Physical pages need not be
+ * contiguous.
+ *
+ * VA slots are handed out MONOTONICALLY and never recycled: this kernel has no
+ * cross-CPU TLB shootdown, so re-pointing a live kernel VA at a fresh physical
+ * page would leave stale global TLB entries on other CPUs. A retired slot's
+ * stale entries are harmless because nothing ever touches that VA again. When
+ * the window is exhausted we fall back to a plain contiguous HHDM stack.
+ *
+ * The window lives inside the HHDM's PML4 entry (index 256), far past real RAM
+ * but under a top-level table Limine populated before the APs started: adding
+ * a *PML4* entry after CR3 load would need a shootdown to be seen elsewhere,
+ * whereas entries below an already-present PML4 slot are picked up by any CPU
+ * that faults on the range. */
+#define KSTACK_PAGES        4                                  /* 16 KB usable */
+#define KSTACK_GUARD_PAGES  1
+#define KSTACK_SLOT_PAGES   (KSTACK_PAGES + KSTACK_GUARD_PAGES)
+#define KSTACK_MAX_SLOTS    8192
+#define KSTACK_AREA_BASE    (0xFFFF800000000000ULL + 0x7000000000ULL)
+#define KSTACK_AREA_END     (KSTACK_AREA_BASE + \
+                             (u64)KSTACK_MAX_SLOTS * KSTACK_SLOT_PAGES * PAGE_SIZE)
+
+static spinlock_t g_kstack_lock = SPINLOCK_INIT;
+static u64        g_kstack_next;   /* monotonic slot index */
+
+/* Returns the VA of the lowest mapped stack page (the guard page sits at
+ * base - PAGE_SIZE), or 0 on out-of-memory. */
+static u64 kstack_alloc(void)
+{
+    irqflags_t f = spinlock_lock_irqsave(&g_kstack_lock);
+    u64 slot = g_kstack_next;
+    if (slot < KSTACK_MAX_SLOTS) g_kstack_next++;
+    spinlock_unlock_irqrestore(&g_kstack_lock, f);
+
+    if (slot >= KSTACK_MAX_SLOTS) {
+        phys_addr_t phys = pmm_alloc_pages(KSTACK_PAGES);
+        return phys ? (u64)PHYS_TO_VIRT(phys) : 0;
+    }
+
+    u64 slot_base  = KSTACK_AREA_BASE + slot * (u64)KSTACK_SLOT_PAGES * PAGE_SIZE;
+    u64 stack_base = slot_base + (u64)KSTACK_GUARD_PAGES * PAGE_SIZE;
+
+    for (int p = 0; p < KSTACK_PAGES; p++) {
+        phys_addr_t phys = pmm_alloc_page();
+        u64 va = stack_base + (u64)p * PAGE_SIZE;
+        if (!phys || vmm_map(vmm_kernel_space(), va, phys, VMM_KERNEL_RW) != 0) {
+            if (phys) pmm_free_page(phys);
+            for (int q = 0; q < p; q++) {
+                u64 rva = stack_base + (u64)q * PAGE_SIZE;
+                phys_addr_t rp = vmm_translate(vmm_kernel_space(), rva);
+                vmm_unmap(vmm_kernel_space(), rva);
+                if (rp) pmm_free_page(rp);
+            }
+            return 0;
+        }
+        /* Zero the freshly mapped stack page (kzalloc-equivalent hygiene). */
+        __builtin_memset((void *)va, 0, PAGE_SIZE);
+    }
+    return stack_base;
+}
+
+static void kstack_free(u64 stack_base)
+{
+    if (!stack_base) return;
+
+    if (stack_base >= KSTACK_AREA_BASE && stack_base < KSTACK_AREA_END) {
+        for (int p = 0; p < KSTACK_PAGES; p++) {
+            u64 va = stack_base + (u64)p * PAGE_SIZE;
+            phys_addr_t phys = vmm_translate(vmm_kernel_space(), va);
+            vmm_unmap(vmm_kernel_space(), va);
+            if (phys) pmm_free_page(phys);
+        }
+    } else {
+        pmm_free_pages(VIRT_TO_PHYS(stack_base), KSTACK_PAGES);
+    }
+}
 
 thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool is_kernel, bool enqueue)
 {
@@ -274,19 +363,19 @@ thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool
     t->vruntime = 0;
     t->priority = 10;
     
-    /* Allocate 16 KB kernel stack for this thread */
-    phys_addr_t kstack_phys = pmm_alloc_pages(4);
-    if (!kstack_phys) {
+    /* Allocate a guarded 16 KB kernel stack for this thread */
+    u64 kstack_base = kstack_alloc();
+    if (!kstack_base) {
         kfree(t);
         return NULL;
     }
+    t->kernel_stack_base = kstack_base;
+    t->kernel_stack_top  = kstack_base + (KSTACK_PAGES * PAGE_SIZE);
 
     irqf = spinlock_lock_irqsave(&g_sched_lock);
     t->proc_next = t->proc->threads;
     t->proc->threads = t;
     spinlock_unlock_irqrestore(&g_sched_lock, irqf);
-
-    t->kernel_stack_top = (u64)PHYS_TO_VIRT(kstack_phys) + (4 * PAGE_SIZE);
 
     /* Initialize default clean x87 / SSE control state */
     *(u16 *)&t->fpu_state.buffer[0] = 0x037F;  /* FCW default */
@@ -428,10 +517,8 @@ static void sched_reaper_loop(void *arg)
                 t = proc->threads;
                 while (t) {
                     thread_t *next_t = t->proc_next;
-                    /* Free kernel stack */
-                    phys_addr_t phys_stack = VIRT_TO_PHYS(t->kernel_stack_top - (4 * PAGE_SIZE));
-                    pmm_free_pages(phys_stack, 4);
-                    /* Free thread struct */
+                    /* Free guarded kernel stack + thread struct */
+                    kstack_free(t->kernel_stack_base);
                     kfree(t);
                     t = next_t;
                 }
@@ -451,8 +538,7 @@ static void sched_reaper_loop(void *arg)
                         *pt = curr_t->proc_next;
                         spinlock_unlock_irqrestore(&g_sched_lock, irqf);
                         
-                        phys_addr_t phys_stack = VIRT_TO_PHYS(curr_t->kernel_stack_top - (4 * PAGE_SIZE));
-                        pmm_free_pages(phys_stack, 4);
+                        kstack_free(curr_t->kernel_stack_base);
                         kfree(curr_t);
                         
                         irqf = spinlock_lock_irqsave(&g_sched_lock);
@@ -880,7 +966,18 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
         process_t *p = g_process_list;
         while (p) {
             if (p->parent == curr_proc) {
-                if (target_pid == -1 || (s32)p->pid == target_pid) {
+                /* POSIX waitpid pid argument:
+                 *   -1  : any child
+                 *    0  : any child in the caller's process group
+                 *  < -1 : any child in process group |pid|
+                 *  > 0  : the child with that exact pid                */
+                bool match;
+                if (target_pid == -1)      match = true;
+                else if (target_pid == 0)  match = (p->pgid == curr_proc->pgid);
+                else if (target_pid < -1)  match = (p->pgid == (u32)(-target_pid));
+                else                       match = ((s32)p->pid == target_pid);
+
+                if (match) {
                     has_children = true;
                     if (p->is_zombie) {
                         zombie_child = p;
@@ -907,15 +1004,20 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
             spinlock_unlock_irqrestore(&g_sched_lock, irqf);
 
             if (status) {
-                *status = (exit_val & 0xFF) << 8;
+                /* POSIX wait status: WIFSIGNALED when a signal killed the
+                 * child (low 7 bits = WTERMSIG), otherwise WIFEXITED with
+                 * WEXITSTATUS in bits 8-15. */
+                if (zombie_child->term_signal)
+                    *status = zombie_child->term_signal & 0x7f;
+                else
+                    *status = (exit_val & 0xFF) << 8;
             }
 
             /* Free child threads and process */
             thread_t *t = zombie_child->threads;
             while (t) {
                 thread_t *next_t = t->proc_next;
-                phys_addr_t phys_stack = VIRT_TO_PHYS(t->kernel_stack_top - (4 * PAGE_SIZE));
-                pmm_free_pages(phys_stack, 4);
+                kstack_free(t->kernel_stack_base);
                 kfree(t);
                 t = next_t;
             }
@@ -1018,7 +1120,10 @@ s64 sched_kill_process(u32 pid, int sig)
         }
     }
 
-    /* Fatal default signal or unhandled fatal: terminate target threads */
+    /* Fatal default signal or unhandled fatal: terminate target threads.
+     * Record the terminating signal so waitpid() can report WIFSIGNALED;
+     * keep exit_code = 128+sig for the shell's $? convention. */
+    target->term_signal = sig;
     target->exit_code = 128 + sig;
 
     for (thread_t *t = target->threads; t; t = t->proc_next) {

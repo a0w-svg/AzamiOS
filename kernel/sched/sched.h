@@ -35,6 +35,7 @@ typedef struct thread {
     struct process *proc;            /* Owning process */
     u64             kernel_rsp;      /* Saved kernel stack pointer on context switch */
     u64             kernel_stack_top;/* Top of dedicated kernel stack for ring-0 transitions */
+    u64             kernel_stack_base;/* Lowest mapped stack page VA (guard page sits just below) */
     thread_state_t  state;           /* Thread state */
     bool            unblock_pending; /* Signal from sched_unblock during context switch */
     u64             vruntime;        /* Completely Fair Scheduler virtual runtime */
@@ -121,7 +122,11 @@ typedef struct process {
     virt_addr_t     heap_start;            /* Base of user heap for brk */
     virt_addr_t     heap_end;              /* Current break address for brk */
     virt_addr_t     mmap_current;          /* Current bump pointer for anonymous mmap */
-    int             exit_code;             /* Exit status code */
+    void           *vma_list;              /* Sorted vm_area_t list (kernel/mm/vma.c) */
+    int             exit_code;             /* exit() status (0..255), valid when term_signal == 0 */
+    int             term_signal;           /* Signal that terminated the process, or 0 for normal exit */
+    u32             pgid;                  /* POSIX process group ID (job control) */
+    u32             sid;                   /* POSIX session ID */
     bool            is_zombie;             /* Process terminated, awaiting waitpid */
     struct thread  *wait_thread;          /* Parent thread waiting on child exit */
     char            cwd[256];              /* Current working directory */

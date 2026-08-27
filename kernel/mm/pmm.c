@@ -368,7 +368,12 @@ phys_addr_t pmm_alloc_32(u32 order)
     }
 
     phys_addr_t blk_phys = VIRT_TO_PHYS((uintptr_t)target_blk);
-    free_list_remove(found, blk_phys);
+    if (!free_list_remove(found, blk_phys)) {
+        /* Free list / bitmap inconsistency — refuse rather than double-account. */
+        spinlock_unlock_irqrestore(&g_pmm_lock, flags);
+        pr_debug("[PMM] pmm_alloc_32: free_list_remove failed (order=%u)\n", found);
+        return 0;
+    }
     u64 frame = phys_to_frame(blk_phys);
     u64 count = (u64)1 << found;
     for (u64 i = 0; i < count; i++) bitmap_set(frame + i);
@@ -395,9 +400,29 @@ phys_addr_t pmm_alloc_pages_32(size_t page_count)
 void pmm_free_pages(phys_addr_t phys, size_t page_count)
 {
     if (phys == 0 || page_count == 0) return;
+
     u32 order = pages_to_order(page_count);
-    if (order > PMM_MAX_ORDER) return;
-    pmm_free(phys, order);
+    if (order <= PMM_MAX_ORDER) {
+        pmm_free(phys, order);
+        return;
+    }
+
+    /* Region larger than one buddy block (e.g. a 2 MB/1 GB huge-page frame):
+     * free it as a run of naturally-aligned power-of-two blocks so nothing
+     * leaks. `phys` for such regions is always at least MAX_ORDER-aligned. */
+    phys_addr_t cur = phys;
+    size_t left = page_count;
+    while (left) {
+        u32 o = PMM_MAX_ORDER;
+        while (o > 0) {
+            size_t blk = (size_t)1 << o;
+            if (left >= blk && IS_ALIGNED(cur, (phys_addr_t)PAGE_SIZE << o)) break;
+            o--;
+        }
+        pmm_free(cur, o);
+        cur  += (phys_addr_t)PAGE_SIZE << o;
+        left -= (size_t)1 << o;
+    }
 }
 
 u64 pmm_get_free_pages(void)  { return g_free_frames;  }

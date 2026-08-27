@@ -85,9 +85,12 @@ ARCH_ASM_SRCS := \
 KERNEL_C_SRCS := \
     kernel/main.c \
     kernel/panic.c \
+    kernel/signal.c \
     kernel/lib/string.c \
+    kernel/lib/random.c \
     kernel/mm/pmm.c \
     kernel/mm/kmalloc.c \
+    kernel/mm/vma.c \
     kernel/syscall/syscall.c \
     kernel/sched/sched.c \
     kernel/sched/elf.c \
@@ -105,12 +108,14 @@ KERNEL_C_SRCS := \
     hal/pci.c \
     drivers/block/block.c \
     drivers/block/ata.c \
+    drivers/block/ahci.c \
     drivers/input/input.c \
     drivers/char/uart.c \
     drivers/char/console.c \
     drivers/char/lpt.c \
     drivers/misc/bga.c \
     drivers/misc/rtc.c \
+    drivers/misc/hpet.c \
     drivers/acpi/acpi.c \
     drivers/acpi/ioapic.c \
     drivers/acpi/power.c \

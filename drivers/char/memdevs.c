@@ -6,6 +6,7 @@
 #include "memdevs.h"
 #include "../../fs/vfs.h"
 #include "../../kernel/lib/string.h"
+#include "../../kernel/lib/random.h"
 #include "../../include/azami/defs.h"
 #include "console.h"
 #include "uart.h"
@@ -75,47 +76,21 @@ static file_operations_t g_full_fops = {
 
 /* ── /dev/random & /dev/urandom ──────────────────────────────────────────── */
 
-static u64 g_rng_state = 0x853c49e6748fea9bULL;
-
-static u64 get_random_u64(void)
-{
-    u64 val = 0;
-    unsigned char ok = 0;
-    __asm__ volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
-    if (ok && val != 0) {
-        return val;
-    }
-
-    /* Fallback: xorshift64star */
-    g_rng_state ^= g_rng_state >> 12;
-    g_rng_state ^= g_rng_state << 25;
-    g_rng_state ^= g_rng_state >> 27;
-    return g_rng_state * 0x2545F4914F6CDD1DULL;
-}
-
+/* /dev/random and /dev/urandom both draw from the kernel ChaCha20 CSPRNG
+ * (see kernel/lib/random.c). There is no entropy-estimator blocking. */
 static s64 random_read(file_t *filp, void *buf, size_t len, u64 *offset)
 {
     (void)filp; (void)offset;
     if (!buf || len == 0) return 0;
-
-    u8 *dst = (u8 *)buf;
-    size_t i = 0;
-    while (i < len) {
-        u64 r = get_random_u64();
-        size_t chunk = (len - i > 8) ? 8 : (len - i);
-        memcpy(dst + i, &r, chunk);
-        i += chunk;
-    }
+    krandom_bytes(buf, len);
     return (s64)len;
 }
 
 static s64 random_write(file_t *filp, const void *buf, size_t len, u64 *offset)
 {
     (void)filp; (void)offset;
-    if (buf && len >= 8) {
-        u64 seed = *(const u64 *)buf;
-        g_rng_state ^= seed;
-    }
+    /* Writing to /dev/[u]random mixes the data into the pool (POSIX-ish). */
+    if (buf && len) krandom_add_entropy(buf, len);
     return (s64)len;
 }
 

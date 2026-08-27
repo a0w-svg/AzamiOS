@@ -191,6 +191,26 @@ phys_addr_t vmm_translate(vmm_space_t space, virt_addr_t virt)
     return (pt[VMM_PT_IDX(virt)] & VMM_PHYS_MASK) + (virt & 0xFFFUL);
 }
 
+u64 vmm_query_flags(vmm_space_t space, virt_addr_t virt)
+{
+    if (!space) space = g_kernel_pml4;
+
+    u64 *pml4 = phys_to_table(space);
+    if (!(pml4[VMM_PML4_IDX(virt)] & VMM_F_PRESENT)) return 0;
+
+    u64 *pdpt = phys_to_table(pml4[VMM_PML4_IDX(virt)] & VMM_PHYS_MASK);
+    if (!(pdpt[VMM_PDPT_IDX(virt)] & VMM_F_PRESENT)) return 0;
+    if (pdpt[VMM_PDPT_IDX(virt)] & VMM_F_HUGE) return pdpt[VMM_PDPT_IDX(virt)] & ~VMM_PHYS_MASK;
+
+    u64 *pd = phys_to_table(pdpt[VMM_PDPT_IDX(virt)] & VMM_PHYS_MASK);
+    if (!(pd[VMM_PD_IDX(virt)] & VMM_F_PRESENT)) return 0;
+    if (pd[VMM_PD_IDX(virt)] & VMM_F_HUGE) return pd[VMM_PD_IDX(virt)] & ~VMM_PHYS_MASK;
+
+    u64 *pt = phys_to_table(pd[VMM_PD_IDX(virt)] & VMM_PHYS_MASK);
+    if (!(pt[VMM_PT_IDX(virt)] & VMM_F_PRESENT)) return 0;
+    return pt[VMM_PT_IDX(virt)] & ~VMM_PHYS_MASK;
+}
+
 /* ── Address space management ─────────────────────────────────────────────── */
 
 vmm_space_t vmm_create_space(void)
@@ -243,7 +263,11 @@ vmm_space_t vmm_clone_space(vmm_space_t src)
         for (int pdpti = 0; pdpti < 512; pdpti++) {
             if (!(src_pdpt[pdpti] & VMM_F_PRESENT)) { dst_pdpt[pdpti] = 0; continue; }
             if (src_pdpt[pdpti] & VMM_F_HUGE) {
-                /* 1 GB user huge page — deep copy if writable, share r/o pages */
+                /* 1 GB user huge page — deep copy if writable, share r/o pages.
+                 * NOTE: the buddy allocator maxes out at PMM_MAX_ORDER (4 MB),
+                 * so a private 1 GB copy cannot be satisfied and the fork fails
+                 * cleanly (goto oom). Userspace 1 GB huge pages are not expected;
+                 * if they become real, promote them to a PT walk here. */
                 if ((src_pdpt[pdpti] & VMM_F_WRITE) && (src_pdpt[pdpti] & VMM_F_USER) && !(src_pdpt[pdpti] & VMM_F_SHARED)) {
                     phys_addr_t new_phys = pmm_alloc_pages(512 * 512); /* 1 GB = 2^18 pages */
                     if (!new_phys) goto oom;
@@ -447,16 +471,31 @@ void vmm_init(u64 hhdm_base, u64 phys_base, u64 virt_base, void *memmap_raw)
     if (memmap) {
         for (u64 i = 0; i < memmap->entry_count; i++) {
             struct limine_memmap_entry *entry = memmap->entries[i];
+
+            /* Choose caching by region type: RAM/ACPI-reclaimable → write-back,
+             * framebuffer → write-combining, and everything else (RESERVED,
+             * ACPI NVS, bad RAM, device holes) → uncacheable + NX so a stray
+             * HHDM access to MMIO isn't silently cached. */
+            u64 flags;
+            switch (entry->type) {
+                case 7:  /* FRAMEBUFFER            */ flags = VMM_KERNEL_RW | VMM_F_WC; break;
+                case 0:  /* USABLE                 */
+                case 2:  /* ACPI_RECLAIMABLE       */
+                case 5:  /* BOOTLOADER_RECLAIMABLE */
+                case 6:  /* KERNEL_AND_MODULES     */ flags = VMM_KERNEL_RW;            break;
+                default: /* RESERVED / NVS / bad   */ flags = VMM_MMIO;                 break;
+            }
+
             u64 start = ALIGN_DOWN(entry->base, 4096);
             u64 end = ALIGN_UP(entry->base + entry->length, 4096);
             for (u64 p = start; p < end; p += 4096) {
                 virt_addr_t va = (virt_addr_t)PHYS_TO_VIRT(p);
                 if (!vmm_translate(g_kernel_pml4, va)) {
-                    vmm_map(g_kernel_pml4, va, p, VMM_KERNEL_RW);
+                    vmm_map(g_kernel_pml4, va, p, flags);
                 }
             }
         }
-        kprintf("[VMM] Mapped remaining memmap regions into HHDM\n");
+        kprintf("[VMM] Mapped remaining memmap regions into HHDM (typed caching)\n");
     }
 }
 

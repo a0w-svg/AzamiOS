@@ -13,6 +13,7 @@
 #include "../../drivers/char/console.h"
 #include "../../include/azami/defs.h"
 #include "../../kernel/lib/string.h"
+#include "../../kernel/lib/random.h"
 
 #define USER_STACK_TOP      0x00007fffffffe000ULL
 #define USER_STACK_PAGES    64
@@ -22,17 +23,10 @@
 #define INTERP_LOAD_BASE    0x00007ffff7dd5000ULL
 #define MAX_RECURSION_DEPTH 4
 
-/* Simple pseudo-random entropy generator for AT_RANDOM stack seed */
+/* AT_RANDOM entropy comes straight from the kernel CSPRNG. */
 static void get_random_bytes(void *buf, size_t n)
 {
-    u8 *p = (u8 *)buf;
-    static u64 s_seed = 0x9e3779b97f4a7c15ULL;
-    for (size_t i = 0; i < n; i++) {
-        s_seed ^= s_seed << 13;
-        s_seed ^= s_seed >> 7;
-        s_seed ^= s_seed << 17;
-        p[i] = (u8)(s_seed ^ (s_seed >> 32));
-    }
+    krandom_bytes(buf, n);
 }
 
 static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t top_page_phys,
@@ -43,153 +37,131 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
     (void)user_space;
     char *kstack = (char *)PHYS_TO_VIRT(top_page_phys);
     size_t top_offset = PAGE_SIZE; /* Top of stack page */
+    int rc = -ENOMEM;
 
-    /* 1. Put AT_RANDOM 16-byte entropy block */
-    if (top_offset < 16 + 256) return -ENOMEM;
+    /* Pointer arrays live on the heap, not the 16 KB kernel stack. */
+    u64 *u_argv = NULL;
+    u64 *u_envp = NULL;
+
+    /* Guard: bail out (unwinding to the caller, which tears down the address
+     * space) rather than letting an unsigned `top_offset` wrap and scribble
+     * over adjacent HHDM memory. */
+    #define STK_NEED(n) do { if (top_offset < (size_t)(n)) goto out; } while (0)
+    #define PUSHQ(v)    do { STK_NEED(8); top_offset -= 8; \
+                             *(u64 *)(kstack + top_offset) = (u64)(v); } while (0)
+
+    /* Number of auxv (key,value) pairs written below — keep in sync. */
+    #define AUX_PAIRS 18
+
+    /* Determine argc / envc up front so the string loops can reserve the exact
+     * space the fixed structure (argc + pointer arrays + auxv) will need. */
+    int envc = 0;
+    if (envp) { while (envp[envc] && envc < 512) envc++; }
+    int argc = 0;
+    if (argv) { while (argv[argc] && argc < 512) argc++; }
+    if (argc == 0) argc = 1;
+
+    /* argc(1) + argv[argc] + NULL(1) + envp[envc] + NULL(1) + auxv(2*AUX_PAIRS)
+     * + up to one 8-byte alignment pad. */
+    size_t fixed_bytes = 8u * (size_t)(1 + argc + 1 + envc + 1 + 2 * AUX_PAIRS + 1);
+
+    u_argv = (u64 *)kmalloc((size_t)argc * sizeof(u64));
+    u_envp = (u64 *)kmalloc((size_t)(envc ? envc : 1) * sizeof(u64));
+    if (!u_argv || !u_envp) goto out;
+
+    /* 1. AT_RANDOM 16-byte entropy block */
+    STK_NEED(16 + fixed_bytes);
     top_offset -= 16;
     get_random_bytes(kstack + top_offset, 16);
     u64 u_random_ptr = USER_STACK_TOP - (PAGE_SIZE - top_offset);
 
-    /* 2. Put AT_PLATFORM string ("x86_64") */
+    /* 2. AT_PLATFORM string ("x86_64") */
     const char *platform_str = "x86_64";
     size_t plat_len = strlen(platform_str) + 1;
-    if (top_offset < plat_len + 256) return -ENOMEM;
+    STK_NEED(plat_len + fixed_bytes);
     top_offset -= plat_len;
     memcpy(kstack + top_offset, platform_str, plat_len);
     u64 u_platform_ptr = USER_STACK_TOP - (PAGE_SIZE - top_offset);
 
-    /* 3. Put AT_EXECFN string (path to executable) */
+    /* 3. AT_EXECFN string (path to executable) */
     const char *execfn_src = exec_path ? exec_path : "/bin/sh.elf";
     size_t execfn_len = strlen(execfn_src) + 1;
-    if (top_offset < execfn_len + 256) return -ENOMEM;
+    STK_NEED(execfn_len + fixed_bytes);
     top_offset -= execfn_len;
     memcpy(kstack + top_offset, execfn_src, execfn_len);
     u64 u_execfn_ptr = USER_STACK_TOP - (PAGE_SIZE - top_offset);
 
-    /* 4. Determine envc and copy envp strings */
-    int envc = 0;
-    if (envp) {
-        while (envp[envc] && envc < 512) envc++;
-    }
-    u64 u_envp[512];
+    /* 4. envp strings */
     for (int i = 0; i < envc; i++) {
-        const char *src = envp[i];
+        const char *src = envp[i] ? envp[i] : "";
         size_t len = strlen(src) + 1;
-        if (top_offset < len + 256) return -ENOMEM;
+        STK_NEED(len + fixed_bytes);
         top_offset -= len;
         memcpy(kstack + top_offset, src, len);
         u_envp[i] = USER_STACK_TOP - (PAGE_SIZE - top_offset);
     }
 
-    /* 5. Determine argc and copy argv strings */
-    int argc = 0;
-    if (argv) {
-        while (argv[argc] && argc < 512) argc++;
-    }
-    if (argc == 0) argc = 1;
-
-    u64 u_argv[512];
+    /* 5. argv strings */
     for (int i = 0; i < argc; i++) {
-        const char *src = (argv && argv[i]) ? argv[i] : exec_path;
+        const char *src = (argv && argv[i]) ? argv[i] : (exec_path ? exec_path : "");
         size_t len = strlen(src) + 1;
-        if (top_offset < len + 256) return -ENOMEM;
+        STK_NEED(len + fixed_bytes);
         top_offset -= len;
         memcpy(kstack + top_offset, src, len);
         u_argv[i] = USER_STACK_TOP - (PAGE_SIZE - top_offset);
     }
 
-    /* Align stack down to 8 bytes */
+    /* Align string area down to 8 bytes */
     top_offset &= ~7ULL;
 
-    /* Calculate total pointer slots needed:
-     * - auxv pairs (18 pairs = 36 slots)
-     * - envp NULL terminator (1 slot) + envc pointers (envc slots)
-     * - argv NULL terminator (1 slot) + argc pointers (argc slots)
-     * - argc integer (1 slot)
-     */
-    size_t num_slots = 36 + (envc + 1) + (argc + 1) + 1;
+    size_t num_slots = (size_t)(2 * AUX_PAIRS) + (envc + 1) + (argc + 1) + 1;
 
-    /* Ensure 16-byte System V AMD64 ABI stack alignment at entry point */
+    /* Ensure 16-byte System V AMD64 ABI stack alignment at the entry point */
     if (((top_offset - (num_slots * 8)) & 0xF) != 0) {
-        top_offset -= 8;
-        *(u64 *)(kstack + top_offset) = 0;
+        PUSHQ(0);
     }
 
-    /* ── Auxiliary Vector Table (Standard Linux AMD64 auxv) ───────────────── */
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = 0;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_NULL;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = u_platform_ptr;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_PLATFORM;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = u_execfn_ptr;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_EXECFN;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = u_random_ptr;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_RANDOM;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = 0;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_SECURE;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = 100; /* Standard 100 HZ ticks */
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_CLKTCK;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = 0xbfebfbffULL; /* Standard x86_64 HWCAP */
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_HWCAP;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = proc ? (u64)proc->egid : 0;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_EGID;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = proc ? (u64)proc->gid : 0;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_GID;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = proc ? (u64)proc->euid : 0;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_EUID;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = proc ? (u64)proc->uid : 0;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_UID;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = main_entry;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_ENTRY;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = 0;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_FLAGS;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = interp_base;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_BASE;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = PAGE_SIZE;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_PAGESZ;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = phnum;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_PHNUM;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = phent;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_PHENT;
-
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = phdr_vaddr;
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = AT_PHDR;
+    /* ── Auxiliary Vector Table (Standard Linux AMD64 auxv, written high→low) ─ */
+    PUSHQ(0);                               PUSHQ(AT_NULL);
+    PUSHQ(u_platform_ptr);                  PUSHQ(AT_PLATFORM);
+    PUSHQ(u_execfn_ptr);                    PUSHQ(AT_EXECFN);
+    PUSHQ(u_random_ptr);                    PUSHQ(AT_RANDOM);
+    PUSHQ(0);                               PUSHQ(AT_SECURE);
+    PUSHQ(100);                             PUSHQ(AT_CLKTCK);
+    PUSHQ(0xbfebfbffULL);                   PUSHQ(AT_HWCAP);
+    PUSHQ(proc ? (u64)proc->egid : 0);      PUSHQ(AT_EGID);
+    PUSHQ(proc ? (u64)proc->gid  : 0);      PUSHQ(AT_GID);
+    PUSHQ(proc ? (u64)proc->euid : 0);      PUSHQ(AT_EUID);
+    PUSHQ(proc ? (u64)proc->uid  : 0);      PUSHQ(AT_UID);
+    PUSHQ(main_entry);                      PUSHQ(AT_ENTRY);
+    PUSHQ(0);                               PUSHQ(AT_FLAGS);
+    PUSHQ(interp_base);                     PUSHQ(AT_BASE);
+    PUSHQ(PAGE_SIZE);                       PUSHQ(AT_PAGESZ);
+    PUSHQ(phnum);                           PUSHQ(AT_PHNUM);
+    PUSHQ(phent);                           PUSHQ(AT_PHENT);
+    PUSHQ(phdr_vaddr);                      PUSHQ(AT_PHDR);
 
     /* Envp NULL terminator and pointers */
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = 0;
-    for (int i = envc - 1; i >= 0; i--) {
-        top_offset -= 8;
-        *(u64 *)(kstack + top_offset) = u_envp[i];
-    }
+    PUSHQ(0);
+    for (int i = envc - 1; i >= 0; i--) PUSHQ(u_envp[i]);
 
     /* Argv NULL terminator and pointers */
-    top_offset -= 8; *(u64 *)(kstack + top_offset) = 0;
-    for (int i = argc - 1; i >= 0; i--) {
-        top_offset -= 8;
-        *(u64 *)(kstack + top_offset) = u_argv[i];
-    }
+    PUSHQ(0);
+    for (int i = argc - 1; i >= 0; i--) PUSHQ(u_argv[i]);
 
     /* Argc */
-    top_offset -= 8;
-    *(u64 *)(kstack + top_offset) = (u64)argc;
+    PUSHQ((u64)argc);
 
     *out_rsp = USER_STACK_TOP - (PAGE_SIZE - top_offset);
-    return 0;
+    rc = 0;
+
+out:
+    kfree(u_argv);
+    kfree(u_envp);
+    #undef STK_NEED
+    #undef PUSHQ
+    #undef AUX_PAIRS
+    return rc;
 }
 
 /* Helper to map and load ELF PT_LOAD segments into a virtual address space */
@@ -239,10 +211,18 @@ static int load_elf_segments(vmm_space_t user_space, file_t *file, const elf64_e
         for (u64 vaddr = start_vaddr; vaddr < end_vaddr; vaddr += PAGE_SIZE) {
             phys_addr_t phys = vmm_translate(user_space, vaddr);
             if (phys) {
-                /* Page already mapped by adjacent segment: merge flags and preserve data */
+                /* Page already mapped by an adjacent segment (page-unaligned
+                 * segment boundary). Merge permissions conservatively rather
+                 * than forcing RWX: writable if either segment needs it,
+                 * executable only if either segment is executable. */
                 phys = phys & VMM_PHYS_MASK;
-                u64 cur_flags = VMM_F_PRESENT | VMM_F_USER | VMM_F_WRITE;
-                vmm_map(user_space, vaddr, phys, cur_flags);
+                u64 old_flags = vmm_query_flags(user_space, vaddr);
+                u64 merged = VMM_F_PRESENT | VMM_F_USER;
+                if ((old_flags & VMM_F_WRITE) || (vmm_flags & VMM_F_WRITE))
+                    merged |= VMM_F_WRITE;
+                if ((old_flags & VMM_F_NX) && (vmm_flags & VMM_F_NX))
+                    merged |= VMM_F_NX;   /* NX only when neither part is code */
+                vmm_map(user_space, vaddr, phys, merged);
             } else {
                 phys = pmm_alloc_page();
                 if (!phys) return -ENOMEM;

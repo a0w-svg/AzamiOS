@@ -46,3 +46,31 @@ int msync(void *addr, size_t length, int flags)
     }
     return 0;
 }
+
+int mlock(const void *addr, size_t len)
+{
+    long ret = syscall2(SYS_mlock, (long)addr, (long)len);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}
+
+int munlock(const void *addr, size_t len)
+{
+    long ret = syscall2(SYS_munlock, (long)addr, (long)len);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}
+
+int mlockall(int flags)
+{
+    long ret = syscall1(SYS_mlockall, flags);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}
+
+int munlockall(void)
+{
+    long ret = syscall1(SYS_munlockall, 0);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}

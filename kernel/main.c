@@ -134,6 +134,10 @@ void kernel_main(void)
     acpi_init();
     ioapic_init();
 
+    /* HPET: nanosecond monotonic time source (optional; needs VMM up) */
+    extern void hpet_init(void);
+    hpet_init();
+
     /* ── Step 7: Framebuffer console ─────────────────────────────────────── */
     struct limine_framebuffer *fb = az_boot_framebuffer();
     if (fb) {
@@ -153,6 +157,12 @@ void kernel_main(void)
 
     /* ── Step 9: Kernel Dynamic Heap Allocator (kmalloc) ─────────────────── */
     kmalloc_init();
+
+    /* ── Kernel CSPRNG (ChaCha20) — backs getrandom(2), /dev/[u]random,
+     *    stack canaries and AT_RANDOM ──────────────────────────────────── */
+    extern void krandom_init(void);
+    krandom_init();
+    pr_debug("[BOOT] CSPRNG seeded\n");
 
     /* ── Step 10: Security & Stack Canaries ──────────────────────────────── */
     security_init();

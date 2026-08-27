@@ -38,3 +38,7 @@ int   munmap(void *addr, size_t length);
 int   mprotect(void *addr, size_t len, int prot);
 int   msync(void *addr, size_t length, int flags);
 int   madvise(void *addr, size_t length, int advice);
+int   mlock(const void *addr, size_t len);
+int   munlock(const void *addr, size_t len);
+int   mlockall(int flags);
+int   munlockall(void);

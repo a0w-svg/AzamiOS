@@ -299,10 +299,13 @@ void dentry_build_path(dentry_t *d, char *buf, size_t max)
     buf[off] = '\0';
 }
 
-static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry, int symlink_depth)
+#define VFS_MAXSYMLINKS 40
+
+static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry,
+                                    int symlink_depth, bool follow_final)
 {
     if (!path || !g_vfs_root) return -(s64)ENOENT;
-    if (symlink_depth > 16) return -(s64)ELOOP;
+    if (symlink_depth > VFS_MAXSYMLINKS) return -(s64)ELOOP;
     
     char resolved[512];
     if (vfs_resolve_path("/", path, resolved, sizeof(resolved)) == 0) {
@@ -366,8 +369,14 @@ static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry, int
             }
         }
         
-        /* If component is a symbolic link, resolve it */
+        /* If component is a symbolic link, resolve it — unless it is the final
+         * component and the caller asked not to follow it (lstat / readlink /
+         * O_NOFOLLOW), in which case the link dentry itself is the result. */
         if (S_ISLNK(next->d_inode->i_mode)) {
+            if (*p == '\0' && !follow_final) {
+                *out_dentry = next;
+                return 0;
+            }
             char link_target[512];
             s64 read_res = -1;
             if (next->d_inode->i_op && next->d_inode->i_op->readlink) {
@@ -392,7 +401,7 @@ static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry, int
                         snprintf(target_full, sizeof(target_full), "%s/%s", parent_path, link_target);
                     }
                 }
-                return vfs_path_lookup_internal(target_full, out_dentry, symlink_depth + 1);
+                return vfs_path_lookup_internal(target_full, out_dentry, symlink_depth + 1, true);
             }
         }
         
@@ -412,7 +421,12 @@ static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry, int
 
 s64 vfs_path_lookup(const char *path, dentry_t **out_dentry)
 {
-    return vfs_path_lookup_internal(path, out_dentry, 0);
+    return vfs_path_lookup_internal(path, out_dentry, 0, true);
+}
+
+s64 vfs_path_lookup_nofollow(const char *path, dentry_t **out_dentry)
+{
+    return vfs_path_lookup_internal(path, out_dentry, 0, false);
 }
 
 
@@ -427,8 +441,16 @@ file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno)
     if (out_errno) *out_errno = -(s64)ENOENT; /* default */
 
     dentry_t *dentry = NULL;
-    s64 err = vfs_path_lookup(path, &dentry);
-    
+    s64 err = (flags & O_NOFOLLOW) ? vfs_path_lookup_nofollow(path, &dentry)
+                                  : vfs_path_lookup(path, &dentry);
+
+    /* O_NOFOLLOW: a trailing symlink is an error (POSIX → ELOOP). */
+    if (err == 0 && (flags & O_NOFOLLOW) && dentry && dentry->d_inode &&
+        S_ISLNK(dentry->d_inode->i_mode)) {
+        if (out_errno) *out_errno = -(s64)ELOOP;
+        return NULL;
+    }
+
     if (err == 0 && dentry && dentry->d_inode && (flags & O_CREAT) && (flags & O_EXCL)) {
         /* BUG-10 fix: file exists and O_EXCL was requested → EEXIST */
         if (out_errno) *out_errno = -(s64)EEXIST;
@@ -567,11 +589,12 @@ s64 vfs_lseek(file_t *file, s64 offset, int whence)
     return new_pos;
 }
 
-s64 vfs_stat(const char *path, struct stat *statbuf)
+static s64 vfs_stat_common(const char *path, struct stat *statbuf, bool follow)
 {
     if (!statbuf) return -(s64)EINVAL;
     dentry_t *dentry = NULL;
-    s64 err = vfs_path_lookup(path, &dentry);
+    s64 err = follow ? vfs_path_lookup(path, &dentry)
+                     : vfs_path_lookup_nofollow(path, &dentry);
     if (err < 0) {
         if (dentry && !dentry->d_inode) kfree(dentry);
         return err;
@@ -580,7 +603,7 @@ s64 vfs_stat(const char *path, struct stat *statbuf)
         if (dentry && !dentry->d_inode) kfree(dentry);
         return -(s64)ENOENT;
     }
-    
+
     inode_t *i = dentry->d_inode;
     __builtin_memset(statbuf, 0, sizeof(struct stat));
     statbuf->st_dev = 0;
@@ -593,8 +616,13 @@ s64 vfs_stat(const char *path, struct stat *statbuf)
     statbuf->st_atime = i->i_atime;
     statbuf->st_mtime = i->i_mtime;
     statbuf->st_ctime = i->i_ctime;
-    
+
     return 0;
+}
+
+s64 vfs_stat(const char *path, struct stat *statbuf)
+{
+    return vfs_stat_common(path, statbuf, true);
 }
 
 s64 vfs_fstat(file_t *file, struct stat *statbuf)
@@ -782,15 +810,15 @@ s64 vfs_symlink(const char *target, const char *linkpath)
 
 s64 vfs_lstat(const char *path, struct stat *statbuf)
 {
-    /* Without symlink following, lstat is identical to stat for now */
-    return vfs_stat(path, statbuf);
+    /* lstat() stats the symlink itself, not its target. */
+    return vfs_stat_common(path, statbuf, false);
 }
 
 s64 vfs_readlink(const char *path, char *buf, size_t bufsiz)
 {
     if (!path || !buf || bufsiz == 0) return -(s64)EINVAL;
     dentry_t *dentry = NULL;
-    s64 err = vfs_path_lookup(path, &dentry);
+    s64 err = vfs_path_lookup_nofollow(path, &dentry);
     if (err < 0 || !dentry || !dentry->d_inode) {
         if (dentry && !dentry->d_inode) kfree(dentry);
         return -(s64)ENOENT;
@@ -827,6 +855,19 @@ s64 vfs_chown(const char *path, u32 uid, u32 gid)
 {
     dentry_t *dentry = NULL;
     s64 err = vfs_path_lookup(path, &dentry);
+    if (err < 0 || !dentry || !dentry->d_inode) {
+        if (dentry && !dentry->d_inode) kfree(dentry);
+        return -(s64)ENOENT;
+    }
+    if (uid != (u32)-1) dentry->d_inode->i_uid = uid;
+    if (gid != (u32)-1) dentry->d_inode->i_gid = gid;
+    return 0;
+}
+
+s64 vfs_lchown(const char *path, u32 uid, u32 gid)
+{
+    dentry_t *dentry = NULL;
+    s64 err = vfs_path_lookup_nofollow(path, &dentry);
     if (err < 0 || !dentry || !dentry->d_inode) {
         if (dentry && !dentry->d_inode) kfree(dentry);
         return -(s64)ENOENT;

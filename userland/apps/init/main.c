@@ -14,6 +14,8 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
+#include <signal.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -34,6 +36,10 @@
 
 static int g_tests_passed = 0;
 static int g_tests_total = 0;
+
+static volatile int g_sig_hits = 0;
+static volatile int g_last_sig = 0;
+static void sig_test_handler(int signo) { g_sig_hits++; g_last_sig = signo; }
 
 #define TEST_ASSERT(expr, desc) do { \
     g_tests_total++; \
@@ -142,7 +148,111 @@ static void run_posix_verification_suite(void)
         TEST_ASSERT(r_fcntl_lk == 0, "fcntl POSIX record locking (F_GETLK)");
 
         close(test_fd);
+
+        /* O_APPEND always writes at end-of-file regardless of seek. */
+        int ap_fd = open("/tmp/posix_test.tmp", O_WRONLY | O_APPEND);
+        if (ap_fd >= 0) {
+            lseek(ap_fd, 0, SEEK_SET);
+            write(ap_fd, "XYZ", 3);
+            close(ap_fd);
+        }
+        struct stat ap_st;
+        int r_ap = stat("/tmp/posix_test.tmp", &ap_st);
+        TEST_ASSERT(r_ap == 0 && ap_st.st_size == (off_t)(strlen(tdata) + 3),
+                    "O_APPEND writes at end-of-file after SEEK_SET");
+
         unlink("/tmp/posix_test.tmp");
+    }
+
+    /* 6b. Symbolic links: lstat / readlink must act on the link, not the target */
+    {
+        const char *lp = "/tmp/posix_test.link";
+        const char *tgt = "/tmp/posix_test.target";
+        unlink(lp); unlink(tgt);
+        int tf = open(tgt, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (tf >= 0) { write(tf, "abcd", 4); close(tf); }
+
+        int r_sl = symlink(tgt, lp);
+        TEST_ASSERT(r_sl == 0, "symlink() creates a symbolic link");
+
+        struct stat ls, ss;
+        int r_ls = lstat(lp, &ls);
+        int r_ss = stat(lp, &ss);
+        TEST_ASSERT(r_ls == 0 && S_ISLNK(ls.st_mode), "lstat() reports the link itself (S_ISLNK)");
+        TEST_ASSERT(r_ss == 0 && S_ISREG(ss.st_mode) && ss.st_size == 4,
+                    "stat() follows the link to the target");
+
+        char lbuf[64];
+        ssize_t r_rl = readlink(lp, lbuf, sizeof(lbuf) - 1);
+        TEST_ASSERT(r_rl == (ssize_t)strlen(tgt) &&
+                    (lbuf[r_rl] = 0, strcmp(lbuf, tgt) == 0),
+                    "readlink() returns the link target path");
+
+        int nf = open(lp, O_RDONLY | O_NOFOLLOW);
+        TEST_ASSERT(nf < 0, "open(O_NOFOLLOW) on a symlink fails");
+        if (nf >= 0) close(nf);
+
+        /* lchown() acts on the link, not the target. */
+        int r_lch = lchown(lp, 0, 0);
+        struct stat lch_st;
+        int r_lst2 = lstat(lp, &lch_st);
+        TEST_ASSERT(r_lch == 0 && r_lst2 == 0 && S_ISLNK(lch_st.st_mode),
+                    "lchown() operates on the symlink itself");
+
+        unlink(lp); unlink(tgt);
+    }
+
+    /* 6c. creat(), positional vectored I/O, and mlock() */
+    {
+        int cfd = creat("/tmp/posix_pv.tmp", 0644);
+        TEST_ASSERT(cfd >= 0, "creat() creates a new writable file");
+        if (cfd >= 0) {
+            char b0[5] = "HELLO", b1[5] = "world";
+            struct iovec wv[2] = { { b0, 5 }, { b1, 5 } };
+            ssize_t nw = pwritev(cfd, wv, 2, 0);
+            TEST_ASSERT(nw == 10, "pwritev() writes all iovec segments at offset");
+
+            char r0[4], r1[6];
+            struct iovec rv[2] = { { r0, 4 }, { r1, 6 } };
+            ssize_t nr = preadv(cfd, rv, 2, 1);
+            TEST_ASSERT(nr == 9 && memcmp(r0, "ELLO", 4) == 0 && memcmp(r1, "world", 5) == 0,
+                        "preadv() reads scattered from an explicit offset");
+            close(cfd);
+        }
+        unlink("/tmp/posix_pv.tmp");
+
+        void *lk = malloc(8192);
+        int r_ml = mlock(lk, 8192);
+        int r_mu = munlock(lk, 8192);
+        TEST_ASSERT(r_ml == 0 && r_mu == 0, "mlock / munlock succeed (no swap device)");
+        free(lk);
+    }
+
+    /* 6d. Real userspace signal delivery */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = sig_test_handler;
+        int r_sa = sigaction(SIGUSR1, &sa, NULL);
+
+        g_sig_hits = 0; g_last_sig = 0;
+        raise(SIGUSR1);
+        raise(SIGUSR1);
+        TEST_ASSERT(r_sa == 0 && g_sig_hits == 2 && g_last_sig == SIGUSR1,
+                    "sigaction handler runs and control resumes (x2)");
+
+        sigset_t m;
+        sigemptyset(&m);
+        sigaddset(&m, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &m, NULL);
+        g_sig_hits = 0;
+        raise(SIGUSR1);
+        int while_blocked = g_sig_hits;
+        sigprocmask(SIG_UNBLOCK, &m, NULL);
+        TEST_ASSERT(while_blocked == 0 && g_sig_hits == 1,
+                    "signal held pending while blocked, delivered on unblock");
+
+        signal(SIGUSR1, SIG_DFL);
     }
 
     /* 7. Sockets and IPC */
