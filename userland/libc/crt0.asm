@@ -8,6 +8,7 @@ global _start
 extern main
 extern exit
 extern __libc_init
+extern __init_tls
 
 section .text
 _start:
@@ -32,6 +33,11 @@ _start:
 
     ; Align stack to 16 bytes for System V AMD64 ABI
     and rsp, -16
+
+    ; Set up the main thread's TLS block (%fs) before anything — including
+    ; __libc_init below — can touch a __thread variable such as errno.
+    mov rdi, r14
+    call __init_tls
 
     ; Initialize libc environment
     mov rdi, r12

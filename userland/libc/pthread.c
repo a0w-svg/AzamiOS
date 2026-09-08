@@ -12,19 +12,112 @@
 #define DEFAULT_THREAD_STACK_SIZE (64 * 1024) /* 64 KB */
 #define PTHREAD_KEYS_MAX 64
 
+/* ── Join bookkeeping ────────────────────────────────────────────────────
+ *
+ * pthread_join() used to be `wait4(tid, ...)` — but wait4(2) waits on child
+ * *processes*, and a pthread_create()'d thread is not one (SYS_AZ_THREAD_CREATE
+ * spawns a thread inside the *same* process, sharing its pid). That call
+ * returned -ECHILD immediately without blocking at all, so pthread_join()
+ * never actually joined anything — confirmed by a regression test
+ * (userland/examples/thread_tls_test.c) racing main() reading a worker
+ * thread's results against pthread_join() returning instantly.
+ *
+ * Fixed with a small fixed-size table of join slots: pthread_create()
+ * reserves one before the new thread starts running and hands the new
+ * thread a pointer to it directly (no need to search by tid later), the
+ * new thread's own trampoline marks it done with its return value once
+ * start_routine returns, and pthread_join() spins/yields (same pattern as
+ * every other lock in this file) until it sees `done`. */
+#define PTHREAD_JOIN_MAX 256
+
+typedef struct {
+    int in_use;
+    pthread_t tid;
+    volatile int done;
+    void *retval;
+} join_slot_t;
+
+static join_slot_t g_join_slots[PTHREAD_JOIN_MAX];
+static int g_join_lock = 0;
+
+static void join_lock(void)
+{
+    int spin = 0;
+    while (__sync_lock_test_and_set(&g_join_lock, 1)) {
+        if (++spin < 100) { __asm__ volatile("pause"); }
+        else { syscall0(SYS_AZ_YIELD); spin = 0; }
+    }
+}
+
+static void join_unlock(void)
+{
+    __sync_lock_release(&g_join_lock);
+}
+
+/* Reserved for the child before it starts running, so the child never has
+ * to search the table (and can't race pthread_join() adding the tid). */
+static join_slot_t *join_slot_alloc(void)
+{
+    join_lock();
+    join_slot_t *slot = NULL;
+    for (int i = 0; i < PTHREAD_JOIN_MAX; i++) {
+        if (!g_join_slots[i].in_use) {
+            g_join_slots[i].in_use = 1;
+            g_join_slots[i].tid = 0;
+            g_join_slots[i].done = 0;
+            g_join_slots[i].retval = NULL;
+            slot = &g_join_slots[i];
+            break;
+        }
+    }
+    join_unlock();
+    return slot; /* NULL if all PTHREAD_JOIN_MAX slots are in use */
+}
+
+static join_slot_t *join_slot_find(pthread_t tid)
+{
+    join_slot_t *found = NULL;
+    join_lock();
+    for (int i = 0; i < PTHREAD_JOIN_MAX; i++) {
+        if (g_join_slots[i].in_use && g_join_slots[i].tid == tid) {
+            found = &g_join_slots[i];
+            break;
+        }
+    }
+    join_unlock();
+    return found;
+}
+
 typedef struct {
     void *(*start_routine)(void *);
     void *arg;
+    join_slot_t *slot; /* NULL if pthread_create() couldn't reserve one —
+                         * the thread still runs, it just can't be joined. */
 } thread_startup_ctx_t;
+
+/* Sets up this thread's own TLS block (%fs) — see userland/libc/tls.c —
+ * before anything the thread does, including touching errno, can rely on
+ * per-thread storage. Not declared in a shared header: it is an
+ * implementation seam between tls.c and pthread.c only. */
+extern void __init_thread_tls(void);
 
 static void thread_startup_trampoline(void *raw_ctx)
 {
+    __init_thread_tls();
+
     thread_startup_ctx_t *ctx = (thread_startup_ctx_t *)raw_ctx;
     void *(*fn)(void *) = ctx->start_routine;
     void *arg = ctx->arg;
+    join_slot_t *slot = ctx->slot;
     free(ctx);
 
     void *ret = fn(arg);
+
+    if (slot) {
+        slot->retval = ret;
+        __sync_synchronize();
+        slot->done = 1;
+    }
     pthread_exit(ret);
 }
 
@@ -46,28 +139,60 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_
     }
     ctx->start_routine = start_routine;
     ctx->arg = arg;
+    /* All PTHREAD_JOIN_MAX slots in use just means this thread can't be
+     * pthread_join()'d — not a reason to fail thread creation outright. */
+    ctx->slot = join_slot_alloc();
 
     long tid = syscall3(SYS_AZ_THREAD_CREATE, (long)thread_startup_trampoline, (long)stack_top, (long)ctx);
     if (tid < 0) {
+        if (ctx->slot) { join_lock(); ctx->slot->in_use = 0; join_unlock(); }
         free(ctx);
         free(stack);
         return -1;
     }
 
+    if (ctx->slot) ctx->slot->tid = (pthread_t)tid;
     if (thread) *thread = (pthread_t)tid;
     return 0;
 }
 
 int pthread_join(pthread_t thread, void **retval)
 {
-    (void)retval;
-    int status = 0;
-    return (int)syscall3(SYS_wait4, (int)thread, (long)&status, 0);
+    join_slot_t *slot = join_slot_find(thread);
+    if (!slot) {
+        /* Either an invalid tid, already joined, or created when the join
+         * table was full — matches ESRCH's real meaning closely enough. */
+        return ESRCH;
+    }
+
+    int spin = 0;
+    while (!slot->done) {
+        if (++spin < 100) { __asm__ volatile("pause"); }
+        else { syscall0(SYS_AZ_YIELD); spin = 0; }
+    }
+    __sync_synchronize();
+    if (retval) *retval = slot->retval;
+
+    join_lock();
+    slot->in_use = 0; /* joining twice is undefined behavior in POSIX too */
+    join_unlock();
+    return 0;
 }
 
 int pthread_detach(pthread_t thread)
 {
     (void)thread;
+    /* Not tracked as a distinct state: a detached thread's join slot is
+     * simply never freed by anyone (PTHREAD_JOIN_MAX total leaked slots in
+     * the worst case for an app that detaches every thread it creates) —
+     * matches this file's existing, separately-noted "nothing frees a
+     * finished thread's stack either" limitation rather than introducing a
+     * new one. Freeing it here instead, while the thread may still be
+     * running, would be actively wrong: thread_startup_trampoline() writes
+     * through the slot pointer it was handed at creation without
+     * re-checking in_use, so a slot freed (and possibly reallocated to an
+     * unrelated new thread) while the original thread is still running
+     * would let that write land on the wrong thread's join state. */
     return 0;
 }
 
@@ -80,9 +205,24 @@ void pthread_exit(void *retval)
     }
 }
 
+/* Cached per-thread: gettid() is a syscall, and pthread_self() is called
+ * from every mutex/rwlock operation, so every thread pays for it once.
+ *
+ * This used to return sys_getpid(), which is the same value for every
+ * thread in a process (threads share a pid) — every mutex's
+ * `owner == pthread_self()` check therefore treated any thread as already
+ * holding the lock, letting two different threads both proceed through a
+ * critical section a recursive mutex should have serialized. gettid()
+ * (kernel/syscall/syscall.c's sys_gettid_impl) returns the calling
+ * thread_t's own tid, which is what SYS_AZ_THREAD_CREATE hands back to
+ * pthread_create()'s caller as *thread — the two now agree. */
+static __thread pthread_t g_self_tid_cache = 0;
+
 pthread_t pthread_self(void)
 {
-    return (pthread_t)sys_getpid();
+    if (g_self_tid_cache == 0)
+        g_self_tid_cache = (pthread_t)syscall0(SYS_gettid);
+    return g_self_tid_cache;
 }
 
 int pthread_equal(pthread_t t1, pthread_t t2)
@@ -113,8 +253,11 @@ typedef struct {
     void (*destructor)(void *);
 } tls_key_entry_t;
 
+/* The key table (which slots are allocated, and their destructors) is
+ * process-wide, matching POSIX: a key created by one thread is valid on
+ * every thread. Only the values are per-thread. */
 static tls_key_entry_t g_tls_keys[PTHREAD_KEYS_MAX];
-static const void *g_tls_values[PTHREAD_KEYS_MAX];
+static __thread const void *g_tls_values[PTHREAD_KEYS_MAX];
 
 int pthread_key_create(pthread_key_t *key, void (*destructor)(void *))
 {

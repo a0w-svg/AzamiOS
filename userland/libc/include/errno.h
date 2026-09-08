@@ -4,7 +4,10 @@
  * ============================================================================ */
 #pragma once
 
-extern int errno;
+/* Per-thread since Phase 1 of the libc hardening work: each thread (main or
+ * pthread_create()'d) gets its own %fs-relative storage — see
+ * userland/libc/tls.c and thread_startup_trampoline() in pthread.c. */
+extern __thread int errno;
 
 /* Canonical E* values, shared verbatim with the kernel
  * (include/azami/defs.h). This copy is regenerated from
