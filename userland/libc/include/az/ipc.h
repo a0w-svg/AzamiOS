@@ -19,15 +19,10 @@ typedef struct {
     unsigned char data[AZ_IPC_MSG_MAX_SIZE];
 } az_ipc_msg_t;
 
-/* ── Framebuffer info structure (must match kernel az_fb_info_t) ───────────── */
-typedef struct {
-    unsigned int  width;
-    unsigned int  height;
-    unsigned int  pitch;
-    unsigned char bpp;
-    unsigned char _pad[3];
-    unsigned long phys_addr;
-} az_fb_info_t;
+/* az_fb_info_t comes from <sys/syscall.h> (included above)'s canonical uapi
+ * header (include/azami/uapi/syscall_nr.h) — this used to be a second,
+ * hand-duplicated copy, which is exactly the kind of drift
+ * scripts/check_uapi_sync.sh exists to catch. */
 
 /* ── Input event structure (must match kernel input_event_t) ───────────────── */
 #define AZ_INPUT_EVENT_NONE   0

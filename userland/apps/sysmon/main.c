@@ -35,11 +35,10 @@ static uk_window_t g_win;
 static unsigned int g_tick = 0;
 
 /* ── System Telemetry ───────────────────────────────────────────────────── */
-typedef struct {
-    unsigned long long idle_ticks[16];
-    unsigned long long active_ticks[16];
-} az_sysstat_t;
-
+/* az_sysstat_t comes from <sys/syscall.h> (included above)'s canonical uapi
+ * header (include/azami/uapi/syscall_nr.h) — this used to be a second,
+ * hand-duplicated copy, which is exactly the kind of drift
+ * scripts/check_uapi_sync.sh exists to catch. */
 static az_sysstat_t g_last_stat;
 
 /* Rolling history for CPU cores and memory */
