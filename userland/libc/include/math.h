@@ -50,6 +50,38 @@ double frexp(double x, int *exp);
 double ldexp(double x, int exp);
 double modf(double x, double *iptr);
 
+/* C99 additions, previously undeclared here. Not IEEE-754-exact (this
+ * whole file is naive Taylor-series/Newton's-method arithmetic, not a
+ * fdlibm-derived implementation) — usable, not bit-for-bit-correct. */
+double asinh(double x);
+double acosh(double x);
+double atanh(double x);
+double log1p(double x);
+double expm1(double x);
+double copysign(double x, double y);
+double nextafter(double x, double y);
+double scalbn(double x, int n);
+double scalbln(double x, long n);
+double remainder(double x, double y);
+double remquo(double x, double y, int *quo);
+double fma(double x, double y, double z);
+float  fmaf(float x, float y, float z);
+
+/* isnan/isinf/isfinite/signbit/fpclassify are C99 macros, not functions —
+ * GCC's type-generic __builtin_* forms need no libm and work for float,
+ * double, and long double alike. */
+#define FP_NAN       0
+#define FP_INFINITE  1
+#define FP_ZERO      2
+#define FP_SUBNORMAL 3
+#define FP_NORMAL    4
+
+#define fpclassify(x) __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, (x))
+#define isnan(x)      __builtin_isnan(x)
+#define isinf(x)      __builtin_isinf(x)
+#define isfinite(x)   __builtin_isfinite(x)
+#define signbit(x)    __builtin_signbit(x)
+
 /* Single-precision float variants */
 float fabsf(float x);
 float floorf(float x);

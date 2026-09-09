@@ -323,3 +323,127 @@ double modf(double x, double *iptr)
     if (iptr) *iptr = (double)n;
     return x - (double)n;
 }
+
+/* ── C99 additions ───────────────────────────────────────────────────────── */
+
+double asinh(double x)
+{
+    return log(x + sqrt(x * x + 1.0));
+}
+
+double acosh(double x)
+{
+    if (x < 1.0) return NAN;
+    return log(x + sqrt(x * x - 1.0));
+}
+
+double atanh(double x)
+{
+    if (x <= -1.0 || x >= 1.0) return NAN;
+    return 0.5 * log((1.0 + x) / (1.0 - x));
+}
+
+/* log(1+x) and exp(x)-1 both need a series for small x: computing
+ * log(1.0 + x) or exp(x) - 1.0 directly loses precision to catastrophic
+ * cancellation exactly where these functions are meant to be more accurate
+ * than their plain counterparts. */
+double log1p(double x)
+{
+    if (x <= -1.0) return (x == -1.0) ? -INFINITY : NAN;
+    if (fabs(x) > 1e-4) return log(1.0 + x);
+    double term = x, sum = x;
+    for (int i = 2; i <= 12; i++) {
+        term *= -x;
+        sum += term / (double)i;
+    }
+    return sum;
+}
+
+double expm1(double x)
+{
+    if (fabs(x) > 1e-4) return exp(x) - 1.0;
+    double term = x, sum = x;
+    for (int i = 2; i <= 15; i++) {
+        term *= x / (double)i;
+        sum += term;
+    }
+    return sum;
+}
+
+double copysign(double x, double y)
+{
+    double ax = fabs(x);
+    /* 1.0/y distinguishes +0.0 from -0.0 (1.0/-0.0 == -INFINITY), which a
+     * plain `y < 0.0` comparison can't. */
+    return (y < 0.0 || (y == 0.0 && 1.0 / y < 0.0)) ? -ax : ax;
+}
+
+/* Steps x by one ULP toward y, via the raw IEEE-754 bit pattern: for a
+ * positive x, incrementing the bits increases the value; for a negative x,
+ * incrementing the bits increases the *magnitude* (moves further from
+ * zero) — sign-magnitude total ordering, matching IEEE-754's bit layout.
+ * `(x < y) == (x > 0)` is true exactly when stepping toward y means
+ * stepping away from zero, i.e. exactly when the bit pattern should be
+ * incremented rather than decremented. Same technique musl's nextafter()
+ * uses. */
+double nextafter(double x, double y)
+{
+    if (x != x || y != y) return x + y; /* propagate NaN without a libm dependency */
+    if (x == y) return y;
+
+    union { double d; unsigned long long u; } v;
+    v.d = x;
+
+    if (x == 0.0) {
+        v.u = 1ULL; /* smallest positive subnormal */
+        if (y < 0.0) v.u |= (1ULL << 63);
+        return v.d;
+    }
+
+    if ((x < y) == (x > 0.0)) v.u++;
+    else                       v.u--;
+    return v.d;
+}
+
+double scalbn(double x, int n)
+{
+    return ldexp(x, n);
+}
+
+double scalbln(double x, long n)
+{
+    return ldexp(x, (int)n);
+}
+
+/* IEEE remainder: x - round(x/y)*y with round-to-nearest (ties not exactly
+ * broken to even — a plain round-half-away-from-zero is used instead,
+ * matching this file's general "usable, not bit-exact" precision level). */
+double remainder(double x, double y)
+{
+    if (y == 0.0) return NAN;
+    double n = x / y;
+    double n_rounded = (n >= 0.0) ? floor(n + 0.5) : ceil(n - 0.5);
+    return x - n_rounded * y;
+}
+
+double remquo(double x, double y, int *quo)
+{
+    if (y == 0.0) { if (quo) *quo = 0; return NAN; }
+    double n = x / y;
+    long long n_rounded = (long long)((n >= 0.0) ? floor(n + 0.5) : ceil(n - 0.5));
+    if (quo) *quo = (int)(n_rounded % 8); /* POSIX only guarantees the sign + low bits */
+    return x - (double)n_rounded * y;
+}
+
+/* Plain multiply-then-add: two rounding steps, not the single fused
+ * rounding real fma(3) guarantees — this file has no double-double or
+ * extended-precision arithmetic to do better with. */
+double fma(double x, double y, double z)
+{
+    return x * y + z;
+}
+
+float fmaf(float x, float y, float z)
+{
+    return x * y + z;
+}
