@@ -487,6 +487,16 @@ struct futex_waitv {
 #define AT_STATX_FORCE_SYNC   0x2000
 #define AT_STATX_DONT_SYNC    0x4000
 
+/* utimensat(2)/futimens(2) tv_nsec sentinels. */
+#define UTIME_NOW  ((1L << 30) - 1L)
+#define UTIME_OMIT ((1L << 30) - 2L)
+
+/* mlockall(2) / mlock2(2) flags. */
+#define MCL_CURRENT     1
+#define MCL_FUTURE      2
+#define MCL_ONFAULT     4
+#define MLOCK_ONFAULT   1
+
 /* Azami-specific extended calls (base 512 to avoid Linux conflicts) */
 #define SYS_AZ_CHANNEL_CREATE  512
 #define SYS_AZ_CHANNEL_SEND    513
