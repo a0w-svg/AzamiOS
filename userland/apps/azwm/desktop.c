@@ -168,3 +168,15 @@ void desktop_draw_cursor(unsigned int *buf, unsigned int w, unsigned int h, unsi
         }
     }
 }
+
+void desktop_cursor_blit_bgra(unsigned int *dst, unsigned int dst_w, unsigned int dst_h)
+{
+    /* The sprite is already 0xAARRGGBB, which is the byte order the display's
+     * BGRA8888 cursor resource expects on a little-endian guest — the same
+     * pixels the framebuffer path feeds. */
+    for (int row = 0; row < DESKTOP_CURSOR_H && (unsigned)row < dst_h; row++) {
+        for (int col = 0; col < DESKTOP_CURSOR_W && (unsigned)col < dst_w; col++) {
+            dst[(unsigned)row * dst_w + (unsigned)col] = g_cursor_sprite[row][col];
+        }
+    }
+}

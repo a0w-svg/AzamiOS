@@ -17,6 +17,45 @@
 #define FBIOPUT_CON2FBMAP   0x4610
 #define FBIO_WAITFORVSYNC   0x4620
 
+/* ── AzamiOS hardware-cursor plane (VirtIO-GPU) ─────────────────────────────
+ * A backend with a real cursor overlay lets a client hand the pointer sprite
+ * to the display once and then just move it: no framebuffer redraw, no
+ * transfer to the host per pointer step. FBIOAZ_HWCURSOR_SET returns 0 when
+ * the backend took the cursor, -ENOTTY when it has none (the client then
+ * composites the pointer itself, as before). */
+#define FBIOAZ_HWCURSOR_SET   0x4680   /* arg: struct fb_az_hwcursor *      */
+#define FBIOAZ_HWCURSOR_MOVE  0x4681   /* arg: struct fb_az_hwcursor_pos *  */
+#define FBIOAZ_HWCURSOR_HIDE  0x4682   /* arg: ignored                      */
+
+/* FBIOAZ_DAMAGE — report the rectangle a client just drew. On a backend that
+ * pushes frames to a host (VirtIO-GPU) the present worker then transfers only
+ * those rows instead of the whole scanout, which is the difference between a
+ * 4 MiB copy per frame and a few KiB. Rectangles union until the next flush.
+ * A no-op (harmless) on a direct-scanout backend. */
+#define FBIOAZ_DAMAGE         0x4683   /* arg: struct fb_az_rect *          */
+
+struct fb_az_rect {
+    u32 x;
+    u32 y;
+    u32 w;
+    u32 h;
+};
+
+#define FB_AZ_HWCURSOR_MAX 64          /* image is at most 64x64, BGRA8888  */
+
+struct fb_az_hwcursor {
+    u32 width;
+    u32 height;
+    u32 hot_x;
+    u32 hot_y;
+    u64 image;      /* userspace pointer to width*height BGRA8888 pixels */
+};
+
+struct fb_az_hwcursor_pos {
+    s32 x;
+    s32 y;
+};
+
 /* fb_var_screeninfo::activate — when a change takes effect. */
 #define FB_ACTIVATE_NOW     0    /* apply immediately (or at the next vblank) */
 #define FB_ACTIVATE_NXTOPEN 1    /* apply on the next open                    */

@@ -180,17 +180,38 @@ static void proc_clone_attrs(process_t *child, const process_t *parent)
     child->mempolicy_mode      = parent->mempolicy_mode;
     child->mempolicy_nodemask  = parent->mempolicy_nodemask;
     child->mempolicy_home_node = parent->mempolicy_home_node;
+
+    /* Resource limits are inherited whole and survive a later execve(). */
+    for (int i = 0; i < RLIMIT_NLIMITS; i++)
+        child->rlimits[i] = parent->rlimits[i];
+
+    /* Scheduling policy, RT priority and nice are inherited by fork() (absent
+     * SCHED_RESET_ON_FORK, which this kernel does not implement). The child's
+     * threads are created with the default weight; the nice value is re-applied
+     * to them below via sched_apply_weight(). */
+    child->sched_policy  = parent->sched_policy;
+    child->sched_rt_prio = parent->sched_rt_prio;
+    child->prio_nice     = parent->prio_nice;
 }
 
 /* fd_install_from() — atomically claim the lowest free fd >= minfd for `file`.
  * Returns the fd, or -EMFILE if the table is full. Prevents two threads racing
  * on the "find a NULL slot" scan from both grabbing the same descriptor. */
+/* RLIMIT_NOFILE (index 7, see the RLIMIT_* block further down) soft limit as an
+ * fd-count ceiling, clamped to the table size. */
+static int fd_limit(process_t *proc)
+{
+    u64 lim = proc->rlimits[7].rlim_cur;
+    return (lim >= PROC_MAX_FDS) ? PROC_MAX_FDS : (int)lim;
+}
+
 static s64 fd_install_from(process_t *proc, void *file, u8 fd_flags, int minfd)
 {
     if (!proc) return -(s64)EPERM;
     if (minfd < 0) minfd = 0;
+    int limit = fd_limit(proc);
     irqflags_t fl = spinlock_lock_irqsave(&g_fd_lock);
-    for (int i = minfd; i < PROC_MAX_FDS; i++) {
+    for (int i = minfd; i < limit; i++) {
         if (!proc->handle_table[i]) {
             proc->handle_table[i] = file;
             proc->fd_flags[i] = fd_flags;
@@ -219,9 +240,10 @@ static s64 fd_install_pair(process_t *proc, void *f0, void *f1, u8 fd_flags,
                            int *out0, int *out1)
 {
     if (!proc) return -(s64)EPERM;
+    int limit = fd_limit(proc);
     irqflags_t fl = spinlock_lock_irqsave(&g_fd_lock);
     int a = -1, b = -1;
-    for (int i = 0; i < PROC_MAX_FDS; i++) {
+    for (int i = 0; i < limit; i++) {
         if (!proc->handle_table[i]) {
             if (a < 0) a = i;
             else { b = i; break; }
@@ -2779,7 +2801,11 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
     sysvipc_process_exec(proc);   /* POSIX: SysV segments do not survive exec */
 
     proc->pml4_phys = new_space;
-    vmm_switch(new_space);
+    /* Same PCID tag, brand-new address space behind it: clear the primed mask
+     * so the next switch to it flushes that tag on each core, evicting the
+     * image that just exec'd away. */
+    proc->pcid_primed = 0;
+    vmm_switch_proc(new_space, proc->pcid, smp_current_cpu_id(), &proc->pcid_primed);
 
     if (old_space && old_space != vmm_kernel_space()) {
         vmm_destroy_space(old_space);
@@ -5165,7 +5191,43 @@ struct rlimit {
 #define RLIMIT_NOFILE     7
 #define RLIMIT_MEMLOCK    8
 #define RLIMIT_AS         9
-#define RLIM_INFINITY     (~0ULL)
+/* RLIM_INFINITY comes from sched.h (shared with proc_create's defaults). */
+
+/*
+ * do_prlimit() — the shared core of getrlimit/setrlimit/prlimit64.
+ *
+ * Reads the current pair into @old (when non-NULL), then, when @new is given,
+ * validates and stores it on @target->rlimits[resource]:
+ *   - rlim_cur must not exceed rlim_max                     -> EINVAL
+ *   - raising the hard limit needs euid 0 or CAP_SYS_RESOURCE
+ *   - RLIMIT_NOFILE cannot be raised past the fd table size (PROC_MAX_FDS)
+ * The caller has already resolved @target and checked it may act on it.
+ */
+static s64 do_prlimit(process_t *target, int resource,
+                      const krlimit_t *new_lim, krlimit_t *old_lim)
+{
+    if (resource < 0 || resource >= RLIMIT_NLIMITS) return -(s64)EINVAL;
+
+    if (old_lim) *old_lim = target->rlimits[resource];
+
+    if (new_lim) {
+        krlimit_t nl = *new_lim;
+        if (nl.rlim_cur > nl.rlim_max) return -(s64)EINVAL;
+
+        process_t *self = sched_current_process();
+        if (nl.rlim_max > target->rlimits[resource].rlim_max &&
+            self && self->euid != 0 &&
+            !security_check_permission(self, CAP_SYS_RESOURCE)) {
+            return -(s64)EPERM;
+        }
+        if (resource == RLIMIT_NOFILE && nl.rlim_max > PROC_MAX_FDS) {
+            nl.rlim_max = PROC_MAX_FDS;
+            if (nl.rlim_cur > nl.rlim_max) nl.rlim_cur = nl.rlim_max;
+        }
+        target->rlimits[resource] = nl;
+    }
+    return 0;
+}
 
 static s64 sys_getrlimit_impl(pt_regs_t *r)
 {
@@ -5173,30 +5235,32 @@ static s64 sys_getrlimit_impl(pt_regs_t *r)
     struct rlimit *rlim = (struct rlimit *)r->rsi;
     if (!rlim || (uintptr_t)rlim >= 0x8000000000000000ULL) return -(s64)EFAULT;
 
-    struct rlimit krlim;
-    switch (resource) {
-    case RLIMIT_NOFILE:
-        krlim.rlim_cur = 64;
-        krlim.rlim_max = 64;
-        break;
-    case RLIMIT_STACK:
-        krlim.rlim_cur = 8 * 1024 * 1024; /* 8 MB stack */
-        krlim.rlim_max = 8 * 1024 * 1024;
-        break;
-    default:
-        krlim.rlim_cur = RLIM_INFINITY;
-        krlim.rlim_max = RLIM_INFINITY;
-        break;
-    }
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
 
-    if (copy_to_user(rlim, &krlim, sizeof(struct rlimit)) != 0) return -(s64)EFAULT;
+    krlimit_t k;
+    s64 rc = do_prlimit(proc, resource, NULL, &k);
+    if (rc != 0) return rc;
+
+    struct rlimit out = { k.rlim_cur, k.rlim_max };
+    if (copy_to_user(rlim, &out, sizeof(out)) != 0) return -(s64)EFAULT;
     return 0;
 }
 
 static s64 sys_setrlimit_impl(pt_regs_t *r)
 {
-    (void)r;
-    return 0;
+    int resource = (int)r->rdi;
+    const struct rlimit *rlim = (const struct rlimit *)r->rsi;
+    if (!rlim || (uintptr_t)rlim >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    struct rlimit in;
+    if (copy_from_user(&in, rlim, sizeof(in)) != 0) return -(s64)EFAULT;
+
+    krlimit_t nl = { in.rlim_cur, in.rlim_max };
+    return do_prlimit(proc, resource, &nl, NULL);
 }
 
 struct rusage {
@@ -6005,47 +6069,41 @@ static s64 sys_prlimit64_impl(pt_regs_t *r)
     const struct kernel_rlimit64 *new_rlim = (const struct kernel_rlimit64 *)r->rdx;
     struct kernel_rlimit64 *old_rlim = (struct kernel_rlimit64 *)r->r10;
 
-    (void)pid;
-    (void)new_rlim;
+    if (resource < 0 || resource >= RLIMIT_NLIMITS) return -(s64)EINVAL;
+    if (new_rlim && (uintptr_t)new_rlim >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (old_rlim && (uintptr_t)old_rlim >= 0x8000000000000000ULL) return -(s64)EFAULT;
 
-    if (resource < 0 || resource > 15) return -(s64)EINVAL;
+    process_t *self = sched_current_process();
+    if (!self) return -(s64)EPERM;
 
-    if (old_rlim && (uintptr_t)old_rlim < 0x8000000000000000ULL) {
-        struct kernel_rlimit64 cur;
-        cur.rlim_cur = RLIM64_INFINITY;
-        cur.rlim_max = RLIM64_INFINITY;
-
-        switch (resource) {
-        case RLIMIT_STACK:
-            cur.rlim_cur = 8 * 1024 * 1024ULL;  /* 8 MB */
-            cur.rlim_max = 64 * 1024 * 1024ULL; /* 64 MB */
-            break;
-        case RLIMIT_NOFILE:
-            cur.rlim_cur = 64;
-            cur.rlim_max = 64;
-            break;
-        case RLIMIT_NPROC:
-            cur.rlim_cur = 1024;
-            cur.rlim_max = 4096;
-            break;
-        case RLIMIT_CORE:
-            cur.rlim_cur = 0;
-            cur.rlim_max = RLIM64_INFINITY;
-            break;
-        case RLIMIT_MEMLOCK:
-            cur.rlim_cur = 64 * 1024ULL;
-            cur.rlim_max = 64 * 1024ULL;
-            break;
-        default:
-            cur.rlim_cur = RLIM64_INFINITY;
-            cur.rlim_max = RLIM64_INFINITY;
-            break;
-        }
-
-        if (copy_to_user(old_rlim, &cur, sizeof(struct kernel_rlimit64)) != 0) {
-            return -(s64)EFAULT;
+    /* pid 0 means "this process". Acting on another process needs matching
+     * effective uid or CAP_SYS_RESOURCE, as Linux requires. */
+    process_t *target = self;
+    bool put_target = false;
+    if (pid != 0 && pid != self->pid) {
+        target = proc_get_by_pid(pid);
+        if (!target) return -(s64)ESRCH;
+        put_target = true;
+        if (self->euid != 0 && self->euid != target->euid &&
+            !security_check_permission(self, CAP_SYS_RESOURCE)) {
+            proc_put(target);
+            return -(s64)EPERM;
         }
     }
+
+    krlimit_t nl, ol;
+    if (new_rlim && copy_from_user(&nl, new_rlim, sizeof(nl)) != 0) {
+        if (put_target) proc_put(target);
+        return -(s64)EFAULT;
+    }
+
+    s64 rc = do_prlimit(target, resource, new_rlim ? &nl : NULL,
+                        old_rlim ? &ol : NULL);
+
+    if (put_target) proc_put(target);
+    if (rc != 0) return rc;
+
+    if (old_rlim && copy_to_user(old_rlim, &ol, sizeof(ol)) != 0) return -(s64)EFAULT;
     return 0;
 }
 
@@ -6202,15 +6260,129 @@ static s64 sys_seccomp_impl(pt_regs_t *r)
     }
 }
 
+/* ── Scheduling policy / parameters (shared helpers) ────────────────────────
+ * Policy + RT priority + nice are stored per process (see process_t) and
+ * mapped onto this CFS's weight by sched_weight_for(); every get* reflects
+ * exactly what the matching set* stored. */
+#define SCHED_OTHER   0
+#define SCHED_FIFO    1
+#define SCHED_RR      2
+#define SCHED_BATCH   3
+#define SCHED_IDLE    5
+#define SCHED_RESET_ON_FORK 0x40000000
+
+struct sched_param { int sched_priority; };
+
+struct sched_attr {
+    u32 size;
+    u32 sched_policy;
+    u64 sched_flags;
+    s32 sched_nice;
+    u32 sched_priority;
+    u64 sched_runtime;
+    u64 sched_deadline;
+    u64 sched_period;
+};
+
+/* Resolve a pid argument (0 = caller) and check the caller may reschedule the
+ * target: same effective uid, or CAP_SYS_NICE. Returns a process with a held
+ * reference when @put is set true (release with proc_put), else NULL with the
+ * negative errno in @err. */
+static process_t *sched_target(u32 pid, bool *put, s64 *err)
+{
+    *put = false; *err = 0;
+    process_t *self = sched_current_process();
+    if (!self) { *err = -(s64)EPERM; return NULL; }
+    if (pid == 0 || pid == self->pid) return self;
+
+    process_t *t = proc_get_by_pid(pid);
+    if (!t) { *err = -(s64)ESRCH; return NULL; }
+    if (self->euid != 0 && self->euid != t->euid &&
+        !security_check_permission(self, CAP_SYS_NICE)) {
+        proc_put(t);
+        *err = -(s64)EPERM;
+        return NULL;
+    }
+    *put = true;
+    return t;
+}
+
+static bool sched_policy_valid(int p)
+{
+    return p == SCHED_OTHER || p == SCHED_FIFO || p == SCHED_RR ||
+           p == SCHED_BATCH || p == SCHED_IDLE;
+}
+
 static s64 sys_sched_setattr_impl(pt_regs_t *r)
 {
-    (void)r;
+    u32 pid = (u32)(s32)r->rdi;
+    struct sched_attr *uattr = (struct sched_attr *)r->rsi;
+    if (!uattr || (uintptr_t)uattr >= 0x0000800000000000ULL) return -(s64)EINVAL;
+
+    /* size-versioned struct: read the leading u32, then the smaller of what
+     * the caller offered and what we understand. */
+    u32 size = 0;
+    if (copy_from_user(&size, uattr, sizeof(u32)) != 0) return -(s64)EFAULT;
+    if (size < sizeof(u32)) return -(s64)EINVAL;
+
+    struct sched_attr a;
+    memset(&a, 0, sizeof(a));
+    u32 copy = size < sizeof(a) ? size : (u32)sizeof(a);
+    if (copy_from_user(&a, uattr, copy) != 0) return -(s64)EFAULT;
+
+    int policy = (int)a.sched_policy;
+    if (!sched_policy_valid(policy)) return -(s64)EINVAL;
+    bool rt = (policy == SCHED_FIFO || policy == SCHED_RR);
+
+    if (rt) {
+        if (a.sched_priority < 1 || a.sched_priority > 99) return -(s64)EINVAL;
+    } else if (a.sched_priority != 0) {
+        return -(s64)EINVAL;
+    }
+    s32 nice = a.sched_nice;
+    if (nice < -20) nice = -20;
+    if (nice >  19) nice =  19;
+
+    process_t *self = sched_current_process();
+    if (rt && self && self->euid != 0 &&
+        !security_check_permission(self, CAP_SYS_NICE))
+        return -(s64)EPERM;
+
+    bool put; s64 err;
+    process_t *tgt = sched_target(pid, &put, &err);
+    if (!tgt) return err;
+
+    tgt->sched_policy  = (u32)policy;
+    tgt->sched_rt_prio = rt ? (s32)a.sched_priority : 0;
+    if (!rt) tgt->prio_nice = nice;
+    sched_apply_weight(tgt);
+
+    if (put) proc_put(tgt);
     return 0;
 }
 
 static s64 sys_sched_getattr_impl(pt_regs_t *r)
 {
-    (void)r;
+    u32 pid = (u32)(s32)r->rdi;
+    struct sched_attr *uattr = (struct sched_attr *)r->rsi;
+    u32 size = (u32)r->rdx;
+    if (!uattr || (uintptr_t)uattr >= 0x0000800000000000ULL) return -(s64)EINVAL;
+    if (size < sizeof(struct sched_attr)) return -(s64)EINVAL;
+
+    bool put; s64 err;
+    process_t *tgt = sched_target(pid, &put, &err);
+    if (!tgt) return err;
+
+    struct sched_attr a;
+    memset(&a, 0, sizeof(a));
+    a.size          = sizeof(a);
+    a.sched_policy  = tgt->sched_policy;
+    a.sched_nice    = tgt->prio_nice;
+    a.sched_priority = (u32)tgt->sched_rt_prio;
+
+    if (put) proc_put(tgt);
+
+    if (copy_to_user(uattr, &a, sizeof(a)) != 0) return -(s64)EFAULT;
     return 0;
 }
 
@@ -7538,6 +7710,21 @@ static s64 sys_mremap_impl(pt_regs_t *r)
 #define FUTEX_CLOCK_REALTIME  256
 #define FUTEX_BITSET_MATCH_ANY 0xFFFFFFFF
 
+/* FUTEX_WAKE_OP encoded-operation field (val3):
+ *   bits 28-31 op, 24-27 cmp, 12-23 oparg (12-bit signed), 0-11 cmparg. */
+#define FUTEX_OP_SET          0   /* *uaddr2 = oparg        */
+#define FUTEX_OP_ADD          1   /* *uaddr2 += oparg       */
+#define FUTEX_OP_OR           2   /* *uaddr2 |= oparg       */
+#define FUTEX_OP_ANDN         3   /* *uaddr2 &= ~oparg      */
+#define FUTEX_OP_XOR          4   /* *uaddr2 ^= oparg       */
+#define FUTEX_OP_OPARG_SHIFT  8   /* oparg is (1 << oparg)  */
+#define FUTEX_OP_CMP_EQ       0
+#define FUTEX_OP_CMP_NE       1
+#define FUTEX_OP_CMP_LT       2
+#define FUTEX_OP_CMP_LE       3
+#define FUTEX_OP_CMP_GT       4
+#define FUTEX_OP_CMP_GE       5
+
 typedef struct futex_q {
     thread_t        *thread;
     process_t       *proc;
@@ -7689,6 +7876,66 @@ static s64 sys_futex_impl(pt_regs_t *r)
         if (bitset == 0) return -(s64)EINVAL;
 
         return futex_wake_addr(proc, uaddr, val, bitset);
+    }
+    case FUTEX_WAKE_OP: {
+        /* Atomically apply an operation to *uaddr2, wake up to @val waiters on
+         * uaddr, then — if oldval compares true against cmparg — wake up to
+         * @val2 waiters on uaddr2. This is what glibc's pthread_cond_signal /
+         * _broadcast and several bounded-queue primitives are built on. */
+        if (uaddr2 >= 0x0000800000000000ULL || (uaddr2 & 3) != 0) return -(s64)EFAULT;
+
+        u32 nr_wake  = val;
+        u32 nr_wake2 = (u32)(uintptr_t)timeout;   /* val2 shares the timeout slot */
+        u32 encoded  = val3;
+
+        int wake_op  = (int)((encoded >> 28) & 0xf);
+        int wake_cmp = (int)((encoded >> 24) & 0xf);
+        s32 oparg    = (s32)((encoded >> 12) & 0xfff);
+        s32 cmparg   = (s32)(encoded & 0xfff);
+        if (oparg  & 0x800) oparg  |= ~0xfff;     /* sign-extend 12-bit fields */
+        if (cmparg & 0x800) cmparg |= ~0xfff;
+
+        if (wake_op & FUTEX_OP_OPARG_SHIFT) {
+            if (oparg < 0 || oparg > 31) return -(s64)EINVAL;
+            oparg = 1 << oparg;
+            wake_op &= ~FUTEX_OP_OPARG_SHIFT;
+        }
+
+        u32 oldval = 0;
+        if (copy_from_user(&oldval, (const void *)uaddr2, sizeof(u32)) != 0)
+            return -(s64)EFAULT;
+
+        u32 newval;
+        switch (wake_op) {
+        case FUTEX_OP_SET:  newval = (u32)oparg;          break;
+        case FUTEX_OP_ADD:  newval = oldval + (u32)oparg; break;
+        case FUTEX_OP_OR:   newval = oldval | (u32)oparg; break;
+        case FUTEX_OP_ANDN: newval = oldval & ~(u32)oparg; break;
+        case FUTEX_OP_XOR:  newval = oldval ^ (u32)oparg; break;
+        default: return -(s64)ENOSYS;
+        }
+
+        if (newval != oldval &&
+            copy_to_user((void *)uaddr2, &newval, sizeof(u32)) != 0)
+            return -(s64)EFAULT;
+
+        int woken = futex_wake_addr(proc, uaddr, nr_wake, FUTEX_BITSET_MATCH_ANY);
+
+        int cmp_res;
+        switch (wake_cmp) {
+        case FUTEX_OP_CMP_EQ: cmp_res = ((s32)oldval == cmparg); break;
+        case FUTEX_OP_CMP_NE: cmp_res = ((s32)oldval != cmparg); break;
+        case FUTEX_OP_CMP_LT: cmp_res = ((s32)oldval <  cmparg); break;
+        case FUTEX_OP_CMP_LE: cmp_res = ((s32)oldval <= cmparg); break;
+        case FUTEX_OP_CMP_GT: cmp_res = ((s32)oldval >  cmparg); break;
+        case FUTEX_OP_CMP_GE: cmp_res = ((s32)oldval >= cmparg); break;
+        default: return -(s64)ENOSYS;
+        }
+
+        if (cmp_res)
+            woken += futex_wake_addr(proc, uaddr2, nr_wake2, FUTEX_BITSET_MATCH_ANY);
+
+        return woken;
     }
     case FUTEX_REQUEUE:
     case FUTEX_CMP_REQUEUE: {
@@ -8436,31 +8683,104 @@ static s64 sys_signalfd_impl(pt_regs_t *r)
 }
 
 /* ── Linux Scheduling & Personality ABIs ──────────────────────────────────── */
+/* SCHED_* / struct sched_param / sched_target() / sched_policy_valid() are
+ * defined above with sched_setattr(). */
+
 static s64 sys_sched_setscheduler_impl(pt_regs_t *r)
 {
-    (void)r;
+    u32 pid    = (u32)(s32)r->rdi;
+    int policy = (int)r->rsi;
+    const struct sched_param *uparam = (const struct sched_param *)r->rdx;
+
+    bool reset_on_fork = (policy & SCHED_RESET_ON_FORK) != 0;
+    policy &= ~SCHED_RESET_ON_FORK;
+    (void)reset_on_fork;  /* accepted, not acted on */
+
+    if (policy != SCHED_OTHER && policy != SCHED_FIFO && policy != SCHED_RR &&
+        policy != SCHED_BATCH && policy != SCHED_IDLE)
+        return -(s64)EINVAL;
+
+    int prio = 0;
+    bool rt = (policy == SCHED_FIFO || policy == SCHED_RR);
+    if (uparam) {
+        struct sched_param kp;
+        if (copy_from_user(&kp, uparam, sizeof(kp)) != 0) return -(s64)EFAULT;
+        prio = kp.sched_priority;
+    }
+    if (rt) {
+        if (prio < 1 || prio > 99) return -(s64)EINVAL;
+    } else if (prio != 0) {
+        return -(s64)EINVAL;
+    }
+
+    process_t *self = sched_current_process();
+    if (rt && self && self->euid != 0 &&
+        !security_check_permission(self, CAP_SYS_NICE))
+        return -(s64)EPERM;
+
+    bool put; s64 err;
+    process_t *tgt = sched_target(pid, &put, &err);
+    if (!tgt) return err;
+
+    tgt->sched_policy  = (u32)policy;
+    tgt->sched_rt_prio = rt ? prio : 0;
+    sched_apply_weight(tgt);
+
+    if (put) proc_put(tgt);
     return 0;
 }
 
 static s64 sys_sched_getscheduler_impl(pt_regs_t *r)
 {
-    (void)r;
-    return 0; /* SCHED_OTHER */
+    u32 pid = (u32)(s32)r->rdi;
+    bool put; s64 err;
+    process_t *tgt = sched_target(pid, &put, &err);
+    if (!tgt) return err;
+    s64 policy = (s64)tgt->sched_policy;
+    if (put) proc_put(tgt);
+    return policy;
 }
 
 static s64 sys_sched_setparam_impl(pt_regs_t *r)
 {
-    (void)r;
-    return 0;
+    u32 pid = (u32)(s32)r->rdi;
+    const struct sched_param *uparam = (const struct sched_param *)r->rsi;
+    if (!uparam) return -(s64)EINVAL;
+
+    struct sched_param kp;
+    if (copy_from_user(&kp, uparam, sizeof(kp)) != 0) return -(s64)EFAULT;
+
+    bool put; s64 err;
+    process_t *tgt = sched_target(pid, &put, &err);
+    if (!tgt) return err;
+
+    bool rt = (tgt->sched_policy == SCHED_FIFO || tgt->sched_policy == SCHED_RR);
+    s64 rc = 0;
+    if (rt) {
+        if (kp.sched_priority < 1 || kp.sched_priority > 99) rc = -(s64)EINVAL;
+        else tgt->sched_rt_prio = kp.sched_priority;
+    } else if (kp.sched_priority != 0) {
+        rc = -(s64)EINVAL;
+    }
+
+    if (put) proc_put(tgt);
+    return rc;
 }
 
 static s64 sys_sched_getparam_impl(pt_regs_t *r)
 {
-    int *param = (int *)r->rsi;
-    if (param && (uintptr_t)param < 0x0000800000000000ULL) {
-        int priority = 0;
-        copy_to_user(param, &priority, sizeof(int));
-    }
+    u32 pid = (u32)(s32)r->rdi;
+    struct sched_param *uparam = (struct sched_param *)r->rsi;
+    if (!uparam || (uintptr_t)uparam >= 0x0000800000000000ULL) return -(s64)EINVAL;
+
+    bool put; s64 err;
+    process_t *tgt = sched_target(pid, &put, &err);
+    if (!tgt) return err;
+
+    struct sched_param kp = { .sched_priority = tgt->sched_rt_prio };
+    if (put) proc_put(tgt);
+
+    if (copy_to_user(uparam, &kp, sizeof(kp)) != 0) return -(s64)EFAULT;
     return 0;
 }
 
@@ -8659,21 +8979,95 @@ static s64 sys_setdomainname_impl(pt_regs_t *r)
     return 0;
 }
 
+/* setpriority(2) selectors. */
+#define PRIO_PROCESS 0
+#define PRIO_PGRP    1
+#define PRIO_USER    2
+
+/* Resolve a getpriority/setpriority (which, who) into a pid list. who==0 maps
+ * to the caller's own pid / pgid / real-uid. Returns count, or <0 errno. */
+static int prio_targets(int which, int who, u32 *pids, int max)
+{
+    process_t *self = sched_current_process();
+    if (!self) return -(int)EPERM;
+    if (which != PRIO_PROCESS && which != PRIO_PGRP && which != PRIO_USER)
+        return -(int)EINVAL;
+
+    u32 key;
+    if (who == 0) {
+        key = (which == PRIO_PROCESS) ? self->pid
+            : (which == PRIO_PGRP)    ? self->pgid
+                                      : self->uid;
+    } else {
+        key = (u32)who;
+    }
+    return sched_collect_pids(pids, max, which, key);
+}
+
 static s64 sys_getpriority_impl(pt_regs_t *r)
 {
     int which = (int)r->rdi;
-    int who = (int)r->rsi;
-    (void)which; (void)who;
-    return 0;
+    int who   = (int)r->rsi;
+
+    u32 pids[64];
+    int n = prio_targets(which, who, pids, 64);
+    if (n < 0)  return (s64)n;
+    if (n == 0) return -(s64)ESRCH;
+
+    /* Kernel ABI: return 20 - nice, so the value is always positive (glibc
+     * maps it back). Report the highest priority = lowest nice = largest 20-n. */
+    int best = -1;   /* 20 - 19 */
+    for (int i = 0; i < n; i++) {
+        process_t *p = proc_get_by_pid(pids[i]);
+        if (!p) continue;
+        int v = 20 - p->prio_nice;
+        if (v > best) best = v;
+        proc_put(p);
+    }
+    return (s64)best;
 }
 
 static s64 sys_setpriority_impl(pt_regs_t *r)
 {
     int which = (int)r->rdi;
-    int who = (int)r->rsi;
-    int prio = (int)r->rdx;
-    (void)which; (void)who; (void)prio;
-    return 0;
+    int who   = (int)r->rsi;
+    int prio  = (int)r->rdx;
+
+    if (prio < -20) prio = -20;
+    if (prio >  19) prio =  19;
+
+    process_t *self = sched_current_process();
+
+    u32 pids[64];
+    int n = prio_targets(which, who, pids, 64);
+    if (n < 0)  return (s64)n;
+    if (n == 0) return -(s64)ESRCH;
+
+    s64 rc = -(s64)ESRCH;
+    for (int i = 0; i < n; i++) {
+        process_t *p = proc_get_by_pid(pids[i]);
+        if (!p) continue;
+
+        /* Must own the target (euid match) unless privileged; lowering the
+         * nice value (raising priority) additionally needs CAP_SYS_NICE or
+         * headroom under RLIMIT_NICE (encoded Linux-style as 20 - nice). */
+        bool allowed = self && (self->euid == 0 || self->euid == p->euid ||
+                                self->euid == p->uid);
+        if (allowed && prio < p->prio_nice) {
+            u64 nice_ceiling = p->rlimits[13 /* RLIMIT_NICE */].rlim_cur;
+            int lowest_nice = (nice_ceiling >= 40) ? -20 : (20 - (int)nice_ceiling);
+            if (prio < lowest_nice && self->euid != 0 &&
+                !security_check_permission(self, CAP_SYS_NICE))
+                allowed = false;
+        }
+        if (!allowed) { proc_put(p); rc = -(s64)EACCES; continue; }
+
+        p->prio_nice = prio;
+        sched_apply_weight(p);
+        proc_put(p);
+        if (rc == -(s64)ESRCH) rc = 0;
+    }
+    return rc;
 }
 
 static s64 sys_chroot_impl(pt_regs_t *r)

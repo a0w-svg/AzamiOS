@@ -91,6 +91,8 @@ typedef struct {
     int           cursor_y;
     int           old_cursor_x;
     int           old_cursor_y;
+    int           hw_cursor;      /* 1 when the display drives the pointer overlay */
+    int           hw_cursor_fd;   /* /dev/fb0, held open for the cursor ioctls */
 
     /* Interactive Enhancements: Snap Preview, Alt+Tab Switcher & Desktop Context Menu */
     int           snap_preview_mode; /* 0 = none, 1 = left, 2 = right, 3 = max, 4 = top-left, 5 = top-right, 6 = bot-left, 7 = bot-right */
@@ -174,6 +176,15 @@ void compositor_enable_page_flip(az_compositor_t *comp, int fb_fd,
 
 /** compositor_present(comp) — put the composed frame on screen. */
 void compositor_present(az_compositor_t *comp);
+
+/**
+ * compositor_enable_hw_cursor(comp, fb_fd) — hand the pointer sprite to the
+ * display's cursor overlay if it has one. On success the compositor stops
+ * drawing the pointer into the framebuffer and a pointer move becomes one
+ * ioctl instead of a recomposite. A no-op (leaves hw_cursor 0) when the
+ * backend has no overlay.
+ */
+void compositor_enable_hw_cursor(az_compositor_t *comp, int fb_fd);
 
 /** compositor_update_cursor(comp) — Update only the cursor region without full redraw. */
 void compositor_update_cursor(az_compositor_t *comp);

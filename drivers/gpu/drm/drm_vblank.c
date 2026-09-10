@@ -155,26 +155,61 @@ void drm_vblank_crtc_reset(drm_crtc_t *crtc, const drm_display_mode_t *mode)
 
 /* ── Damage ──────────────────────────────────────────────────────────────── */
 
+/* Two rects that touch or overlap: one covering rectangle beats pushing both. */
+static bool drm_rect_mergeable(const drm_rect_t *a, const drm_rect_t *b)
+{
+    return !(b->x1 > a->x2 || b->x2 < a->x1 ||
+             b->y1 > a->y2 || b->y2 < a->y1);
+}
+
+static void drm_rect_union(drm_rect_t *a, const drm_rect_t *b)
+{
+    if (b->x1 < a->x1) a->x1 = b->x1;
+    if (b->y1 < a->y1) a->y1 = b->y1;
+    if (b->x2 > a->x2) a->x2 = b->x2;
+    if (b->y2 > a->y2) a->y2 = b->y2;
+}
+
 /* Caller holds dev->lock. */
 static void drm_crtc_add_damage_locked(drm_crtc_t *crtc, const drm_rect_t *r)
 {
-    /* A NULL rectangle means "all of it", which no union can narrow again. */
+    /* A NULL rectangle means "all of it", which no set of rects can narrow. */
     if (!r) {
-        crtc->damage       = (drm_rect_t){ 0, 0, 0, 0 };
-        crtc->damage_valid = false;
+        crtc->damage_full  = true;
+        crtc->damage_count = 0;
         return;
     }
     if (r->x2 <= r->x1 || r->y2 <= r->y1) return;
+    if (crtc->damage_full) return;
 
-    if (!crtc->damage_valid) {
-        crtc->damage       = *r;
-        crtc->damage_valid = true;
+    /* Fold into the first rect it touches; the grown rect may now reach a
+     * later one, so coalesce the tail too. */
+    for (u32 i = 0; i < crtc->damage_count; i++) {
+        if (!drm_rect_mergeable(&crtc->damage[i], r)) continue;
+        drm_rect_union(&crtc->damage[i], r);
+        for (u32 j = i + 1; j < crtc->damage_count; ) {
+            if (drm_rect_mergeable(&crtc->damage[i], &crtc->damage[j])) {
+                drm_rect_union(&crtc->damage[i], &crtc->damage[j]);
+                crtc->damage[j] = crtc->damage[--crtc->damage_count];
+            } else {
+                j++;
+            }
+        }
         return;
     }
-    if (r->x1 < crtc->damage.x1) crtc->damage.x1 = r->x1;
-    if (r->y1 < crtc->damage.y1) crtc->damage.y1 = r->y1;
-    if (r->x2 > crtc->damage.x2) crtc->damage.x2 = r->x2;
-    if (r->y2 > crtc->damage.y2) crtc->damage.y2 = r->y2;
+
+    if (crtc->damage_count < DRM_MAX_DAMAGE) {
+        crtc->damage[crtc->damage_count++] = *r;
+        return;
+    }
+
+    /* Set is full and nothing merged: collapse everything, plus r, to one
+     * bounding box. Still a rectangle — never a whole-screen push. */
+    drm_rect_t bb = crtc->damage[0];
+    for (u32 i = 1; i < crtc->damage_count; i++) drm_rect_union(&bb, &crtc->damage[i]);
+    drm_rect_union(&bb, r);
+    crtc->damage[0]    = bb;
+    crtc->damage_count = 1;
 }
 
 void drm_crtc_add_damage(drm_crtc_t *crtc, const drm_rect_t *r)
@@ -186,14 +221,34 @@ void drm_crtc_add_damage(drm_crtc_t *crtc, const drm_rect_t *r)
     spinlock_unlock(&crtc->dev->lock);
 }
 
-/* Take the pending damage and clear it.  Returns NULL when the whole
- * framebuffer has to be pushed. */
-static const drm_rect_t *drm_crtc_take_damage(drm_crtc_t *crtc, drm_rect_t *out)
+/* Take the pending damage and clear it. Copies up to DRM_MAX_DAMAGE rects into
+ * @out, returns the count; *full is set when the whole framebuffer is owed.
+ * Count 0 with *full false means nothing changed. Caller holds dev->lock. */
+static u32 drm_crtc_take_damage(drm_crtc_t *crtc, drm_rect_t *out, bool *full)
 {
-    if (!crtc->damage_valid) return NULL;
-    *out = crtc->damage;
-    crtc->damage_valid = false;
-    return out;
+    *full = crtc->damage_full;
+    u32 n = crtc->damage_count;
+    for (u32 i = 0; i < n; i++) out[i] = crtc->damage[i];
+    crtc->damage_full  = false;
+    crtc->damage_count = 0;
+    return n;
+}
+
+/* Run @hook (a driver page_flip or dirty_fb) once per damage rectangle. @flip
+ * is true for a page flip, where the scanout target itself changes and the
+ * hook must fire at least once even with no damage. Returns the first non-zero
+ * hook result, else 0. */
+static int drm_present(drm_crtc_t *crtc, drm_framebuffer_t *fb,
+                       int (*hook)(drm_crtc_t *, drm_framebuffer_t *, const drm_rect_t *),
+                       const drm_rect_t *rects, u32 n, bool full, bool flip)
+{
+    if (!hook || !fb) return 0;
+    if (full || (n == 0 && flip))
+        return hook(crtc, fb, NULL);
+    int ret = 0;
+    for (u32 i = 0; i < n && ret == 0; i++)
+        ret = hook(crtc, fb, &rects[i]);
+    return ret;
 }
 
 int drm_crtc_flush_damage(drm_crtc_t *crtc)
@@ -203,13 +258,15 @@ int drm_crtc_flush_damage(drm_crtc_t *crtc)
 
     drm_device_t *dev = crtc->dev;
 
+    drm_rect_t rects[DRM_MAX_DAMAGE];
+    bool full;
     spinlock_lock(&dev->lock);
-    drm_rect_t clip;
-    const drm_rect_t *cp = drm_crtc_take_damage(crtc, &clip);
+    u32 n = drm_crtc_take_damage(crtc, rects, &full);
     drm_framebuffer_t *fb = crtc->fb;
     spinlock_unlock(&dev->lock);
 
-    return dev->driver->dirty_fb(crtc, fb, cp);
+    if (!full && n == 0) return 0;
+    return drm_present(crtc, fb, dev->driver->dirty_fb, rects, n, full, false);
 }
 
 /* ── Page flips ──────────────────────────────────────────────────────────── */
@@ -249,12 +306,13 @@ int drm_vblank_queue_flip(drm_crtc_t *crtc, drm_file_t *file,
     /* An asynchronous flip is a request to tear on purpose (Linux's
      * DRM_MODE_PAGE_FLIP_ASYNC), and so is a flip with no worker to defer to. */
     if (async || !g_vblank_running) {
-        drm_rect_t clip;
+        drm_rect_t rects[DRM_MAX_DAMAGE];
+        bool full;
         spinlock_lock(&dev->lock);
-        const drm_rect_t *cp = drm_crtc_take_damage(crtc, &clip);
+        u32 n = drm_crtc_take_damage(crtc, rects, &full);
         spinlock_unlock(&dev->lock);
 
-        int ret = dev->driver->page_flip ? dev->driver->page_flip(crtc, fb, cp) : 0;
+        int ret = drm_present(crtc, fb, dev->driver->page_flip, rects, n, full, true);
         if (ret != 0) return ret;
 
         fb->refcount++;
@@ -359,13 +417,15 @@ static void drm_vblank_advance(drm_device_t *dev, drm_crtc_t *crtc, u64 now)
     crtc->flip_file      = NULL;
     crtc->flip_event     = false;
 
-    drm_rect_t clip;
-    const drm_rect_t *cp = drm_crtc_take_damage(crtc, &clip);
+    drm_rect_t rects[DRM_MAX_DAMAGE];
+    bool dmg_full;
+    u32  dmg_n = drm_crtc_take_damage(crtc, rects, &dmg_full);
     drm_framebuffer_t *cur = crtc->fb;
     spinlock_unlock(&dev->lock);
 
     if (fb) {
-        int ret = dev->driver->page_flip ? dev->driver->page_flip(crtc, fb, cp) : 0;
+        int ret = drm_present(crtc, fb, dev->driver->page_flip,
+                              rects, dmg_n, dmg_full, true);
         __atomic_add_fetch(&crtc->vblank_count, elapsed, __ATOMIC_RELEASE);
         dev->vblank_count += elapsed;
 
@@ -385,8 +445,9 @@ static void drm_vblank_advance(drm_device_t *dev, drm_crtc_t *crtc, u64 now)
         /* No flip this frame — push whatever damage a shadow driver still
          * owes, so a client that only ever calls DIRTYFB still gets its
          * updates at a frame boundary instead of mid-scanout. */
-        if (cp && cur && dev->driver->dirty_fb) {
-            dev->driver->dirty_fb(crtc, cur, cp);
+        if ((dmg_full || dmg_n) && cur && dev->driver->dirty_fb) {
+            drm_present(crtc, cur, dev->driver->dirty_fb,
+                        rects, dmg_n, dmg_full, false);
         }
         __atomic_add_fetch(&crtc->vblank_count, elapsed, __ATOMIC_RELEASE);
         dev->vblank_count += elapsed;

@@ -176,6 +176,11 @@ void kernel_main(void)
     /* ── Step 11: SMP & Local APIC ───────────────────────────────────────── */
     smp_init();
 
+    /* Every core now has a valid GS base, so kmalloc()/kfree() can move their
+     * bucket fast path onto per-CPU magazines and stop serialising small
+     * allocations on the shared bucket locks. */
+    kmalloc_enable_percpu();
+
     /* ── Performance counters ────────────────────────────────────────────
      * After smp_init(), because programming a counter is per-logical-processor
      * and pmu_sync_local() needs this core's id from the per-CPU block. */

@@ -1026,6 +1026,34 @@ void compositor_enable_page_flip(az_compositor_t *comp, int fb_fd,
     comp->cursor_rect[0].valid = comp->cursor_rect[1].valid = 0;
 }
 
+void compositor_enable_hw_cursor(az_compositor_t *comp, int fb_fd)
+{
+    if (!comp || fb_fd < 0) return;
+
+    /* 64x64x4 = 16 KiB; static because this runs once at init and a frame that
+     * big does not belong on the stack. */
+    static unsigned int img[FB_AZ_HWCURSOR_MAX * FB_AZ_HWCURSOR_MAX];
+    memset(img, 0, sizeof(img));
+    desktop_cursor_blit_bgra(img, FB_AZ_HWCURSOR_MAX, FB_AZ_HWCURSOR_MAX);
+
+    struct fb_az_hwcursor c = {
+        .width  = DESKTOP_CURSOR_W,
+        .height = DESKTOP_CURSOR_H,
+        .hot_x  = DESKTOP_CURSOR_HX,
+        .hot_y  = DESKTOP_CURSOR_HY,
+        .image  = (uint64_t)(uintptr_t)img,
+    };
+
+    if (ioctl(fb_fd, FBIOAZ_HWCURSOR_SET, &c) != 0)
+        return;                        /* no overlay — stay on the software path */
+
+    comp->hw_cursor    = 1;
+    comp->hw_cursor_fd = fb_fd;
+
+    struct fb_az_hwcursor_pos p = { comp->cursor_x, comp->cursor_y };
+    ioctl(fb_fd, FBIOAZ_HWCURSOR_MOVE, &p);
+}
+
 /* Move the scanout to @buf.  The kernel waits for the frame boundary. */
 static int display_pan(az_compositor_t *comp, int buf)
 {
@@ -1081,7 +1109,11 @@ static void compositor_present_internal(az_compositor_t *comp, bool recomposited
         }
     }
 
-    azwm_rect_t new_cursor = cursor_bounds(comp, comp->cursor_x, comp->cursor_y);
+    /* With a hardware cursor overlay the pointer is not in the framebuffer at
+     * all, so it owes the copy nothing and is never drawn here. */
+    azwm_rect_t new_cursor = comp->hw_cursor
+        ? (azwm_rect_t){ 0, 0, 0, 0, 0 }
+        : cursor_bounds(comp, comp->cursor_x, comp->cursor_y);
 
     if (comp->hw_page_flip) {
         int next = 1 - comp->active_vram_buf;
@@ -1090,12 +1122,15 @@ static void compositor_present_internal(az_compositor_t *comp, bool recomposited
         /* What this buffer is owed, plus the pointer left in it two frames
          * ago — copying over that is what erases it. */
         azwm_rect_t area = comp->pending[next];
-        rect_union_rect(&area, &comp->cursor_rect[next]);
-        rect_union_rect(&area, &new_cursor);
+        if (!comp->hw_cursor) {
+            rect_union_rect(&area, &comp->cursor_rect[next]);
+            rect_union_rect(&area, &new_cursor);
+        }
 
         copy_rect(comp, dst, &area);
-        desktop_draw_cursor(dst, comp->fb_width, comp->fb_height, pitch_px,
-                            comp->cursor_x, comp->cursor_y);
+        if (!comp->hw_cursor)
+            desktop_draw_cursor(dst, comp->fb_width, comp->fb_height, pitch_px,
+                                comp->cursor_x, comp->cursor_y);
 
         comp->pending[next].valid = 0;
         comp->cursor_rect[next]   = new_cursor;
@@ -1114,12 +1149,27 @@ static void compositor_present_internal(az_compositor_t *comp, bool recomposited
     } else {
         /* Single-buffered: copy the damage straight to the live scanout. */
         azwm_rect_t area = comp->pending[0];
-        rect_union_rect(&area, &comp->cursor_rect[0]);
-        rect_union_rect(&area, &new_cursor);
+        if (!comp->hw_cursor) {
+            rect_union_rect(&area, &comp->cursor_rect[0]);
+            rect_union_rect(&area, &new_cursor);
+        }
 
         copy_rect(comp, comp->frontbuf, &area);
-        desktop_draw_cursor(comp->frontbuf, comp->fb_width, comp->fb_height, pitch_px,
-                            comp->cursor_x, comp->cursor_y);
+        if (!comp->hw_cursor)
+            desktop_draw_cursor(comp->frontbuf, comp->fb_width, comp->fb_height, pitch_px,
+                                comp->cursor_x, comp->cursor_y);
+
+        /* Tell the kernel exactly what changed so a host-backed framebuffer
+         * (VirtIO-GPU) transfers only these rows, not the whole screen. */
+        if (comp->fb_fd >= 0 && area.valid && area.x1 > area.x0 && area.y1 > area.y0) {
+            struct fb_az_rect d = {
+                (unsigned)(area.x0 < 0 ? 0 : area.x0),
+                (unsigned)(area.y0 < 0 ? 0 : area.y0),
+                (unsigned)(area.x1 - (area.x0 < 0 ? 0 : area.x0)),
+                (unsigned)(area.y1 - (area.y0 < 0 ? 0 : area.y0)),
+            };
+            ioctl(comp->fb_fd, FBIOAZ_DAMAGE, &d);
+        }
 
         comp->pending[0].valid = 0;
         comp->pending[1].valid = 0;
@@ -1183,6 +1233,15 @@ void compose_screen(az_compositor_t *comp)
  */
 void compositor_update_cursor(az_compositor_t *comp)
 {
+    /* A hardware overlay moves with one message and no framebuffer touch —
+     * no recomposite, no damage copy, no transfer to the host. */
+    if (comp->hw_cursor) {
+        struct fb_az_hwcursor_pos p = { comp->cursor_x, comp->cursor_y };
+        ioctl(comp->hw_cursor_fd, FBIOAZ_HWCURSOR_MOVE, &p);
+        comp->old_cursor_x = comp->cursor_x;
+        comp->old_cursor_y = comp->cursor_y;
+        return;
+    }
     compositor_present_internal(comp, false);
 }
 

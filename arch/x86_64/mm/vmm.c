@@ -594,7 +594,10 @@ vmm_space_t vmm_clone_space(vmm_space_t src)
         }
     }
     spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
-    vmm_switch(read_cr3());
+    /* Reload CR3 verbatim (PCID bits and all) to drop this core's non-global
+     * entries the deep-copy above may have created through scratch mappings;
+     * the shootdown covers the others. */
+    write_cr3(read_cr3());
     tlb_shootdown_all();
     return dst_phys;
 

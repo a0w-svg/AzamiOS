@@ -37,6 +37,7 @@ struct drm_crtc;
 #define DRM_MAX_MODES           16     /* probed modes per connector         */
 #define DRM_MAX_FORMATS          8     /* pixel formats per plane            */
 #define DRM_MAX_EVENTS          16     /* queued flip/vblank events per file */
+#define DRM_MAX_DAMAGE           8     /* damage rects tracked per CRTC      */
 
 /* ── Driver feature bits ─────────────────────────────────────────────────── */
 #define DRIVER_MODESET          (1U << 0)
@@ -155,10 +156,15 @@ typedef struct drm_crtc {
     bool               flip_event;
 
     /* ── Damage accumulated since the last flush ────────────────────────
-     * Shadow-buffered drivers copy only these rows, so a compositor that
-     * reports its damage pays for what it changed and nothing more. */
-    drm_rect_t         damage;
-    bool               damage_valid;
+     * A shadow-buffered driver's dirty_fb/page_flip hook is invoked once per
+     * rectangle here, so a compositor that reports two changes far apart pays
+     * for two small copies rather than the bounding box that spans them.
+     * When the set fills it collapses to its own bounding box — still one
+     * rectangle, never the whole screen unless a NULL rect was reported,
+     * which is what damage_full records. */
+    drm_rect_t         damage[DRM_MAX_DAMAGE];
+    u32                damage_count;
+    bool               damage_full;
 
     struct drm_crtc   *next;
 } drm_crtc_t;
@@ -426,7 +432,9 @@ int  drm_vblank_queue_flip(drm_crtc_t *crtc, drm_file_t *file,
  */
 int  drm_vblank_wait(drm_crtc_t *crtc, u64 target, u64 *out_seq, u64 *out_ns);
 
-/** drm_crtc_add_damage(crtc, r) — union @r into the CRTC's pending damage. */
+/** drm_crtc_add_damage(crtc, r) — add @r to the CRTC's pending damage set,
+ *  merging it into an overlapping rect already there. @r NULL means the whole
+ *  framebuffer. */
 void drm_crtc_add_damage(drm_crtc_t *crtc, const drm_rect_t *r);
 
 /** drm_crtc_flush_damage(crtc) — push pending damage to the display now. */

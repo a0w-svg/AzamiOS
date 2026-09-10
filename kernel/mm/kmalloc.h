@@ -9,6 +9,17 @@
 /** kmalloc_init() — Initialize the kernel slab/bucket allocator. */
 void kmalloc_init(void);
 
+/** kmalloc_enable_percpu() — Switch bucket alloc/free onto per-CPU magazines
+ *  (a lockless fast path over the shared bucket free lists). Call once from
+ *  the boot path after smp_init() has published a valid GS base on every core;
+ *  before that the BSP allocates straight from the shared buckets. */
+void kmalloc_enable_percpu(void);
+
+/** kmalloc_drain_local() — Flush the calling CPU's magazines back to the
+ *  shared free lists. Safe only on the current core. kmalloc_reclaim() calls
+ *  it; a low-memory handler that wants every core drained must run it on each. */
+void kmalloc_drain_local(void);
+
 /** kmalloc(size) — Allocate `size` bytes of kernel memory. */
 void *kmalloc(size_t size);
 

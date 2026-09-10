@@ -190,7 +190,52 @@ static inline void vmm_switch(vmm_space_t space)
         __asm__ volatile("mov %%cr3, %0" : "=r"(prev));
         mitigations_switch_mm(prev & ~0xFFFULL, (u64)space & ~0xFFFULL);
     }
-    __asm__ volatile("mov %0, %%cr3" : : "r"((u64)space) : "memory");
+    /* Legacy callers load a bare PML4: PCID 0, and the write flushes that
+     * context's non-global entries. Used for the kernel address space, which
+     * lives in PCID 0 and whose pages are global anyway. */
+    __asm__ volatile("mov %0, %%cr3" : : "r"((u64)space & VMM_PHYS_MASK) : "memory");
+}
+
+extern u8 g_pcid_enabled;   /* cpu.c — CR4.PCIDE is live */
+
+/**
+ * vmm_switch_proc(pml4, pcid, cpu, primed_mask) — switch to a process address
+ * space, tagged with its PCID so the CPU keeps that space's TLB entries across
+ * the switch instead of flushing the whole non-global TLB every time.
+ *
+ * @primed_mask is a per-address-space bitmask, one bit per CPU. The first
+ * switch to this space on a given core is a *flushing* load (bit clear ->
+ * clears any entries a previous owner of the same PCID number left behind),
+ * every switch after that sets CR3[63] so the entries are kept. A cross-CPU
+ * TLB shootdown flushes every PCID (INVPCID all-contexts), so a stale mapping
+ * can never outlive an unmap.
+ */
+static inline void vmm_switch_proc(phys_addr_t pml4, u32 pcid, u32 cpu,
+                                   u64 *primed_mask)
+{
+    u64 phys = (u64)pml4 & VMM_PHYS_MASK;
+
+    if (__builtin_expect(g_ibpb_on_switch != 0, 0)) {
+        u64 prev;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(prev));
+        mitigations_switch_mm(prev & ~0xFFFULL, phys);
+    }
+
+    if (!g_pcid_enabled) {
+        __asm__ volatile("mov %0, %%cr3" : : "r"(phys) : "memory");
+        return;
+    }
+
+    u64 cr3 = phys | (pcid & 0xFFFu);
+    if (cpu < 64 && primed_mask) {
+        u64 bit = 1ULL << cpu;
+        if (*primed_mask & bit) {
+            cr3 |= (1ULL << 63);                       /* keep this PCID's TLB */
+        } else {
+            __atomic_or_fetch(primed_mask, bit, __ATOMIC_RELAXED);  /* flush once */
+        }
+    }
+    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
 }
 
 /** vmm_kernel_space() — Returns the physical address of the kernel's PML4. */

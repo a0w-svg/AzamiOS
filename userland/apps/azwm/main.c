@@ -85,10 +85,12 @@ static int map_shared_memory(void **frontbuf, void **backbuf,
                  * what keeps a frame from being shown half-drawn.
                  */
                 if (var.yres && fix.ypanstep && var.yres_virtual >= var.yres * 2) {
-                    disp->fb_fd   = fb_fd;      /* held open for FBIOPAN_DISPLAY */
                     disp->buffers = var.yres_virtual / var.yres;
                     disp->yres    = var.yres;
                 }
+                /* Keep /dev/fb0 open regardless: single-buffered or not, the
+                 * compositor still needs it for the hardware-cursor ioctls. */
+                disp->fb_fd = fb_fd;
             }
         }
         if (disp->fb_fd < 0) close(fb_fd);
@@ -285,8 +287,18 @@ int main(int argc, char **argv)
         compositor_enable_page_flip(&comp, disp.fb_fd, frontbuf, disp.yres);
         de_log("[azwm] Double-buffered: presenting by page flip at vsync");
     } else {
+        /* Keep /dev/fb0 for FBIOAZ_DAMAGE so a host-backed scanout transfers
+         * only the rows that changed. */
+        comp.fb_fd = disp.fb_fd;
         de_log("[azwm] Single-buffered display: presenting by damage copy");
     }
+
+    /* Hand the pointer to the display's cursor overlay if it has one — then a
+     * mouse move is one ioctl, not a recomposite and a host transfer. */
+    compositor_enable_hw_cursor(&comp, disp.fb_fd);
+    if (comp.hw_cursor)
+        de_log("[azwm] Pointer: hardware cursor overlay");
+
     de_log("[azwm] Compositor initialised");
 
     /* ── DE compositor extension init ──────────────────────────────────── */

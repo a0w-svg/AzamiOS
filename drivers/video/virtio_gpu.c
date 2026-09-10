@@ -15,44 +15,90 @@
 virtio_gpu_state_t g_gpu;
 static spinlock_t g_gpu_lock = SPINLOCK_INIT;
 
-int virtio_gpu_send_command(virtio_gpu_state_t *gpu, void *cmd, u32 cmd_size, void *resp, u32 resp_size)
+/* Submit one command/response pair on a chosen queue and block until the
+ * device retires it. queue_index selects both the virtqueue and the notify
+ * register: 0 = controlq (2D resource management), 1 = cursorq (cursor). */
+static int virtio_gpu_submit(virtio_gpu_state_t *gpu, u16 queue_index,
+                             virtqueue_t *vq, void *cmd, u32 cmd_size,
+                             void *resp, u32 resp_size)
 {
-    phys_addr_t cmd_phys = vmm_translate(vmm_kernel_space(), (virt_addr_t)cmd);
-    phys_addr_t resp_phys = vmm_translate(vmm_kernel_space(), (virt_addr_t)resp);
+    phys_addr_t addrs[2];
+    u32         lens[2];
+    bool        is_write[2] = {false, true}; /* Device reads cmd, writes resp */
+    u32         ndesc = 1;
 
-    phys_addr_t addrs[2] = {cmd_phys, resp_phys};
-    u32 lens[2] = {cmd_size, resp_size};
-    bool is_write[2] = {false, true}; /* Device reads cmd, writes resp */
+    addrs[0] = vmm_translate(vmm_kernel_space(), (virt_addr_t)cmd);
+    lens[0]  = cmd_size;
+
+    /* The cursor queue is out-only — a MOVE/UPDATE_CURSOR takes no response.
+     * Callers signal that by passing resp == NULL. */
+    if (resp) {
+        addrs[1] = vmm_translate(vmm_kernel_space(), (virt_addr_t)resp);
+        lens[1]  = resp_size;
+        ndesc    = 2;
+    }
+
+    if (!vq) {
+        pr_debug("[VIRTIO-GPU] queue %u not available\n", queue_index);
+        return -1;
+    }
 
     irqflags_t flags = spinlock_lock_irqsave(&g_gpu_lock);
 
     int cookie = 1;
-    if (virtqueue_add_chain(gpu->controlq, addrs, lens, is_write, 2, (void *)(uintptr_t)cookie) < 0) {
+    if (virtqueue_add_chain(vq, addrs, lens, is_write, ndesc, (void *)(uintptr_t)cookie) < 0) {
         spinlock_unlock_irqrestore(&g_gpu_lock, flags);
-        pr_debug("[VIRTIO-GPU] Failed to add command to virtqueue\n");
+        pr_debug("[VIRTIO-GPU] Failed to add command to virtqueue %u\n", queue_index);
         return -1;
     }
 
-    virtqueue_kick(gpu->controlq);
-    virtio_pci_notify(&gpu->vpci, 0, gpu->controlq);
+    virtqueue_kick(vq);
+    virtio_pci_notify(&gpu->vpci, queue_index, vq);
 
-    /* Spin wait for completion (simple polling for now) */
+    /*
+     * Poll for completion with interrupts off. Bounded on purpose: this runs
+     * on the compositor's path (a page flip, and — via the cursor queue — every
+     * pointer move), so a device that never retires the descriptor must fail
+     * the operation, not wedge the core forever with IRQs masked. The cap is
+     * far longer than any real round trip (microseconds under QEMU); hitting it
+     * means the queue is genuinely stuck.
+     */
     void *returned_cookie = NULL;
+    u64 spins = 0;
+    const u64 SPIN_LIMIT = 200000000ULL;
     while (!returned_cookie) {
-        returned_cookie = virtqueue_get_used(gpu->controlq, NULL);
-        /* In a real OS we'd yield or wait for an interrupt here */
+        returned_cookie = virtqueue_get_used(vq, NULL);
+        if (returned_cookie) break;
+        if (++spins >= SPIN_LIMIT) {
+            spinlock_unlock_irqrestore(&g_gpu_lock, flags);
+            pr_debug("[VIRTIO-GPU] queue %u timed out waiting for completion\n",
+                     queue_index);
+            return -1;
+        }
         __asm__ volatile("pause");
     }
 
     spinlock_unlock_irqrestore(&g_gpu_lock, flags);
 
-    struct virtio_gpu_ctrl_hdr *hdr = (struct virtio_gpu_ctrl_hdr *)resp;
-    if (hdr->type >= VIRTIO_GPU_RESP_ERR_UNSPEC) {
-        pr_debug("[VIRTIO-GPU] Command failed with error 0x%x\n", hdr->type);
-        return -1;
+    if (resp) {
+        struct virtio_gpu_ctrl_hdr *hdr = (struct virtio_gpu_ctrl_hdr *)resp;
+        if (hdr->type >= VIRTIO_GPU_RESP_ERR_UNSPEC) {
+            pr_debug("[VIRTIO-GPU] Command failed with error 0x%x\n", hdr->type);
+            return -1;
+        }
     }
 
     return 0;
+}
+
+int virtio_gpu_send_command(virtio_gpu_state_t *gpu, void *cmd, u32 cmd_size, void *resp, u32 resp_size)
+{
+    return virtio_gpu_submit(gpu, 0, gpu->controlq, cmd, cmd_size, resp, resp_size);
+}
+
+int virtio_gpu_send_cursor(virtio_gpu_state_t *gpu, void *cmd, u32 cmd_size, void *resp, u32 resp_size)
+{
+    return virtio_gpu_submit(gpu, 1, gpu->cursorq, cmd, cmd_size, resp, resp_size);
 }
 
 int virtio_gpu_init(device_t *pci_dev)

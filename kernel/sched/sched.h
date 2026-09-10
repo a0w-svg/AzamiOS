@@ -134,12 +134,26 @@ typedef struct {
     void *shmem_ptr;
 } proc_shmem_map_t;
 
+/* POSIX resource limit pair. Kept here (rather than in the syscall layer) so
+ * process_t can carry the table directly. RLIMIT_NLIMITS matches Linux's
+ * resource count; the RLIMIT_* index macros live in the syscall layer. */
+#define RLIMIT_NLIMITS 16
+#define RLIM_INFINITY  (~0ULL)
+
+typedef struct {
+    u64 rlim_cur;   /* soft limit — the value enforced                 */
+    u64 rlim_max;   /* hard limit — ceiling a soft limit may be raised to */
+} krlimit_t;
+
 /**
  * struct process — Microkernel address space and resource container.
  */
 typedef struct process {
     u32             pid;             /* Process ID */
     phys_addr_t     pml4_phys;       /* Physical address of level-4 page table (CR3) */
+    u16             pcid;            /* PCID tag for this address space (0 = kernel) */
+    u64             pcid_primed;     /* bit per CPU: set once this core has done a
+                                        flushing load of this PCID (see vmm_switch_proc) */
     char            name[32];        /* Process name */
     thread_t       *threads;         /* Head of threads list in this process */
     struct process *parent;          /* Parent process */
@@ -307,6 +321,23 @@ typedef struct process {
     u32             mempolicy_mode;
     u64             mempolicy_nodemask;
     u32             mempolicy_home_node;
+
+    /* Scheduling policy and priority (sched_setscheduler/setparam/setattr,
+     * setpriority/nice). This CFS accrues vruntime by thread->priority, so the
+     * nice value is mapped onto that weight and genuinely changes CPU share;
+     * SCHED_FIFO/RR are recorded for a faithful get* round-trip and mapped to
+     * the strongest weight rather than true run-to-completion. */
+    u32             sched_policy;      /* SCHED_OTHER(0)/FIFO(1)/RR(2)/BATCH(3)/IDLE(5) */
+    s32             sched_rt_prio;     /* 1..99 for FIFO/RR, else 0 */
+    s32             prio_nice;         /* -20..19, 0 = default */
+
+    /* POSIX resource limits (getrlimit/setrlimit/prlimit64). One soft/hard
+     * pair per RLIMIT_* resource, seeded with defaults in proc_create(),
+     * inherited verbatim by fork() and preserved across execve(). RLIMIT_NOFILE
+     * is enforced by the fd allocator; the rest round-trip faithfully even
+     * where the kernel cannot yet act on them (house style, as with ioprio /
+     * mempolicy above). */
+    krlimit_t       rlimits[RLIMIT_NLIMITS];
 } process_t;
 
 /* wait4(2) option bits this kernel honours. */
@@ -366,6 +397,17 @@ thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool
 
 /** sched_enqueue_thread(t) — Add a prepared thread to the CFS ready queue. */
 void sched_enqueue_thread(thread_t *t);
+
+/** sched_weight_for(proc) — CFS weight implied by proc's policy + nice. */
+u32 sched_weight_for(const process_t *proc);
+
+/** sched_apply_weight(proc) — push that weight onto all of proc's threads. */
+void sched_apply_weight(process_t *proc);
+
+/** sched_collect_pids(out, max, which, who) — snapshot pids matching a
+ *  setpriority(2) selector (0=PRIO_PROCESS pid, 1=PRIO_PGRP pgid, 2=PRIO_USER
+ *  uid). Returns the count written. */
+int sched_collect_pids(u32 *out, int max, int which, u32 who);
 
 /** thread_clear_child_tid() — Honour CLONE_CHILD_CLEARTID for a dying thread:
  *  zero the registered user word and wake one futex waiter on it. Must run in

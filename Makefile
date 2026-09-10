@@ -66,6 +66,7 @@ CFLAGS := \
     -falign-functions=16 \
     -falign-loops=16 \
     -falign-jumps=16 \
+    -fno-semantic-interposition \
     -pipe \
     -I. \
     -Iinclude \

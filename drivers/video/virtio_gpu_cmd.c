@@ -110,17 +110,20 @@ int virtio_gpu_set_scanout(u32 scanout_id, u32 resource_id, u32 width, u32 heigh
     return (resp.type == VIRTIO_GPU_RESP_OK_NODATA) ? 0 : -1;
 }
 
-int virtio_gpu_transfer_to_host_2d(u32 resource_id, u32 width, u32 height)
+int virtio_gpu_transfer_to_host_2d_rect(u32 resource_id, u32 x, u32 y,
+                                        u32 width, u32 height, u64 offset)
 {
     struct virtio_gpu_transfer_to_host_2d cmd;
     struct virtio_gpu_ctrl_hdr resp;
 
+    if (width == 0 || height == 0) return 0;
+
     memset(&cmd, 0, sizeof(cmd));
     cmd.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
     cmd.resource_id = resource_id;
-    cmd.offset = 0;
-    cmd.r.x = 0;
-    cmd.r.y = 0;
+    cmd.offset = offset;
+    cmd.r.x = x;
+    cmd.r.y = y;
     cmd.r.width = width;
     cmd.r.height = height;
 
@@ -133,16 +136,19 @@ int virtio_gpu_transfer_to_host_2d(u32 resource_id, u32 width, u32 height)
     return (resp.type == VIRTIO_GPU_RESP_OK_NODATA) ? 0 : -1;
 }
 
-int virtio_gpu_resource_flush(u32 resource_id, u32 width, u32 height)
+int virtio_gpu_resource_flush_rect(u32 resource_id, u32 x, u32 y,
+                                   u32 width, u32 height)
 {
     struct virtio_gpu_resource_flush cmd;
     struct virtio_gpu_ctrl_hdr resp;
 
+    if (width == 0 || height == 0) return 0;
+
     memset(&cmd, 0, sizeof(cmd));
     cmd.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
     cmd.resource_id = resource_id;
-    cmd.r.x = 0;
-    cmd.r.y = 0;
+    cmd.r.x = x;
+    cmd.r.y = y;
     cmd.r.width = width;
     cmd.r.height = height;
 
@@ -153,6 +159,18 @@ int virtio_gpu_resource_flush(u32 resource_id, u32 width, u32 height)
     }
 
     return (resp.type == VIRTIO_GPU_RESP_OK_NODATA) ? 0 : -1;
+}
+
+/* Whole-scanout wrappers: unchanged ABI for callers that repaint everything
+ * (initial mode set, a client with no damage information). */
+int virtio_gpu_transfer_to_host_2d(u32 resource_id, u32 width, u32 height)
+{
+    return virtio_gpu_transfer_to_host_2d_rect(resource_id, 0, 0, width, height, 0);
+}
+
+int virtio_gpu_resource_flush(u32 resource_id, u32 width, u32 height)
+{
+    return virtio_gpu_resource_flush_rect(resource_id, 0, 0, width, height);
 }
 
 int virtio_gpu_setup_framebuffer(void)
@@ -223,4 +241,92 @@ int virtio_gpu_setup_framebuffer(void)
     
     pr_debug("[VIRTIO-GPU] Framebuffer setup complete.\n");
     return 0;
+}
+
+/* ── Hardware cursor ─────────────────────────────────────────────────────────
+ *
+ * The cursor is a separate host resource that the device composites over the
+ * scanout on its own. Once its 64x64 BGRA image is uploaded, moving it is a
+ * single MOVE_CURSOR on the cursor queue: no scanout transfer, no flush, and
+ * nothing for the compositor to redraw. UPDATE_CURSOR with resource_id 0
+ * removes it.
+ * ------------------------------------------------------------------------- */
+
+#define VIRTIO_GPU_CURSOR_RESID  0xC0
+#define VIRTIO_GPU_CURSOR_BYTES  (VIRTIO_GPU_CURSOR_W * VIRTIO_GPU_CURSOR_H * 4)
+
+static int virtio_gpu_cursor_alloc(void)
+{
+    if (g_gpu.cursor_virt) return 0;
+
+    u32 pages = (VIRTIO_GPU_CURSOR_BYTES + 4095) / 4096;
+    g_gpu.cursor_phys = pmm_alloc_pages(pages);
+    if (!g_gpu.cursor_phys) return -1;
+
+    g_gpu.cursor_virt = vmm_map_io(g_gpu.cursor_phys, pages * 4096);
+    if (!g_gpu.cursor_virt) return -1;
+    memset(g_gpu.cursor_virt, 0, VIRTIO_GPU_CURSOR_BYTES);
+    g_gpu.cursor_res_id = VIRTIO_GPU_CURSOR_RESID;
+
+    if (virtio_gpu_resource_create_2d(g_gpu.cursor_res_id,
+                                      VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
+                                      VIRTIO_GPU_CURSOR_W, VIRTIO_GPU_CURSOR_H) < 0)
+        return -1;
+    if (virtio_gpu_resource_attach_backing(g_gpu.cursor_res_id, g_gpu.cursor_phys,
+                                           VIRTIO_GPU_CURSOR_BYTES) < 0)
+        return -1;
+
+    pr_debug("[VIRTIO-GPU] hardware cursor resource %u ready (64x64 BGRA)\n",
+             g_gpu.cursor_res_id);
+    return 0;
+}
+
+int virtio_gpu_cursor_define(const u32 *bgra, u32 hot_x, u32 hot_y)
+{
+    if (!bgra) return -1;
+    if (virtio_gpu_cursor_alloc() < 0) return -1;
+
+    memcpy(g_gpu.cursor_virt, bgra, VIRTIO_GPU_CURSOR_BYTES);
+    if (virtio_gpu_transfer_to_host_2d_rect(g_gpu.cursor_res_id, 0, 0,
+                                            VIRTIO_GPU_CURSOR_W,
+                                            VIRTIO_GPU_CURSOR_H, 0) < 0)
+        return -1;
+
+    struct virtio_gpu_update_cursor cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.hdr.type       = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+    cmd.pos.scanout_id = 0;
+    cmd.resource_id    = g_gpu.cursor_res_id;
+    cmd.hot_x          = hot_x;
+    cmd.hot_y          = hot_y;
+
+    return virtio_gpu_send_cursor(&g_gpu, &cmd, sizeof(cmd), NULL, 0);
+}
+
+int virtio_gpu_cursor_move(u32 x, u32 y)
+{
+    if (!g_gpu.cursor_virt) return -1;   /* no image uploaded yet */
+
+    struct virtio_gpu_update_cursor cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.hdr.type       = VIRTIO_GPU_CMD_MOVE_CURSOR;
+    cmd.pos.scanout_id = 0;
+    cmd.pos.x          = x;
+    cmd.pos.y          = y;
+    cmd.resource_id    = g_gpu.cursor_res_id;   /* keep the current image */
+
+    return virtio_gpu_send_cursor(&g_gpu, &cmd, sizeof(cmd), NULL, 0);
+}
+
+int virtio_gpu_cursor_hide(void)
+{
+    if (!g_gpu.cursor_virt) return 0;
+
+    struct virtio_gpu_update_cursor cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.hdr.type       = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+    cmd.pos.scanout_id = 0;
+    cmd.resource_id    = 0;   /* 0 removes the overlay */
+
+    return virtio_gpu_send_cursor(&g_gpu, &cmd, sizeof(cmd), NULL, 0);
 }

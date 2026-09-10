@@ -27,6 +27,10 @@ typedef struct block_header {
 #define BLOCK_MAGIC         0x415A414D494D414CUL
 #define ALIGNED_BLOCK_MAGIC 0x415A414D414C4947UL
 
+/* How much the heap grows on a miss. The surplus over the current request is
+ * left on the free list, so most malloc()s never reach the brk() syscall. */
+#define MALLOC_ARENA_CHUNK  (256UL * 1024UL)
+
 static block_header_t *g_block_head = NULL;
 static block_header_t *g_block_tail = NULL; /* BUG-11: tail pointer for O(1) append */
 static void *g_heap_top = NULL;
@@ -95,7 +99,10 @@ static void *malloc_unlocked(size_t size)
         curr = curr->next;
     }
 
-    /* 2. No suitable block found, allocate new memory from OS via sys_brk */
+    /* 2. No reusable block. Grow the heap — but in large arena chunks, keeping
+     * the surplus as one trailing free block. A run of small malloc()s then
+     * costs a single brk() syscall instead of one per allocation, and every
+     * allocation after the first is served from the free list above. */
     if (!g_heap_top) {
         long base = syscall1(SYS_brk, 0);
         if (base <= 0) return NULL;
@@ -103,10 +110,19 @@ static void *malloc_unlocked(size_t size)
     }
 
     size_t total_alloc = sizeof(block_header_t) + aligned_size;
-    long next_brk = (long)g_heap_top + (long)total_alloc;
+
+    size_t grow = total_alloc;
+    if (grow < MALLOC_ARENA_CHUNK) grow = MALLOC_ARENA_CHUNK;
+    grow = (grow + 4095UL) & ~4095UL;                 /* whole pages */
+
+    long next_brk = (long)g_heap_top + (long)grow;
     long res = syscall1(SYS_brk, next_brk);
     if (res < next_brk) {
-        return NULL;
+        /* The big request failed; retry with just what this call needs. */
+        grow = (total_alloc + 15UL) & ~15UL;
+        next_brk = (long)g_heap_top + (long)grow;
+        res = syscall1(SYS_brk, next_brk);
+        if (res < next_brk) return NULL;
     }
 
     block_header_t *new_block = (block_header_t *)g_heap_top;
@@ -114,6 +130,8 @@ static void *malloc_unlocked(size_t size)
 
     new_block->size = aligned_size;
     new_block->is_free = 0;
+    new_block->_pad = 0;
+    new_block->_pad2 = 0;
     new_block->magic = BLOCK_MAGIC;
     new_block->next = NULL;
     new_block->prev = NULL;
@@ -126,6 +144,22 @@ static void *malloc_unlocked(size_t size)
         g_block_tail->next = new_block;
         new_block->prev = g_block_tail;
         g_block_tail = new_block;
+    }
+
+    /* Carve the remainder of the arena chunk into a trailing free block that
+     * is physically contiguous with new_block, so free()'s coalescing can
+     * still merge across it later. */
+    if (grow >= total_alloc + sizeof(block_header_t) + 16) {
+        block_header_t *rest = (block_header_t *)((char *)(new_block + 1) + aligned_size);
+        rest->size = grow - total_alloc - sizeof(block_header_t);
+        rest->is_free = 1;
+        rest->_pad = 0;
+        rest->_pad2 = 0;
+        rest->magic = BLOCK_MAGIC;
+        rest->next = NULL;
+        rest->prev = new_block;
+        new_block->next = rest;
+        g_block_tail = rest;
     }
 
     return (void *)(new_block + 1);
@@ -950,6 +984,13 @@ int system(const char *command)
 void __libc_init(int argc, char **argv, char **envp)
 {
     (void)argc; (void)argv;
+
+    /* Pick the widest string/memory scanners this CPU supports before the
+     * first strdup() below reaches for strlen()/memcpy(). Skipping this only
+     * costs the AVX2 path — the SSE2 default is always correct. */
+    extern void __libc_simd_init(void);
+    __libc_simd_init();
+
     if (envp) {
         int i = 0;
         while (envp[i] && i < MAX_ENV_VARS) {

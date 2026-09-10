@@ -1,6 +1,7 @@
-# compiled object files (C and assembly)
+# compiled object files (C and assembly) and static archives
+*.o
 *.obj
-*.obj
+*.a
 
 #generated binary files and kernel 
 *.bin

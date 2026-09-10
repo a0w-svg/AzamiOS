@@ -278,7 +278,8 @@ static s64 drm_ioctl_setcrtc(drm_device_t *dev, drm_file_t *file, u64 arg)
     /* The frame period follows the mode, and the freshly programmed scanout
      * is already correct, so nothing is owed to the next frame. */
     drm_vblank_crtc_reset(crtc, &mode);
-    crtc->damage_valid = false;
+    crtc->damage_count = 0;
+    crtc->damage_full  = false;
 
     pr_debug("[DRM] card%d: CRTC %u set to %ux%u fb=%u\n",
              dev->index, crtc->base.id, mode.hdisplay, mode.vdisplay, req.fb_id);
@@ -747,6 +748,14 @@ static s64 drm_ioctl_cursor(drm_device_t *dev, drm_file_t *file, u32 cmd, u64 ar
     drm_crtc_t *crtc = drm_crtc_find(dev, req.crtc_id);
     if (!crtc) return -(s64)ENOENT;
 
+    /* CURSOR2 carries the hotspot on the SET as well as the MOVE (libdrm's
+     * drmModeSetCursor2 sends BO-only). Apply it before cursor_set() runs so
+     * the driver uploads the image with the right hotspot, not a stale one. */
+    if (cmd == DRM_IOCTL_MODE_CURSOR2) {
+        crtc->cursor_hot_x = req.hot_x;
+        crtc->cursor_hot_y = req.hot_y;
+    }
+
     if (req.flags & DRM_MODE_CURSOR_BO) {
         drm_gem_object_t *bo = req.handle ? drm_gem_handle_lookup(file, req.handle) : NULL;
         if (req.handle && !bo) return -(s64)ENOENT;
@@ -765,10 +774,6 @@ static s64 drm_ioctl_cursor(drm_device_t *dev, drm_file_t *file, u32 cmd, u64 ar
     if (req.flags & DRM_MODE_CURSOR_MOVE) {
         crtc->cursor_x = req.x;
         crtc->cursor_y = req.y;
-        if (cmd == DRM_IOCTL_MODE_CURSOR2) {
-            crtc->cursor_hot_x = req.hot_x;
-            crtc->cursor_hot_y = req.hot_y;
-        }
         if (dev->driver->cursor_move) {
             int ret = dev->driver->cursor_move(crtc, req.x, req.y);
             if (ret != 0) return (s64)ret;

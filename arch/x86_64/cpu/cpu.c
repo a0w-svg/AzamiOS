@@ -423,6 +423,11 @@ static u64 compose_cr4(u64 cr4)
     if (g_smep_enabled)     cr4 |= CR4_SMEP;
     if (g_smap_enabled)     cr4 |= CR4_SMAP;
     if (g_pku_enabled)      cr4 |= CR4_PKE;
+    /* PCID tags TLB entries by address space, so a context switch keeps the
+     * incoming process's translations instead of flushing the whole
+     * non-global TLB. Setting the bit is only legal while CR3[11:0] == 0,
+     * which holds here — PCID has never been enabled, so CR3 is a bare PML4. */
+    if (g_pcid_enabled)     cr4 |= CR4_PCIDE;
 
     /* RDPMC from ring 3 is a side channel with no user in this kernel: it hands
      * userspace cycle-accurate counters for code it does not own. Never set. */
@@ -622,6 +627,11 @@ void cpu_enable_features_bsp(void)
     if (g_cpu_info.has_pku)      g_pku_enabled      = 1;
     if (g_cpu_info.has_erms)     g_erms_enabled     = 1;
     if (g_cpu_info.has_invpcid)  g_invpcid_enabled  = 1;
+    /* Require INVPCID alongside PCID: the TLB-shootdown handler leans on
+     * INVPCID "all contexts, including globals" to flush every tagged context
+     * on a remote core in one instruction. Both are present on every CPU new
+     * enough to care and on QEMU's -cpu max. */
+    if (g_cpu_info.has_pcid && g_cpu_info.has_invpcid) g_pcid_enabled = 1;
 
     /* XSAVE first: configure_xsave() needs OSXSAVE live and may decide the
      * feature is unusable, which compose_cr4() then has to reflect. */
@@ -664,7 +674,7 @@ void cpu_enable_features_bsp(void)
     mce_init();
     cpu_arm_split_lock_detect();
 
-    kprintf("[CPU] Enabled:%s%s%s%s%s%s%s%s%s%s%s\n",
+    kprintf("[CPU] Enabled:%s%s%s%s%s%s%s%s%s%s%s%s\n",
             g_pge_enabled       ? " PGE"      : "",
             g_umip_enabled      ? " UMIP"     : "",
             g_fsgsbase_enabled  ? " FSGSBASE" : "",
@@ -672,6 +682,7 @@ void cpu_enable_features_bsp(void)
             g_smap_enabled      ? " SMAP"     : "",
             g_osxsave_enabled   ? " OSXSAVE"  : "",
             g_pku_enabled       ? " PKU"      : "",
+            g_pcid_enabled      ? " PCID"     : "",
             g_invpcid_enabled   ? " INVPCID"  : "",
             g_mwait_idle_enabled? " MWAIT"    : "",
             g_mce_enabled       ? " MCE"      : "",

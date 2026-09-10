@@ -31,6 +31,7 @@ static thread_t  *g_ready_queue = NULL;
 static process_t *g_process_list = NULL;
 static process_t *g_kernel_proc = NULL;
 static u32 g_next_pid = 1;
+static u32 g_next_pcid = 0;   /* rolls 1..4095 for user address spaces */
 static u32 g_next_tid = 1;
 
 /* CFS min_vruntime: monotonically-advancing floor equal to the largest
@@ -74,7 +75,17 @@ void sched_post_switch(void)
     perf_sched_switch(cpu->prev_thread ? cpu->prev_thread->proc : NULL,
                       cpu->current_thread ? cpu->current_thread->proc : NULL);
 
-    if (cpu->current_thread && cpu->current_thread->proc) {
+    /*
+     * FS base and KERNEL_GS_BASE only matter to code that will run in ring 3:
+     * a kernel thread uses neither (%gs in ring 0 is the per-CPU block, set
+     * once at boot) and never sysrets to user, so its switch skips these
+     * writes entirely — an MSR write and an FSGSBASE write saved on every
+     * switch that lands on the idle thread or a kernel worker. The registers
+     * keep whatever the last user thread left; the next user thread's switch
+     * reloads them here.
+     */
+    if (cpu->current_thread && cpu->current_thread->proc &&
+        cpu->current_thread->proc != g_kernel_proc) {
         /* Per-thread TLS base when the thread set one (CLONE_SETTLS); otherwise
          * the process-wide base (single-threaded / main thread). */
         thread_t *ct = cpu->current_thread;
@@ -82,10 +93,6 @@ void sched_post_switch(void)
         if (g_fsgsbase_enabled) wrfsbase(base);
         else wrmsr(MSR_FS_BASE, base);
         wrmsr(MSR_KERNEL_GS_BASE, ct->proc->gs_base);
-    } else {
-        if (g_fsgsbase_enabled) wrfsbase(0);
-        else wrmsr(MSR_FS_BASE, 0);
-        wrmsr(MSR_KERNEL_GS_BASE, 0);
     }
 
     if (cpu->prev_thread) {
@@ -155,6 +162,30 @@ u32 sched_get_process_count(void)
     return count;
 }
 
+/*
+ * Collect the PIDs of live processes matching a setpriority(2)-style selector
+ * into @out (capacity @max). @which is PRIO_PROCESS(0) / PRIO_PGRP(1) /
+ * PRIO_USER(2); @who is the pid / pgid / real-uid (0 already resolved by the
+ * caller to its own). Returns the number written (capped at @max). Snapshots
+ * under g_sched_lock and returns bare pids so the caller can re-resolve each
+ * with proc_get_by_pid() without holding the scheduler lock across the work.
+ */
+int sched_collect_pids(u32 *out, int max, int which, u32 who)
+{
+    if (!out || max <= 0) return 0;
+    int n = 0;
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    for (process_t *p = g_process_list; p && n < max; p = p->next) {
+        bool match = (which == 0) ? (p->pid  == who)
+                   : (which == 1) ? (p->pgid == who)
+                   : (which == 2) ? (p->uid  == who)
+                   : false;
+        if (match) out[n++] = p->pid;
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    return n;
+}
+
 u64 sched_get_idle_ticks(u32 cpu_id)
 {
     if (cpu_id >= SMP_MAX_CPUS) return 0;
@@ -215,6 +246,28 @@ static inline void fpu_restore(const fpu_state_t *fs)
     void *a = FPU_ALIGN(fs->buffer);
     if (g_osxsave_enabled) xsave_restore_asm(a, g_xcr0_mask);
     else                   fpu_restore_asm(a);
+}
+
+/*
+ * The kernel is built -mno-sse/-mno-mmx, so a kernel thread provably never
+ * touches x87/SSE/AVX state: its save area stays at init and restoring it is
+ * pointless. fpu_switch() skips both ends for a kernel thread, so an
+ * idle-thread or kernel-worker switch — the common case on a lightly loaded
+ * box — pays no XSAVE/XRSTOR (up to ~2.7 KiB of state traffic per direction)
+ * at all, and a user->kernel->user round trip leaves the user thread's live
+ * vector registers untouched. A user thread is still eager-saved on
+ * switch-out, so one that migrates to another core finds its state where
+ * XRSTOR expects it — laziness never crosses a CPU boundary.
+ */
+static inline bool thread_uses_fpu(const thread_t *t)
+{
+    return t && t->proc && t->proc != g_kernel_proc;
+}
+
+static inline void fpu_switch(thread_t *prev, thread_t *next)
+{
+    if (thread_uses_fpu(prev)) fpu_save(&prev->fpu_state);
+    if (thread_uses_fpu(next)) fpu_restore(&next->fpu_state);
 }
 
 /* Prepare a fresh thread's SIMD area. A zeroed area is "init state" for the
@@ -295,16 +348,24 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     process_t *proc = (process_t *)kzalloc(sizeof(process_t));
     if (!proc) return NULL;
 
+    proc->pml4_phys = pml4_phys ? pml4_phys : vmm_kernel_space();
+
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
     proc->pid = g_next_pid++;
+    /* PCID: the kernel address space is always tag 0 (its pages are global,
+     * shared by every context); each user address space gets a distinct tag,
+     * recycled modulo the 12-bit space. pcid_primed starts clear so the first
+     * switch to this space on each core is a flushing load — which is what
+     * makes a recycled tag safe. */
+    proc->pcid = (proc->pml4_phys == vmm_kernel_space())
+                     ? 0
+                     : (u16)(g_next_pcid++ % 4095u) + 1u;
     spinlock_unlock_irqrestore(&g_sched_lock, irqf);
 
     /* New process starts as the sole member and leader of its own process
      * group and session; fork() overrides this by inheriting from the parent. */
     proc->pgid = proc->pid;
     proc->sid  = proc->pid;
-
-    proc->pml4_phys = pml4_phys ? pml4_phys : vmm_kernel_space();
     for (int i = 0; name && name[i] && i < 31; i++) {
         proc->name[i] = name[i];
     }
@@ -318,6 +379,25 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     proc->wait_thread = NULL;
     proc->umask = 022; /* POSIX-02: default file creation mask */
     proc->pkey_alloc_map = 0x1; /* key 0 is the default key, always taken */
+
+    /* POSIX resource limits: infinite unless a resource has a real ceiling.
+     * fork() overwrites the whole table from the parent in proc_clone_attrs().
+     * Index constants (RLIMIT_STACK = 3, RLIMIT_NPROC = 6, RLIMIT_NOFILE = 7,
+     * RLIMIT_MEMLOCK = 8) match Linux and the syscall layer's RLIMIT_* macros. */
+    for (int i = 0; i < RLIMIT_NLIMITS; i++) {
+        proc->rlimits[i].rlim_cur = RLIM_INFINITY;
+        proc->rlimits[i].rlim_max = RLIM_INFINITY;
+    }
+    proc->rlimits[3].rlim_cur = 8 * 1024 * 1024;          /* STACK  soft 8 MiB */
+    proc->rlimits[4].rlim_cur = 0;                        /* CORE   soft 0     */
+    proc->rlimits[6].rlim_cur = 1024;                     /* NPROC  soft       */
+    proc->rlimits[6].rlim_max = 4096;                     /* NPROC  hard       */
+    proc->rlimits[7].rlim_cur = PROC_MAX_FDS;             /* NOFILE soft = hard */
+    proc->rlimits[7].rlim_max = PROC_MAX_FDS;             /*        (table size) */
+    proc->rlimits[8].rlim_cur = 64 * 1024;                /* MEMLOCK soft 64 KiB */
+    proc->rlimits[8].rlim_max = 64 * 1024;
+    proc->rlimits[13].rlim_cur = 0;  proc->rlimits[13].rlim_max = 0;  /* NICE   */
+    proc->rlimits[14].rlim_cur = 0;  proc->rlimits[14].rlim_max = 0;  /* RTPRIO */
 
     /* Seed the capability sets. kzalloc left euid == 0, so a plain new process
      * starts fully privileged exactly as it did before capabilities existed;
@@ -557,6 +637,38 @@ static void kstack_free(u64 stack_base)
     }
 }
 
+/*
+ * Map a process's scheduling policy + nice value onto the CFS weight this
+ * scheduler uses (thread->priority: vruntime += priority per tick, so a
+ * smaller number is a bigger CPU share).
+ *   - SCHED_FIFO / SCHED_RR  -> weight 1 (strongest share this design allows;
+ *     not true run-to-completion, but RT tasks clearly dominate)
+ *   - SCHED_IDLE             -> weight 40 (runs only when nothing else wants to)
+ *   - otherwise              -> 10 + nice, clamped to [1, 39]
+ */
+u32 sched_weight_for(const process_t *proc)
+{
+    if (!proc) return 10;
+    if (proc->sched_policy == 1 || proc->sched_policy == 2) return 1;   /* FIFO / RR */
+    if (proc->sched_policy == 5) return 40;                             /* IDLE */
+    s32 w = 10 + proc->prio_nice;
+    if (w < 1)  w = 1;
+    if (w > 39) w = 39;
+    return (u32)w;
+}
+
+/* Re-apply the process's weight to every thread it currently has. Called after
+ * setpriority()/sched_setscheduler() change the policy or nice value. */
+void sched_apply_weight(process_t *proc)
+{
+    if (!proc) return;
+    u32 w = sched_weight_for(proc);
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    for (thread_t *t = proc->threads; t; t = t->proc_next)
+        t->priority = w;
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+}
+
 thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool is_kernel, bool enqueue)
 {
     thread_t *t = (thread_t *)kzalloc(sizeof(thread_t));
@@ -569,7 +681,10 @@ thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool
     t->proc = proc ? proc : g_kernel_proc;
     t->state = THREAD_READY;
     t->vruntime = 0;
-    t->priority = 10;
+    /* Base CFS weight is 10 (vruntime grows by this each tick — lower means a
+     * larger CPU share). A process that has changed its nice value or picked
+     * an RT policy carries that onto every thread it spawns. */
+    t->priority = sched_weight_for(t->proc);
     
     /* Allocate a guarded 16 KB kernel stack for this thread */
     u64 kstack_base = kstack_alloc();
@@ -853,10 +968,11 @@ void sched_start(void)
 
     /* Switch CR3 if necessary */
     if (next->proc && next->proc->pml4_phys && (read_cr3() & VMM_PHYS_MASK) != next->proc->pml4_phys) {
-        vmm_switch(next->proc->pml4_phys);
+        vmm_switch_proc(next->proc->pml4_phys, next->proc->pcid,
+                        cpu->cpu_id, &next->proc->pcid_primed);
     }
 
-    fpu_restore(&next->fpu_state);
+    if (thread_uses_fpu(next)) fpu_restore(&next->fpu_state);
 
     /* Jump into the first thread's stack */
     __asm__ volatile(
@@ -920,23 +1036,19 @@ void sched_yield(void)
     }
 
     if (next->proc && next->proc->pml4_phys && (read_cr3() & VMM_PHYS_MASK) != next->proc->pml4_phys) {
-        vmm_switch(next->proc->pml4_phys);
+        vmm_switch_proc(next->proc->pml4_phys, next->proc->pcid,
+                        cpu->cpu_id, &next->proc->pcid_primed);
     }
-    if (next->proc) {
-        u64 next_fs = next->fs_base ? next->fs_base : next->proc->fs_base;
-        if (g_fsgsbase_enabled) wrfsbase(next_fs);
-        else wrmsr(MSR_FS_BASE, next_fs);
-        wrmsr(MSR_KERNEL_GS_BASE, next->proc->gs_base);
-    } else {
-        if (g_fsgsbase_enabled) wrfsbase(0);
-        else wrmsr(MSR_FS_BASE, 0);
-        wrmsr(MSR_KERNEL_GS_BASE, 0);
-    }
+
+    /* The incoming thread's FS base and KERNEL_GS_BASE are programmed by
+     * sched_post_switch(), which always runs on the far side of the switch
+     * (interrupts stay masked until then, and a first-run thread reaches it
+     * through the entry trampoline). This path used to write them here too —
+     * pure duplication of ~3 register writes on every yield. */
 
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
-    fpu_save(&prev->fpu_state);
-    fpu_restore(&next->fpu_state);
+    fpu_switch(prev, next);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
     if (irqf & (1 << 9)) cpu_sti();
@@ -981,20 +1093,38 @@ void sched_tick(pt_regs_t *regs)
         }
     }
 
-    /* Wake up sleeping threads and check preemption */
-    spinlock_lock(&g_sched_lock);
-    
-    /* Wake sleeping threads. Queue is sorted ascending by sleep_end_ticks so we
-     * can early-exit as soon as we see a tick in the future (PERF-02). */
-    while (g_sleep_queue && g_sleep_queue->sleep_end_ticks <= current_ticks) {
-        thread_t *waking = g_sleep_queue;
-        g_sleep_queue = waking->next;
-        waking->next = NULL;
-        enqueue_ready(waking);
-    }
+    /*
+     * Lock-free pre-check. At 100 Hz on every core this is one of the busiest
+     * would-be acquisitions of the global scheduler lock, and on the vast
+     * majority of ticks there is nothing to do: no sleeper's deadline has
+     * come up in this exact 10 ms window and the run queue is empty. Both
+     * loads are racy on purpose — a wake missed here is picked up on the next
+     * tick, and the preemption result only ever sets a hint that sched_yield()
+     * re-derives under the lock — so a stale read costs at most one tick of
+     * latency, never correctness.
+     */
+    thread_t *sq_head = __atomic_load_n(&g_sleep_queue, __ATOMIC_RELAXED);
+    bool wake_due   = sq_head && sq_head->sleep_end_ticks <= current_ticks;
+    bool rq_nonempty = __atomic_load_n(&g_ready_queue, __ATOMIC_RELAXED) != NULL;
 
-    bool should_preempt = (g_ready_queue && (curr == g_idle_threads[cpu->cpu_id] || g_ready_queue->vruntime < curr->vruntime));
-    spinlock_unlock(&g_sched_lock);
+    bool should_preempt = false;
+
+    if (wake_due || rq_nonempty) {
+        spinlock_lock(&g_sched_lock);
+
+        /* Wake sleeping threads. Queue is sorted ascending by sleep_end_ticks
+         * so we can early-exit as soon as we see a tick in the future. */
+        while (g_sleep_queue && g_sleep_queue->sleep_end_ticks <= current_ticks) {
+            thread_t *waking = g_sleep_queue;
+            g_sleep_queue = waking->next;
+            waking->next = NULL;
+            enqueue_ready(waking);
+        }
+
+        should_preempt = (g_ready_queue && (curr == g_idle_threads[cpu->cpu_id] ||
+                                            g_ready_queue->vruntime < curr->vruntime));
+        spinlock_unlock(&g_sched_lock);
+    }
 
     if (should_preempt || curr->state == THREAD_DYING) {
         cpu->needs_reschedule = true;
@@ -1071,13 +1201,13 @@ void sched_block(thread_state_t new_state)
     cpu->kernel_rsp0 = next->kernel_stack_top;
 
     if (next->proc && next->proc->pml4_phys && (read_cr3() & VMM_PHYS_MASK) != next->proc->pml4_phys) {
-        vmm_switch(next->proc->pml4_phys);
+        vmm_switch_proc(next->proc->pml4_phys, next->proc->pcid,
+                        cpu->cpu_id, &next->proc->pcid_primed);
     }
 
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
-    fpu_save(&prev->fpu_state);
-    fpu_restore(&next->fpu_state);
+    fpu_switch(prev, next);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
     if (irqf & (1 << 9)) cpu_sti();
@@ -1122,13 +1252,13 @@ void sched_sleep(u64 ticks)
     cpu->kernel_rsp0 = next->kernel_stack_top;
     
     if (next->proc && next->proc->pml4_phys && (read_cr3() & VMM_PHYS_MASK) != next->proc->pml4_phys) {
-        vmm_switch(next->proc->pml4_phys);
+        vmm_switch_proc(next->proc->pml4_phys, next->proc->pcid,
+                        cpu->cpu_id, &next->proc->pcid_primed);
     }
     
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
-    fpu_save(&prev->fpu_state);
-    fpu_restore(&next->fpu_state);
+    fpu_switch(prev, next);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
     if (irqf & (1 << 9)) cpu_sti();
@@ -1527,12 +1657,13 @@ void sched_exit_thread(void)
     cpu->kernel_rsp0 = next->kernel_stack_top;
 
     if (next->proc && next->proc->pml4_phys && (read_cr3() & VMM_PHYS_MASK) != next->proc->pml4_phys) {
-        vmm_switch(next->proc->pml4_phys);
+        vmm_switch_proc(next->proc->pml4_phys, next->proc->pcid,
+                        cpu->cpu_id, &next->proc->pcid_primed);
     }
 
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
-    fpu_restore(&next->fpu_state);
+    if (thread_uses_fpu(next)) fpu_restore(&next->fpu_state);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
     /* Should never reach here — prev is ZOMBIE */

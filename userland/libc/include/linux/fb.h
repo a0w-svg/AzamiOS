@@ -112,4 +112,40 @@ struct fb_cmap {
     uint16_t *transp;        /* transparency, can be NULL */
 };
 
+/* ── AzamiOS hardware-cursor plane ─────────────────────────────────────────
+ * FBIOAZ_HWCURSOR_SET returns 0 when the backend has a cursor overlay and
+ * took the image, -1/ENOTTY when it does not (composite the pointer yourself).
+ * After a successful SET, FBIOAZ_HWCURSOR_MOVE repositions it with no
+ * framebuffer work. */
+#define FBIOAZ_HWCURSOR_SET   0x4680
+#define FBIOAZ_HWCURSOR_MOVE  0x4681
+#define FBIOAZ_HWCURSOR_HIDE  0x4682
+
+/* Report the rectangle just drawn; the backend transfers only those rows to
+ * the host instead of the whole scanout. Rectangles union until the next
+ * flush. No-op on a direct-scanout backend. */
+#define FBIOAZ_DAMAGE         0x4683
+
+struct fb_az_rect {
+    uint32_t x;
+    uint32_t y;
+    uint32_t w;
+    uint32_t h;
+};
+
+#define FB_AZ_HWCURSOR_MAX 64        /* overlay is at most 64x64 BGRA8888 */
+
+struct fb_az_hwcursor {
+    uint32_t width;
+    uint32_t height;
+    uint32_t hot_x;
+    uint32_t hot_y;
+    uint64_t image;         /* pointer to width*height BGRA8888 pixels */
+};
+
+struct fb_az_hwcursor_pos {
+    int32_t x;
+    int32_t y;
+};
+
 #endif /* _LINUX_FB_H */

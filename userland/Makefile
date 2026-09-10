@@ -4,7 +4,7 @@ LD = $(CROSS_PREFIX)ld
 AR = $(CROSS_PREFIX)ar
 
 CFLAGS = -std=c11 -ffreestanding -fno-stack-protector -fno-pie -fno-pic -m64 \
-         -Wall -Wextra -Wno-unused-parameter -O3 -pipe \
+         -Wall -Wextra -Wno-unused-parameter -O3 -fno-semantic-interposition -pipe \
          -ffunction-sections -fdata-sections \
          -I. -Ilibc/include -Iapps/shared -Iapps/azwm
 

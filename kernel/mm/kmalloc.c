@@ -9,6 +9,7 @@
 #include "pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/smp.h"
 #include "../../drivers/char/console.h"
 #include "../../include/azami/defs.h"
 #include "../sched/sched.h"
@@ -60,11 +61,191 @@ static int size_to_bucket(size_t size)
 {
     size_t total = size + sizeof(block_hdr_t);
     if (total < size) return -1; /* Integer overflow */
-    
+
     for (int i = 0; i < BUCKET_COUNT; i++) {
         if (total <= g_buckets[i].block_size) return i;
     }
     return -1;
+}
+
+/* ============================================================================
+ * Per-CPU magazines
+ *
+ * Every bucket alloc/free above serialises on one of BUCKET_COUNT global
+ * spinlocks. On a multi-core build that is the kernel's busiest lock, and the
+ * cache line under it ping-pongs between cores on traffic that is otherwise
+ * embarrassingly parallel. A magazine is a small per-CPU stack of ready
+ * objects for one size class: the fast path pops or pushes it with interrupts
+ * merely disabled — no lock, no shared cache line — and only touches the
+ * bucket when its magazine runs dry (one bulk refill) or overflows (one bulk
+ * flush). Objects are identical wherever they were carved, so the CPU that
+ * frees one need not be the CPU that allocated it.
+ *
+ * A magazine is only ever mutated on its owning CPU with interrupts off, which
+ * is what makes the lockless path safe: interrupt-context allocations on the
+ * same core are excluded, and no other core touches the row. Nothing here
+ * drains another CPU's magazine — kmalloc_slab_stats() and kmalloc_reclaim()
+ * read the counts racily and treat what they see as an estimate, exactly as
+ * the page counters above already do.
+ *
+ * Disabled until kmalloc_enable_percpu(), which the boot path calls once
+ * smp_init() has published a valid GS base on every core; before that the BSP
+ * is single-threaded and allocates straight from the shared buckets.
+ * ========================================================================== */
+
+#define MAG_CAP     62                  /* objects cached per CPU per bucket   */
+#define MAG_BATCH   31                  /* moved in/out on a miss / overflow   */
+
+typedef struct {
+    u32   count;
+    void *slot[MAG_CAP];
+} magazine_t;
+
+/* [cpu][bucket]. ~250 KiB of BSS at the 64-core ceiling (SMP_MAX_CPUS *
+ * BUCKET_COUNT * sizeof(magazine_t)); each core writes only its own row, and
+ * the table is cache-line aligned. */
+static magazine_t g_mag[SMP_MAX_CPUS][BUCKET_COUNT]
+    __attribute__((aligned(64)));
+
+static bool g_percpu_ready = false;
+
+static __always_inline irqflags_t irq_save(void)
+{
+    irqflags_t f;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
+    return f;
+}
+static __always_inline void irq_restore(irqflags_t f)
+{
+    __asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory");
+}
+
+/*
+ * Pop up to @want raw objects (block_hdr region) from bucket @b's shared free
+ * list into @out, refilling one page from the PMM if the list is empty. One
+ * lock acquisition covers the whole batch. Returns how many were obtained;
+ * fewer than @want (possibly 0) means the PMM is out of memory.
+ */
+static size_t bucket_bulk_alloc(bucket_t *b, void **out, size_t want)
+{
+    size_t got = 0;
+    irqflags_t flags = spinlock_lock_irqsave(&b->lock);
+
+    while (got < want) {
+        if (!b->free_list) {
+            /* Same as the historical single-object path: drop the bucket lock
+             * across pmm_alloc_page() so the bucket->pmm lock order is never
+             * held both ways, build the slice list locally, splice it back. */
+            spinlock_unlock_irqrestore(&b->lock, flags);
+
+            phys_addr_t page = pmm_alloc_page();
+            if (!page) return got;
+
+            u8 *virt = (u8 *)PHYS_TO_VIRT(page);
+            size_t blk_size = b->block_size;
+            size_t count = PAGE_SIZE / blk_size;
+
+            free_block_t *local_head = NULL;
+            for (size_t j = 0; j < count; j++) {
+                free_block_t *blk = (free_block_t *)(virt + j * blk_size);
+                blk->next = local_head;
+                local_head = blk;
+            }
+
+            flags = spinlock_lock_irqsave(&b->lock);
+            free_block_t *tail = local_head;
+            while (tail->next) tail = tail->next;
+            tail->next = b->free_list;
+            b->free_list = local_head;
+            b->pages++;
+        }
+
+        free_block_t *blk = b->free_list;
+        b->free_list = blk->next;
+        out[got++] = blk;
+    }
+
+    spinlock_unlock_irqrestore(&b->lock, flags);
+    return got;
+}
+
+/* Push @n objects back onto bucket @b's shared free list under one lock. */
+static void bucket_bulk_free(bucket_t *b, void **objs, size_t n)
+{
+    if (n == 0) return;
+
+    for (size_t i = 0; i + 1 < n; i++)
+        ((free_block_t *)objs[i])->next = (free_block_t *)objs[i + 1];
+
+    irqflags_t flags = spinlock_lock_irqsave(&b->lock);
+    ((free_block_t *)objs[n - 1])->next = b->free_list;
+    b->free_list = (free_block_t *)objs[0];
+    spinlock_unlock_irqrestore(&b->lock, flags);
+}
+
+/* Fast-path bucket allocation: try this CPU's magazine, refill it from the
+ * shared list on a miss, fall back to a direct shared-list pop. Returns a raw
+ * object pointer (caller writes the header) or NULL on OOM. */
+static void *bucket_alloc(int idx)
+{
+    bucket_t *b = &g_buckets[idx];
+    void *obj = NULL;
+
+    if (g_percpu_ready) {
+        irqflags_t f = irq_save();
+        magazine_t *m = &g_mag[smp_current_cpu_id()][idx];
+        if (m->count == 0)
+            m->count = (u32)bucket_bulk_alloc(b, m->slot, MAG_BATCH);
+        if (m->count > 0)
+            obj = m->slot[--m->count];
+        irq_restore(f);
+    }
+
+    if (!obj) {
+        void *one[1];
+        if (bucket_bulk_alloc(b, one, 1) == 1)
+            obj = one[0];
+    }
+    return obj;
+}
+
+/* Fast-path bucket free: push onto this CPU's magazine, flushing a batch back
+ * to the shared list first if it is full. Returns false if the magazine layer
+ * is not active yet, in which case the caller uses the shared list directly. */
+static bool bucket_free(int idx, void *obj)
+{
+    if (!g_percpu_ready) return false;
+
+    bucket_t *b = &g_buckets[idx];
+    irqflags_t f = irq_save();
+    magazine_t *m = &g_mag[smp_current_cpu_id()][idx];
+    if (m->count == MAG_CAP) {
+        bucket_bulk_free(b, &m->slot[MAG_BATCH], MAG_CAP - MAG_BATCH);
+        m->count = MAG_BATCH;
+    }
+    m->slot[m->count++] = obj;
+    irq_restore(f);
+    return true;
+}
+
+/* Best-effort count of objects parked in every CPU's magazine for bucket @idx.
+ * Raced against live pushes/pops on other cores by design; the callers that
+ * use it (slabinfo, reclaim) only ever want an estimate. */
+static u64 magazine_parked(int idx)
+{
+    u64 n = 0;
+    u32 ncpu = g_percpu_ready ? smp_cpu_count() : 0;
+    if (ncpu > SMP_MAX_CPUS) ncpu = SMP_MAX_CPUS;
+    for (u32 c = 0; c < ncpu; c++)
+        n += __atomic_load_n(&g_mag[c][idx].count, __ATOMIC_RELAXED);
+    return n;
+}
+
+void kmalloc_enable_percpu(void)
+{
+    g_percpu_ready = true;
+    pr_debug("[KMALLOC] per-CPU magazines active (cap %d, batch %d)\n",
+             MAG_CAP, MAG_BATCH);
 }
 
 void *kmalloc(size_t size)
@@ -98,45 +279,10 @@ void *kmalloc(size_t size)
         return (void *)(hdr + 1);
     }
 
-    bucket_t *b = &g_buckets[idx];
-    irqflags_t flags = spinlock_lock_irqsave(&b->lock);
+    void *raw = bucket_alloc(idx);
+    if (!raw) return NULL;
 
-    if (!b->free_list) {
-        /* PERF-03: Release bucket lock before calling pmm_alloc_page() to avoid
-         * holding two locks simultaneously (bucket -> pmm). Build the slice list
-         * locally and re-acquire the lock only to splice it in. */
-        spinlock_unlock_irqrestore(&b->lock, flags);
-
-        phys_addr_t page = pmm_alloc_page();
-        if (!page) return NULL;
-
-        u8 *virt = (u8 *)PHYS_TO_VIRT(page);
-        size_t blk_size = b->block_size;
-        size_t count = PAGE_SIZE / blk_size;
-
-        /* Build local free list from the new page */
-        free_block_t *local_head = NULL;
-        for (size_t j = 0; j < count; j++) {
-            free_block_t *blk = (free_block_t *)(virt + j * blk_size);
-            blk->next = local_head;
-            local_head = blk;
-        }
-
-        /* Re-acquire bucket lock to splice in the new blocks */
-        flags = spinlock_lock_irqsave(&b->lock);
-        /* Another CPU may have refilled while we were unlocked; append ours anyway */
-        free_block_t *tail = local_head;
-        while (tail->next) tail = tail->next;
-        tail->next = b->free_list;
-        b->free_list = local_head;
-        b->pages++;
-    }
-
-    free_block_t *blk = b->free_list;
-    b->free_list = blk->next;
-    spinlock_unlock_irqrestore(&b->lock, flags);
-
-    block_hdr_t *hdr = (block_hdr_t *)blk;
+    block_hdr_t *hdr = (block_hdr_t *)raw;
     hdr->magic = KMALLOC_MAGIC;
     hdr->bucket_idx = (u32)idx;
     hdr->size = size;
@@ -273,6 +419,11 @@ void kfree(void *ptr)
         PANIC("kfree invalid bucket index!");
     }
 
+    /* Fast path: back onto this CPU's magazine. Falls through to the shared
+     * free list when the magazine layer is not enabled yet (early boot). */
+    if (bucket_free((int)idx, hdr))
+        return;
+
     bucket_t *b = &g_buckets[idx];
     free_block_t *blk = (free_block_t *)hdr;
 
@@ -395,6 +546,10 @@ int kmalloc_slab_stats(kmalloc_slab_stat_t *out, int max)
         for (free_block_t *f = b->free_list; f; f = f->next) freen++;
         spinlock_unlock_irqrestore(&b->lock, flags);
 
+        /* Objects parked in per-CPU magazines are free too, just not on the
+         * shared list — without this they would show up as "active". */
+        freen += magazine_parked(i);
+
         u64 total = pages * per;
         out[i].obj_size      = obj;
         out[i].objs_per_slab = per;
@@ -405,8 +560,37 @@ int kmalloc_slab_stats(kmalloc_slab_stat_t *out, int max)
     return n;
 }
 
+/*
+ * Return this CPU's magazines to the shared free lists. Runs with interrupts
+ * off on the calling core only — draining a remote core's magazine would race
+ * its lockless fast path — so a caller that wants every core drained has to
+ * arrange to run this on each. The reaper does it once per pass and migrates
+ * over time; a fully-free page pinned by a stray cached object elsewhere is
+ * simply reclaimed on a later tick.
+ */
+void kmalloc_drain_local(void)
+{
+    if (!g_percpu_ready) return;
+
+    for (int i = 0; i < BUCKET_COUNT; i++) {
+        void *tmp[MAG_CAP];
+        size_t n;
+
+        irqflags_t f = irq_save();
+        magazine_t *m = &g_mag[smp_current_cpu_id()][i];
+        n = m->count;
+        for (size_t j = 0; j < n; j++) tmp[j] = m->slot[j];
+        m->count = 0;
+        irq_restore(f);
+
+        bucket_bulk_free(&g_buckets[i], tmp, n);
+    }
+}
+
 size_t kmalloc_reclaim(void)
 {
+    kmalloc_drain_local();
+
     size_t freed = 0;
     for (int i = 0; i < BUCKET_COUNT; i++)
         freed += bucket_reclaim(&g_buckets[i]);

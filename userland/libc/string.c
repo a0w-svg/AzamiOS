@@ -10,42 +10,7 @@
 
 /* ── Lengths ─────────────────────────────────────────────────────────────── */
 
-size_t strlen(const char *s)
-{
-    if (!s) return 0;
-    const char *p = s;
-
-    /* Align to 8-byte boundary */
-    while ((uintptr_t)p & 7) {
-        if (*p == '\0') return (size_t)(p - s);
-        p++;
-    }
-
-    /* Process 8 bytes per iteration using SWAR zero-byte detection */
-    const unsigned long *lp = (const unsigned long *)p;
-    for (;;) {
-        unsigned long w = *lp++;
-        unsigned long zeros = (w - 0x0101010101010101UL) & ~w & 0x8080808080808080UL;
-        if (zeros) {
-            const char *cp = (const char *)(lp - 1);
-            if (cp[0] == '\0') return (size_t)(cp - s);
-            if (cp[1] == '\0') return (size_t)(cp - s + 1);
-            if (cp[2] == '\0') return (size_t)(cp - s + 2);
-            if (cp[3] == '\0') return (size_t)(cp - s + 3);
-            if (cp[4] == '\0') return (size_t)(cp - s + 4);
-            if (cp[5] == '\0') return (size_t)(cp - s + 5);
-            if (cp[6] == '\0') return (size_t)(cp - s + 6);
-            return (size_t)(cp - s + 7);
-        }
-    }
-}
-
-size_t strnlen(const char *s, size_t maxlen)
-{
-    size_t len = 0;
-    while (len < maxlen && s && s[len]) len++;
-    return len;
-}
+/* strlen() and strnlen() are the SSE2/AVX2 versions in string_simd.c. */
 
 /* ── Copy ────────────────────────────────────────────────────────────────── */
 
@@ -157,22 +122,7 @@ int strncasecmp(const char *s1, const char *s2, size_t n)
 
 /* ── Search ──────────────────────────────────────────────────────────────── */
 
-char *strchr(const char *s, int c)
-{
-    if (!s) return 0;
-    char ch = (char)c;
-    while (*s) { if (*s == ch) return (char *)s; s++; }
-    return (ch == '\0') ? (char *)s : 0;
-}
-
-char *strrchr(const char *s, int c)
-{
-    if (!s) return 0;
-    char ch = (char)c;
-    const char *last = 0;
-    while (*s) { if (*s == ch) last = s; s++; }
-    return (ch == '\0') ? (char *)s : (char *)last;
-}
+/* strchr() and strrchr() are the SSE2/AVX2 versions in string_simd.c. */
 
 char *strstr(const char *haystack, const char *needle)
 {
@@ -413,42 +363,7 @@ void *memmove(void *dest, const void *src, size_t n)
     }
 }
 
-int memcmp(const void *s1, const void *s2, size_t n)
-{
-    if (s1 == s2 || n == 0) return 0;
-    const unsigned char *p1 = (const unsigned char *)s1;
-    const unsigned char *p2 = (const unsigned char *)s2;
-
-    /* Align to 8-byte boundary if both pointers share alignment */
-    if ((((uintptr_t)p1 ^ (uintptr_t)p2) & 7) == 0) {
-        while (((uintptr_t)p1 & 7) && n > 0) {
-            if (*p1 != *p2) return (int)*p1 - (int)*p2;
-            p1++; p2++; n--;
-        }
-        const unsigned long *lp1 = (const unsigned long *)p1;
-        const unsigned long *lp2 = (const unsigned long *)p2;
-        while (n >= 8) {
-            if (*lp1 != *lp2) break;
-            lp1++; lp2++; n -= 8;
-        }
-        p1 = (const unsigned char *)lp1;
-        p2 = (const unsigned char *)lp2;
-    }
-
-    while (n--) {
-        if (*p1 != *p2) return (int)*p1 - (int)*p2;
-        p1++; p2++;
-    }
-    return 0;
-}
-
-void *memchr(const void *s, int c, size_t n)
-{
-    const unsigned char *p = (const unsigned char *)s;
-    unsigned char ch = (unsigned char)c;
-    while (n--) { if (*p == ch) return (void *)p; p++; }
-    return 0;
-}
+/* memcmp() and memchr() are the SSE2/AVX2 versions in string_simd.c. */
 
 void *memrchr(const void *s, int c, size_t n)
 {
@@ -600,10 +515,7 @@ void bcopy(const void *src, void *dest, size_t n)
     memmove(dest, src, n);
 }
 
-int bcmp(const void *s1, const void *s2, size_t n)
-{
-    return memcmp(s1, s2, n);
-}
+/* bcmp() is defined alongside memcmp() in string_simd.c. */
 
 char *index(const char *s, int c)
 {
@@ -815,20 +727,7 @@ wchar_t *wmemset(wchar_t *s, wchar_t c, size_t n)
     return s;
 }
 
-void *rawmemchr(const void *s, int c)
-{
-    const unsigned char *p = (const unsigned char *)s;
-    unsigned char uc = (unsigned char)c;
-    while (*p != uc) p++;
-    return (void *)p;
-}
-
-char *strchrnul(const char *s, int c)
-{
-    char ch = (char)c;
-    while (*s && *s != ch) s++;
-    return (char *)s;
-}
+/* rawmemchr() and strchrnul() are the SSE2/AVX2 versions in string_simd.c. */
 
 int strverscmp(const char *s1, const char *s2)
 {

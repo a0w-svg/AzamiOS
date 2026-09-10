@@ -23,10 +23,8 @@
 #include "../../../kernel/lib/string.h"
 
 extern virtio_gpu_state_t g_gpu;
-extern int virtio_gpu_setup_framebuffer(void);
-extern int virtio_gpu_set_scanout(u32 scanout_id, u32 resource_id, u32 width, u32 height);
-extern int virtio_gpu_transfer_to_host_2d(u32 resource_id, u32 width, u32 height);
-extern int virtio_gpu_resource_flush(u32 resource_id, u32 width, u32 height);
+/* Command helpers and their rectangle-scoped variants are declared in
+ * virtio_gpu.h, included above. */
 
 typedef struct virtgpu_device {
     u32   width, height, pitch;
@@ -54,14 +52,56 @@ static int virtgpu_flush(drm_crtc_t *crtc, drm_framebuffer_t *fb,
         if (r.x1 >= r.x2 || r.y1 >= r.y2) return 0;
     }
 
-    /* Only the damaged rows are copied into the resource backing.  The
-     * transfer and flush still name the whole scanout: the command helpers
-     * take no origin, and the host discards what did not change. */
+    /* Copy only the damaged rows into the resource backing, then name that
+     * same rectangle to the host: TRANSFER_TO_HOST_2D moves just those bytes
+     * across the virtqueue and RESOURCE_FLUSH repaints just that region.  A
+     * one-line caret blink no longer drags the whole framebuffer to the host
+     * every frame. */
     drm_gem_blit_rect(fb->obj, vg->backing, vg->pitch, &r, 32);
 
-    if (virtio_gpu_transfer_to_host_2d(vg->resource_id, vg->width, vg->height) < 0) return -EIO;
-    if (virtio_gpu_resource_flush(vg->resource_id, vg->width, vg->height) < 0) return -EIO;
+    u32 dw = r.x2 - r.x1, dh = r.y2 - r.y1;
+    u64 doff = (u64)r.y1 * vg->pitch + (u64)r.x1 * 4;
+
+    if (virtio_gpu_transfer_to_host_2d_rect(vg->resource_id, r.x1, r.y1, dw, dh, doff) < 0)
+        return -EIO;
+    if (virtio_gpu_resource_flush_rect(vg->resource_id, r.x1, r.y1, dw, dh) < 0)
+        return -EIO;
     return 0;
+}
+
+/* ── Hardware cursor ─────────────────────────────────────────────────────── */
+
+static int virtgpu_cursor_set(drm_crtc_t *crtc, drm_gem_object_t *bo, u32 w, u32 h)
+{
+    if (!bo)
+        return virtio_gpu_cursor_hide() ? -EIO : 0;
+
+    /* virtio-gpu's hardware cursor is a fixed 64x64 image; a client asking
+     * for another size falls back to a software cursor by getting -EINVAL. */
+    if ((w && w != VIRTIO_GPU_CURSOR_W) || (h && h != VIRTIO_GPU_CURSOR_H))
+        return -EINVAL;
+
+    /* Gather the ARGB8888 image into a linear 64x64 buffer. drm_gem_blit_rect
+     * copes with a bo whose backing pages are not contiguous. One master, and
+     * the device lock inside the command path, keep this static buffer from
+     * being entered twice at once. */
+    static u32 img[VIRTIO_GPU_CURSOR_W * VIRTIO_GPU_CURSOR_H];
+    drm_rect_t all = { 0, 0, VIRTIO_GPU_CURSOR_W, VIRTIO_GPU_CURSOR_H };
+    __builtin_memset(img, 0, sizeof(img));
+    drm_gem_blit_rect(bo, img, VIRTIO_GPU_CURSOR_W * 4, &all, 32);
+
+    return virtio_gpu_cursor_define(img, (u32)crtc->cursor_hot_x,
+                                    (u32)crtc->cursor_hot_y) ? -EIO : 0;
+}
+
+static int virtgpu_cursor_move(drm_crtc_t *crtc, s32 x, s32 y)
+{
+    (void)crtc;
+    /* MOVE_CURSOR places the hotspot on the scanout; a cursor dragged past
+     * the top or left edge is clamped to the origin. */
+    u32 ux = x < 0 ? 0u : (u32)x;
+    u32 uy = y < 0 ? 0u : (u32)y;
+    return virtio_gpu_cursor_move(ux, uy) ? -EIO : 0;
 }
 
 static int virtgpu_mode_set(drm_crtc_t *crtc, drm_framebuffer_t *fb,
@@ -90,8 +130,8 @@ static int virtgpu_load(drm_device_t *dev)
     dev->max_width     = vg->width;
     dev->min_height    = vg->height;
     dev->max_height    = vg->height;
-    dev->cursor_width  = 0;
-    dev->cursor_height = 0;
+    dev->cursor_width  = VIRTIO_GPU_CURSOR_W;
+    dev->cursor_height = VIRTIO_GPU_CURSOR_H;
     dev->prefer_shadow = true;
 
     drm_crtc_t *crtc = drm_crtc_create(dev);
@@ -108,6 +148,12 @@ static int virtgpu_load(drm_device_t *dev)
     static const u32 formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };
     drm_plane_create(dev, DRM_PLANE_TYPE_PRIMARY, 1U << crtc->index,
                      formats, ARRAY_SIZE(formats));
+
+    /* A cursor plane, so universal-plane and atomic clients see the hardware
+     * cursor the legacy CURSOR ioctl drives through .cursor_set/.cursor_move. */
+    static const u32 cursor_formats[] = { DRM_FORMAT_ARGB8888 };
+    drm_plane_create(dev, DRM_PLANE_TYPE_CURSOR, 1U << crtc->index,
+                     cursor_formats, ARRAY_SIZE(cursor_formats));
 
     crtc->mode       = mode;
     crtc->mode_valid = true;
@@ -135,9 +181,11 @@ static const drm_driver_t virtgpu_drm_driver = {
     .features  = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER,
     .load      = virtgpu_load,
     .unload    = virtgpu_unload,
-    .mode_set  = virtgpu_mode_set,
-    .page_flip = virtgpu_flush,
-    .dirty_fb  = virtgpu_flush,
+    .mode_set    = virtgpu_mode_set,
+    .page_flip   = virtgpu_flush,
+    .dirty_fb    = virtgpu_flush,
+    .cursor_set  = virtgpu_cursor_set,
+    .cursor_move = virtgpu_cursor_move,
 };
 
 /* ── PCI binding ─────────────────────────────────────────────────────────── */
