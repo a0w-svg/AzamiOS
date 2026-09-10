@@ -60,7 +60,7 @@ SECTIONS {
     /* ── Exception Table ──────────────────────────────────────────────────── */
     .extable : {
         __extable_start = .;
-        *(.extable)
+        KEEP(*(.extable))
         __extable_end = .;
     } :rodata
 

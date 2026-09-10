@@ -33,6 +33,55 @@ struct tm {
     const char *tm_zone;   /* timezone abbreviation */
 };
 
+/* ── POSIX per-process timers ────────────────────────────────────────────── */
+
+/* clockid_t and timer_t come from <sys/types.h>, already included above. */
+
+/* timer_settime() flag: interpret it_value as an absolute clock reading. */
+#define TIMER_ABSTIME 1
+
+#ifndef __union_sigval_defined
+#define __union_sigval_defined
+union sigval {
+    int   sival_int;
+    void *sival_ptr;
+};
+#endif
+
+#ifndef SIGEV_SIGNAL
+struct sigevent {
+    union sigval sigev_value;
+    int          sigev_signo;
+    int          sigev_notify;
+    int          __pad[12];
+};
+
+#define SIGEV_SIGNAL 0
+#define SIGEV_NONE   1
+#define SIGEV_THREAD 2
+#endif
+
+/**
+ * timer_create(clockid, sevp, timerid) — create a disarmed timer.
+ *
+ * @sevp may be NULL, which requests SIGALRM on expiry.  The timer does not
+ * start counting until timer_settime().
+ */
+int timer_create(clockid_t clockid, struct sigevent *sevp, timer_t *timerid);
+
+/** timer_settime(t, flags, new, old) — arm, re-arm, or (it_value == 0) disarm. */
+int timer_settime(timer_t timerid, int flags,
+                  const struct itimerspec *new_value, struct itimerspec *old_value);
+
+/** timer_gettime(t, curr) — time remaining and the reload interval. */
+int timer_gettime(timer_t timerid, struct itimerspec *curr_value);
+
+/** timer_getoverrun(t) → expiries missed since the last delivery. */
+int timer_getoverrun(timer_t timerid);
+
+/** timer_delete(t) — destroy a timer, armed or not. */
+int timer_delete(timer_t timerid);
+
 #define CLOCK_REALTIME           0
 #define CLOCK_MONOTONIC          1
 #define CLOCK_PROCESS_CPUTIME_ID 2

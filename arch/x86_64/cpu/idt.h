@@ -104,6 +104,23 @@ void idt_init(void);
  */
 void idt_set_gate(u8 vector, uintptr_t handler, u8 ist, u8 dpl, u8 type);
 
+/** irq_handler_fn_t — Device interrupt callback.
+ *  @r    Register frame captured by the ISR stub.
+ *  @ctx  Opaque pointer supplied at registration time.
+ */
+typedef void (*irq_handler_fn_t)(pt_regs_t *r, void *ctx);
+
+/** idt_register_irq() — Attach a handler to an interrupt vector.
+ *  @vector  Interrupt vector (device IRQ line + 32 for the legacy PIC range).
+ *  @fn      Handler to invoke; NULL detaches.
+ *  @ctx     Opaque pointer passed back to @fn.
+ *
+ *  Declared here rather than re-`extern`ed in each driver: seven drivers used
+ *  to carry their own copy of this prototype, none of which the compiler could
+ *  check against the definition.
+ */
+void idt_register_irq(u8 vector, irq_handler_fn_t fn, void *ctx);
+
 /* Called from C interrupt dispatcher (isr.c) */
 void exception_handler(pt_regs_t *r);
 void irq_handler(pt_regs_t *r);

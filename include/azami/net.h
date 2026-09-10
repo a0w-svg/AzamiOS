@@ -148,5 +148,16 @@ void          net_get_dns(u8 dns_out[4]);
 void          net_set_dns(const u8 dns_in[4]);
 int           net_ioctl(u32 cmd, u64 arg);
 u16           net_checksum(const void *data, size_t len);
+
+/**
+ * net_checksum_partial(data, len, sum) → the running Internet checksum sum.
+ *
+ * Chain the regions of a datagram, then finish with net_checksum_fold().
+ * Only the last region passed may have an odd length.
+ */
+u32           net_checksum_partial(const void *data, size_t len, u32 sum);
+
+/** net_checksum_fold(sum) → the folded, complemented 16-bit checksum. */
+u16           net_checksum_fold(u32 sum);
 s64           net_send_raw(const void *data, size_t len);
 

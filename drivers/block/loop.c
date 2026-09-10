@@ -83,7 +83,7 @@ static s64 loop_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
     switch (cmd) {
     case LOOP_SET_FD: {
         int fd = (int)arg;
-        if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+        if (fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
         spinlock_lock(&ld->lock);
         if (ld->is_bound) {

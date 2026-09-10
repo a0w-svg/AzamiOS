@@ -38,50 +38,24 @@ void udp_init(void)
 
 u16 udp_checksum(const udp_hdr_t *udp, const ipv4_hdr_t *ip, const void *payload, size_t payload_len)
 {
-    udp_pseudo_hdr_t pseudo;
-    memcpy(pseudo.src_ip, ip->src_ip, 4);
-    memcpy(pseudo.dst_ip, ip->dst_ip, 4);
-    pseudo.zero = 0;
-    pseudo.protocol = IP_PROTO_UDP;
-    pseudo.udp_length = udp->length;
+    /* The pseudo-header is assembled as plain bytes rather than a struct so
+     * that building it and summing it cannot be reordered against each other
+     * (see net_checksum_partial). */
+    u8 pseudo[12];
+    memcpy(pseudo + 0, ip->src_ip, 4);
+    memcpy(pseudo + 4, ip->dst_ip, 4);
+    pseudo[8] = 0;
+    pseudo[9] = IP_PROTO_UDP;
+    memcpy(pseudo + 10, &udp->length, 2);   /* already in network order */
 
-    u32 sum = 0;
-    const u16 *ptr;
-    size_t len;
+    /* The caller must have zeroed udp->checksum; it is covered by the sum. */
+    u32 sum = net_checksum_partial(pseudo, sizeof(pseudo), 0);
+    sum = net_checksum_partial(udp, sizeof(udp_hdr_t), sum);
+    sum = net_checksum_partial(payload, payload_len, sum);
 
-    /* 1. Sum pseudo header */
-    ptr = (const u16 *)&pseudo;
-    len = sizeof(udp_pseudo_hdr_t);
-    while (len > 1) {
-        sum += *ptr++;
-        len -= 2;
-    }
-
-    /* 2. Sum UDP header */
-    ptr = (const u16 *)udp;
-    len = sizeof(udp_hdr_t);
-    while (len > 1) {
-        sum += *ptr++;
-        len -= 2;
-    }
-
-    /* 3. Sum payload */
-    ptr = (const u16 *)payload;
-    len = payload_len;
-    while (len > 1) {
-        sum += *ptr++;
-        len -= 2;
-    }
-    if (len > 0) {
-        sum += *(const u8 *)ptr;
-    }
-
-    /* Fold 32-bit sum to 16 bits */
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-
-    u16 res = (u16)(~sum);
+    u16 res = net_checksum_fold(sum);
+    /* A computed zero is transmitted as all-ones, which is how UDP
+     * distinguishes "checksum present" from "checksum omitted". */
     return res == 0 ? 0xFFFF : res;
 }
 
@@ -309,10 +283,11 @@ s64 udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], 
         spinlock_lock(&sock->lock);
         if (net_buf_queue_len(&sock->rx_queue) == 0) {
             sock->wait_thread = sched_current_thread();
-            sched_block(THREAD_BLOCKED);
+            spinlock_unlock(&sock->lock);
+            sched_block(THREAD_BLOCKED_PENDING);
+        } else {
+            spinlock_unlock(&sock->lock);
         }
-        spinlock_unlock(&sock->lock);
-        sched_yield();
     }
 }
 
@@ -342,8 +317,13 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     size_t payload_len = udp_len - sizeof(udp_hdr_t);
     const u8 *payload = buf->data + sizeof(udp_hdr_t);
 
-    /* Verify UDP Checksum if non-zero and not on loopback interface */
-    if (ip_hdr->dst_ip[0] != 127 && udp->checksum != 0) {
+    /*
+     * Verify the checksum whenever the sender supplied one — including on
+     * loopback.  Skipping it there costs nothing but hides transmit-side
+     * checksum bugs from every local test, which is exactly how a wrong
+     * checksum on every outgoing datagram went unnoticed.
+     */
+    if (udp->checksum != 0) {
         udp_hdr_t udp_zero = *udp;
         udp_zero.checksum = 0;
         u16 calc = udp_checksum(&udp_zero, ip_hdr, payload, payload_len);
@@ -400,7 +380,7 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         }
     } else if (dst_port != DHCP_CLIENT_PORT) {
         /* Port Unreachable */
-        icmp_send_dest_unreach(ip_hdr, buf->data, ICMP_CODE_PORT_UNREACH);
+        icmp_send_dest_unreach(ip_hdr, buf->data, buf->len, ICMP_CODE_PORT_UNREACH);
     }
 
     net_buf_free(buf);

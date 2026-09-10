@@ -16,6 +16,13 @@
 #define AZWM_ANIM_RESTORE  3
 #define AZWM_ANIM_STEPS    6
 
+/* A screen-space rectangle; x1/y1 are exclusive.  `valid` is 0 for "empty",
+ * which is not the same as a zero-sized rect at the origin. */
+typedef struct {
+    int x0, y0, x1, y1;
+    int valid;
+} azwm_rect_t;
+
 /* ── Window descriptor ────────────────────────────────────────────────────── */
 typedef struct az_window_t {
     unsigned int   wid;           /* Window ID (1-based, 0 = unused) */
@@ -52,11 +59,23 @@ typedef struct {
     unsigned int *frontbuf;   /* Currently displayed buffer */
     unsigned int *backbuf;    /* Off-screen buffer for rendering */
     unsigned int *vram_buf[2];/* VRAM buffer 0 and buffer 1 for hardware flipping */
-    int           hw_page_flip; /* 1 if SYS_AZ_FB_FLIP is supported and active */
-    int           active_vram_buf; /* 0 or 1 */
+    int           hw_page_flip; /* 1 when the display can pan between two buffers */
+    int           active_vram_buf; /* 0 or 1 — the one currently being scanned out */
+    int           fb_fd;        /* /dev/fb0, held open for FBIOPAN_DISPLAY */
+    unsigned int  fb_yres;      /* rows in one VRAM buffer */
     unsigned int  fb_width;
     unsigned int  fb_height;
     unsigned int  fb_pitch;   /* In bytes */
+
+    /*
+     * With two buffers, the one about to be drawn into was last painted two
+     * frames ago, so it is owed everything that changed since — not just this
+     * frame's damage.  `pending[i]` accumulates that debt per buffer and
+     * `cursor_rect[i]` remembers where the pointer was left in each, so the
+     * copy that repays the debt also erases it.
+     */
+    azwm_rect_t   pending[2];
+    azwm_rect_t   cursor_rect[2];
 
     /* Windows */
     az_window_t   window_pool[AZWM_MAX_WINDOWS];
@@ -96,6 +115,12 @@ typedef struct {
 
     /* Active animation tracker */
     int           has_animating_windows;
+
+    /* System-wide clipboard ────────────────────────────────────────────────
+     * Stored as raw UTF-8 bytes, NUL-terminated.  Any client may set via
+     * AZ_WM_CLIPBOARD_SET and read via AZ_WM_CLIPBOARD_GET.              */
+    char          clipboard_buf[4096];
+    unsigned int  clipboard_len;   /* bytes in clipboard_buf (excl. NUL)  */
 } az_compositor_t;
 
 /* ── API ──────────────────────────────────────────────────────────────────── */
@@ -133,6 +158,22 @@ void compositor_focus_window(az_compositor_t *comp, az_window_t *win);
 
 /** compose_screen(comp) — Composite all windows and flip to screen. */
 void compose_screen(az_compositor_t *comp);
+
+/**
+ * compositor_enable_page_flip(comp, fb_fd, vram, yres) — switch to
+ * double-buffered presentation.
+ *
+ * @vram must be a mapping of at least two screens' worth of video memory and
+ * @fb_fd the framebuffer it came from, kept open so the compositor can pan.
+ * Composition still happens in the off-screen buffer; presenting becomes a
+ * copy into the buffer that is not being displayed, followed by a pan at the
+ * frame boundary, so nothing half-drawn is ever on screen.
+ */
+void compositor_enable_page_flip(az_compositor_t *comp, int fb_fd,
+                                 unsigned int *vram, unsigned int yres);
+
+/** compositor_present(comp) — put the composed frame on screen. */
+void compositor_present(az_compositor_t *comp);
 
 /** compositor_update_cursor(comp) — Update only the cursor region without full redraw. */
 void compositor_update_cursor(az_compositor_t *comp);

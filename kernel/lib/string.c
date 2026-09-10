@@ -6,23 +6,47 @@
 #include "string.h"
 #include "../mm/kmalloc.h"
 
+/* Set by cpu_enable_features_bsp() when the CPU advertises Enhanced REP MOVSB/
+ * STOSB (CPUID.7.0:EBX.ERMS). On such parts a single `rep movsb` runs at full
+ * cache-line width and beats a `rep movsq` + tail, and it needs no alignment
+ * fix-ups; on older parts the qword loop is still the faster of the two, so we
+ * keep both and branch once per call. Byte counts too small to amortise the
+ * `rep` start-up cost go through a plain loop either way. */
+extern u8 g_erms_enabled;
+
+/* Below this, the microcode start-up cost of a REP dominates. */
+#define REP_MIN_BYTES  64
+
 void *memset(void *dest, int c, size_t n)
 {
     unsigned char *d = (unsigned char *)dest;
     u64 c8 = (u8)c;
-    u64 c64 = c8 * 0x0101010101010101UL;
 
+    if (n < REP_MIN_BYTES) {
+        for (size_t i = 0; i < n; i++) d[i] = (unsigned char)c8;
+        return dest;
+    }
+
+    if (g_erms_enabled) {
+        __asm__ volatile(
+            "rep stosb"
+            : "+D"(d), "+c"(n)
+            : "a"((u8)c)
+            : "memory"
+        );
+        return dest;
+    }
+
+    u64 c64 = c8 * 0x0101010101010101UL;
     size_t qwords = n >> 3;
     size_t bytes  = n & 7;
 
-    if (qwords > 0) {
-        __asm__ volatile(
-            "rep stosq"
-            : "+D"(d), "+c"(qwords)
-            : "a"(c64)
-            : "memory"
-        );
-    }
+    __asm__ volatile(
+        "rep stosq"
+        : "+D"(d), "+c"(qwords)
+        : "a"(c64)
+        : "memory"
+    );
     if (bytes > 0) {
         __asm__ volatile(
             "rep stosb"
@@ -39,17 +63,30 @@ void *memcpy(void *dest, const void *src, size_t n)
     unsigned char *d = (unsigned char *)dest;
     const unsigned char *s = (const unsigned char *)src;
 
-    size_t qwords = n >> 3;
-    size_t bytes  = n & 7;
+    if (n < REP_MIN_BYTES) {
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
+        return dest;
+    }
 
-    if (qwords > 0) {
+    if (g_erms_enabled) {
         __asm__ volatile(
-            "rep movsq"
-            : "+D"(d), "+S"(s), "+c"(qwords)
+            "rep movsb"
+            : "+D"(d), "+S"(s), "+c"(n)
             :
             : "memory"
         );
+        return dest;
     }
+
+    size_t qwords = n >> 3;
+    size_t bytes  = n & 7;
+
+    __asm__ volatile(
+        "rep movsq"
+        : "+D"(d), "+S"(s), "+c"(qwords)
+        :
+        : "memory"
+    );
     if (bytes > 0) {
         __asm__ volatile(
             "rep movsb"
@@ -68,17 +105,25 @@ void *memmove(void *dest, const void *src, size_t n)
     if (d == s || n == 0) return dest;
     if (d < s || d >= s + n) {
         return memcpy(dest, src, n);
-    } else {
-        d += n - 1;
-        s += n - 1;
-        __asm__ volatile(
-            "std\n\t"
-            "rep movsb\n\t"
-            "cld"
-            : "+D"(d), "+S"(s), "+c"(n)
-            :
-            : "memory"
-        );
+    }
+
+    /* Overlapping, destination above source: copy downwards.
+     *
+     * Deliberately a hand-rolled backward loop rather than `std; rep movsb; cld`.
+     * DF=1 is a global CPU flag, and the System V ABI (which every C function
+     * the compiler emits assumes) requires DF=0 on entry — so any interrupt
+     * taken inside that window would run its handler with the direction flag
+     * inverted. The ISR stubs do `cld` on entry, but NMI and #MC do not go
+     * through them, and the cost of getting this wrong is silent memory
+     * corruption. Copying qwords first keeps it comparable in speed. */
+    size_t i = n;
+    while (i >= 8) {
+        i -= 8;
+        *(u64 *)(d + i) = *(const u64 *)(s + i);
+    }
+    while (i > 0) {
+        i--;
+        d[i] = s[i];
     }
     return dest;
 }
@@ -379,6 +424,25 @@ int snprintf(char *buf, size_t size, const char *fmt, ...)
     __builtin_va_list ap;
     __builtin_va_start(ap, fmt);
     int ret = vsnprintf(buf, size, fmt, ap);
+    __builtin_va_end(ap);
+    return ret;
+}
+
+/* Truncation-safe variants: the result is what landed in the buffer, so it is
+ * always < size and an accumulating caller can never step past the end. */
+int vscnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap)
+{
+    if (size == 0) return 0;
+    int ret = vsnprintf(buf, size, fmt, ap);
+    if (ret < 0) return 0;
+    return (size_t)ret < size ? ret : (int)(size - 1);
+}
+
+int scnprintf(char *buf, size_t size, const char *fmt, ...)
+{
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    int ret = vscnprintf(buf, size, fmt, ap);
     __builtin_va_end(ap);
     return ret;
 }

@@ -32,6 +32,13 @@
 #define AZWM_TASKBAR_H           52
 
 /* ── Framebuffer mapping ────────────────────────────────────────────────────── */
+/* What the display turned out to be capable of, filled in by map_shared_memory. */
+typedef struct {
+    int          fb_fd;    /* /dev/fb0 if it can page-flip, else -1 */
+    unsigned int buffers;  /* screens the video memory holds */
+    unsigned int yres;     /* rows in one of them */
+} azwm_display_t;
+
 /*
  * map_shared_memory — Map the hardware framebuffer and allocate a back buffer.
  *
@@ -48,10 +55,16 @@
 #include <linux/fb.h>
 
 static int map_shared_memory(void **frontbuf, void **backbuf,
-                              unsigned int screen_w, unsigned int screen_h)
+                              unsigned int screen_w, unsigned int screen_h,
+                              azwm_display_t *disp)
 {
     /* 1. Map physical hardware VRAM into frontbuf */
     int mapped_front = 0;
+
+    disp->fb_fd   = -1;
+    disp->buffers = 1;
+    disp->yres    = screen_h;
+
     int fb_fd = open("/dev/fb0", O_RDWR);
     if (fb_fd >= 0) {
         struct fb_var_screeninfo var;
@@ -64,9 +77,21 @@ static int map_shared_memory(void **frontbuf, void **backbuf,
             if (mapped != MAP_FAILED) {
                 *frontbuf = mapped;
                 mapped_front = 1;
+
+                /*
+                 * A virtual height that is a multiple of the visible one, plus
+                 * a non-zero pan step, is how a Linux framebuffer says it has
+                 * the memory to page-flip.  Take it: presenting by panning is
+                 * what keeps a frame from being shown half-drawn.
+                 */
+                if (var.yres && fix.ypanstep && var.yres_virtual >= var.yres * 2) {
+                    disp->fb_fd   = fb_fd;      /* held open for FBIOPAN_DISPLAY */
+                    disp->buffers = var.yres_virtual / var.yres;
+                    disp->yres    = var.yres;
+                }
             }
         }
-        close(fb_fd);
+        if (disp->fb_fd < 0) close(fb_fd);
     }
 
     if (!mapped_front) {
@@ -95,8 +120,23 @@ static int map_shared_memory(void **frontbuf, void **backbuf,
         *backbuf = *frontbuf;
     }
 
+    /* With no off-screen buffer there is nothing to compose into, so there is
+     * nothing to flip either. */
+    if (*backbuf == *frontbuf && disp->fb_fd >= 0) {
+        close(disp->fb_fd);
+        disp->fb_fd   = -1;
+        disp->buffers = 1;
+    }
+
     puts("[azwm] Hardware Framebuffer & Shared Memory Compositor initialized.");
     return 0;
+}
+
+static inline bool win_has_frame(const az_window_t *win)
+{
+    if (!win || win->title[0] == '\0') return false;
+    if (strcmp(win->title, "AzamiOS App Launcher") == 0) return false;
+    return true;
 }
 
 /* ── Close-button hit test ──────────────────────────────────────────────────── */
@@ -109,7 +149,7 @@ static int map_shared_memory(void **frontbuf, void **backbuf,
  */
 static bool hit_close_button(az_window_t *win, int mx, int my)
 {
-    bool has_frame = (win->title[0] != '\0');
+    bool has_frame = win_has_frame(win);
     if (!has_frame) return false;
     int bx = win->x + (int)win->width - 18;
     int by = win->y - AZWM_TITLEBAR_H + 12;
@@ -119,7 +159,7 @@ static bool hit_close_button(az_window_t *win, int mx, int my)
 /* ── Minimise-button hit test ───────────────────────────────────────────────── */
 static bool hit_minimize_button(az_window_t *win, int mx, int my)
 {
-    bool has_frame = (win->title[0] != '\0');
+    bool has_frame = win_has_frame(win);
     if (!has_frame) return false;
     int bx = win->x + (int)win->width - 38;
     int by = win->y - AZWM_TITLEBAR_H + 12;
@@ -129,7 +169,7 @@ static bool hit_minimize_button(az_window_t *win, int mx, int my)
 /* ── Maximise-button hit test ───────────────────────────────────────────────── */
 static bool hit_maximize_button(az_window_t *win, int mx, int my)
 {
-    bool has_frame = (win->title[0] != '\0');
+    bool has_frame = win_has_frame(win);
     if (!has_frame) return false;
     int bx = win->x + (int)win->width - 58;
     int by = win->y - AZWM_TITLEBAR_H + 12;
@@ -139,7 +179,7 @@ static bool hit_maximize_button(az_window_t *win, int mx, int my)
 /* ── Title bar hit test (for drag / focus on click) ─────────────────────────── */
 static bool hit_titlebar(az_window_t *win, int mx, int my)
 {
-    bool has_frame = (win->title[0] != '\0');
+    bool has_frame = win_has_frame(win);
     if (!has_frame) return false;
     int bx = win->x - AZWM_BORDER_W;
     int by = win->y - AZWM_TITLEBAR_H - AZWM_BORDER_W;
@@ -150,7 +190,7 @@ static bool hit_titlebar(az_window_t *win, int mx, int my)
 /* ── Window body hit test ───────────────────────────────────────────────────── */
 static bool hit_window(az_window_t *win, int mx, int my)
 {
-    bool has_frame = (win->title[0] != '\0');
+    bool has_frame = win_has_frame(win);
     int bx = win->x;
     int by = win->y;
     int bw = (int)win->width;
@@ -169,7 +209,7 @@ static bool hit_window(az_window_t *win, int mx, int my)
 /* ── Window resize grip hit test (bottom-right corner) ──────────────────────── */
 static bool hit_resize_grip(az_window_t *win, int mx, int my)
 {
-    bool has_frame = (win->title[0] != '\0');
+    bool has_frame = win_has_frame(win);
     if (!has_frame || win->maximized) return false;
     int rx = win->x + (int)win->width;
     int ry = win->y + (int)win->height;
@@ -226,8 +266,9 @@ int main(int argc, char **argv)
     /* ── Map framebuffer ────────────────────────────────────────────────── */
     unsigned int *frontbuf = (unsigned int *)0x40000000;
     unsigned int *backbuf  = (unsigned int *)0x42000000; /* Ensure enough gap for any resolution */
+    azwm_display_t disp;
     if (map_shared_memory((void **)&frontbuf, (void **)&backbuf,
-                           screen_w, screen_h) < 0) {
+                           screen_w, screen_h, &disp) < 0) {
         de_log("[azwm] FATAL: Could not map framebuffer — exiting");
         return -1;
     }
@@ -239,6 +280,13 @@ int main(int argc, char **argv)
     az_compositor_t comp;
     compositor_init(&comp, frontbuf, backbuf,
                     screen_w, screen_h, screen_pitch, server_chan);
+
+    if (disp.buffers >= 2) {
+        compositor_enable_page_flip(&comp, disp.fb_fd, frontbuf, disp.yres);
+        de_log("[azwm] Double-buffered: presenting by page flip at vsync");
+    } else {
+        de_log("[azwm] Single-buffered display: presenting by damage copy");
+    }
     de_log("[azwm] Compositor initialised");
 
     /* ── DE compositor extension init ──────────────────────────────────── */
@@ -611,6 +659,7 @@ int main(int argc, char **argv)
                                     fwd.mouse.dy      = (short)ev.mouse_dy;
                                     fwd.mouse.abs_x   = (short)(abs_x - hit->x);
                                     fwd.mouse.abs_y   = (short)(abs_y - hit->y);
+                                    fwd.mouse.wheel   = (short)ev.mouse_dz;
                                     fwd.mouse.buttons = ev.mouse_buttons;
                                     int send_ret = az_channel_send_nb(hit->client_chan, (az_ipc_msg_t *)&fwd);
                                     if (send_ret == -32) {
@@ -673,6 +722,7 @@ int main(int argc, char **argv)
                         fwd.mouse.dy      = (short)ev.mouse_dy;
                         fwd.mouse.abs_x   = (short)(abs_x - target_win->x);
                         fwd.mouse.abs_y   = (short)(abs_y - target_win->y);
+                        fwd.mouse.wheel   = (short)ev.mouse_dz;
                         fwd.mouse.buttons = ev.mouse_buttons;
                         int send_ret = az_channel_send_nb(target_win->client_chan, (az_ipc_msg_t *)&fwd);
                         if (send_ret == -32) {
@@ -1095,6 +1145,10 @@ int main(int argc, char **argv)
             case AZ_WM_LAUNCH_APP:
             case AZ_WM_SET_STRUT:
             case AZ_WM_SET_THEME:
+            /* 25002500 Clipboard & notifications 250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500 */
+            case AZ_WM_CLIPBOARD_SET:
+            case AZ_WM_CLIPBOARD_GET:
+            case AZ_WM_NOTIFY:
                 if (de_comp_handle_message(&comp, &de_state, &msg))
                     redraw_needed = true;
                 break;

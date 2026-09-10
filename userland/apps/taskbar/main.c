@@ -37,8 +37,8 @@
 #define SB_W   92
 #define SB_H   40
 
-/* Tray zone width (clock + date + wifi icon, right-aligned) */
-#define TRAY_W  160
+/* Tray zone width (clock + date + wifi + sound + lock icon, right-aligned) */
+#define TRAY_W  180
 #define TRAY_M    8   /* tray right margin */
 
 /* Window button geometry (pill-shaped) */
@@ -288,6 +288,22 @@ static void tb_draw_sound(int bx, int by, unsigned int col)
     tb_put_pixel(bx+10, by+9, col);
 }
 
+/* ── Lock icon ──────────────────────────────────────────────────────────────── */
+static void tb_draw_lock(int bx, int by, unsigned int col)
+{
+    /* Shackle */
+    tb_fill_rect(bx + 3, by, 6, 5, col);
+    tb_fill_rect(bx + 4, by + 1, 4, 4, C_TRAY_BG);
+    /* Body */
+    tb_fill_rect(bx + 1, by + 4, 10, 8, col);
+    /* Keyhole */
+    tb_put_pixel(bx + 5, by + 7, C_TRAY_BG);
+    tb_put_pixel(bx + 6, by + 7, C_TRAY_BG);
+    tb_put_pixel(bx + 5, by + 8, C_TRAY_BG);
+    tb_put_pixel(bx + 6, by + 8, C_TRAY_BG);
+    tb_put_pixel(bx + 5, by + 9, C_TRAY_BG);
+}
+
 /* Gradient vertical separator */
 static void tb_separator(int x)
 {
@@ -463,6 +479,9 @@ static void taskbar_draw(void)
         tb_put_pixel(tray_start_x + 41, SB_Y + 14, 0xFFF38BA8);
     }
 
+    /* Lock icon */
+    tb_draw_lock(tray_start_x + 52, SB_Y + 12, 0xFFCBA6F7);
+
     /* Clock text "HH:MM" (large, right-aligned) */
     char clk[6];
     tb_build_clock(clk);
@@ -601,8 +620,24 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
         return;
     }
 
+    /* Left-click on Lock icon → launch /sbin/lockscreen.elf */
+    if (lclick && lx >= tray_start_x + 48 && lx < tray_start_x + 68) {
+        az_wm_msg_t lmsg;
+        memset(&lmsg, 0, sizeof(lmsg));
+        lmsg.type = AZ_WM_LAUNCH_APP;
+        az_wm_launch_payload_t *pl = AZ_WM_MSG_LAUNCH(&lmsg);
+        const char *path = "/sbin/lockscreen.elf";
+        unsigned int j;
+        for (j = 0; j < AZ_WM_LAUNCH_PATH_MAX - 1 && path[j]; j++)
+            pl->path[j] = path[j];
+        pl->path[j] = '\0';
+        az_channel_send(g_srv, (az_ipc_msg_t *)&lmsg);
+        taskbar_draw();
+        return;
+    }
+
     /* Left-click on Tray Clock / Calendar area → launch Clock & Calendar widget */
-    if (lclick && lx >= tray_start_x + 50 && lx < (int)g_w) {
+    if (lclick && lx >= tray_start_x + 68 && lx < (int)g_w) {
         az_wm_msg_t lmsg;
         memset(&lmsg, 0, sizeof(lmsg));
         lmsg.type = AZ_WM_LAUNCH_APP;

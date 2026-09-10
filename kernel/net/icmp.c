@@ -103,11 +103,34 @@ s64 icmp_send_echo(const u8 target_ip[4], u16 id, u16 seq, const void *payload, 
     return ipv4_send(buf, target_ip, IP_PROTO_ICMP);
 }
 
-void icmp_send_dest_unreach(const ipv4_hdr_t *orig_ip, const void *orig_data, u8 code)
+/*
+ * RFC 792 asks for the offending IP header plus the first 8 bytes of its
+ * payload.  `orig_data_len` says how many of those 8 bytes actually exist:
+ * the quote used to be an unconditional 8-byte copy, so a 20-byte datagram
+ * carrying an unrecognised protocol number — which leaves no payload at all
+ * once the header is pulled — read 8 bytes past the end of the packet buffer.
+ * Any remote host could trigger that with a single packet.
+ */
+static size_t icmp_quote(net_buf_t *buf, const ipv4_hdr_t *orig_ip,
+                         const void *orig_data, size_t orig_data_len)
+{
+    void *dst_data = net_buf_put(buf, sizeof(ipv4_hdr_t));
+    if (!dst_data) return 0;
+    memcpy(dst_data, orig_ip, sizeof(ipv4_hdr_t));
+
+    size_t quote = (orig_data_len < 8) ? orig_data_len : 8;
+    if (orig_data && quote > 0) {
+        void *dst_extra = net_buf_put(buf, quote);
+        if (dst_extra) memcpy(dst_extra, orig_data, quote);
+    }
+    return quote;
+}
+
+void icmp_send_dest_unreach(const ipv4_hdr_t *orig_ip, const void *orig_data,
+                            size_t orig_data_len, u8 code)
 {
     if (!orig_ip) return;
 
-    /* Per RFC 792: include original IP header + first 8 bytes of original datagram payload */
     size_t copy_len = sizeof(ipv4_hdr_t) + 8;
 
     net_buf_t *buf = net_buf_alloc(NET_BUF_HEADROOM + sizeof(icmp_hdr_t) + copy_len);
@@ -121,20 +144,15 @@ void icmp_send_dest_unreach(const ipv4_hdr_t *orig_ip, const void *orig_data, u8
     icmp->id = 0;
     icmp->seq = 0;
 
-    void *dst_data = net_buf_put(buf, sizeof(ipv4_hdr_t));
-    memcpy(dst_data, orig_ip, sizeof(ipv4_hdr_t));
-
-    if (orig_data) {
-        void *dst_extra = net_buf_put(buf, 8);
-        memcpy(dst_extra, orig_data, 8);
-    }
+    icmp_quote(buf, orig_ip, orig_data, orig_data_len);
 
     icmp->checksum = net_checksum(buf->data, buf->len);
 
     ipv4_send(buf, orig_ip->src_ip, IP_PROTO_ICMP);
 }
 
-void icmp_send_time_exceeded(const ipv4_hdr_t *orig_ip, const void *orig_data)
+void icmp_send_time_exceeded(const ipv4_hdr_t *orig_ip, const void *orig_data,
+                             size_t orig_data_len)
 {
     if (!orig_ip) return;
 
@@ -151,13 +169,7 @@ void icmp_send_time_exceeded(const ipv4_hdr_t *orig_ip, const void *orig_data)
     icmp->id = 0;
     icmp->seq = 0;
 
-    void *dst_data = net_buf_put(buf, sizeof(ipv4_hdr_t));
-    memcpy(dst_data, orig_ip, sizeof(ipv4_hdr_t));
-
-    if (orig_data) {
-        void *dst_extra = net_buf_put(buf, 8);
-        memcpy(dst_extra, orig_data, 8);
-    }
+    icmp_quote(buf, orig_ip, orig_data, orig_data_len);
 
     icmp->checksum = net_checksum(buf->data, buf->len);
 

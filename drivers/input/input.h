@@ -122,3 +122,50 @@ int input_poll(input_event_t *out);
  * input_queue_count() — Number of pending events in the input queue.
  */
 u32 input_queue_count(void);
+
+/**
+ * input_inject(evt) — Queue an event from a non-PS/2 input driver.
+ *
+ * Lets bus-attached input hardware (virtio-input, and later USB HID) feed the
+ * same queue the PS/2 controller does, so consumers never learn which device
+ * an event came from.
+ */
+void input_inject(const input_event_t *evt);
+
+/**
+ * input_inject_scancode(code, pressed, extended) — queue a key from a
+ * non-PS/2 keyboard using the shared keymap.
+ *
+ * @code is an AT set-1 scancode with the release bit stripped, and @extended
+ * selects the 0xE0-prefixed block.  Routing through here rather than through
+ * input_inject() means modifier state, Caps/Num Lock and the shift keymap all
+ * behave identically to the PS/2 keyboard.
+ */
+void input_inject_scancode(u8 code, bool pressed, bool extended);
+
+/**
+ * input_register_poll_source(fn) — Register a drain callback.
+ *
+ * Devices without a usable interrupt line hand the subsystem a function that
+ * pulls pending hardware events into the queue; it runs at the head of every
+ * input_poll() and input_queue_count(), so a polled device feels the same as
+ * an interrupt-driven one to userspace.
+ *
+ * Returns 0 on success, negative if the source table is full.
+ */
+int input_register_poll_source(void (*fn)(void));
+
+/**
+ * input_register_observer(fn) — tee every event to another consumer.
+ *
+ * The legacy queue is drained destructively by input_poll(), so a second
+ * reader — the evdev character device, say — cannot simply poll it without
+ * stealing events from the first.  Observers instead see every event as it is
+ * queued, and keep their own buffering.
+ *
+ * @fn runs with the input subsystem's lock held, and from interrupt context:
+ * it must not block, and must not call back into the input subsystem.
+ *
+ * Returns 0 on success, negative if the observer table is full.
+ */
+int input_register_observer(void (*fn)(const input_event_t *));

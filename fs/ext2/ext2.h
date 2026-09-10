@@ -116,8 +116,9 @@ typedef struct ext2_fs_info {
     u32 inodes_per_group;
     u32 blocks_per_group;
     u32 block_groups_count;
+    u32 bgdt_blocks;            /* Blocks the descriptor table occupies */
     ext2_bg_descriptor_t *bgdt; /* Block Group Descriptor Table */
-    
+
     u8 **block_bitmaps;
     u8 **inode_bitmaps;
 } ext2_fs_info_t;
@@ -128,6 +129,13 @@ typedef struct ext2_inode_info {
 
 /** ext2_init() — Register the ext2 filesystem type with the VFS. */
 void ext2_init(void);
+
+/**
+ * ext2_sync() — Flush every dirty block-cache slot of every mounted ext2
+ * instance to its backing device. Called by sync(2)/fsync(2), by the periodic
+ * writeback thread, and once more just before the machine reboots.
+ */
+void ext2_sync(void);
 
 /* Allocation Primitives */
 u32 ext2_alloc_block(ext2_fs_info_t *fs);

@@ -85,6 +85,20 @@ typedef struct __attribute__((packed)) {
 #define E1000_RXD_STAT_DD  (1 << 0) /* Descriptor Done */
 #define E1000_RXD_STAT_EOP (1 << 1) /* End of Packet */
 
+/* RX descriptor error bits.  The checksum-offload results (TCPE/IPE) are not
+ * frame errors — the stack verifies those itself — so they are deliberately
+ * outside FRAME_ERR_MASK. */
+#define E1000_RXD_ERR_CE   (1 << 0) /* CRC error / alignment error */
+#define E1000_RXD_ERR_SE   (1 << 1) /* Symbol error                */
+#define E1000_RXD_ERR_SEQ  (1 << 2) /* Sequence error              */
+#define E1000_RXD_ERR_CXE  (1 << 4) /* Carrier extension error     */
+#define E1000_RXD_ERR_TCPE (1 << 5) /* TCP/UDP checksum error      */
+#define E1000_RXD_ERR_IPE  (1 << 6) /* IPv4 checksum error         */
+#define E1000_RXD_ERR_RXE  (1 << 7) /* RX data error               */
+#define E1000_RXD_ERR_FRAME_ERR_MASK \
+    (E1000_RXD_ERR_CE | E1000_RXD_ERR_SE | E1000_RXD_ERR_SEQ | \
+     E1000_RXD_ERR_CXE | E1000_RXD_ERR_RXE)
+
 typedef struct __attribute__((packed)) {
     u64 addr;
     u16 length;

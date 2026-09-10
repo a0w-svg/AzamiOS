@@ -24,7 +24,7 @@
 #define SERVER_CHAN  1
 #define WIN_W       480
 #define WIN_H       540
-#define MAP_ADDR    ((void *)0x78000000)
+#define MAP_ADDR    ((void *)0x76000000)
 
 #define GRID_W 22
 #define GRID_H 22

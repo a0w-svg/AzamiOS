@@ -14,7 +14,6 @@
 #define CMOS_ADDRESS 0x70
 #define CMOS_DATA    0x71
 
-extern void idt_register_irq(u8 vector, void (*fn)(pt_regs_t *, void *), void *ctx);
 
 static thread_t *g_rtc_waiter = NULL;
 static spinlock_t g_rtc_lock = SPINLOCK_INIT;

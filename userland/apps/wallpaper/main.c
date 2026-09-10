@@ -666,6 +666,10 @@ static void wp_draw_context_menu(unsigned int *pixels, unsigned int w, unsigned 
 }
 
 #define BG_CACHE_MAP_ADDR ((void *)0x66000000)
+
+/* Private buffer a frame is composed in before it is published — see
+ * wallpaper_present(). */
+#define FRAME_BUF_MAP_ADDR ((void *)0x78000000)
 static unsigned int *g_bg_cache = (unsigned int *)0;
 
 static void wallpaper_render_base(unsigned int *px, unsigned int w, unsigned int h)
@@ -716,6 +720,9 @@ static void wp_draw_marquee(unsigned int *pixels, unsigned int w, unsigned int h
     }
 }
 
+/* The private frame buffer, or NULL if it could not be allocated. */
+static unsigned int *g_frame_buf = 0;
+
 static void wallpaper_render_frame(unsigned int *pixels, unsigned int w, unsigned int h, unsigned int phase)
 {
     wp_render_animated_gradient(pixels, w, h, phase);
@@ -732,6 +739,27 @@ static void wallpaper_render_frame(unsigned int *pixels, unsigned int w, unsigne
     if (g_context_menu_open) {
         wp_draw_context_menu(pixels, w, h, g_context_menu_x, g_context_menu_y, g_context_menu_hover);
     }
+}
+
+/*
+ * wallpaper_present — draw a frame and publish it.
+ *
+ * A frame is built in several passes: gradient, stars, logo, then every
+ * desktop icon.  The compositor reads the shared surface whenever it wants,
+ * so building the frame there means it regularly composites a desktop whose
+ * background has been repainted but whose icons have not — which is what
+ * makes them blink.  The frame is composed privately and copied across in one
+ * pass instead, so the compositor only ever sees a complete desktop.
+ */
+static void wallpaper_present(unsigned int *shared, unsigned int w, unsigned int h,
+                              unsigned int phase)
+{
+    if (!g_frame_buf) {
+        wallpaper_render_frame(shared, w, h, phase);
+        return;
+    }
+    wallpaper_render_frame(g_frame_buf, w, h, phase);
+    memcpy(shared, g_frame_buf, (size_t)w * h * sizeof(unsigned int));
 }
 
 /* ============================================================================
@@ -820,11 +848,17 @@ int main(int argc, char **argv)
         wallpaper_render_base(g_bg_cache, screen_w, screen_h);
     }
 
+    /* Private buffer frames are composed in before being published. */
+    int frame_shmem = az_shmem_create((int)bg_pages);
+    if (frame_shmem >= 0 && az_shmem_map(frame_shmem, FRAME_BUF_MAP_ADDR) == 0) {
+        g_frame_buf = (unsigned int *)FRAME_BUF_MAP_ADDR;
+    }
+
     /* Initialize dynamic desktop icons */
     wp_scan_desktop_icons(screen_w, screen_h);
 
     unsigned int phase = 0;
-    wallpaper_render_frame(pixels, screen_w, screen_h, phase);
+    wallpaper_present(pixels, screen_w, screen_h, phase);
 
     /* Lock to bottom */
     az_wm_msg_t zmsg;
@@ -874,7 +908,7 @@ int main(int argc, char **argv)
                 rescan_counter = 0;
                 wp_scan_desktop_icons(screen_w, screen_h);
             }
-            wallpaper_render_frame(pixels, screen_w, screen_h, phase);
+            wallpaper_present(pixels, screen_w, screen_h, phase);
             az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&inv);
             break;
 
@@ -1016,20 +1050,20 @@ int main(int argc, char **argv)
                     if (new_y < 0) new_y = 0;
                     if (new_y > (int)screen_h - 100) new_y = (int)screen_h - 100;
 
-                    if (abs(new_x - g_desktop_icons[g_dragged_icon].x) > 3 ||
-                        abs(new_y - g_desktop_icons[g_dragged_icon].y) > 3) {
+                    if (abs(new_x - g_desktop_icons[g_dragged_icon].x) > 12 ||
+                        abs(new_y - g_desktop_icons[g_dragged_icon].y) > 12) {
                         g_drag_moved = true;
                         g_desktop_icons[g_dragged_icon].is_custom_pos = 1;
+                        g_desktop_icons[g_dragged_icon].x = new_x;
+                        g_desktop_icons[g_dragged_icon].y = new_y;
+                        redraw = true;
                     }
-                    g_desktop_icons[g_dragged_icon].x = new_x;
-                    g_desktop_icons[g_dragged_icon].y = new_y;
-                    redraw = true;
                 } else if (lrelease && g_dragged_icon >= 0) {
                     if (!g_drag_moved) {
                         /* Regular click / double click */
                         static int last_click_icon = -1;
                         static unsigned int last_click_phase = 0;
-                        if (last_click_icon == g_dragged_icon && (phase - last_click_phase) < 4) {
+                        if (last_click_icon == g_dragged_icon && (phase - last_click_phase) < 8) {
                             wp_open_icon(g_dragged_icon);
                             g_selected_icon = -1;
                             last_click_icon = -1;
@@ -1068,7 +1102,7 @@ int main(int argc, char **argv)
             }
 
             if (redraw) {
-                wallpaper_render_frame(pixels, screen_w, screen_h, phase);
+                wallpaper_present(pixels, screen_w, screen_h, phase);
                 az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&inv);
             }
             break;
@@ -1080,7 +1114,7 @@ int main(int argc, char **argv)
             if (g_bg_cache) {
                 wallpaper_render_base(g_bg_cache, screen_w, screen_h);
             }
-            wallpaper_render_frame(pixels, screen_w, screen_h, phase);
+            wallpaper_present(pixels, screen_w, screen_h, phase);
             az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&inv);
             break;
         }

@@ -104,6 +104,29 @@ static void term_print(const char *s, unsigned int col) {
   }
 }
 
+/* ── Scrolling ──────────────────────────────────────────────────────────────
+ * One place that knows how far the view may travel.  The last legal position
+ * is the one that still fills the window; going past it scrolls the backlog
+ * off the top and leaves the body blank, which reads as the output having
+ * been lost.
+ */
+static void term_scroll_by(int delta) {
+  int max_vis = ((int)g_win.height > 80) ? ((int)g_win.height - 80) / FONT_H
+                                         : (TERM_ROWS - 2);
+  if (max_vis < 1)
+    max_vis = 1;
+
+  int max_scroll = g_line_count - max_vis;
+  if (max_scroll < 0)
+    max_scroll = 0;
+
+  g_scroll += delta;
+  if (g_scroll > max_scroll)
+    g_scroll = max_scroll;
+  if (g_scroll < 0)
+    g_scroll = 0;
+}
+
 /* ── ANSI SGR Color Decoder ───────────────────────────────────────────────────
  */
 static unsigned int parse_ansi_color(const char *code,
@@ -777,25 +800,13 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
 
   /* Page Up: Scroll back */
   if (keycode == KEY_PAGEUP || scancode == 73 || scancode == 0x49) {
-    if (g_scroll > 5)
-      g_scroll -= 5;
-    else
-      g_scroll = 0;
+    term_scroll_by(-5);
     return;
   }
 
   /* Page Down: Scroll forward */
   if (keycode == KEY_PAGEDOWN || scancode == 81 || scancode == 0x51) {
-    int max_vis = ((int)g_win.height > 80) ? ((int)g_win.height - 80) / FONT_H
-                                           : (TERM_ROWS - 2);
-    if (max_vis < 1)
-      max_vis = 1;
-    int max_scroll = g_line_count - max_vis;
-    if (max_scroll < 0)
-      max_scroll = 0;
-    g_scroll += 5;
-    if (g_scroll > max_scroll)
-      g_scroll = max_scroll;
+    term_scroll_by(5);
     return;
   }
 
@@ -910,17 +921,13 @@ int main(int argc, char **argv) {
       /* Blink cursor */
       needs_redraw = true;
     } else if (msg.type == AZ_WM_MOUSE_EVENT) {
-      if (msg.mouse.dy < 0) {
-        if (g_scroll > 2)
-          g_scroll -= 2;
-        else
-          g_scroll = 0;
+      /* Scrolling follows the wheel.  Pointer motion (dx/dy) deliberately
+       * does not: reading that as a wheel scrolls the backlog away the
+       * moment the pointer crosses the window. */
+      if (msg.mouse.wheel != 0) {
+        term_scroll_by(msg.mouse.wheel > 0 ? 2 : -2);
         needs_redraw = true;
-      } else if (msg.mouse.dy > 0) {
-        if (g_scroll + 2 < g_line_count)
-          g_scroll += 2;
-        needs_redraw = true;
-      } else if (msg.mouse.buttons == 0) {
+      } else {
         needs_redraw = false;
       }
     }

@@ -13,6 +13,7 @@
 #include "../../drivers/char/console.h"
 #include "../../include/azami/defs.h"
 #include "../syscall/syscall.h" /* Error codes like ENOMEM, EAGAIN */
+#include "../perf/ktrace.h"
 
 
 static spinlock_t g_ipc_lock = SPINLOCK_INIT;
@@ -166,6 +167,7 @@ void ipc_channel_close_all(process_t *proc)
 
 s64 ipc_channel_send(ipc_channel_t *chan, const ipc_msg_t *msg, bool block)
 {
+    KTRACE_CALL("ipc_channel_send", chan ? chan->channel_id : 0);
     if (!chan || !msg) return -(s64)EINVAL;
     if (msg->length > IPC_MSG_MAX_SIZE) return -(s64)EINVAL;
 
@@ -201,7 +203,10 @@ s64 ipc_channel_send(ipc_channel_t *chan, const ipc_msg_t *msg, bool block)
         wait_queue_push(&chan->send_wait, curr);
         spinlock_unlock(&chan->lock);
 
-        sched_block(THREAD_BLOCKED);
+        /* BUG fix: must use _PENDING variant so a concurrent sched_unblock()
+         * that races between push and block sets unblock_pending and
+         * sched_post_switch() requeues the thread rather than losing the wakeup. */
+        sched_block(THREAD_BLOCKED_PENDING);
     }
 }
 
@@ -242,7 +247,8 @@ s64 ipc_channel_recv(ipc_channel_t *chan, ipc_msg_t *out_msg, bool block)
         wait_queue_push(&chan->recv_wait, curr);
         spinlock_unlock(&chan->lock);
 
-        sched_block(THREAD_BLOCKED);
+        /* BUG fix: must use _PENDING variant (see send path above). */
+        sched_block(THREAD_BLOCKED_PENDING);
     }
 }
 
@@ -424,9 +430,9 @@ s64 ipc_shmem_unmap(ipc_shmem_t *shmem, process_t *target_proc, virt_addr_t virt
 
     if (slot == -1 || !shmem) return -(s64)EINVAL;
 
-    for (size_t i = 0; i < shmem->page_count; i++) {
-        vmm_unmap(pml4, virt_addr + i * PAGE_SIZE);
-    }
+    /* Batched: one TLB shootdown for the whole segment instead of one per
+     * page. The frames belong to the shmem object, so nothing is freed here. */
+    vmm_unmap_range(pml4, virt_addr, shmem->page_count, false);
 
     ipc_shmem_put(shmem);
 
@@ -446,9 +452,7 @@ void ipc_shmem_unmap_all(process_t *proc)
         spinlock_unlock(&g_ipc_lock);
 
         if (shmem && proc->pml4_phys) {
-            for (size_t p = 0; p < shmem->page_count; p++) {
-                vmm_unmap(proc->pml4_phys, vaddr + p * PAGE_SIZE);
-            }
+            vmm_unmap_range(proc->pml4_phys, vaddr, shmem->page_count, false);
             ipc_shmem_put(shmem);
         }
     }

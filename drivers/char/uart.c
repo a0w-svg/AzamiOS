@@ -55,7 +55,6 @@ typedef struct {
 static uart_port_t g_com1 = { .port = UART_COM1, .irq = 4, .lock = SPINLOCK_INIT };
 static uart_port_t g_com2 = { .port = UART_COM2, .irq = 3, .lock = SPINLOCK_INIT };
 
-extern void idt_register_irq(u8 vector, void (*fn)(pt_regs_t *, void *), void *ctx);
 
 static void uart_set_baud(u16 port, u32 baud)
 {

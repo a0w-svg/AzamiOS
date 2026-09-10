@@ -10,6 +10,7 @@
 
 #include "../../../include/azami/types.h"
 #include "../../../include/azami/defs.h"
+#include "hwaccel.h"
 
 /* ── Ticket spinlock ─────────────────────────────────────────────────────── */
 typedef struct {
@@ -34,8 +35,14 @@ static __always_inline void spinlock_init(spinlock_t *l)
 static __always_inline void spinlock_lock(spinlock_t *l)
 {
     u32 ticket = __atomic_fetch_add(&l->ticket, 1U, __ATOMIC_SEQ_CST);
-    while (__atomic_load_n(&l->serving, __ATOMIC_ACQUIRE) != ticket)
-        cpu_pause();
+    /* PAUSE for the first few rounds, then let hw_spin_wait() park the core in
+     * TPAUSE's C0.2 state where the CPU supports it. A ticket lock's waiters
+     * are ordered, so the ones far back in the queue are guaranteed to spin
+     * for a while and are exactly the ones worth taking out of the pipeline. */
+    for (u32 spins = 0;
+         __atomic_load_n(&l->serving, __ATOMIC_ACQUIRE) != ticket;
+         spins++)
+        hw_spin_wait(spins);
 }
 
 /**
@@ -43,9 +50,13 @@ static __always_inline void spinlock_lock(spinlock_t *l)
  */
 static __always_inline void spinlock_unlock(spinlock_t *l)
 {
-    u32 next = __atomic_load_n(&l->serving, __ATOMIC_RELAXED) + 1U;
-    __atomic_store_n(&l->serving, next, __ATOMIC_RELEASE);
+    /* BUG-K fix: a RELAXED load followed by a RELEASE store does not order the
+     * load against critical-section stores on weakly-ordered architectures.
+     * A single fetch_add with RELEASE is the correct portable idiom and also
+     * reduces to a single locked XADD (or plain store on TSO). */
+    __atomic_fetch_add(&l->serving, 1U, __ATOMIC_RELEASE);
 }
+
 
 /**
  * spinlock_lock_irqsave(lock) — Disable interrupts, then acquire the lock.

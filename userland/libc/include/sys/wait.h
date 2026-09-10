@@ -27,7 +27,10 @@ typedef enum {
     P_PGID
 } idtype_t;
 
+#ifndef __siginfo_t_defined
+#define __siginfo_t_defined
 typedef struct siginfo siginfo_t;
+#endif
 
 int wait(int *status);
 int waitpid(int pid, int *status, int options);

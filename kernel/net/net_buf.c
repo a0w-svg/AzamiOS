@@ -123,6 +123,24 @@ void *net_buf_pull(net_buf_t *buf, size_t len)
     return orig;
 }
 
+/*
+ * Cut the buffer back to `len` bytes of payload, discarding the tail.
+ *
+ * Ethernet pads every frame out to 60 bytes, so a received buffer is routinely
+ * longer than the datagram it carries.  Trimming has to move `tail` as well as
+ * `len` — leaving the two disagreeing would let a later net_buf_put() write
+ * into the discarded region and hand back a buffer whose length no longer
+ * matches its contents.  Growing is not this function's job: a larger `len` is
+ * ignored rather than silently exposing whatever the tail happens to hold.
+ */
+void net_buf_trim(net_buf_t *buf, size_t len)
+{
+    if (!buf || len >= buf->len) return;
+
+    buf->len  = len;
+    buf->tail = buf->data + len;
+}
+
 /* ── Queue Operations ─────────────────────────────────────────────────────── */
 
 void net_buf_queue_init(net_buf_queue_t *q)

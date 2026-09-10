@@ -29,7 +29,47 @@ int munmap(void *addr, size_t length)
 
 int mprotect(void *addr, size_t len, int prot)
 {
-    long ret = syscall3(10 /* SYS_mprotect */, (long)addr, (long)len, prot);
+    long ret = syscall3(SYS_mprotect, (long)addr, (long)len, prot);
+    if (ret < 0) {
+        errno = (int)-ret;
+        return -1;
+    }
+    return 0;
+}
+
+int pkey_alloc(unsigned int flags, unsigned int access_rights)
+{
+    long ret = syscall2(SYS_pkey_alloc, (long)flags, (long)access_rights);
+    if (ret < 0) {
+        errno = (int)-ret;
+        return -1;
+    }
+    return (int)ret;
+}
+
+int pkey_free(int pkey)
+{
+    long ret = syscall1(SYS_pkey_free, pkey);
+    if (ret < 0) {
+        errno = (int)-ret;
+        return -1;
+    }
+    return 0;
+}
+
+int pkey_mprotect(void *addr, size_t len, int prot, int pkey)
+{
+    long ret = syscall4(SYS_pkey_mprotect, (long)addr, (long)len, prot, pkey);
+    if (ret < 0) {
+        errno = (int)-ret;
+        return -1;
+    }
+    return 0;
+}
+
+int mseal(void *addr, size_t len, unsigned long flags)
+{
+    long ret = syscall3(SYS_mseal, (long)addr, (long)len, (long)flags);
     if (ret < 0) {
         errno = (int)-ret;
         return -1;
@@ -72,5 +112,26 @@ int munlockall(void)
 {
     long ret = syscall1(SYS_munlockall, 0);
     if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}
+
+int mlock2(const void *addr, size_t len, int flags)
+{
+    long ret = syscall3(SYS_mlock2, (long)addr, (long)len, flags);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}
+
+int madvise(void *addr, size_t length, int advice)
+{
+    long ret = syscall3(SYS_madvise, (long)addr, (long)length, advice);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}
+
+int posix_madvise(void *addr, size_t len, int advice)
+{
+    long ret = syscall3(SYS_madvise, (long)addr, (long)len, advice);
+    if (ret < 0) return (int)-ret;
     return 0;
 }

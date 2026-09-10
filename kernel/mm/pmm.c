@@ -41,6 +41,7 @@
 #include <azami/debug.h>
 #include "pmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../drivers/char/console.h"
 
 
@@ -91,6 +92,90 @@ static __always_inline bool bitmap_test(u64 frame) {
     return (g_bitmap[frame / 64] >> (frame % 64)) & 1ULL;
 }
 
+/* ── Word-at-a-time range operations ─────────────────────────────────────── */
+/*
+ * Every allocator path below touches a whole buddy block at once, and a block
+ * at PMM_MAX_ORDER is 1024 frames. Walking that a bit at a time is 1024 loads,
+ * shifts and stores where sixteen masked word operations do the identical job,
+ * and pmm_alloc()/pmm_free() run it on every allocation and every coalescing
+ * step. The loops below cost one iteration per 64 frames.
+ *
+ * The set and clear variants also return how many bits they actually changed.
+ * That is not used for accounting — g_free_frames follows the block size, for
+ * the reasons free_list_push() explains — but it is what lets free_list_pop()
+ * notice a block that was on a free list while still marked allocated. POPCNT
+ * makes that check cost nothing on top of the store that was happening anyway.
+ */
+
+/* Mask of @n bits starting at bit @bit within one word. */
+static __always_inline u64 word_mask(u64 bit, u64 n)
+{
+    return (n >= 64) ? ~0ULL : (((1ULL << n) - 1) << bit);
+}
+
+/* Clamp a range to the bitmap, mirroring the per-bit helpers' habit of
+ * silently ignoring frames past the end rather than faulting. */
+static __always_inline bool range_clamp(u64 frame, u64 *count)
+{
+    if (unlikely(frame >= PMM_MAX_FRAMES)) return false;
+    if (unlikely(*count > PMM_MAX_FRAMES - frame)) *count = PMM_MAX_FRAMES - frame;
+    return *count != 0;
+}
+
+/* Mark [frame, frame+count) allocated. Returns the number that were free. */
+static u64 bitmap_range_set(u64 frame, u64 count)
+{
+    if (!range_clamp(frame, &count)) return 0;
+    u64 changed = 0;
+    while (count) {
+        u64 bit = frame % 64;
+        u64 n   = 64 - bit;
+        if (n > count) n = count;
+        u64 mask = word_mask(bit, n);
+        u64 *w = &g_bitmap[frame / 64];
+        changed += hw_popcnt64(~*w & mask);
+        *w |= mask;
+        frame += n;
+        count -= n;
+    }
+    return changed;
+}
+
+/* Mark [frame, frame+count) free. Returns the number that were allocated. */
+static u64 bitmap_range_clear(u64 frame, u64 count)
+{
+    if (!range_clamp(frame, &count)) return 0;
+    u64 changed = 0;
+    while (count) {
+        u64 bit = frame % 64;
+        u64 n   = 64 - bit;
+        if (n > count) n = count;
+        u64 mask = word_mask(bit, n);
+        u64 *w = &g_bitmap[frame / 64];
+        changed += hw_popcnt64(*w & mask);
+        *w &= ~mask;
+        frame += n;
+        count -= n;
+    }
+    return changed;
+}
+
+/* True when every frame in the range is unallocated. A range running past the
+ * end of the bitmap reads as allocated, matching bitmap_test(). */
+static bool bitmap_range_is_clear(u64 frame, u64 count)
+{
+    while (count) {
+        if (unlikely(frame >= PMM_MAX_FRAMES)) return false;
+        u64 bit = frame % 64;
+        u64 n   = 64 - bit;
+        if (n > count) n = count;
+        if (g_bitmap[frame / 64] & word_mask(bit, n)) return false;
+        frame += n;
+        count -= n;
+    }
+    return true;
+}
+
 /* ── Free lists ──────────────────────────────────────────────────────────── */
 
 #define PMM_BLOCK_MAGIC 0x504D4D31ULL
@@ -129,7 +214,7 @@ static void free_list_push(u32 order, phys_addr_t phys)
 {
     u64 frame = phys_to_frame(phys);
     u64 count = (u64)1 << order;
-    for (u64 i = 0; i < count; i++) bitmap_clear(frame + i);
+    bitmap_range_clear(frame, count);
 
     free_block_t *blk  = phys_to_block(phys);
     blk->order         = order;
@@ -141,6 +226,11 @@ static void free_list_push(u32 order, phys_addr_t phys)
         g_free_list[order]->prev = blk;
     }
     g_free_list[order] = blk;
+    /* Deliberately the whole block, not just the frames this call transitioned:
+     * when pmm_free() coalesces, the buddy's frames are already clear here and
+     * it has already subtracted them, so the two adjustments only balance if
+     * this one covers the merged block in full. See the invariant note in
+     * pmm_alloc_32(). */
     g_free_frames     += count;
 }
 
@@ -162,7 +252,18 @@ static phys_addr_t free_list_pop(u32 order)
     phys_addr_t phys = VIRT_TO_PHYS((uintptr_t)blk);
     u64 frame  = phys_to_frame(phys);
     u64 count  = (u64)1 << order;
-    for (u64 i = 0; i < count; i++) bitmap_set(frame + i);
+    /* Everything on a free list must be clear in the bitmap. Anything else is
+     * the free-list/bitmap divergence the allocator has no other way to
+     * notice — the block would be handed out while still marked allocated, and
+     * the next coalesce would silently refuse to merge it forever. */
+    u64 was_free = bitmap_range_set(frame, count);
+    if (unlikely(was_free != count)) {
+        pr_debug("[PMM] free list/bitmap divergence: order=%u frame=%llu "
+                 "%llu of %llu frames were already allocated\n",
+                 order, (unsigned long long)frame,
+                 (unsigned long long)(count - was_free),
+                 (unsigned long long)count);
+    }
     g_free_frames -= count;
     return phys;
 }
@@ -295,11 +396,8 @@ void pmm_free(phys_addr_t phys, u32 order)
         u64 buddy_frame   = phys_to_frame(buddy);
 
         /* Is the buddy free? (all frames in buddy block must be unallocated) */
-        bool buddy_free = true;
         u64  count      = (u64)1 << order;
-        for (u64 i = 0; i < count && buddy_free; i++) {
-            if (bitmap_test(buddy_frame + i)) buddy_free = false;
-        }
+        bool buddy_free = bitmap_range_is_clear(buddy_frame, count);
 
         if (!buddy_free) break;  /* Can't coalesce further */
         if (!free_list_remove(order, buddy)) break; /* Buddy already gone? */
@@ -331,6 +429,12 @@ static u32 pages_to_order(size_t count)
     return order;
 }
 
+/* BUG-U note: pmm_alloc_pages(N) allocates the smallest 2^order block that
+ * holds N pages (2^order >= N).  The CALLER must remember the exact `page_count`
+ * it passed and use the SAME value when calling pmm_free_pages().  Passing a
+ * different count produces mis-sized frees that corrupt the buddy free list.
+ * If you need to know the actual allocated size, compute (1 << pages_to_order(N))
+ * yourself or use pmm_alloc()/pmm_free() with an explicit order instead. */
 phys_addr_t pmm_alloc_pages(size_t page_count)
 {
     if (page_count == 0) return 0;
@@ -374,9 +478,22 @@ phys_addr_t pmm_alloc_32(u32 order)
         pr_debug("[PMM] pmm_alloc_32: free_list_remove failed (order=%u)\n", found);
         return 0;
     }
+    /* BUG-7 hardening: unlike pmm_alloc() which delegates accounting to
+     * free_list_pop(), this path calls free_list_remove() which does NOT touch
+     * g_free_frames.  We must manually subtract the block we removed (count
+     * frames at order `found`) here, BEFORE the split loop calls
+     * free_list_push() for each buddy — free_list_push adds (1<<buddy_order)
+     * frames back each iteration.  Net effect after the loop:
+     *   −(1<<found) + [(1<<(found−1)) + … + (1<<order)] = −(1<<order)
+     * which is exactly the number of frames handed to the caller.  Any change
+     * to this block (reordering the decrement, changing the split loop) MUST
+     * preserve this invariant or g_free_frames will drift. */
     u64 frame = phys_to_frame(blk_phys);
     u64 count = (u64)1 << found;
-    for (u64 i = 0; i < count; i++) bitmap_set(frame + i);
+    if (unlikely(bitmap_range_set(frame, count) != count)) {
+        pr_debug("[PMM] free list/bitmap divergence in alloc_32: order=%u "
+                 "frame=%llu\n", found, (unsigned long long)frame);
+    }
     g_free_frames -= count;
 
     while (found > order) {
@@ -425,8 +542,12 @@ void pmm_free_pages(phys_addr_t phys, size_t page_count)
     }
 }
 
-u64 pmm_get_free_pages(void)  { return g_free_frames;  }
-u64 pmm_get_total_pages(void) { return g_total_frames; }
+/* BUG-AC fix: g_free_frames is written under g_pmm_lock but read here without
+ * any lock.  On x86-64 a 64-bit aligned load is atomic at the hardware level,
+ * but the C standard still considers an un-annotated plain load a data race
+ * (UB).  __ATOMIC_RELAXED costs nothing on x86 and makes the intent explicit. */
+u64 pmm_get_free_pages(void)  { return __atomic_load_n(&g_free_frames,  __ATOMIC_RELAXED); }
+u64 pmm_get_total_pages(void) { return __atomic_load_n(&g_total_frames, __ATOMIC_RELAXED); }
 
 void pmm_dump_stats(void)
 {

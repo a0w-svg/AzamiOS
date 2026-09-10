@@ -13,6 +13,12 @@
 
 #define MAX_ROUTES 32
 
+/* ipv4_hdr_t.frag_offset, in host order: 3 flag bits then a 13-bit offset
+ * counted in 8-byte units. */
+#define IP_FLAG_DF         0x4000
+#define IP_FLAG_MF         0x2000
+#define IP_FRAG_OFF_MASK   0x1FFF
+
 /* Routing table flags */
 #define RT_FLAG_UP      0x01
 #define RT_FLAG_GATEWAY 0x02

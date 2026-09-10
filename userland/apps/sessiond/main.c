@@ -199,11 +199,15 @@ int main(int argc, char **argv)
         de_log("[sessiond] wallpaper.elf spawned.");
     }
 
-    /* ── Step 5: Spawn Taskbar ───────────────────────────────────────────── */
+    /* ── Step 5: Spawn Taskbar & Services ───────────────────────────────── */
     if (splash_ok) render_splash(&g_splash_win, 75);
     int tb_pid = az_spawn("/sbin/taskbar.elf");
     if (tb_pid >= 0) {
         de_log("[sessiond] taskbar.elf spawned.");
+    }
+    int notif_pid = az_spawn("/sbin/notifyd.elf");
+    if (notif_pid >= 0) {
+        de_log("[sessiond] notifyd.elf spawned.");
     }
 
     /* Auto-launch terminal emulator on startup */

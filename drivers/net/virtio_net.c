@@ -179,6 +179,8 @@ int virtio_net_init(device_t *pci_dev)
     memset(&ndev, 0, sizeof(ndev));
     strcpy(ndev.name, "virtio-net");
     memcpy(ndev.mac, g_vnet.mac, 6);
+    ndev.flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+    ndev.mtu = 1500;
     ndev.send = virtio_net_send_packet;
     net_register_device(&ndev);
 

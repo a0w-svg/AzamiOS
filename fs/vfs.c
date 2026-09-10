@@ -12,6 +12,7 @@
 #include "../drivers/char/console.h"
 #include "../include/azami/defs.h"
 #include "../kernel/syscall/syscall.h"
+#include "../arch/x86_64/cpu/hwaccel.h"
 
 
 static spinlock_t g_vfs_lock = SPINLOCK_INIT;
@@ -44,12 +45,18 @@ dentry_t *dcache_alloc(dentry_t *parent, const char *name)
 #define DCACHE_HASH_SIZE 256
 static dentry_t *g_dcache_hash[DCACHE_HASH_SIZE];
 
+/* Path lookup hashes every component of every path, so this is one of the
+ * hottest loops in the kernel. crc32c() is a single CRC32 instruction per byte
+ * (per 8 bytes once aligned) on any SSE4.2 part and a table lookup elsewhere,
+ * and it mixes far better than the multiply-by-31 chain it replaces — dentry
+ * names differ mostly in their last few characters, which is precisely the
+ * case where a weak polynomial rolling hash piles collisions into one bucket. */
 static inline u32 dcache_hash_fn(dentry_t *parent, const char *name)
 {
-    u32 hash = (u32)(uintptr_t)parent ^ 0x9e3779b9;
-    for (size_t i = 0; name[i] && i < VFS_NAME_MAX; i++) {
-        hash = (hash * 31) + (u8)name[i];
-    }
+    u32 hash = crc32c(0xFFFFFFFFu, &parent, sizeof(parent));
+    size_t len = 0;
+    while (len < VFS_NAME_MAX && name[len]) len++;
+    hash = crc32c(hash, name, len) ^ 0xFFFFFFFFu;
     return hash & (DCACHE_HASH_SIZE - 1);
 }
 
@@ -109,12 +116,20 @@ dentry_t *dcache_lookup(dentry_t *parent, const char *name)
         entry = entry->d_hash_next;
     }
 
-    /* Fallback: check direct child list */
+    /* Fallback: check direct child list for dentries not yet in the hash
+     * (e.g. added to d_subdirs but with a negative entry that was never hashed). */
     dentry_t *child = parent->d_subdirs;
     while (child) {
         if (strncmp(name, child->d_name, VFS_NAME_MAX) == 0) {
-            child->d_hash_next = g_dcache_hash[bucket];
-            g_dcache_hash[bucket] = child;
+            /* BUG-9: Only promote to the hash if the dentry has an inode — this
+             * matches the invariant enforced by dcache_add().  Inserting a
+             * negative dentry (no inode) into the hash would create a duplicate
+             * if it was already placed there by a concurrent dcache_add() after
+             * the inode was assigned, leading to double-removal on eviction. */
+            if (child->d_inode) {
+                child->d_hash_next = g_dcache_hash[bucket];
+                g_dcache_hash[bucket] = child;
+            }
             spinlock_unlock(&g_vfs_lock);
             return child;
         }
@@ -147,9 +162,14 @@ file_system_type_t *vfs_find_fs(const char *name)
         int i;
         for (i = 0; i < 32; i++) {
             if (name[i] != curr->name[i]) { match = false; break; }
-            if (name[i] == '\0') break;
+            if (name[i] == '\0') break; /* both NUL at same position → equal */
         }
-        if (match && i < 32) {
+        /* BUG-10: the original code had `match && i < 32` which failed for
+         * names exactly 32 chars long (i reaches 32, i < 32 is false → not
+         * found even though all chars matched).  When the loop exits via the
+         * NUL break, name[i] == curr->name[i] == '\0', so `match` already
+         * encodes equality at the right position; no extra bound needed. */
+        if (match) {
             spinlock_unlock(&g_vfs_lock);
             return curr;
         }
@@ -166,6 +186,64 @@ s64 vfs_mount(const char *source, const char *target, const char *fstype, void *
     if (!fs->mount) return -(s64)EINVAL;
     
     return fs->mount(fs, source, target, data);
+}
+
+s64 vfs_umount(const char *target, int flags)
+{
+    (void)flags;
+    if (!target || !target[0]) return -(s64)EINVAL;
+    dentry_t *dentry = NULL;
+    s64 err = vfs_path_lookup(target, &dentry);
+    if (err < 0 || !dentry) return -(s64)ENOENT;
+    if (!dentry->d_inode || !S_ISDIR(dentry->d_inode->i_mode)) return -(s64)ENOTDIR;
+    /* No real detach yet — at least make sure the volume's data is on disk so
+     * a umount followed by poweroff does not lose the last few writes. */
+    vfs_sync_all();
+    return 0;
+}
+
+void vfs_sync_all(void)
+{
+    /* ext2 is the only filesystem here that buffers writes; tmpfs/procfs/sysfs
+     * are RAM-only and fat32/squashfs write through. Declared here rather than
+     * via ext2.h to keep the VFS free of a filesystem-specific include. */
+    extern void ext2_sync(void);
+    ext2_sync();
+}
+
+s64 vfs_sync_fs(struct super_block *sb)
+{
+    if (!sb) return -(s64)EINVAL;
+    if (sb->s_op && sb->s_op->sync_fs)
+        return sb->s_op->sync_fs(sb);
+    return 0;   /* nothing buffered → already durable */
+}
+
+s64 vfs_fadvise(file_t *file, u64 offset, u64 len, int advice)
+{
+    if (!file || !file->f_inode) return -(s64)EBADF;
+    const file_operations_t *fops = file->f_inode->i_fop;
+    if (fops && fops->fadvise)
+        return fops->fadvise(file, offset, len, advice);
+    return 0;   /* filesystem has no opinion → the hint is a no-op */
+}
+
+s64 vfs_fallocate(file_t *file, int mode, u64 offset, u64 len)
+{
+    if (!file || !file->f_inode) return -(s64)EBADF;
+    if (S_ISDIR(file->f_inode->i_mode)) return -(s64)EISDIR;
+    if (!S_ISREG(file->f_inode->i_mode)) return -(s64)ENODEV;
+
+    const file_operations_t *fops = file->f_inode->i_fop;
+    if (fops && fops->fallocate)
+        return fops->fallocate(file, mode, offset, len);
+
+    /* Fallback: no real reservation, just make the size reflect the request
+     * (FALLOC_FL_KEEP_SIZE = 0x01 leaves it alone). Matches the historical
+     * behaviour for filesystems with no fallocate of their own. */
+    if (!(mode & 0x01) && file->f_inode->i_size < offset + len)
+        file->f_inode->i_size = offset + len;
+    return 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -207,27 +285,47 @@ void vfs_init(void)
  * Path Lookup & Resolution
  * -------------------------------------------------------------------------- */
 
-static void path_add_comp(char comps[32][64], int *depth, const char *s, size_t len)
+#define PATH_MAX_COMPS 32
+#define PATH_MAX_COMP_LEN 63   /* excluding the NUL */
+
+/*
+ * Append one path component, or report that the path does not fit.
+ *
+ * Overflowing either limit used to be silent: a 33rd component was dropped and
+ * a component longer than 63 bytes was truncated. Both turn a path into a
+ * *different, shorter* path that resolves successfully — "/a/…/deep/secret"
+ * quietly becoming its own parent directory, or two distinct long names
+ * colliding on their first 63 bytes. Resolution has to fail instead, the way
+ * every other path limit in the kernel does.
+ *
+ * Returns false when the component does not fit; the caller aborts with
+ * -ENAMETOOLONG.
+ */
+static bool path_add_comp(char comps[PATH_MAX_COMPS][PATH_MAX_COMP_LEN + 1],
+                          int *depth, const char *s, size_t len)
 {
-    if (len == 0) return;
-    if (len == 1 && s[0] == '.') return;
+    if (len == 0) return true;
+    if (len == 1 && s[0] == '.') return true;
     if (len == 2 && s[0] == '.' && s[1] == '.') {
+        /* ".." at the root stays at the root — this is what stops a path from
+         * climbing out of a chroot(2) jail. */
         if (*depth > 0) (*depth)--;
-        return;
+        return true;
     }
-    if (*depth < 32) {
-        size_t cpy = (len < 63) ? len : 63;
-        for (size_t i = 0; i < cpy; i++) comps[*depth][i] = s[i];
-        comps[*depth][cpy] = '\0';
-        (*depth)++;
-    }
+    if (len > PATH_MAX_COMP_LEN) return false;
+    if (*depth >= PATH_MAX_COMPS) return false;
+
+    for (size_t i = 0; i < len; i++) comps[*depth][i] = s[i];
+    comps[*depth][len] = '\0';
+    (*depth)++;
+    return true;
 }
 
 s64 vfs_resolve_path(const char *cwd, const char *path, char *out_buf, size_t out_len)
 {
     if (!path || !out_buf || out_len < 2) return -(s64)EINVAL;
 
-    char comps[32][64];
+    char comps[PATH_MAX_COMPS][PATH_MAX_COMP_LEN + 1];
     int depth = 0;
 
     if (path[0] != '/') {
@@ -237,7 +335,8 @@ s64 vfs_resolve_path(const char *cwd, const char *path, char *out_buf, size_t ou
             if (!*c) break;
             const char *start = c;
             while (*c && *c != '/') c++;
-            path_add_comp(comps, &depth, start, (size_t)(c - start));
+            if (!path_add_comp(comps, &depth, start, (size_t)(c - start)))
+                return -(s64)ENAMETOOLONG;
         }
     }
 
@@ -247,7 +346,8 @@ s64 vfs_resolve_path(const char *cwd, const char *path, char *out_buf, size_t ou
         if (!*p) break;
         const char *start = p;
         while (*p && *p != '/') p++;
-        path_add_comp(comps, &depth, start, (size_t)(p - start));
+        if (!path_add_comp(comps, &depth, start, (size_t)(p - start)))
+            return -(s64)ENAMETOOLONG;
     }
 
     if (depth == 0) {
@@ -271,6 +371,10 @@ s64 vfs_resolve_path(const char *cwd, const char *path, char *out_buf, size_t ou
     return 0;
 }
 
+/* Max path components dentry_build_path() will walk. Stored as pointers, so
+ * raising this costs 8 bytes per level rather than VFS_NAME_MAX. */
+#define VFS_PATH_MAX_DEPTH 32
+
 void dentry_build_path(dentry_t *d, char *buf, size_t max)
 {
     if (!d || !buf || max < 2) return;
@@ -279,22 +383,32 @@ void dentry_build_path(dentry_t *d, char *buf, size_t max)
         buf[1] = '\0';
         return;
     }
-    char stack[16][VFS_NAME_MAX];
+    /* Collect the chain root-ward as pointers rather than copying each name
+     * into its own 255-byte slot. The old char stack[16][VFS_NAME_MAX] cost
+     * 4 KB of a 16 KB kernel stack, and its strncpy(dst, src, VFS_NAME_MAX-1)
+     * wrote no terminator for a name of exactly VFS_NAME_MAX-1 chars, so the
+     * strlen() below ran off the end of the slot into the next row. */
+    const dentry_t *chain[VFS_PATH_MAX_DEPTH];
     int count = 0;
-    dentry_t *curr = d;
-    while (curr && curr != g_vfs_root && curr->d_parent && count < 16) {
-        strncpy(stack[count++], curr->d_name, VFS_NAME_MAX - 1);
-        curr = curr->d_parent;
+    for (dentry_t *curr = d;
+         curr && curr != g_vfs_root && curr->d_parent && count < VFS_PATH_MAX_DEPTH;
+         curr = curr->d_parent) {
+        chain[count++] = curr;
     }
+
     size_t off = 0;
     buf[off++] = '/';
     for (int i = count - 1; i >= 0; i--) {
-        size_t nlen = strlen(stack[i]);
-        if (off + nlen + 1 < max) {
-            memcpy(buf + off, stack[i], nlen);
-            off += nlen;
-            if (i > 0) buf[off++] = '/';
-        }
+        const char *nm = chain[i]->d_name;
+        size_t nlen = 0;
+        while (nlen < VFS_NAME_MAX && nm[nlen]) nlen++;
+        /* Stop at the first component that will not fit. Skipping it and
+         * carrying on (the previous behaviour) silently dropped a middle
+         * component and produced a wrong-but-plausible path. */
+        if (off + nlen + (i > 0 ? 1u : 0u) >= max) break;
+        memcpy(buf + off, nm, nlen);
+        off += nlen;
+        if (i > 0) buf[off++] = '/';
     }
     buf[off] = '\0';
 }
@@ -305,15 +419,26 @@ static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry,
                                     int symlink_depth, bool follow_final)
 {
     if (!path || !g_vfs_root) return -(s64)ENOENT;
-    if (symlink_depth > VFS_MAXSYMLINKS) return -(s64)ELOOP;
-    
+
+    /* Symlink hops iterate here instead of recursing. Each frame of this
+     * function holds ~2 KB of path buffers, and a symlink chain could drive
+     * VFS_MAXSYMLINKS (40) nested frames — ~90 KB against a 16 KB kernel
+     * stack. Any user able to create symlinks could therefore run the kernel
+     * stack into its guard page. Hoisting the buffers out of the recursion
+     * keeps the cost flat at one frame no matter how long the chain. */
     char resolved[512];
+    char next_path[512];   /* rewritten path carried into the next hop */
+    char parent_path[512]; /* scratch for a relative link's containing dir */
+
+restart:
+    if (symlink_depth > VFS_MAXSYMLINKS) return -(s64)ELOOP;
+
     if (vfs_resolve_path("/", path, resolved, sizeof(resolved)) == 0) {
         path = resolved;
     } else if (path[0] != '/') {
         return -(s64)EINVAL;
     }
-    
+
     dentry_t *curr = g_vfs_root;
     const char *p = path + 1;
     
@@ -333,6 +458,7 @@ static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry,
         comp[i] = '\0';
         
         dentry_t *next = dcache_lookup(curr, comp);
+        bool dentry_is_ours = false;
         if (!next) {
             /* Try to ask the filesystem's inode->lookup */
             if (!curr->d_inode || !curr->d_inode->i_op || !curr->d_inode->i_op->lookup) {
@@ -346,6 +472,9 @@ static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry,
                 /* If filesystem returned a different dentry, use it */
                 if (res != new_dentry) {
                     kfree(new_dentry);
+                    dentry_is_ours = false; /* res is owned by the filesystem */
+                } else {
+                    dentry_is_ours = true;
                 }
                 next = res;
                 if (next && next->d_inode) {
@@ -353,6 +482,7 @@ static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry,
                 }
             } else {
                 next = new_dentry; /* Might be negative, meaning file doesn't exist */
+                dentry_is_ours = true;
             }
         }
         
@@ -360,8 +490,8 @@ static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry,
         
         if (!next->d_inode) {
             if (*p) {
-                /* Missing intermediate directory */
-                kfree(next);
+                /* Missing intermediate directory — only free if we own it */
+                if (dentry_is_ours) kfree(next);
                 return -(s64)ENOENT;
             } else {
                 *out_dentry = next;
@@ -384,31 +514,34 @@ static s64 vfs_path_lookup_internal(const char *path, dentry_t **out_dentry,
             }
             if (read_res > 0) {
                 link_target[read_res] = '\0';
-                char target_full[512];
                 if (link_target[0] == '/') {
                     if (*p) {
-                        snprintf(target_full, sizeof(target_full), "%s/%s", link_target, p);
+                        snprintf(next_path, sizeof(next_path), "%s/%s", link_target, p);
                     } else {
-                        strncpy(target_full, link_target, sizeof(target_full) - 1);
-                        target_full[sizeof(target_full) - 1] = '\0';
+                        snprintf(next_path, sizeof(next_path), "%s", link_target);
                     }
                 } else {
-                    char parent_path[512];
+                    /* Must not build into `resolved`: after a restart `path`
+                     * aliases it and `p` points into it, so overwriting it here
+                     * would corrupt the trailing components read just below. */
                     dentry_build_path(curr, parent_path, sizeof(parent_path));
                     if (*p) {
-                        snprintf(target_full, sizeof(target_full), "%s/%s/%s", parent_path, link_target, p);
+                        snprintf(next_path, sizeof(next_path), "%s/%s/%s", parent_path, link_target, p);
                     } else {
-                        snprintf(target_full, sizeof(target_full), "%s/%s", parent_path, link_target);
+                        snprintf(next_path, sizeof(next_path), "%s/%s", parent_path, link_target);
                     }
                 }
-                return vfs_path_lookup_internal(target_full, out_dentry, symlink_depth + 1, true);
+                /* Follow the link by restarting the walk, not by recursing. */
+                path          = next_path;
+                symlink_depth = symlink_depth + 1;
+                follow_final  = true;
+                goto restart;
             }
         }
         
         if (*p && !S_ISDIR(next->d_inode->i_mode)) {
-            if (!next->d_parent || dcache_lookup(next->d_parent, next->d_name) != next) {
-                kfree(next);
-            }
+            /* next has a valid inode — if we allocated it and added it to the
+             * dcache, it is now owned by the cache and must not be freed here. */
             return -(s64)ENOTDIR;
         }
         
@@ -589,6 +722,31 @@ s64 vfs_lseek(file_t *file, s64 offset, int whence)
     return new_pos;
 }
 
+/* vfs_fill_stat() — project an inode into the Linux struct stat userspace
+ * expects. Shared by stat/lstat/fstat so the three can never disagree.
+ *
+ * st_nlink matters more than it looks: find(1) uses a directory's link count
+ * to decide how many subdirectories are left to visit and stops descending
+ * early when it reads 0, and tools that de-duplicate hard links read it on
+ * files. A filesystem that does not track links reports 0, so substitute the
+ * honest minimum — 1 for a file, 2 for a directory (itself and its own '.'). */
+static void vfs_fill_stat(inode_t *i, struct stat *statbuf)
+{
+    __builtin_memset(statbuf, 0, sizeof(struct stat));
+    statbuf->st_ino   = i->i_ino;
+    statbuf->st_mode  = i->i_mode;
+    statbuf->st_uid   = i->i_uid;
+    statbuf->st_gid   = i->i_gid;
+    statbuf->st_size  = i->i_size;
+    statbuf->st_blocks = i->i_blocks;
+    statbuf->st_atime = i->i_atime;
+    statbuf->st_mtime = i->i_mtime;
+    statbuf->st_ctime = i->i_ctime;
+
+    statbuf->st_nlink = i->i_nlink ? i->i_nlink : (S_ISDIR(i->i_mode) ? 2 : 1);
+    statbuf->st_blksize = (i->i_sb && i->i_sb->s_blocksize) ? (s64)i->i_sb->s_blocksize : 4096;
+}
+
 static s64 vfs_stat_common(const char *path, struct stat *statbuf, bool follow)
 {
     if (!statbuf) return -(s64)EINVAL;
@@ -605,18 +763,7 @@ static s64 vfs_stat_common(const char *path, struct stat *statbuf, bool follow)
     }
 
     inode_t *i = dentry->d_inode;
-    __builtin_memset(statbuf, 0, sizeof(struct stat));
-    statbuf->st_dev = 0;
-    statbuf->st_ino = i->i_ino;
-    statbuf->st_mode = i->i_mode;
-    statbuf->st_uid = i->i_uid;
-    statbuf->st_gid = i->i_gid;
-    statbuf->st_size = i->i_size;
-    statbuf->st_blocks = i->i_blocks;
-    statbuf->st_atime = i->i_atime;
-    statbuf->st_mtime = i->i_mtime;
-    statbuf->st_ctime = i->i_ctime;
-
+    vfs_fill_stat(i, statbuf);
     return 0;
 }
 
@@ -630,19 +777,7 @@ s64 vfs_fstat(file_t *file, struct stat *statbuf)
     if (!is_valid_vfs_file(file) || !file->f_inode) return -(s64)EBADF;
     if (!statbuf) return -(s64)EINVAL;
     
-    inode_t *i = file->f_inode;
-    __builtin_memset(statbuf, 0, sizeof(struct stat));
-    statbuf->st_dev = 0;
-    statbuf->st_ino = i->i_ino;
-    statbuf->st_mode = i->i_mode;
-    statbuf->st_uid = i->i_uid;
-    statbuf->st_gid = i->i_gid;
-    statbuf->st_size = i->i_size;
-    statbuf->st_blocks = i->i_blocks;
-    statbuf->st_atime = i->i_atime;
-    statbuf->st_mtime = i->i_mtime;
-    statbuf->st_ctime = i->i_ctime;
-    
+    vfs_fill_stat(file->f_inode, statbuf);
     return 0;
 }
 
@@ -683,7 +818,10 @@ s64 vfs_mkdir(const char *path, u32 mode)
 s64 vfs_unlink(const char *path)
 {
     dentry_t *dentry = NULL;
-    s64 err = vfs_path_lookup(path, &dentry);
+    /* nofollow: unlink(2) removes the name it was given. Following the final
+     * link here means `rm somelink` deletes the *target* and leaves the link
+     * dangling — silent data loss for any program that manages symlinks. */
+    s64 err = vfs_path_lookup_nofollow(path, &dentry);
     if (err < 0) {
         if (dentry && !dentry->d_inode) kfree(dentry);
         return err;
@@ -709,7 +847,10 @@ s64 vfs_unlink(const char *path)
 s64 vfs_rmdir(const char *path)
 {
     dentry_t *dentry = NULL;
-    s64 err = vfs_path_lookup(path, &dentry);
+    /* nofollow, for the same reason as vfs_unlink(); a trailing symlink is
+     * not a directory, so this correctly yields ENOTDIR instead of removing
+     * whatever the link pointed at. */
+    s64 err = vfs_path_lookup_nofollow(path, &dentry);
     if (err < 0) {
         if (dentry && !dentry->d_inode) kfree(dentry);
         return err;
@@ -772,6 +913,10 @@ s64 vfs_rename(const char *oldpath, const char *newpath)
 s64 vfs_truncate(file_t *file, u64 length)
 {
     if (!file || !file->f_inode) return -(s64)EBADF;
+    if (file->f_inode->i_sb && file->f_inode->i_sb->s_magic == 0x01021994) {
+        extern s64 tmpfs_truncate(struct inode *inode, u64 length);
+        return tmpfs_truncate(file->f_inode, length);
+    }
     if (length == 0) {
         extern void ext2_truncate(struct inode *inode);
         if (file->f_inode->i_sb && file->f_inode->i_sb->s_magic == 0xEF53) {
@@ -806,6 +951,50 @@ s64 vfs_symlink(const char *target, const char *linkpath)
     if (err == 0) return -(s64)EEXIST;
     if (dentry && !dentry->d_inode) kfree(dentry);
     return err;
+}
+
+/* vfs_link() — hard-link @newpath to the inode @oldpath already names.
+ * link(2) does not follow a trailing symlink on the *new* path (that name must
+ * not exist at all) but does resolve the old one, matching Linux's default. */
+s64 vfs_link(const char *oldpath, const char *newpath)
+{
+    dentry_t *old_dentry = NULL;
+    s64 err = vfs_path_lookup(oldpath, &old_dentry);
+    if (err < 0 || !old_dentry || !old_dentry->d_inode) {
+        if (old_dentry && !old_dentry->d_inode) kfree(old_dentry);
+        return err < 0 ? err : -(s64)ENOENT;
+    }
+    /* POSIX reserves directory hard links to the filesystem itself. */
+    if (S_ISDIR(old_dentry->d_inode->i_mode)) return -(s64)EPERM;
+
+    dentry_t *new_dentry = NULL;
+    err = vfs_path_lookup_nofollow(newpath, &new_dentry);
+    if (err == 0) {
+        return -(s64)EEXIST;
+    }
+    if (err != -(s64)ENOENT || !new_dentry) {
+        if (new_dentry && !new_dentry->d_inode) kfree(new_dentry);
+        return err;
+    }
+
+    inode_t *dir = new_dentry->d_parent ? new_dentry->d_parent->d_inode : NULL;
+    if (!dir || !dir->i_op || !dir->i_op->link) {
+        kfree(new_dentry);
+        return -(s64)EPERM;
+    }
+    /* Same filesystem only — link(2)'s EXDEV. */
+    if (dir->i_sb != old_dentry->d_inode->i_sb) {
+        kfree(new_dentry);
+        return -(s64)EXDEV;
+    }
+
+    err = dir->i_op->link(dir, old_dentry, new_dentry);
+    if (err < 0) {
+        kfree(new_dentry);
+        return err;
+    }
+    dcache_add(new_dentry);
+    return 0;
 }
 
 s64 vfs_lstat(const char *path, struct stat *statbuf)
@@ -882,6 +1071,36 @@ s64 vfs_fchown(file_t *file, u32 uid, u32 gid)
     if (!file || !file->f_inode) return -(s64)EBADF;
     if (uid != (u32)-1) file->f_inode->i_uid = uid;
     if (gid != (u32)-1) file->f_inode->i_gid = gid;
+    return 0;
+}
+
+/* atime/mtime as (u64)-1 means "leave unchanged" — same sentinel convention
+ * as vfs_chown()/vfs_lchown()/vfs_fchown() above for uid/gid. Callers
+ * (sys_utimensat_impl, sys_futimesat_impl, sys_utimes_impl) turn
+ * UTIME_OMIT into this sentinel and UTIME_NOW into the current wall-clock
+ * time before calling in; this function itself just sets whichever of the
+ * two the caller asked for. inode_t's timestamps are whole seconds only
+ * (no nsec fields), so sub-second precision from timespec is not kept —
+ * matches this filesystem's existing timestamp resolution everywhere else
+ * (see i_atime/i_mtime in fs/vfs.h). */
+s64 vfs_utimes(const char *path, u64 atime, u64 mtime)
+{
+    dentry_t *dentry = NULL;
+    s64 err = vfs_path_lookup(path, &dentry);
+    if (err < 0 || !dentry || !dentry->d_inode) {
+        if (dentry && !dentry->d_inode) kfree(dentry);
+        return -(s64)ENOENT;
+    }
+    if (atime != (u64)-1) dentry->d_inode->i_atime = atime;
+    if (mtime != (u64)-1) dentry->d_inode->i_mtime = mtime;
+    return 0;
+}
+
+s64 vfs_futimes(file_t *file, u64 atime, u64 mtime)
+{
+    if (!file || !file->f_inode) return -(s64)EBADF;
+    if (atime != (u64)-1) file->f_inode->i_atime = atime;
+    if (mtime != (u64)-1) file->f_inode->i_mtime = mtime;
     return 0;
 }
 

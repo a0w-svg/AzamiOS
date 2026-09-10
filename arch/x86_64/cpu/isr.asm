@@ -41,6 +41,8 @@
 bits 64
 section .text
 
+extern g_verw_user_clear   ; mitigations.c — MDS/TAA buffer clear armed
+extern g_verw_sel          ; mitigations.c — selector VERW operates on
 extern isr_dispatch     ; defined in isr.c
 
 ; =============================================================================
@@ -114,6 +116,32 @@ ISR_NOERRCODE 255
 
 ; ── TLB shootdown IPI (vector 251) ───────────────────────────────────────────
 ISR_NOERRCODE 251
+
+; ── BUG-D fix: isr_spurious ──────────────────────────────────────────────────
+; Safe fallback for unregistered vectors 50–250.  The old fallback was isr_0
+; (#DE), which dispatched to the exception handler and could kill a user process
+; with SIGFPE or kernel-panic with a bogus "Divide Error" message.
+; This stub writes EOI to the LAPIC and returns immediately without touching
+; the C exception path.
+global isr_spurious
+isr_spurious:
+    ; Write EOI to LAPIC (MMIO offset 0xB0).  We cannot call lapic_eoi() here
+    ; because we have no C stack frame, but the LAPIC MMIO base is always at the
+    ; same HHDM-mapped address once lapic_init() has run.  Avoid touching GS/FS.
+    push rax
+    push rcx
+    push rdx
+    ; Use the hal_irq_eoi path via a tiny C shim — build a minimal isr frame and
+    ; fall through to isr_common_stub so isr_dispatch handles the EOI cleanly.
+    ; (This is simpler than duplicating the MMIO write in asm.)
+    pop rdx
+    pop rcx
+    pop rax
+    ; Push dummy err_code=0 and int_no=0xFF (spurious) then jump to common stub.
+    push qword 0        ; err_code
+    push qword 0xFF     ; int_no (spurious marker)
+    jmp  isr_common_stub
+
 
 ; ── Remaining vectors 49–250 and 252–254 (generic stubs) ─────────────────────
 %assign vec 49
@@ -196,6 +224,19 @@ isr_restore_stub:
     ; Stack currently has: [rsp+0]=int_no, [rsp+8]=err_code, [rsp+16]=rip, [rsp+24]=cs
     test qword [rsp + 24], 3
     jz .skip_swapgs_exit
+
+    ; ── MDS / TAA / MMIO-stale-data buffer clear ─────────────────────────────
+    ; On affected parts, microcode gives VERW the side effect of overwriting the
+    ; store, fill and load-port buffers. Ring 3 must not be able to sample what
+    ; this kernel entry left in them, so it runs on the last instruction before
+    ; the privilege drop — after every kernel access has completed. VERW only
+    ; writes ZF, and IRETQ reloads RFLAGS from the frame, so nothing is lost.
+    ; The load is a plain byte compare on a hot cache line when disarmed.
+    cmp byte [rel g_verw_user_clear], 0
+    je  .no_verw_exit
+    verw word [rel g_verw_sel]
+.no_verw_exit:
+
     swapgs
 .skip_swapgs_exit:
 

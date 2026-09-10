@@ -56,6 +56,37 @@ AzamiOS enforces a standard Unix directory structure generated automatically dur
 
 ---
 
+## 🐧 Stock Linux Binaries
+
+AzamiOS implements the Linux `x86_64` system call ABI, so software built by an
+ordinary Linux toolchain runs **unmodified** — no recompilation against the
+AzamiOS libc, no patches, no shim layer:
+
+```sh
+make            # kernel
+make linux      # musl + a static BusyBox, built by a real Linux toolchain
+make iso && make run
+```
+
+```
+/ # busybox sh
+~ $ seq 1 10 | awk '{s+=$1} END{print s}'
+55
+```
+
+`make linux` builds musl 1.2.5 and BusyBox 1.36.1 (401 applets, statically
+linked) under `tools/linux/` and stages them into the initrd — BusyBox at
+`/bin/busybox` with its applets under `/usr/bin` and `/usr/sbin`, where they
+complement rather than shadow AzamiOS's own utilities.
+
+`make linux-test` boots a headless VM with a Linux-ABI conformance probe as
+PID 1; `scripts/linux-test.sh <binary>` does the same for any static Linux
+binary you point it at. See **[docs/LINUX-BINARIES.md](docs/LINUX-BINARIES.md)**
+for how to port your own programs and how to diagnose a syscall the kernel does
+not yet answer.
+
+---
+
 ## 📦 Userland Utilities
 
 AzamiOS ships an extensive set of POSIX shell utilities:
@@ -173,6 +204,11 @@ AzamiOS includes a fully custom freestanding C runtime (`userland/libc/`) target
 | `poll.h`, `sys/select.h` | I/O multiplexing |
 | `syslog.h` | System logging |
 | `semaphore.h` | POSIX semaphores |
+| `mqueue.h` | POSIX message queues (`mq_open`, `mq_send`/`mq_receive`, `mq_timedsend`/`mq_timedreceive`, `mq_notify`, `mq_getattr`/`mq_setattr`, `mq_unlink`) |
+| `sys/ipc.h`, `sys/shm.h`, `sys/sem.h`, `sys/msg.h` | System V (XSI) shared memory, semaphores and message queues |
+| `sys/ioprio.h` | I/O scheduling class and priority (`ioprio_set`, `ioprio_get`) |
+| `numaif.h` | NUMA memory policy (`set_mempolicy`, `get_mempolicy`, `mbind`, `migrate_pages`) |
+| `linux/futex.h` | `futex` plus the futex2 calls (`futex_wake`, `futex_wait`, `futex_requeue`, `futex_waitv`) |
 | `spawn.h` | `posix_spawn` and `posix_spawnp` |
 
 ---
@@ -228,10 +264,12 @@ make run-uefi
 ### Kernel
 
 - **Memory Management**: Physical Memory Manager (PMM), slab-based `kmalloc`, x86_64 PML4 virtual memory management with `mmap`/`munmap` support.
-- **Scheduler**: Preemptive multi-tasking with per-CPU run queues, ELF64 binary loader, POSIX threads with System V AMD64 stack alignment, and signal delivery.
+- **Scheduler**: Preemptive multi-tasking with per-CPU run queues, ELF64 binary loader, POSIX threads with System V AMD64 stack alignment, signal delivery, and job-control stop — `SIGSTOP`/`SIGTSTP` park a process instead of killing it, `SIGCONT` resumes it, and `wait4(WUNTRACED|WCONTINUED)` reports both. A process asleep inside a blocking syscall stops too, because the stop is raised through the same pending-signal test the rest of the kernel already uses for `EINTR`.
+- **Debugging and profiling**: `ptrace(2)` with `TRACEME`/`ATTACH`/`SEIZE`, syscall entry-and-exit stops, signal-delivery stops, `int3` breakpoints and `RFLAGS.TF` single-step, `PEEK`/`POKE` (which breaks a page shared with the tracee's parent rather than patching both), `GETREGS`/`SETREGS`/`GETREGSET`, and the `PTRACE_O_TRACE*` events — enough for `strace`- and `gdb`-shaped tools. `perf_event_open(2)` counts hardware events on the Intel architectural PMU or AMD's counters, plus software events (task clock, page faults, context switches) drawn from real per-process counters; sampling is not implemented and is refused rather than silently ignored. `RDPMC` is probed once at boot behind an exception fixup, so a hypervisor that enumerates a PMU it does not emulate falls back to software events instead of panicking. The result is reported in `/proc/cpuinfo`'s `azami_pmu` field.
 - **System Calls**: Linux-compatible system call ABI (`syscall` instruction, x86_64 System V AMD64 calling convention) with over 100+ registered handlers including `flock`, `fsync`, `fdatasync`, `sync`, `syncfs`, `getpgid`, `getsid`, `setreuid`, `setregid`, `setresuid`, `getresuid`, `setresgid`, `getresgid`, `getgroups`, `setgroups`, `clock_getres`, `clock_settime`, `clock_nanosleep`, and more.
 - **IPC**: Inter-process communication via pipes, shared memory, and the AzamiOS IPC message bus.
 - **Security**: Capability-based security model with POSIX ACL enforcement.
+- **CPU Extensions**: CPUID enumeration across leaves 1, 4-7, 0xB, 0xD, 0x15/0x16 and 0x8000_0001-8 (including leaf 7 subleaf 1 and AMD's 0x8000_0008 EBX), surfaced as Linux-format flag and bug lists in `/proc/cpuinfo`. What the CPU offers is then actually spent: SMEP/SMAP/UMIP/PKU/NX/FSGSBASE/PCID, XSAVE-XSAVEOPT-XSAVEC context switching (each probed before use), MONITOR/MWAIT idling, RDRAND/RDSEED entropy, SSE4.2 CRC-32C for the dentry hash, POPCNT for the physical-page bitmap, CLZERO or non-temporal stores for page clearing, and WAITPKG's TPAUSE for spin-lock backoff. Every instruction whose absence would only show up as a `#UD` is probed once at boot behind an exception fixup, so a hypervisor that advertises a feature it does not implement causes a fallback rather than a panic. The chosen paths are reported in `/proc/cpuinfo`'s `azami_hwaccel` field.
 
 ### Hardware Abstraction Layer (HAL)
 

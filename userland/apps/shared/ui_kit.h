@@ -123,8 +123,26 @@ static inline const uk_theme_palette_t *uk_get_theme_palette(unsigned int theme_
 /* ============================================================================
  * Window connection state
  * ============================================================================ */
+
+/* Where per-window private drawing buffers are mapped, one 16 MB slot each. */
+#define UK_BACKBUF_BASE  0x78000000UL
+#define UK_BACKBUF_STEP  0x01000000UL
+
+/*
+ * A window is two buffers, not one.
+ *
+ * `pixels` is where the application draws — a private buffer the compositor
+ * never looks at.  `shared` is the surface azwm composites from.  Drawing a
+ * frame takes many calls (clear, then panels, then text, then icons), and the
+ * compositor runs whenever it likes; if those calls landed straight on the
+ * shared surface, azwm would regularly composite a frame that was cleared but
+ * not yet redrawn, and the window's contents would flicker.  uk_invalidate()
+ * copies the finished frame across in one pass and only then tells azwm, so
+ * what gets composited is always a whole frame.
+ */
 typedef struct {
-    unsigned int *pixels;       /* Mapped pixel buffer                    */
+    unsigned int *pixels;       /* Private drawing buffer                 */
+    unsigned int *shared;       /* Surface the compositor reads           */
     unsigned int  width;        /* Client area width                      */
     unsigned int  height;       /* Client area height                     */
     unsigned int  wid;          /* Window ID assigned by compositor       */
@@ -633,9 +651,19 @@ static inline void uk_icon_about(uk_window_t *w, int ix, int iy)
  * IPC helpers
  * ============================================================================ */
 
-/* Send AZ_WM_INVALIDATE to the compositor */
+/*
+ * uk_invalidate() — publish the frame just drawn and tell the compositor.
+ *
+ * This is the commit point: the private buffer is copied to the shared surface
+ * as one linear pass, so azwm never composites a half-drawn window.
+ */
 static inline void uk_invalidate(uk_window_t *win)
 {
+    if (win->shared && win->pixels && win->shared != win->pixels) {
+        memcpy(win->shared, win->pixels,
+               (size_t)win->width * win->height * sizeof(unsigned int));
+    }
+
     az_wm_msg_t inv;
     memset(&inv, 0, sizeof(inv));
     inv.type = AZ_WM_INVALIDATE;
@@ -715,9 +743,30 @@ static inline int uk_window_connect(uk_window_t *win,
 
     win->wid = resp.created.assigned_wid;
 
-    /* Map pixel buffer */
+    /* Map the surface the compositor reads. */
     if (az_shmem_map((int)resp.created.shmem_id, map_addr) < 0) return -3;
-    win->pixels = (unsigned int *)map_addr;
+    win->shared = (unsigned int *)map_addr;
+    win->pixels = win->shared;
+
+    /*
+     * Then a private buffer of the same size to draw into.  Windows are laid
+     * out 16 MB apart, which is more than any client area needs and keeps a
+     * second window in the same process clear of the first.  If the
+     * allocation fails the window still works — it just draws straight to the
+     * surface, and may flicker while doing so.
+     */
+    static unsigned long s_next_backbuf = UK_BACKBUF_BASE;
+
+    size_t bytes = (size_t)w * h * sizeof(unsigned int);
+    int    pages = (int)((bytes + 4095) / 4096);
+    int    back_id = az_shmem_create(pages);
+    if (back_id >= 0) {
+        void *back = (void *)s_next_backbuf;
+        if (az_shmem_map(back_id, back) == 0) {
+            win->pixels = (unsigned int *)back;
+            s_next_backbuf += UK_BACKBUF_STEP;
+        }
+    }
 
     return 0;
 }
@@ -763,6 +812,49 @@ static inline void uk_launch_app(uk_window_t *win, const char *path)
         pl->path[j] = path[j];
     pl->path[j] = '\0';
     az_channel_send(win->server_chan, (az_ipc_msg_t *)&lmsg);
+}
+
+/*
+ * uk_move_window() — move window to absolute screen coordinates (x, y).
+ */
+static inline void uk_move_window(uk_window_t *win, int x, int y)
+{
+    if (!win) return;
+    az_wm_msg_t mmsg;
+    memset(&mmsg, 0, sizeof(mmsg));
+    mmsg.type = AZ_WM_MOVE_WINDOW;
+    mmsg.wid  = win->wid;
+    mmsg.move.x = x;
+    mmsg.move.y = y;
+    win->x = x;
+    win->y = y;
+    az_channel_send(win->server_chan, (az_ipc_msg_t *)&mmsg);
+}
+
+/*
+ * uk_window_destroy() — tell azwm to destroy the window.
+ */
+static inline void uk_window_destroy(uk_window_t *win)
+{
+    if (!win || win->wid == 0) return;
+    az_wm_msg_t dmsg;
+    memset(&dmsg, 0, sizeof(dmsg));
+    dmsg.type = AZ_WM_DESTROY_WINDOW;
+    dmsg.wid  = win->wid;
+    az_channel_send(win->server_chan, (az_ipc_msg_t *)&dmsg);
+    win->wid = 0;
+}
+
+/*
+ * uk_clear() — fill the window drawing buffer with a solid ARGB colour.
+ */
+static inline void uk_clear(uk_window_t *w, unsigned int col)
+{
+    if (!w || !w->pixels) return;
+    unsigned int total = w->width * w->height;
+    for (unsigned int i = 0; i < total; i++) {
+        w->pixels[i] = col;
+    }
 }
 
 /* ============================================================================
@@ -1091,3 +1183,155 @@ static inline void uk_draw_gauge(uk_window_t *w, int cx, int cy, int radius, int
     }
 }
 
+
+/* ============================================================================
+ * Clipboard helpers (cross-process, backed by azwm compositor)
+ * ============================================================================ */
+
+/**
+ * uk_clipboard_set() — push up to AZ_WM_CLIPBOARD_TEXT_MAX-1 bytes of @text
+ * into the system-wide clipboard.  The compositor stores it for all processes.
+ */
+static inline void uk_clipboard_set(uk_window_t *win, const char *text)
+{
+    if (!text || !win) return;
+    az_wm_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = AZ_WM_CLIPBOARD_SET;
+    az_wm_clipboard_payload_t *pl = AZ_WM_MSG_CLIPBOARD(&msg);
+    unsigned int len = 0;
+    while (text[len] && len < AZ_WM_CLIPBOARD_TEXT_MAX - 1) len++;
+    pl->len = len;
+    unsigned int i;
+    for (i = 0; i < len; i++) pl->text[i] = text[i];
+    pl->text[len] = '\0';
+    pl->reply_chan = 0;
+    az_channel_send(win->server_chan, (az_ipc_msg_t *)&msg);
+}
+
+/**
+ * uk_clipboard_get() — read the compositor's clipboard into @buf (up to
+ * @maxlen-1 bytes + NUL).  Returns bytes copied, or -1 on error.
+ */
+static inline int uk_clipboard_get(uk_window_t *win, char *buf, int maxlen)
+{
+    if (!win || !buf || maxlen <= 0) return -1;
+    az_wm_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = AZ_WM_CLIPBOARD_GET;
+    az_wm_clipboard_payload_t *pl = AZ_WM_MSG_CLIPBOARD(&msg);
+    pl->len        = 0;
+    pl->reply_chan = (unsigned int)win->client_chan;
+    if (az_channel_send(win->server_chan, (az_ipc_msg_t *)&msg) < 0) return -1;
+
+    az_wm_msg_t resp;
+    az_wm_msg_t deferred[8];
+    int def_count = 0;
+    int found = 0;
+
+    for (int it = 0; it < 32; it++) {
+        if (az_channel_recv(win->client_chan, (az_ipc_msg_t *)&resp) < 0) break;
+        if (resp.type == AZ_WM_CLIPBOARD_DATA) {
+            found = 1;
+            break;
+        }
+        if (def_count < 8) {
+            deferred[def_count++] = resp;
+        }
+    }
+
+    /* Re-inject any interleaved window events back into client_chan */
+    for (int k = 0; k < def_count; k++) {
+        az_channel_send_nb(win->client_chan, (az_ipc_msg_t *)&deferred[k]);
+    }
+
+    if (!found) return -1;
+
+    az_wm_clipboard_payload_t *rpl = AZ_WM_MSG_CLIPBOARD(&resp);
+    int copy = (int)rpl->len;
+    if (copy >= maxlen) copy = maxlen - 1;
+    int j;
+    for (j = 0; j < copy; j++) buf[j] = rpl->text[j];
+    buf[copy] = '\0';
+    return copy;
+}
+
+/* ============================================================================
+ * Toast notification helpers
+ * ============================================================================ */
+
+/**
+ * uk_draw_toast() — render a glassmorphic notification bubble in the
+ * bottom-right corner of the window.  Call once per frame while visible.
+ *
+ * @title  Short heading (accent colour)
+ * @body   Message body  (subtext colour)
+ * @alpha  0 = invisible, 255 = fully opaque (callers decrement each frame)
+ */
+static inline void uk_draw_toast(uk_window_t *w,
+                                  const char *title, const char *body,
+                                  unsigned int alpha)
+{
+    if (!w || !w->pixels || alpha == 0) return;
+    int toast_w = 280;
+    int toast_h = 64;
+    int margin  = 12;
+    int tx = (int)w->width  - toast_w - margin;
+    int ty = (int)w->height - toast_h - margin;
+    if (tx < 0) tx = 0;
+    if (ty < 0) ty = 0;
+    unsigned int bg = 0xFF1E1E2E;
+    uk_fill_rounded_rect(w, tx, ty, toast_w, toast_h, 10, bg);
+    /* Specular top-edge highlight */
+    int px;
+    for (px = tx + 10; px < tx + toast_w - 10; px++) {
+        if (px >= 0 && (unsigned int)px < w->width &&
+            ty >= 0 && (unsigned int)ty < w->height) {
+            unsigned int *p = &w->pixels[(unsigned int)ty * w->width + (unsigned int)px];
+            *p = uk_blend(*p, 0xFFFFFFFF, 0x28);
+        }
+    }
+    uk_fill_rect(w, tx, ty + 10, 3, toast_h - 20, UK_MAUVE);
+    uk_fill_circle(w, tx + 18, ty + 20, 7, UK_MAUVE);
+    uk_fill_circle(w, tx + 18, ty + 20, 4, bg);
+    uk_fill_rect(w, tx + 16, ty + 26, 5, 3, UK_MAUVE);
+    if (title && title[0])
+        uk_draw_text_clip(w, tx + 34, ty + 10, title, UK_MAUVE, toast_w - 40);
+    uk_fill_rect(w, tx + 34, ty + 28, toast_w - 42, 1, UK_SURFACE1);
+    if (body && body[0])
+        uk_draw_text_clip(w, tx + 34, ty + 34, body, UK_SUBTEXT1, toast_w - 42);
+    uk_draw_text(w, tx + toast_w - 16, ty + 6, "x", UK_OVERLAY0);
+    uk_draw_rounded_rect_outline(w, tx, ty, toast_w, toast_h, 10, UK_SURFACE1);
+    if (alpha < 255) {
+        unsigned int total = w->width * w->height;
+        for (unsigned int i = 0; i < total; i++) {
+            unsigned int c = w->pixels[i];
+            unsigned int ca = (c >> 24) & 0xFF;
+            if (ca > 0) {
+                unsigned int na = (ca * alpha) / 255;
+                w->pixels[i] = (na << 24) | (c & 0x00FFFFFF);
+            }
+        }
+    }
+}
+
+/**
+ * uk_notify() — broadcast AZ_WM_NOTIFY so notifyd renders a toast overlay.
+ */
+static inline void uk_notify(uk_window_t *win,
+                              const char *title, const char *body)
+{
+    if (!win) return;
+    az_wm_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = AZ_WM_NOTIFY;
+    az_wm_notify_payload_t *pl = AZ_WM_MSG_NOTIFY(&msg);
+    int i;
+    for (i = 0; title && title[i] && i < AZ_WM_NOTIFY_TITLE_MAX - 1; i++)
+        pl->title[i] = title[i];
+    pl->title[i] = '\0';
+    for (i = 0; body && body[i] && i < AZ_WM_NOTIFY_BODY_MAX - 1; i++)
+        pl->body[i] = body[i];
+    pl->body[i] = '\0';
+    az_channel_send(win->server_chan, (az_ipc_msg_t *)&msg);
+}

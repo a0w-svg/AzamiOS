@@ -10,6 +10,8 @@
 #   make gdb        — attach GDB to a waiting run-debug instance
 #   make clean      — remove all build artefacts
 #   make iso        — build bootable ISO image (requires xorriso + limine)
+#   make linux      — build stock Linux binaries (musl + BusyBox) for the initrd
+#   make linux-test — boot a headless VM and run the Linux-ABI probe
 # ==============================================================================
 
 # ── Toolchain ─────────────────────────────────────────────────────────────────
@@ -19,6 +21,18 @@ LD    := $(CROSS_PREFIX)ld
 AR    := $(CROSS_PREFIX)ar
 GDB   := $(CROSS_PREFIX)gdb
 NASM  := nasm
+
+# ── Parallel build ───────────────────────────────────────────────────────────
+# Compile across all host CPUs by default (recursive sub-makes inherit this).
+# `make -j1` on the command line still wins (last -j takes effect), and
+# `make PARALLEL=0` disables it entirely for clean serial logs.
+# The recipe graph is parallel-safe: per-object compiles are independent, and
+# the multi-step recipes (iso:, hdd.img:) run their own steps sequentially.
+PARALLEL ?= 1
+ifeq ($(PARALLEL),1)
+NPROC := $(shell nproc 2>/dev/null || echo 4)
+MAKEFLAGS += -j$(NPROC)
+endif
 
 # ── Build directories ─────────────────────────────────────────────────────────
 BUILD_DIR := build
@@ -42,9 +56,17 @@ CFLAGS := \
     -Wextra \
     -Wshadow \
     -Wno-unused-parameter \
-    -O2 \
+    -O3 \
     -g \
     -fno-omit-frame-pointer \
+    -fno-strict-aliasing \
+    -fno-delete-null-pointer-checks \
+    -ffunction-sections \
+    -fdata-sections \
+    -falign-functions=16 \
+    -falign-loops=16 \
+    -falign-jumps=16 \
+    -pipe \
     -I. \
     -Iinclude \
     -Iarch/x86_64 \
@@ -54,9 +76,17 @@ LDFLAGS := \
     -T scripts/kernel.ld \
     -nostdlib \
     --no-warn-rwx-segments \
-    -z max-page-size=0x1000
+    -z max-page-size=0x1000 \
+    --gc-sections
 
 NASM_FLAGS := -f elf64 -g -F dwarf
+
+# Header dependency tracking. Without it a change to a header rebuilds nothing,
+# and the link happily mixes objects compiled against different versions of the
+# same struct — a silently corrupt kernel rather than a build error. -MMD emits
+# a .d file next to each object listing the headers it read; -MP adds phony
+# targets so deleting a header does not wedge the build.
+CFLAGS += -MMD -MP
 
 # ── Source files ──────────────────────────────────────────────────────────────
 
@@ -66,17 +96,24 @@ BOOT_ASM_SRCS := arch/x86_64/boot/entry.asm
 # Architecture C sources
 ARCH_C_SRCS := \
     arch/x86_64/boot/limine_req.c \
+    arch/x86_64/cpu/cpu.c \
+    arch/x86_64/cpu/hwaccel.c \
+    arch/x86_64/cpu/pmu.c \
+    arch/x86_64/cpu/mitigations.c \
+    arch/x86_64/cpu/mce.c \
     arch/x86_64/cpu/gdt.c \
     arch/x86_64/cpu/idt.c \
     arch/x86_64/cpu/pic.c \
     arch/x86_64/cpu/lapic.c \
     arch/x86_64/cpu/smp.c \
-    arch/x86_64/mm/vmm.c
+    arch/x86_64/mm/vmm.c \
+    arch/x86_64/mm/tlb.c
 
 # Architecture ASM sources
 ARCH_ASM_SRCS := \
     arch/x86_64/cpu/gdt_flush.asm \
     arch/x86_64/cpu/isr.asm \
+    arch/x86_64/cpu/hwprobe.asm \
     arch/x86_64/cpu/switch_to.asm \
     arch/x86_64/syscall/syscall_entry.asm \
     arch/x86_64/lib/uaccess.asm
@@ -86,6 +123,9 @@ KERNEL_C_SRCS := \
     kernel/main.c \
     kernel/panic.c \
     kernel/signal.c \
+    kernel/ptrace.c \
+    kernel/perf/perf.c \
+    kernel/perf/ktrace.c \
     kernel/lib/string.c \
     kernel/lib/random.c \
     kernel/mm/pmm.c \
@@ -95,6 +135,10 @@ KERNEL_C_SRCS := \
     kernel/sched/sched.c \
     kernel/sched/elf.c \
     kernel/ipc/ipc.c \
+    kernel/ipc/sysvipc.c \
+    kernel/ipc/mqueue.c \
+    kernel/ipc/posix_sem.c \
+    kernel/ktimer.c \
     kernel/security/security.c \
     kernel/object/object.c \
     fs/vfs.c \
@@ -109,6 +153,7 @@ KERNEL_C_SRCS := \
     drivers/block/block.c \
     drivers/block/ata.c \
     drivers/block/ahci.c \
+    drivers/block/nvme.c \
     drivers/input/input.c \
     drivers/char/uart.c \
     drivers/char/console.c \
@@ -130,7 +175,28 @@ KERNEL_C_SRCS := \
     drivers/video/virtio_gpu.c \
     drivers/video/virtio_gpu_cmd.c \
     drivers/video/fbdev.c \
-    drivers/video/drm.c \
+    drivers/base/core.c \
+    drivers/base/bus.c \
+    drivers/base/platform.c \
+    drivers/base/pci_bus.c \
+    drivers/base/uevent.c \
+    drivers/gpu/drm/drm_mode.c \
+    drivers/gpu/drm/drm_gem.c \
+    drivers/gpu/drm/drm_ioctl.c \
+    drivers/gpu/drm/drm_drv.c \
+    drivers/gpu/drm/drm_vblank.c \
+    drivers/gpu/drm/bochs_drv.c \
+    drivers/gpu/drm/vmwgfx_drv.c \
+    drivers/gpu/drm/simpledrm.c \
+    drivers/gpu/drm/virtgpu_drm.c \
+    drivers/input/virtio_input.c \
+    drivers/char/virtio_console.c \
+    drivers/net/ne2k_pci.c \
+    drivers/watchdog/i6300esb.c \
+    drivers/input/evdev.c \
+    drivers/i2c/i2c-core.c \
+    drivers/i2c/i2c-i801.c \
+    drivers/misc/virtio_balloon.c \
     hal/virtio_pci.c \
     hal/virtqueue.c \
     kernel/net/net.c \
@@ -141,10 +207,12 @@ KERNEL_C_SRCS := \
     kernel/net/udp.c \
     kernel/net/tcp.c \
     kernel/net/socket.c \
+    kernel/net/unix_socket.c \
     kernel/net/dhcp.c \
     fs/pipe.c \
     fs/fat32.c \
     fs/procfs.c \
+    fs/tmpfs.c \
     kernel/security/acl.c \
     drivers/misc/virtio_rng.c \
     drivers/net/pcnet.c \
@@ -154,6 +222,7 @@ KERNEL_C_SRCS := \
     drivers/block/loop.c \
     fs/sysfs.c \
     fs/devpts.c \
+    fs/squashfs/squashfs.c \
     drivers/char/pty.c
 
 # ── Object file lists ─────────────────────────────────────────────────────────
@@ -168,6 +237,12 @@ ALL_OBJS := \
     $(ARCH_A_OBJS) \
     $(KERN_OBJS)
 
+# Generated by -MMD; each one names the headers its object depends on. They are
+# pulled in at the very bottom of this file: an `include` contributes rules, and
+# the first rule make sees sets the default goal — including them here would
+# make a stray .o the default target instead of `all`.
+DEPFILES := $(ALL_OBJS:.o=.d)
+
 # ── Userspace (unchanged from original; just kept so `make run` still
 #    can build initrd if desired) ──────────────────────────────────────────────
 UTIL_LIST := ls help cat write time clear ifconfig ping arp lsmod reload cpu \
@@ -176,9 +251,12 @@ UTIL_LIST := ls help cat write time clear ifconfig ping arp lsmod reload cpu \
 UTIL_TARGETS := $(foreach u,$(UTIL_LIST),userland/apps/$(u)/$(u))
 
 # ── Primary targets ───────────────────────────────────────────────────────────
-.PHONY: all run run-debug gdb iso clean userspace doc
+.PHONY: all run run-debug gdb iso clean userspace doc \
+        linux linux-install linux-test linux-clean
 
-all: doc $(KERNEL_ELF) hdd.img
+# `doc` regenerates docs/*.md from source comments; it is not a build input, so
+# it is no longer a prerequisite of `all` (run `make doc` to refresh it).
+all: $(KERNEL_ELF) hdd.img
 
 $(KERNEL_ELF): $(ALL_OBJS)
 	@mkdir -p $(dir $@)
@@ -202,12 +280,23 @@ $(OBJ_DIR)/%.o: %.asm
 
 # ── QEMU run targets ──────────────────────────────────────────────────────────
 QEMU := qemu-system-x86_64
-DISPLAY_FLAG ?= 
+DISPLAY_FLAG ?=
+
+# Acceleration. KVM is ~10-20x faster than emulation but needs /dev/kvm access
+# (`sudo usermod -aG kvm $$USER`, then re-login). If it is readable we use it
+# with the host CPU model; otherwise we fall back to multi-threaded TCG, which
+# still spreads the guest's 4 vCPUs across host cores.
+ifeq ($(shell test -r /dev/kvm && test -w /dev/kvm && echo y),y)
+  QEMU_ACCEL ?= -enable-kvm -cpu host
+else
+  QEMU_ACCEL ?= -accel tcg,thread=multi,tb-size=512 -cpu max,+rdrand,+rdseed
+endif
+
 QEMU_FLAGS := \
     -M q35 \
     -m 1536M \
     -smp 4 \
-    -cpu max,+rdrand,+rdseed \
+    $(QEMU_ACCEL) \
     -serial stdio \
     -vga std \
     $(DISPLAY_FLAG) \
@@ -259,7 +348,21 @@ iso: $(KERNEL_ELF) | tools/limine
 	@mkdir -p $(BUILD_DIR)/iso_root/boot/limine
 	@mkdir -p $(BUILD_DIR)/iso_root/EFI/BOOT
 	@$(MAKE) -C userland ARCH=x86_64 >/dev/null
-	@mke2fs -F -t ext2 -b 4096 -d userland/build $(BUILD_DIR)/initrd.ext2 200M
+	@scripts/check_uapi_sync.sh
+	@# Strip userland binaries for a smaller/faster-loading initrd.
+	@# Off by default (adds a few seconds); enable with `make iso STRIP_INITRD=1`.
+	@if [ "$(STRIP_INITRD)" = "1" ]; then \
+	   before=$$(du -sm userland/build | cut -f1); \
+	   find userland/build -type f ! -name '*.a' ! -name '*.o' -exec sh -c \
+	     'for f; do $(CROSS_PREFIX)strip --strip-unneeded "$$f" 2>/dev/null || true; done' _ {} + ; \
+	   after=$$(du -sm userland/build | cut -f1); \
+	   echo "  ↓  Stripped userland binaries: $${before}M -> $${after}M"; \
+	 fi
+	@$(MAKE) --no-print-directory linux-install
+	@rm -f $(BUILD_DIR)/initrd.ext2
+	@sz=$$(du -sm userland/build | cut -f1); sz=$$((sz + sz/8 + 16)); \
+	 echo "  ↓  Building initrd.ext2 ($${sz}M for $$(du -sh userland/build | cut -f1) of content)"; \
+	 mke2fs -q -F -t ext2 -b 4096 -d userland/build $(BUILD_DIR)/initrd.ext2 $${sz}M
 
 
 
@@ -293,6 +396,33 @@ iso: $(KERNEL_ELF) | tools/limine
 	fi
 	@echo "  ✓  ISO: $(BUILD_DIR)/AzamiOS.iso"
 
+# ── Stock Linux userland ─────────────────────────────────────────────────────
+# AzamiOS implements the Linux x86_64 syscall ABI, so software built by an
+# ordinary Linux toolchain runs unmodified. `make linux` builds musl and a
+# static BusyBox and leaves them in tools/linux/out; the next `make iso` picks
+# them up automatically. See docs/LINUX-BINARIES.md.
+linux:
+	@$(MAKE) -C tools/linux
+
+# Called from `iso`. A no-op until `make linux` has been run, so the ISO build
+# never depends on a network fetch.
+linux-install:
+	@if [ -x tools/linux/out/bin/busybox ]; then \
+	    $(MAKE) --no-print-directory -C tools/linux install \
+	        DESTDIR=$(CURDIR)/userland/build; \
+	 fi
+
+# Boot headless with the Linux-ABI probe as PID 1 and print its verdict. This
+# is the regression test for the ABI itself: it exercises the parts of the
+# kernel only a stock-libc binary reaches (auxv layout, TLS setup,
+# CLONE_CHILD_CLEARTID, link counts) and reports pass/fail counts on serial.
+linux-test: $(KERNEL_ELF)
+	@$(MAKE) --no-print-directory -C tools/linux probe
+	@scripts/linux-test.sh
+
+linux-clean:
+	@$(MAKE) -C tools/linux clean
+
 hdd.img:
 	@echo "  ↓  Generating persistent storage disk (hdd.img)..."
 	@mkdir -p hdd_root
@@ -304,12 +434,13 @@ hdd.img:
 userland/libc/libc.a:
 	$(MAKE) -C userland/libc ARCH=x86_64
 
-userland/apps/shell/shell: userland/libc/libc.a
-	$(MAKE) -C userland/apps/shell ARCH=x86_64
-
-userspace: userland/apps/shell/shell
+userspace:
+	$(MAKE) -C userland ARCH=x86_64
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
 	rm -rf $(BUILD_DIR) kernel.log
 	@echo "  ✓  Build directory cleaned"
+
+# ── Header dependencies (must stay last; see DEPFILES above) ─────────────────
+-include $(DEPFILES)

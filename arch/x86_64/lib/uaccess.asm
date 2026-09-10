@@ -26,9 +26,11 @@ copy_from_user:
     mov rax, rsi
     add rax, rdx
     jc .fail                 ; Overflow wrap-around
-    mov rcx, 0x00007FFFFFFFFFFF
+    ; BUG-O fix: exclusive upper bound is 0x0000800000000000; use jae (above-or-equal)
+    ; so a single byte at 0x00007FFFFFFFFFFF is also rejected correctly.
+    mov rcx, 0x0000800000000000
     cmp rax, rcx
-    ja .fail                 ; Above user space boundary
+    jae .fail                ; At or above user space boundary
 
     mov rcx, rdx
 
@@ -59,11 +61,15 @@ copy_from_user:
     ret
 
 .fault_fixup:
-    ; If fault occurred with SMAP active, ensure EFLAGS.AC is cleared
+    ; Close the SMAP window before anything else, so an NMI/#MC landing between
+    ; the fault and this fixup cannot run with AC=1. CLAC is #UD on a CPU
+    ; without SMAP, though, so it stays behind the same guard as the STAC that
+    ; opened the window — an unconditional CLAC here turned a recoverable user
+    ; fault into a kernel panic on any pre-Broadwell part.
     cmp byte [rel g_smap_enabled], 0
-    je .fixup_done
+    je .ff_done
     clac
-.fixup_done:
+.ff_done:
     mov rax, rcx
     ret
 
@@ -80,9 +86,10 @@ copy_to_user:
     mov rax, rdi
     add rax, rdx
     jc .fail
-    mov rcx, 0x00007FFFFFFFFFFF
+    ; BUG-O fix: exclusive upper bound is 0x0000800000000000; use jae (above-or-equal).
+    mov rcx, 0x0000800000000000
     cmp rax, rcx
-    ja .fail
+    jae .fail
 
     mov rcx, rdx
 
@@ -113,10 +120,12 @@ copy_to_user:
     ret
 
 .fault_fixup:
+    ; Same reasoning as copy_from_user.fault_fixup: guard the CLAC, it is #UD
+    ; when the CPU has no SMAP.
     cmp byte [rel g_smap_enabled], 0
-    je .fixup_done
+    je .ff_done
     clac
-.fixup_done:
+.ff_done:
     mov rax, rcx
     ret
 

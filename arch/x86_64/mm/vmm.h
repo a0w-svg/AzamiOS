@@ -27,6 +27,7 @@
 
 #include "../../../include/azami/types.h"
 #include "../../../include/azami/defs.h"
+#include "../cpu/mitigations.h"
 
 /* ── PTE flag bits ─────────────────────────────────────────────────────────── */
 #define VMM_F_PRESENT   (1ULL << 0)
@@ -39,7 +40,24 @@
 #define VMM_F_HUGE      (1ULL << 7)
 #define VMM_F_GLOBAL    (1ULL << 8)
 #define VMM_F_SHARED    (1ULL << 9)
+/* Software-only COW marker: this PTE shares a physical frame with at least one
+ * other mapping. On a write fault the page-fault handler copies the frame and
+ * promotes the copy to writable. Sits in available PTE bit 10 — the hardware
+ * ignores all of bits 9–11 on leaf 4-KiB PTEs. */
+#define VMM_F_COW       (1ULL << 10)
 #define VMM_F_NX        (1ULL << 63)
+
+/* Memory-protection keys (CR4.PKE). Bits 62:59 of a leaf PTE name one of 16
+ * keys; PKRU then gates read/write access per key for user-accessible pages.
+ * VMM_F_PKEY_SET is an internal marker on the *flags argument* of
+ * vmm_set_flags(), not a hardware bit: it distinguishes "apply the key in bits
+ * 62:59" (pkey_mprotect) from "leave whatever key the page already has"
+ * (plain mprotect), including the case of assigning key 0. It is stripped
+ * before the PTE is written. */
+#define VMM_PKEY_SHIFT  59
+#define VMM_PKEY_MASK   (0xFULL << VMM_PKEY_SHIFT)
+#define VMM_F_PKEY(k)   (((u64)(k) & 0xF) << VMM_PKEY_SHIFT)
+#define VMM_F_PKEY_SET  (1ULL << 58)
 
 /* Mask to extract the physical address from a PTE (bits 12–51). */
 #define VMM_PHYS_MASK   0x000FFFFFFFFFF000ULL
@@ -81,6 +99,21 @@ typedef phys_addr_t vmm_space_t;
 void vmm_init(u64 hhdm_base, u64 phys_base, u64 virt_base, void *memmap);
 
 /**
+ * vmm_unmap_range(space, virt, count, free_frames) — Tear down `count`
+ * consecutive 4 KB mappings starting at `virt`.
+ *
+ * Prefer this over a loop of vmm_unmap_get(): each unmap that removes a live
+ * translation owes the other CPUs a TLB shootdown, and doing that once per page
+ * turns unmapping a large region into thousands of IPI round-trips. This
+ * batches the page-table edits and pays for one shootdown per chunk.
+ *
+ * With `free_frames` set, a page whose old PTE was user-owned and not
+ * VMM_F_SHARED is returned to the PMM — after the shootdown, never before.
+ * Returns the number of frames freed.
+ */
+size_t vmm_unmap_range(vmm_space_t space, virt_addr_t virt, size_t count, bool free_frames);
+
+/**
  * vmm_map(space, virt, phys, flags) — Map one 4 KB page.
  *
  * Creates intermediate page table levels as needed (allocating from PMM).
@@ -96,6 +129,12 @@ int vmm_map(vmm_space_t space, virt_addr_t virt, phys_addr_t phys, u64 flags);
  * vmm_unmap(space, virt) — Unmap one 4 KB page and invalidate the TLB entry.
  */
 void vmm_unmap(vmm_space_t space, virt_addr_t virt);
+
+/**
+ * vmm_unmap_get(space, virt) — Clear the leaf PTE, flush TLB, and return the
+ * previous PTE value (containing physical address and flags). Returns 0 if unmapped.
+ */
+u64 vmm_unmap_get(vmm_space_t space, virt_addr_t virt);
 
 /**
  * vmm_translate(space, virt) → physical address, or 0 if not mapped.
@@ -135,9 +174,22 @@ void vmm_destroy_space(vmm_space_t space);
 
 /**
  * vmm_switch(space) — Load the given PML4 into CR3 (switches address space).
+ *
+ * Where the Spectre-v2 policy calls for it (no enhanced IBRS on this part), an
+ * address-space change is also the boundary at which the indirect-branch
+ * predictor must be flushed, so the outgoing process cannot steer the
+ * incoming one's indirect branches. The check is a byte load against a global
+ * the branch predictor learns immediately, so a machine that does not need the
+ * barrier pays nothing for the test — which is why the CR3 read that the
+ * barrier needs sits *inside* the guarded path.
  */
 static inline void vmm_switch(vmm_space_t space)
 {
+    if (__builtin_expect(g_ibpb_on_switch != 0, 0)) {
+        u64 prev;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(prev));
+        mitigations_switch_mm(prev & ~0xFFFULL, (u64)space & ~0xFFFULL);
+    }
     __asm__ volatile("mov %0, %%cr3" : : "r"((u64)space) : "memory");
 }
 
@@ -152,3 +204,25 @@ void *vmm_map_io(phys_addr_t phys, size_t size);
  * Used by sys_mprotect.
  */
 int vmm_set_flags(vmm_space_t space, virt_addr_t virt, size_t count, u64 flags);
+
+/**
+ * vmm_cow_fault(space, virt) — Handle a copy-on-write write fault.
+ *
+ * Called from the #PF handler when: (a) the fault is a write to a non-writable
+ * page, (b) the page has VMM_F_COW set, and (c) vma_probe() confirms the VMA
+ * is writable. If the physical frame's refcount drops to 1 the page is promoted
+ * writable in-place; otherwise a private copy is made.
+ *
+ * Returns 0 on success, -ENOMEM if no frame could be allocated.
+ */
+int vmm_cow_fault(vmm_space_t space, virt_addr_t virt);
+
+/**
+ * vmm_page_ref_inc(phys) / vmm_page_ref_dec(phys) — Manage the per-frame
+ * reference counter used by the COW implementation.
+ *
+ * Both are exported so vmm_clone_space() can bump counts from vmm.c and
+ * higher-level code can inspect them if needed.
+ */
+void vmm_page_ref_inc(phys_addr_t phys);
+uint16_t vmm_page_ref_dec(phys_addr_t phys);

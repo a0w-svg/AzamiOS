@@ -27,6 +27,7 @@
 
 #include "ahci.h"
 #include "block.h"
+#include "../misc/hpet.h"
 #include "../../include/azami/defs.h"
 #include "../../include/azami/types.h"
 #include "../../kernel/mm/kmalloc.h"
@@ -118,6 +119,21 @@ static void port_start(ahci_port_t *p)
 
 /* ── Issue the command in slot 0 and wait for completion ────────────────── */
 
+/* Bring a wedged port back to a usable state: stop the engine (which drops any
+ * command the HBA still thinks is outstanding and clears its CI shadow), scrub
+ * latched error/interrupt status, restart. Without this one transient error
+ * leaves the port BSY forever and every subsequent I/O eats the full WAIT_LONG
+ * timeout with the drive lock held. */
+static void port_recover(ahci_drive_t *d)
+{
+    ahci_port_t *p = d->port;
+    port_stop(p);
+    mw(&p->serr, 0xFFFFFFFFu);
+    mw(&p->is,   0xFFFFFFFFu);
+    port_start(p);
+    wait_bits(&p->tfd, AHCI_PxTFD_BSY | AHCI_PxTFD_DRQ, 0, WAIT_SHORT);
+}
+
 static int port_run_slot0(ahci_drive_t *d)
 {
     ahci_port_t *p = d->port;
@@ -127,8 +143,10 @@ static int port_run_slot0(ahci_drive_t *d)
     mw(&p->is, 0xFFFFFFFFu);
 
     /* Device must not be BSY/DRQ before we hand it a new command. */
-    if (wait_bits(&p->tfd, AHCI_PxTFD_BSY | AHCI_PxTFD_DRQ, 0, WAIT_LONG) != 0)
+    if (wait_bits(&p->tfd, AHCI_PxTFD_BSY | AHCI_PxTFD_DRQ, 0, WAIT_LONG) != 0) {
+        port_recover(d);
         return -(s64)EIO;
+    }
 
     mw(&p->ci, 1u);
 
@@ -138,12 +156,14 @@ static int port_run_slot0(ahci_drive_t *d)
         if (is & AHCI_PxIS_ERR_MASK) {
             mw(&p->is, is);
             mw(&p->serr, 0xFFFFFFFFu);
+            port_recover(d);
             return -(s64)EIO;
         }
         if ((ci & 1u) == 0) return 0;
         cpu_pause();
     }
-    return -(s64)EIO;   /* timed out — leave the port for the next reset */
+    port_recover(d);           /* timed out — don't leave the port wedged */
+    return -(s64)EIO;
 }
 
 /* ── Build the slot-0 command (FIS + single-entry PRDT) ─────────────────── */
@@ -211,7 +231,7 @@ static s64 ahci_rw(ahci_drive_t *d, u64 lba, u32 count, void *buf, int write)
     }
 
     spinlock_unlock_irqrestore(&d->lock, f);
-    return (s64)(count * 512);
+    return (s64)count * 512;   /* widen before *512 — count*512 overflows u32 at 2^23 sectors */
 }
 
 static s64 ahci_read_sectors(block_dev_t *bd, u64 lba, u32 count, void *buf)
@@ -270,13 +290,25 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no)
 {
     if (g_drive_count >= AHCI_MAX_DRIVES) return;
 
-    /* Wait for SATA PHY link (DET reaches 3). After an HBA reset this takes a
-     * few ms of COMRESET/COMWAKE negotiation, so an empty slot must be given
-     * that grace period before being written off. */
+    /* Wait for SATA PHY link (DET reaches 3). After an HBA reset a populated
+     * port takes a few ms of COMRESET/COMWAKE negotiation; an *empty* port
+     * reports DET==0 immediately, so bail fast once we've seen a stable 0 and
+     * only spin the long budget while negotiation is actually in progress. */
     u32 ssts = 0;
+    bool have_hpet = hpet_available();
+    u64 t0 = have_hpet ? hpet_now_ns() : 0;
     for (u32 i = 0; i < WAIT_SHORT; i++) {
         ssts = mr(&port->ssts);
-        if ((ssts & 0x0F) == 3) break;
+        u32 det = ssts & 0x0F;
+        if (det == 3) break;                   /* device present + PHY up */
+        /* det==1 means a device is there but the PHY hasn't finished
+         * negotiating — keep the full budget for that. A genuinely empty slot
+         * sits at det==0; give it a real ~15 ms grace (wall-clock when HPET is
+         * up, iteration count otherwise) before writing it off. */
+        if (det == 0) {
+            if (have_hpet) { if (hpet_now_ns() - t0 > 15000000ULL) return; }
+            else if (i > 200000) return;
+        }
         cpu_pause();
     }
     if ((ssts & 0x0F) != 3 || ((ssts >> 8) & 0x0F) != 1) return;   /* no device */
@@ -345,7 +377,16 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no)
     return;
 
 fail:
-    port_stop(port);
+    /* The DMA page we are about to free backs the command list and the received
+     * FIS area. If the engine did not actually stop (misbehaving device —
+     * port_stop returns non-zero), the HBA would keep DMAing FISes into a page
+     * the PMM has handed to someone else. Force FRE/ST down and detach the
+     * clb/fb pointers before releasing the page. */
+    if (port_stop(port) != 0) {
+        mw(&port->cmd, mr(&port->cmd) & ~(HBA_PxCMD_ST | HBA_PxCMD_FRE));
+    }
+    mw(&port->clb,  0);  mw(&port->clbu, 0);
+    mw(&port->fb,   0);  mw(&port->fbu,  0);
     pmm_free_page(d->page_phys);
     pmm_free_pages(d->bounce_phys, AHCI_BOUNCE_PAGES);
 }

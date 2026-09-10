@@ -16,7 +16,7 @@ static void panic_print_uint(unsigned long long v)
     buf[i] = '\0';
     if (v == 0) { kputc('0'); return; }
     while (v && i > 0) { buf[--i] = '0' + (int)(v % 10); v /= 10; }
-    kprintf(buf + i);
+    kprintf("%s", buf + i);
 }
 
 /* Minimal unsigned-integer → hex string helper. */
@@ -32,7 +32,7 @@ static void panic_print_hex(unsigned long long v, int min_digits)
         v >>= 4;
         if (min_digits > 0) min_digits--;
     }
-    kprintf(buf + i);
+    kprintf("%s", buf + i);
 }
 
 __noreturn void kernel_panic(const char *fmt, ...)
@@ -68,7 +68,10 @@ __noreturn void kernel_panic(const char *fmt, ...)
         switch (*p) {
         case 's': {
             const char *s = va_arg(ap, const char *);
-            kprintf(s ? s : "(null)");
+            /* Must go through %s: a panic argument that happens to contain a
+             * '%' would otherwise be re-interpreted as a format string and
+             * consume varargs that were never passed. */
+            kprintf("%s", s ? s : "(null)");
             break;
         }
         case 'u':

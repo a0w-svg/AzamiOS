@@ -41,7 +41,6 @@ typedef struct {
 static lpt_port_t g_lpt1 = { .port = LPT1_PORT, .irq = 7, .lock = SPINLOCK_INIT };
 static lpt_port_t g_lpt2 = { .port = LPT2_PORT, .irq = 5, .lock = SPINLOCK_INIT };
 
-extern void idt_register_irq(u8 vector, void (*fn)(pt_regs_t *, void *), void *ctx);
 
 static void lpt_send_byte(lpt_port_t *p, u8 data)
 {

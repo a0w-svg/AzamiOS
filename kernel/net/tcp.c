@@ -6,7 +6,7 @@
  * sequence number tracking, sliding window buffers, listen backlog, and teardown.
  * ============================================================================ */
 
-#define DEBUG 1
+#define DEBUG 0
 #include "../../include/azami/debug.h"
 #include "../../include/azami/defs.h"
 #include "../../include/azami/net.h"
@@ -43,53 +43,45 @@ void tcp_init(void)
     pr_debug("[TCP] Full TCP 11-state protocol engine initialized.\n");
 }
 
-u16 tcp_checksum(const tcp_hdr_t *tcp, const ipv4_hdr_t *ip, const void *payload, size_t payload_len)
+/*
+ * The TCP checksum covers the whole header — options included — and the
+ * pseudo-header length is the whole segment, so `header_len` has to come from
+ * the caller rather than being assumed to be sizeof(tcp_hdr_t).
+ *
+ * It was assumed.  Every SYN and SYN-ACK a real peer sends carries options
+ * (an MSS announcement at minimum, so 24 bytes of header), and the four
+ * option bytes fell outside both the sum and the length in the pseudo-header.
+ * The result never matched, so every one of those segments was dropped as
+ * corrupt and no connection could be established in either direction.
+ *
+ * header_len is validated by the caller against the bytes actually present;
+ * it is clamped here so a short value cannot shrink the header below the
+ * fixed fields.
+ */
+u16 tcp_checksum(const tcp_hdr_t *tcp, const ipv4_hdr_t *ip, size_t header_len,
+                 const void *payload, size_t payload_len)
 {
-    tcp_pseudo_hdr_t pseudo;
-    memcpy(pseudo.src_ip, ip->src_ip, 4);
-    memcpy(pseudo.dst_ip, ip->dst_ip, 4);
-    pseudo.zero = 0;
-    pseudo.protocol = IP_PROTO_TCP;
-    pseudo.tcp_length = htons((u16)(sizeof(tcp_hdr_t) + payload_len));
+    if (header_len < sizeof(tcp_hdr_t)) header_len = sizeof(tcp_hdr_t);
 
-    u32 sum = 0;
-    const u16 *ptr;
-    size_t len;
+    u8 pseudo[12];
+    memcpy(pseudo + 0, ip->src_ip, 4);
+    memcpy(pseudo + 4, ip->dst_ip, 4);
+    pseudo[8] = 0;
+    pseudo[9] = IP_PROTO_TCP;
+    u16 tcp_len = htons((u16)(header_len + payload_len));
+    memcpy(pseudo + 10, &tcp_len, 2);
 
-    /* 1. Sum pseudo header */
-    ptr = (const u16 *)&pseudo;
-    len = sizeof(tcp_pseudo_hdr_t);
-    while (len > 1) {
-        sum += *ptr++;
-        len -= 2;
+    /* The caller must have zeroed tcp->checksum; it is covered by the sum.
+     * A header of odd length would misalign the payload words, but the 4-bit
+     * data offset counts 32-bit words, so header_len is always a multiple
+     * of four. */
+    u32 sum = net_checksum_partial(pseudo, sizeof(pseudo), 0);
+    sum = net_checksum_partial(tcp, header_len, sum);
+    if (payload && payload_len) {
+        sum = net_checksum_partial(payload, payload_len, sum);
     }
 
-    /* 2. Sum TCP header */
-    ptr = (const u16 *)tcp;
-    len = sizeof(tcp_hdr_t);
-    while (len > 1) {
-        sum += *ptr++;
-        len -= 2;
-    }
-
-    /* 3. Sum payload data */
-    ptr = (const u16 *)payload;
-    len = payload_len;
-    while (len > 1) {
-        sum += *ptr++;
-        len -= 2;
-    }
-    if (len > 0) {
-        sum += *(const u8 *)ptr;
-    }
-
-    /* Fold to 16 bits */
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-
-    u16 res = (u16)(~sum);
-    return res == 0 ? 0xFFFF : res;
+    return net_checksum_fold(sum);
 }
 
 static s64 tcp_send_packet(tcp_sock_t *sock, u8 flags, const void *payload, size_t payload_len)
@@ -117,18 +109,9 @@ static s64 tcp_send_packet(tcp_sock_t *sock, u8 flags, const void *payload, size
         memcpy(pdata, payload, payload_len);
     }
 
-    /* 3. Compute TCP Checksum */
-    u8 host_ip[4];
-    net_get_ip(host_ip);
-    ipv4_hdr_t pseudo_ip;
-    if (sock->remote_ip[0] == 127) {
-        static const u8 loop_ip[4] = { 127, 0, 0, 1 };
-        memcpy(pseudo_ip.src_ip, loop_ip, 4);
-    } else {
-        memcpy(pseudo_ip.src_ip, host_ip, 4);
-    }
-    memcpy(pseudo_ip.dst_ip, sock->remote_ip, 4);
-    tcp->checksum = tcp_checksum(tcp, &pseudo_ip, payload, payload_len);
+    /* 3. The checksum is left zero: ipv4_send() computes it against the
+     * header it emits, so it cannot disagree with the source address. */
+    tcp->checksum = 0;
 
     /* Advance send sequence number */
     if (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) {
@@ -324,9 +307,8 @@ tcp_sock_t *tcp_accept(tcp_sock_t *listener, u8 client_ip_out[4], u16 *client_po
         }
 
         listener->accept_wait_thread = sched_current_thread();
-        sched_block(THREAD_BLOCKED);
         spinlock_unlock(&listener->lock);
-        sched_yield();
+        sched_block(THREAD_BLOCKED_PENDING);
     }
 }
 
@@ -359,9 +341,8 @@ int tcp_connect(tcp_sock_t *sock, const u8 dst_ip[4], u16 dst_port, bool nonbloc
     /* Block waiting for 3-way handshake completion */
     while (sock->state == TCP_STATE_SYN_SENT) {
         sock->conn_wait_thread = sched_current_thread();
-        sched_block(THREAD_BLOCKED);
         spinlock_unlock(&sock->lock);
-        sched_yield();
+        sched_block(THREAD_BLOCKED_PENDING);
         spinlock_lock(&sock->lock);
     }
 
@@ -420,9 +401,8 @@ s64 tcp_recv(tcp_sock_t *sock, void *buf, size_t max_len, bool nonblock)
         }
 
         sock->rx_wait_thread = sched_current_thread();
-        sched_block(THREAD_BLOCKED);
         spinlock_unlock(&sock->lock);
-        sched_yield();
+        sched_block(THREAD_BLOCKED_PENDING);
     }
 }
 
@@ -474,7 +454,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     const u8 *payload = buf->data + header_len;
 
     /* Verify Checksum */
-    if (tcp_checksum(tcp, ip_hdr, payload, payload_len) != 0) {
+    if (tcp_checksum(tcp, ip_hdr, header_len, payload, payload_len) != 0) {
         pr_debug("[TCP] Bad checksum in incoming packet, dropping.\n");
         net_buf_free(buf);
         return;
@@ -522,7 +502,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
                 ipv4_hdr_t p_ip;
                 memcpy(p_ip.src_ip, host_ip, 4);
                 memcpy(p_ip.dst_ip, ip_hdr->src_ip, 4);
-                rst_tcp->checksum = tcp_checksum(rst_tcp, &p_ip, NULL, 0);
+                rst_tcp->checksum = tcp_checksum(rst_tcp, &p_ip, sizeof(tcp_hdr_t), NULL, 0);
 
                 ipv4_send(rst_buf, ip_hdr->src_ip, IP_PROTO_TCP);
             }
@@ -532,6 +512,79 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     }
 
     spinlock_lock(&sock->lock);
+
+    /*
+     * ── Sequence validation (RFC 793 §3.9, "SEGMENT ARRIVES") ─────────────
+     *
+     * Everything below this point acts on the segment: it appends payload to
+     * the receive stream, advances rcv_nxt, and moves the connection between
+     * states. None of that was gated on the sequence number, so any segment
+     * that merely carried the right four-tuple and a valid checksum was taken
+     * as the next thing the peer said. An attacker who can guess or observe
+     * the ports — and a checksum is not a secret — could inject bytes into an
+     * established stream, or close it with a forged FIN, without ever having
+     * to match a sequence number. Reordering on the wire had the same effect
+     * by accident: out-of-order segments were concatenated in arrival order.
+     *
+     * There is no reassembly queue here, so the acceptance test is the strict
+     * one: in a synchronised state a segment is processed only if it starts
+     * exactly where the receiver is looking. Anything else is answered with a
+     * duplicate ACK telling the peer what we actually want next, which is also
+     * what drives its fast retransmit.
+     *
+     * A RST is checked the same way — an off-path RST that does not sit at
+     * rcv_nxt must not be able to tear the connection down.
+     */
+    bool synchronised = (sock->state == TCP_STATE_ESTABLISHED ||
+                         sock->state == TCP_STATE_FIN_WAIT_1  ||
+                         sock->state == TCP_STATE_FIN_WAIT_2  ||
+                         sock->state == TCP_STATE_CLOSE_WAIT   ||
+                         sock->state == TCP_STATE_CLOSING      ||
+                         sock->state == TCP_STATE_LAST_ACK     ||
+                         sock->state == TCP_STATE_TIME_WAIT);
+
+    if (synchronised) {
+        if (seq_num != sock->rcv_nxt) {
+            /* Not the segment we are waiting for. A pure ACK carrying no data
+             * and no flags that consume sequence space is still useful for
+             * window/ack processing, but this stack does no window management,
+             * so the safe answer for everything is: say where we are. */
+            bool consumes_seq = (payload_len > 0) ||
+                                (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN));
+            if (consumes_seq && !(flags & TCP_FLAG_RST))
+                tcp_send_packet(sock, TCP_FLAG_ACK, NULL, 0);
+            spinlock_unlock(&sock->lock);
+            net_buf_free(buf);
+            return;
+        }
+
+        /* An in-window ACK must acknowledge something we actually sent.
+         * Accepting an arbitrary ack_num would let a forged segment drag
+         * snd_una past snd_nxt and desynchronise the sender. */
+        if (flags & TCP_FLAG_ACK) {
+            u32 acked = ack_num - sock->snd_una;          /* modulo 2^32 */
+            u32 in_flight = sock->snd_nxt - sock->snd_una;
+            if (acked > in_flight) {
+                spinlock_unlock(&sock->lock);
+                net_buf_free(buf);
+                return;
+            }
+        }
+
+        /* A valid RST closes the connection and wakes anyone blocked on it.
+         * Previously RST was ignored outright in every synchronised state, so
+         * a peer that reset left this side wedged until its socket was closed
+         * by hand. */
+        if (flags & TCP_FLAG_RST) {
+            sock->state = TCP_STATE_CLOSED;
+            if (sock->rx_wait_thread) { sched_unblock(sock->rx_wait_thread); sock->rx_wait_thread = NULL; }
+            if (sock->tx_wait_thread) { sched_unblock(sock->tx_wait_thread); sock->tx_wait_thread = NULL; }
+            if (sock->conn_wait_thread) { sched_unblock(sock->conn_wait_thread); sock->conn_wait_thread = NULL; }
+            spinlock_unlock(&sock->lock);
+            net_buf_free(buf);
+            return;
+        }
+    }
 
     /* ── State Machine Processing ─────────────────────────────────────────── */
     switch (sock->state) {
@@ -563,7 +616,12 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         break;
 
     case TCP_STATE_SYN_SENT:
-        if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK)) {
+        /* RFC 793: in SYN-SENT the only acceptable ACK is one for our own ISS,
+         * and that is the only sequence check available before the connection
+         * is synchronised — without it any SYN-ACK for the four-tuple
+         * completed the handshake. */
+        if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK) &&
+            ack_num == sock->iss + 1) {
             sock->irs = seq_num;
             sock->rcv_nxt = seq_num + 1;
             sock->snd_una = ack_num;
@@ -580,22 +638,35 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         break;
 
     case TCP_STATE_SYN_RECEIVED:
-        if (flags & TCP_FLAG_ACK) {
+        if ((flags & TCP_FLAG_ACK) && ack_num == sock->iss + 1 &&
+            seq_num == sock->rcv_nxt) {
             sock->snd_una = ack_num;
             sock->state = TCP_STATE_ESTABLISHED;
 
-            /* Notify listener's accept thread */
+            /* Notify listener's accept thread.
+             * BUG fix: must hold g_tcp_lock before walking g_tcp_sockets;
+             * release sock->lock first to preserve ordering (g_tcp_lock -> sock->lock). */
+            u16 my_local_port = sock->local_port;
+            spinlock_unlock(&sock->lock);
+
+            spinlock_lock(&g_tcp_lock);
             tcp_sock_t *l = g_tcp_sockets;
             while (l) {
-                if (l->state == TCP_STATE_LISTEN && l->local_port == sock->local_port) {
+                if (l->state == TCP_STATE_LISTEN && l->local_port == my_local_port) {
+                    spinlock_lock(&l->lock);
                     if (l->accept_wait_thread) {
                         sched_unblock(l->accept_wait_thread);
                         l->accept_wait_thread = NULL;
                     }
+                    spinlock_unlock(&l->lock);
                     break;
                 }
                 l = l->next;
             }
+            spinlock_unlock(&g_tcp_lock);
+
+            /* Re-acquire sock->lock so the outer spinlock_unlock() at line 623 is balanced */
+            spinlock_lock(&sock->lock);
         }
         break;
 
@@ -603,13 +674,16 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         /* Process Inbound Data */
         if (payload_len > 0) {
             /* Copy into reception circular buffer */
+            size_t bytes_stored = 0;
             for (size_t i = 0; i < payload_len; i++) {
                 if (sock->rx_len < TCP_RX_BUF_SIZE) {
                     sock->rx_buf[(sock->rx_head + sock->rx_len) % TCP_RX_BUF_SIZE] = payload[i];
                     sock->rx_len++;
+                    bytes_stored++;
                 }
             }
-            sock->rcv_nxt += payload_len;
+            sock->rcv_nxt += bytes_stored;  /* BUG fix: advance only by bytes actually buffered,
+                                              * not payload_len — dropped bytes must not be ACK'd */
 
             /* Acknowledge received data */
             tcp_send_packet(sock, TCP_FLAG_ACK, NULL, 0);

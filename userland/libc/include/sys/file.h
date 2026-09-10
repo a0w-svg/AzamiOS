@@ -11,4 +11,9 @@
 #define LOCK_NB 4   /* Don't block when locking */
 #define LOCK_UN 8   /* Unlock */
 
+/* Legacy BSD/POSIX seek aliases */
+#define L_SET   0   /* SEEK_SET */
+#define L_INCR  1   /* SEEK_CUR */
+#define L_XTND  2   /* SEEK_END */
+
 int flock(int fd, int operation);

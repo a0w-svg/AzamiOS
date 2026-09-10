@@ -103,12 +103,43 @@ struct cmsghdr {
     int    cmsg_type;
 };
 
+/* Ancillary data (cmsghdr) macros and the one cmsg_type this libc actually
+ * backs: SCM_RIGHTS, AF_UNIX fd-passing (kernel/net/socket.c's unix_sock_t).
+ * CMSG_DATA()'s payload starts right after a cmsghdr, size_t-aligned same as
+ * the header itself — matches how sendmsg()/recvmsg() below build/parse the
+ * control buffer, and how the kernel side (sys_sendmsg_impl/sys_recvmsg_impl)
+ * lays out what it copies to/from userspace. */
+#define SCM_RIGHTS 0x01
+
+#define CMSG_ALIGN(len) (((len) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
+#define CMSG_DATA(cmsg) ((unsigned char *)(cmsg) + CMSG_ALIGN(sizeof(struct cmsghdr)))
+#define CMSG_SPACE(len) (CMSG_ALIGN(sizeof(struct cmsghdr)) + CMSG_ALIGN(len))
+#define CMSG_LEN(len)   (CMSG_ALIGN(sizeof(struct cmsghdr)) + (len))
+
+static inline struct cmsghdr *CMSG_FIRSTHDR(const struct msghdr *msg)
+{
+    if (!msg || msg->msg_controllen < sizeof(struct cmsghdr)) return NULL;
+    return (struct cmsghdr *)msg->msg_control;
+}
+
+static inline struct cmsghdr *CMSG_NXTHDR(const struct msghdr *msg, struct cmsghdr *cmsg)
+{
+    if (!msg || !cmsg) return NULL;
+    unsigned char *ctrl_end = (unsigned char *)msg->msg_control + msg->msg_controllen;
+    unsigned char *next = (unsigned char *)cmsg + CMSG_ALIGN(cmsg->cmsg_len);
+    if (next + sizeof(struct cmsghdr) > ctrl_end) return NULL;
+    return (struct cmsghdr *)next;
+}
+
 /* Socket Syscall Wrappers */
 int     socket(int domain, int type, int protocol);
 int     bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int     connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int     listen(int sockfd, int backlog);
 int     accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+/* accept4(): accept() that applies SOCK_NONBLOCK / SOCK_CLOEXEC to the new
+ * descriptor atomically, closing the window a separate fcntl() would leave. */
+int     accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags);
 ssize_t send(int sockfd, const void *buf, size_t len, int flags);
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen);
 ssize_t recv(int sockfd, void *buf, size_t len, int flags);

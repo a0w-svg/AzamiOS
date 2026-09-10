@@ -28,6 +28,9 @@ void kputs(const char *s);
 /** kputc(c) — Output a single character. */
 void kputc(char c);
 
+/** console_write(buf, len) — Atomically write buffer to console backends. */
+void console_write(const char *buf, size_t len);
+
 /** console_read_klog(buf, max_len, offset) — Read from kernel log ring buffer. */
 s64 console_read_klog(void *buf, size_t max_len, u64 *offset);
 

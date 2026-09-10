@@ -4,6 +4,7 @@
  * ============================================================================ */
 
 #include "smp.h"
+#include "cpu.h"
 #include "gdt.h"
 #include "idt.h"
 #include "lapic.h"
@@ -55,35 +56,8 @@ void ap_c_entry(struct limine_smp_info *info)
     /* Initialize Local APIC on this CPU */
     lapic_init();
 
-    /* Enable FPU & SSE/SSE2 on AP (clear EM/TS, set MP, OSFXSR, OSXMMEXCPT) */
-    u64 cr0 = read_cr0();
-    cr0 &= ~(1ULL << 2); /* clear EM */
-    cr0 &= ~(1ULL << 3); /* clear TS */
-    cr0 |=  (1ULL << 1); /* set MP */
-    write_cr0(cr0);
-
-    /* Apply OSFXSR / OSXMMEXCPT / SMEP / SMAP / FSGSBASE / OSXSAVE on AP */
-    extern u8 g_smep_enabled;
-    extern u8 g_smap_enabled;
-    extern u8 g_fsgsbase_enabled;
-    extern u8 g_osxsave_enabled;
-    u64 cr4 = read_cr4();
-    cr4 |= (1ULL << 9);  /* OSFXSR */
-    cr4 |= (1ULL << 10); /* OSXMMEXCPT */
-    if (g_fsgsbase_enabled) cr4 |= (1ULL << 16);
-    if (g_osxsave_enabled)  cr4 |= (1ULL << 18);
-    if (g_smep_enabled)     cr4 |= (1ULL << 20);
-    if (g_smap_enabled)     cr4 |= (1ULL << 21);
-    write_cr4(cr4);
-
-    if (g_osxsave_enabled) {
-        xsetbv(0, 0x7); /* x87 + SSE + AVX */
-    }
-
-
-    u64 efer = rdmsr(MSR_EFER);
-    efer |= EFER_NXE;
-    wrmsr(MSR_EFER, efer);
+    /* Enable FPU, SSE, PGE, UMIP, FSGSBASE, OSXSAVE/AVX, SMEP, SMAP, NXE on AP */
+    cpu_enable_features_ap();
 
     /* Enable SYSCALL / SYSRET on AP */
     extern void syscall_abi_init(void);
@@ -108,13 +82,22 @@ void ap_c_entry(struct limine_smp_info *info)
 static void ap_entry(struct limine_smp_info *info)
 {
     u32 cpu_id = (u32)info->extra_argument;
-    u64 new_rsp = g_cpu_infos[cpu_id].kernel_rsp0 - 8;
+    u64 new_rsp = g_cpu_infos[cpu_id].kernel_rsp0 - 16; /* BUG-F fix: must be 16-byte aligned before call */
+
+    /* BUG-16 fix: pin new_rsp to RCX (caller-saved, not an argument register)
+     * so the compiler cannot alias it with RDI.  The original `"r"(new_rsp)`
+     * constraint allowed the compiler to choose RDI for new_rsp; if it did,
+     * the `mov %%rcx, %%rsp` would have clobbered info (the first argument to
+     * ap_c_entry) before the call could consume it.  With explicit RCX/RDI
+     * constraints the register assignment is unambiguous and compiler-agnostic. */
+    register u64 _rsp  __asm__("rcx") = new_rsp;
+    register struct limine_smp_info *_info __asm__("rdi") = info;
 
     __asm__ volatile(
-        "mov %0, %%rsp \n\t"
-        "call ap_c_entry \n\t"
+        "mov %%rcx, %%rsp \n\t"
+        "call ap_c_entry  \n\t"
         :
-        : "r"(new_rsp), "D"(info)
+        : "r"(_rsp), "r"(_info)
         : "memory"
     );
     __builtin_unreachable();
@@ -162,7 +145,9 @@ void smp_init(void)
 
     /* Boot all APs */
     u32 ap_id = 1; /* BSP always gets ID 0; APs get 1, 2, 3... */
-    for (u32 i = 0; i < smp_resp->cpu_count && ap_id < SMP_MAX_CPUS; i++) {
+    /* BUG-E fix: iterate up to g_cpu_count (already capped) rather than the raw
+     * Limine count, which may exceed SMP_MAX_CPUS and waste iterations. */
+    for (u32 i = 0; i < smp_resp->cpu_count && ap_id < g_cpu_count; i++) {
         struct limine_smp_info *info = smp_resp->cpus[i];
         if (info->lapic_id == smp_resp->bsp_lapic_id) continue; /* Skip BSP */
 
@@ -190,16 +175,24 @@ void smp_init(void)
         timeout--;
     }
 
-    if (__atomic_load_n(&g_aps_online, __ATOMIC_SEQ_CST) < expected_aps) {
+    /* BUG-A fix: capture the atomic load once so the comparison and the log
+     * message use the same consistent value (no torn read in kprintf). */
+    u32 online = __atomic_load_n(&g_aps_online, __ATOMIC_SEQ_CST);
+    if (online < expected_aps) {
         kprintf("[SMP] WARNING: Only %u/%u APs came online!\n",
-                g_aps_online, expected_aps);
+                online, expected_aps);
     } else {
-        kprintf("[SMP] All %u AP(s) successfully booted and online.\n", g_aps_online);
+        kprintf("[SMP] All %u AP(s) successfully booted and online.\n", online);
     }
+}
+
+void smp_send_ipi(u32 cpu_id, u8 vector)
+{
+    if (cpu_id >= g_cpu_count || cpu_id == smp_current_cpu_id()) return;
+    lapic_send_ipi(g_cpu_infos[cpu_id].lapic_id, vector);
 }
 
 void smp_send_reschedule(u32 cpu_id)
 {
-    if (cpu_id >= g_cpu_count || cpu_id == smp_current_cpu_id()) return;
-    lapic_send_ipi(g_cpu_infos[cpu_id].lapic_id, 49); /* Reschedule IPI vector 49 */
+    smp_send_ipi(cpu_id, 49); /* Reschedule IPI vector 49 */
 }

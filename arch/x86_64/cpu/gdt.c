@@ -21,11 +21,18 @@
 #include "../../../drivers/char/console.h"
 
 /* ── Per-CPU GDT + TSS storage ───────────────────────────────────────────── */
+/* IST stacks: 16 KiB each. #DF is the net that catches a kernel-stack overflow
+ * (a #PF on the exhausted stack escalates to #DF, which switches to IST1), and
+ * that handler runs the full multi-line register + stack-dump panic — 4 KiB was
+ * not enough headroom for it plus a nested fault. NOTE: #PF and #GP deliberately
+ * do NOT use an IST: #PF nests routinely (demand paging, COW, uaccess fixups)
+ * and a shared IST stack would be clobbered by the nested fault. */
+#define IST_STACK_SIZE 16384
 static cpu_gdt_t g_cpu_gdt[HAL_MAX_CPUS] __aligned(64);
-static u8 g_df_stack[HAL_MAX_CPUS][4096] __aligned(16);
-static u8 g_nmi_stack[HAL_MAX_CPUS][4096] __aligned(16);
-static u8 g_mc_stack[HAL_MAX_CPUS][4096] __aligned(16);
-static u8 g_dbg_stack[HAL_MAX_CPUS][4096] __aligned(16);
+static u8 g_df_stack[HAL_MAX_CPUS][IST_STACK_SIZE] __aligned(16);
+static u8 g_nmi_stack[HAL_MAX_CPUS][IST_STACK_SIZE] __aligned(16);
+static u8 g_mc_stack[HAL_MAX_CPUS][IST_STACK_SIZE] __aligned(16);
+static u8 g_dbg_stack[HAL_MAX_CPUS][IST_STACK_SIZE] __aligned(16);
 
 /* ── Internal helpers ─────────────────────────────────────────────────────── */
 
@@ -129,7 +136,21 @@ static void gdt_init_core(u32 core_id, uintptr_t kernel_stack_top)
 
 void gdt_init_bsp(void)
 {
-    /* Use the current stack pointer as the initial ring-0 stack for core 0. */
+    /* Bootstrap the BSP's TSS with the current boot RSP as ring-0 stack.
+     *
+     * BUG-12 note — narrow window risk:
+     *   RSP0 is the ring-0 stack the CPU switches to on any ring-3 → ring-0
+     *   transition (interrupt, SYSCALL, exception).  Seeding it with the
+     *   *current* RSP means it points into the middle of gdt_init_bsp()'s own
+     *   stack frame.  Any interrupt from user space in the window between this
+     *   call and the smp_init() call that installs a proper allocated stack
+     *   (via gdt_init_ap(0, bsp->kernel_rsp0)) would clobber live locals.
+     *
+     *   The window is intentionally short: gdt_init_bsp() is called once very
+     *   early (before user processes exist) and smp_init() follows quickly.
+     *   No ring-3 code runs in that interval, so the risk is only theoretical
+     *   today.  If the boot sequence ever changes, replace this with an early
+     *   pmm_alloc + PHYS_TO_VIRT stack allocation here. */
     uintptr_t rsp;
     __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
     gdt_init_core(0, rsp & ~0xFUL);  /* 16-byte aligned */

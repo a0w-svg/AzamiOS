@@ -23,8 +23,11 @@
 #include "include/shadow.h"
 #include "include/sys/statx.h"
 #include "include/sys/uio.h"
+#include "include/sys/select.h"
+#include "include/grp.h"
+#include "include/limits.h"
 
-int errno = 0;
+__thread int errno = 0;
 
 static inline long __syscall_ret(long r)
 {
@@ -602,9 +605,19 @@ int poll(void *fds, unsigned long nfds, int timeout)
     return (int)__syscall_ret(syscall3(SYS_poll, (long)fds, nfds, timeout));
 }
 
-int select(int nfds, void *readfds, void *writefds, void *exceptfds, void *timeout)
+int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)
 {
     return (int)__syscall_ret(syscall5(SYS_select, nfds, (long)readfds, (long)writefds, (long)exceptfds, (long)timeout));
+}
+
+int pselect(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
+            const struct timespec *timeout, const sigset_t *sigmask)
+{
+    struct {
+        const sigset_t *ss;
+        size_t ss_len;
+    } data = { sigmask, sizeof(sigset_t) };
+    return (int)__syscall_ret(syscall6(SYS_pselect6, nfds, (long)readfds, (long)writefds, (long)exceptfds, (long)timeout, (long)&data));
 }
 
 /* ── Directory & Path Operations ─────────────────────────────────────────── */
@@ -788,6 +801,17 @@ int gettimeofday(struct timeval *tv, struct timezone *tz)
     return (int)__syscall_ret(syscall2(SYS_gettimeofday, (long)tv, 0));
 }
 
+/* Declared in sys/time.h but never actually implemented — every caller got
+ * an undefined-reference link error, so nothing in this codebase could ever
+ * have called it. The kernel's sys_settimeofday_impl (used to unconditionally
+ * -EPERM, now a real CAP_SYS_TIME-gated clock set) has worked correctly this
+ * whole time; nothing wired it up on this side until now. */
+int settimeofday(const struct timeval *tv, const struct timezone *tz)
+{
+    (void)tz;
+    return (int)__syscall_ret(syscall2(SYS_settimeofday, (long)tv, 0));
+}
+
 
 int clock_gettime(int clk_id, struct timespec *tp)
 {
@@ -913,14 +937,17 @@ int nice(int inc)
 
 unsigned int alarm(unsigned int seconds)
 {
-    (void)seconds;
-    return 0;
+    /* Returns the seconds left on the alarm this one replaces, rounded up. */
+    return (unsigned int)syscall1(SYS_alarm, (long)seconds);
 }
 
 int pause(void)
 {
-    struct timespec req = { 1000, 0 };
-    return nanosleep(&req, 0);
+    /* POSIX: suspend until a signal is delivered, then fail with EINTR.
+     * Suspending under the mask already in force is exactly sigsuspend(). */
+    sigset_t current = 0;
+    sigprocmask(SIG_BLOCK, 0, &current);
+    return sigsuspend(&current);
 }
 
 int sched_yield(void)
@@ -1013,6 +1040,14 @@ int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags)
     return sys_fchmodat(dirfd, pathname, mode, flags);
 }
 
+/* fchmodat2() is fchmodat() with the flags argument actually honoured — the
+ * original call has one in its signature that the kernel was never given. */
+int fchmodat2(int dirfd, const char *pathname, mode_t mode, int flags)
+{
+    return (int)__syscall_ret(syscall4(SYS_fchmodat2, dirfd, (long)pathname,
+                                       mode, flags));
+}
+
 int sys_fchownat(int dirfd, const char *path, uint32_t uid, uint32_t gid, int flags)
 {
     return (int)__syscall_ret(syscall5(SYS_fchownat, dirfd, (long)path, uid, gid, flags));
@@ -1073,16 +1108,25 @@ int futimens(int fd, const struct timespec times[2])
     return utimensat(fd, NULL, times, 0);
 }
 
+/*
+ * The kernel implements mknod(2)/mknodat(2), including S_IFIFO. This wrapper
+ * used to ignore both and open() the path with O_CREAT|O_EXCL instead, which
+ * got three things wrong at once: it returned the new descriptor rather than
+ * 0, it leaked that descriptor, and whatever the caller asked for it always
+ * produced a plain regular file — so mkfifo() never made a FIFO.
+ */
 int mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev)
 {
-    (void)dev;
     if (S_ISDIR(mode)) return mkdirat(dirfd, pathname, mode);
-    return openat(dirfd, pathname, O_CREAT | O_EXCL | O_WRONLY, mode);
+    return (int)__syscall_ret(syscall4(SYS_mknodat, dirfd, (long)pathname,
+                                       (long)mode, (long)dev));
 }
 
 int mknod(const char *pathname, mode_t mode, dev_t dev)
 {
-    return mknodat(AT_FDCWD, pathname, mode, dev);
+    if (S_ISDIR(mode)) return mkdir(pathname, mode);
+    return (int)__syscall_ret(syscall3(SYS_mknod, (long)pathname,
+                                       (long)mode, (long)dev));
 }
 
 int posix_fadvise(int fd, off_t offset, off_t len, int advice)
@@ -1137,10 +1181,37 @@ int setgroups(size_t size, const gid_t *list)
     return (int)__syscall_ret(syscall2(SYS_setgroups, size, (long)list));
 }
 
+/* initgroups() used to be a pure no-op — it never looked anything up and
+ * never called setgroups(), so a process's supplementary group list never
+ * reflected /etc/group membership at all. Real behavior: walk /etc/group
+ * (getgrent(), already used by getgrnam()) collecting every group @user is
+ * listed as a member of, then setgroups() the result — no new syscall,
+ * both pieces (the /etc/group walk and setgroups(2)) already existed and
+ * worked, they just weren't wired together. */
 int initgroups(const char *user, gid_t group)
 {
-    (void)user; (void)group;
-    return 0;
+    if (!user) return -1;
+
+    gid_t list[NGROUPS_MAX];
+    int n = 0;
+    list[n++] = group;
+
+    setgrent();
+    struct group *gr;
+    while (n < NGROUPS_MAX && (gr = getgrent()) != NULL) {
+        if (gr->gr_gid == group) continue; /* already have the primary gid */
+        for (char **m = gr->gr_mem; m && *m; m++) {
+            if (strcmp(*m, user) == 0) {
+                int dup = 0;
+                for (int i = 0; i < n; i++) if (list[i] == gr->gr_gid) { dup = 1; break; }
+                if (!dup) list[n++] = gr->gr_gid;
+                break;
+            }
+        }
+    }
+    endgrent();
+
+    return setgroups((size_t)n, list);
 }
 
 /* ── Host & System Metadata ──────────────────────────────────────────────── */
@@ -1236,8 +1307,10 @@ void sync(void)
 
 int fchdir(int fd)
 {
-    (void)fd;
-    return 0;
+    /* Used to be a pure no-op that never touched the kernel at all. The
+     * kernel's own sys_fchdir_impl (kernel/syscall/syscall.c) already
+     * works — nothing here ever called it. */
+    return (int)__syscall_ret(syscall1(SYS_fchdir, fd));
 }
 
 void swab(const void *from, void *to, ssize_t n)
@@ -1510,9 +1583,24 @@ int timerfd_gettime(int fd, struct itimerspec *curr_value)
     return (int)__syscall_ret(syscall2(SYS_timerfd_gettime, fd, (long)curr_value));
 }
 
-int signalfd(int fd, const void *mask, int flags)
+int signalfd(int fd, const sigset_t *mask, int flags)
 {
     return (int)__syscall_ret(syscall4(SYS_signalfd4, fd, (long)mask, sizeof(unsigned long), flags));
+}
+
+int pidfd_open(pid_t pid, unsigned int flags)
+{
+    return (int)__syscall_ret(syscall2(SYS_pidfd_open, (long)pid, (long)flags));
+}
+
+int pidfd_send_signal(int pidfd, int sig, const void *info, unsigned int flags)
+{
+    return (int)__syscall_ret(syscall4(SYS_pidfd_send_signal, pidfd, sig, (long)info, (long)flags));
+}
+
+int memfd_create(const char *name, unsigned int flags)
+{
+    return (int)__syscall_ret(syscall2(SYS_memfd_create, (long)name, (long)flags));
 }
 
 long futex(uint32_t *uaddr, int op, uint32_t val, const struct timespec *timeout, uint32_t *uaddr2, uint32_t val3)
@@ -1565,16 +1653,18 @@ unsigned long getauxval(unsigned long type)
     }
 }
 
+/* adjtimex()/ntp_adjtime() used to ignore `buf` entirely and always report
+ * success without filling it in. The kernel's sys_adjtimex_impl
+ * (kernel/syscall/syscall.c) now genuinely fills the struct timex on every
+ * call; ntp_adjtime(3) is historically just adjtimex(2) under another name. */
 int adjtimex(void *buf)
 {
-    (void)buf;
-    return 0;
+    return (int)__syscall_ret(syscall1(SYS_adjtimex, (long)buf));
 }
 
 int ntp_adjtime(void *buf)
 {
-    (void)buf;
-    return 0;
+    return adjtimex(buf);
 }
 
 int sched_setaffinity(pid_t pid, size_t cpusetsize, const void *mask)
@@ -1689,5 +1779,10 @@ int lremovexattr(const char *path, const char *name)
 int fremovexattr(int fd, const char *name)
 {
     return (int)__syscall_ret(syscall2(SYS_fremovexattr, fd, (long)name));
+}
+
+long ptrace(int request, pid_t pid, void *addr, void *data)
+{
+    return __syscall_ret(syscall4(SYS_ptrace, request, pid, (long)addr, (long)data));
 }
 

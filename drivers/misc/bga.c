@@ -204,7 +204,7 @@ static void bga_scan_tree(device_t *node)
             phys_addr_t fb_aligned = ALIGN_DOWN(fb_phys, 4096);
             virt_addr_t fb_virt = 0xFFFFC00000000000;
             
-            for (uint32_t offset = 0; offset < 16 * 1024 * 1024; offset += 4096) {
+            for (uint32_t offset = 0; offset < BGA_APERTURE_SIZE; offset += 4096) {
                 vmm_map(0, fb_virt + offset, fb_aligned + offset, VMM_MMIO);
             }
             g_bga.fb_virt = fb_virt;
@@ -247,6 +247,19 @@ int bga_flip_buffer(uint32_t buffer_index)
     if (buffer_index > 1) return -1;
     bga_write_reg(VBE_DISPI_INDEX_Y_OFFSET, (uint16_t)(buffer_index * g_bga.height));
     return 0;
+}
+
+virt_addr_t bga_get_fb_virt(void) { return g_bga.fb_virt; }
+
+size_t bga_get_vram_size(void)
+{
+    if (!g_bga.fb_phys) return 0;
+
+    /* The adapter reports its memory in 64 KiB units.  Nothing beyond the
+     * mapped aperture is reachable, so that is the ceiling. */
+    size_t size = (size_t)bga_read_reg(VBE_DISPI_INDEX_VIDEO_MEMORY_64K) * 64 * 1024;
+    if (size == 0 || size > BGA_APERTURE_SIZE) size = BGA_APERTURE_SIZE;
+    return size;
 }
 
 uint32_t    bga_get_width(void)   { return g_bga.width; }

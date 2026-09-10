@@ -23,6 +23,18 @@ static thread_t *pipe_wait_pop(thread_t **queue)
     return t;
 }
 
+static void pipe_wait_remove(thread_t **queue, thread_t *t)
+{
+    while (*queue) {
+        if (*queue == t) {
+            *queue = t->next;
+            t->next = NULL;
+            return;
+        }
+        queue = &(*queue)->next;
+    }
+}
+
 static s64 pipe_read(file_t *filp, void *buf, size_t len, u64 *offset)
 {
     (void)offset;
@@ -70,7 +82,17 @@ static s64 pipe_read(file_t *filp, void *buf, size_t len, u64 *offset)
         pipe_wait_push(&pipe->read_wait, curr);
         spinlock_unlock(&pipe->lock);
 
-        sched_block(THREAD_BLOCKED);
+        sched_block(THREAD_BLOCKED_PENDING);
+
+        /* BUG-AM fix: if awakened by a signal, unlink from queue to avoid
+         * cycles and return -EINTR per POSIX. */
+        process_t *p = curr->proc;
+        if (p && (p->sig_pending & ~p->sig_blocked)) {
+            spinlock_lock(&pipe->lock);
+            pipe_wait_remove(&pipe->read_wait, curr);
+            spinlock_unlock(&pipe->lock);
+            return (bytes_read > 0) ? (s64)bytes_read : -(s64)EINTR;
+        }
     }
 }
 
@@ -126,7 +148,17 @@ static s64 pipe_write(file_t *filp, const void *buf, size_t len, u64 *offset)
         pipe_wait_push(&pipe->write_wait, curr);
         spinlock_unlock(&pipe->lock);
 
-        sched_block(THREAD_BLOCKED);
+        sched_block(THREAD_BLOCKED_PENDING);
+
+        /* BUG-AM fix: if awakened by a signal, unlink from queue to avoid
+         * cycles and return -EINTR per POSIX. */
+        process_t *p = curr->proc;
+        if (p && (p->sig_pending & ~p->sig_blocked)) {
+            spinlock_lock(&pipe->lock);
+            pipe_wait_remove(&pipe->write_wait, curr);
+            spinlock_unlock(&pipe->lock);
+            return (bytes_written > 0) ? (s64)bytes_written : -(s64)EINTR;
+        }
     }
 }
 
@@ -186,6 +218,42 @@ static s64 pipe_write_release(struct inode *inode, file_t *filp)
     return 0;
 }
 
+/* See pipe.h for why these exist: AF_UNIX SOCK_STREAM (kernel/net/socket.c)
+ * needs pipe.c's byte-stream buffering under a g_socket_fops-backed fd
+ * rather than pipe_create()'s own read-only/write-only file_t pair, so it
+ * can only get at pipe_read()/pipe_write() through a pipe_t pointer, not a
+ * file_t one. Same throwaway-on-stack-file_t trick sockpair_read()/
+ * sockpair_write() above already use internally. */
+s64 pipe_read_pipe(pipe_t *p, void *buf, size_t len, bool nonblock)
+{
+    if (!p) return -(s64)EINVAL;
+    file_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.f_flags = nonblock ? O_NONBLOCK : 0;
+    tmp.private_data = p;
+    return pipe_read(&tmp, buf, len, NULL);
+}
+
+s64 pipe_write_pipe(pipe_t *p, const void *buf, size_t len, bool nonblock)
+{
+    if (!p) return -(s64)EINVAL;
+    file_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.f_flags = nonblock ? O_NONBLOCK : 0;
+    tmp.private_data = p;
+    return pipe_write(&tmp, buf, len, NULL);
+}
+
+void pipe_close_end(pipe_t *p, bool is_reader)
+{
+    if (!p) return;
+    file_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.private_data = p;
+    if (is_reader) pipe_read_release(NULL, &tmp);
+    else            pipe_write_release(NULL, &tmp);
+}
+
 #include "../kernel/uaccess.h"
 
 #ifndef POLLIN
@@ -210,7 +278,7 @@ static int pipe_read_poll(file_t *filp)
         mask |= (POLLIN | POLLRDNORM);
     }
     if (pipe->writers == 0) {
-        mask |= POLLHUP;
+        mask |= (POLLHUP | POLLIN | POLLRDNORM);
     }
     spinlock_unlock(&pipe->lock);
     return mask;
@@ -238,14 +306,14 @@ static s64 pipe_ioctl(file_t *filp, u32 cmd, u64 arg)
     pipe_t *pipe = (pipe_t *)filp->private_data;
 
     if (cmd == 0x541B /* FIONREAD */) {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
         int nbytes = (int)pipe->count;
         if (copy_to_user((void *)(uintptr_t)arg, &nbytes, sizeof(int)) != 0) return -(s64)EFAULT;
         return 0;
     }
 
     if (cmd == 0x5421 /* FIONBIO */) {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
         int val = 0;
         if (copy_from_user(&val, (const void *)(uintptr_t)arg, sizeof(int)) != 0) return -(s64)EFAULT;
         if (val) filp->f_flags |= O_NONBLOCK;

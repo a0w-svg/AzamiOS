@@ -110,7 +110,7 @@ s64 az_handle_open(process_t *proc, az_object_t *obj)
 {
     if (!proc || !obj) return -(s64)EINVAL;
 
-    for (s64 i = 3; i < 64; i++) { /* Reserve 0, 1, 2 for stdio */
+    for (s64 i = 3; i < PROC_MAX_FDS; i++) { /* Reserve 0, 1, 2 for stdio */
         if (proc->obj_handle_table[i] == NULL) {
             proc->obj_handle_table[i] = obj;
             az_object_reference(obj);
@@ -120,16 +120,33 @@ s64 az_handle_open(process_t *proc, az_object_t *obj)
     return -(s64)EMFILE;
 }
 
+/* Resolve a process handle to its object, taking a reference so the object
+ * cannot be freed by a concurrent az_handle_close() while the caller uses it.
+ * The caller MUST az_object_dereference() the returned object when done. */
 az_object_t *az_handle_get(process_t *proc, s64 handle_id)
 {
-    if (!proc || handle_id < 0 || handle_id >= 64) return NULL;
-    return proc->obj_handle_table[handle_id];
+    if (!proc || handle_id < 0 || handle_id >= PROC_MAX_FDS) return NULL;
+    spinlock_lock(&g_object_lock);
+    az_object_t *obj = (az_object_t *)__atomic_load_n(&proc->obj_handle_table[handle_id],
+                                                      __ATOMIC_ACQUIRE);
+    if (obj && (uintptr_t)obj >= 0xffff800000000000ULL && obj->ref_count > 0)
+        obj->ref_count++;
+    else
+        obj = NULL;
+    spinlock_unlock(&g_object_lock);
+    return obj;
 }
 
 s64 az_handle_close(process_t *proc, s64 handle_id)
 {
-    if (!proc || handle_id < 0 || handle_id >= 64) return -(s64)EBADF;
+    if (!proc || handle_id < 0 || handle_id >= PROC_MAX_FDS) return -(s64)EBADF;
+    /* Clear the slot under g_object_lock, the same lock az_handle_get() holds
+     * while it loads the slot and bumps ref_count. Without it a get() on
+     * another CPU can read this obj, then this close drops the last reference
+     * and frees it, and the get() increments a freed ref_count. */
+    spinlock_lock(&g_object_lock);
     az_object_t *obj = (az_object_t *)__atomic_exchange_n(&proc->obj_handle_table[handle_id], NULL, __ATOMIC_SEQ_CST);
+    spinlock_unlock(&g_object_lock);
     if (!obj) return -(s64)EBADF;
 
     az_object_dereference(obj);

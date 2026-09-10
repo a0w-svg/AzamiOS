@@ -68,3 +68,4 @@ int   timingsafe_bcmp(const void *b1, const void *b2, size_t n);
 void *memrchr(const void *s, int c, size_t n);
 void *memmem(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen);
 void *memccpy(void *dest, const void *src, int c, size_t n);
+void *mempcpy(void *dest, const void *src, size_t n);

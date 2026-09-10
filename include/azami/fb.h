@@ -17,6 +17,13 @@
 #define FBIOPUT_CON2FBMAP   0x4610
 #define FBIO_WAITFORVSYNC   0x4620
 
+/* fb_var_screeninfo::activate — when a change takes effect. */
+#define FB_ACTIVATE_NOW     0    /* apply immediately (or at the next vblank) */
+#define FB_ACTIVATE_NXTOPEN 1    /* apply on the next open                    */
+#define FB_ACTIVATE_TEST    2    /* validate only, change nothing             */
+#define FB_ACTIVATE_MASK    15
+#define FB_ACTIVATE_VBL     16   /* apply at the next vblank                  */
+
 #define FB_TYPE_PACKED_PIXELS      0
 #define FB_VISUAL_TRUECOLOR        2
 

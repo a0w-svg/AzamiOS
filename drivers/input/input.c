@@ -34,8 +34,23 @@ static volatile u32  g_queue_tail = 0;   /* Next slot to read */
 static spinlock_t    g_input_lock = SPINLOCK_INIT;
 static spinlock_t    g_ps2_lock   = SPINLOCK_INIT;
 
+/* Consumers that see events without removing them from the queue. */
+#define INPUT_MAX_OBSERVERS 4
+static void (*g_observers[INPUT_MAX_OBSERVERS])(const input_event_t *);
+static u32    g_observer_count = 0;
+
+int input_register_observer(void (*fn)(const input_event_t *))
+{
+    if (!fn) return -1;
+    if (g_observer_count >= INPUT_MAX_OBSERVERS) return -1;
+    g_observers[g_observer_count++] = fn;
+    return 0;
+}
+
 static void queue_push(const input_event_t *evt)
 {
+    for (u32 i = 0; i < g_observer_count; i++) g_observers[i](evt);
+
     irqflags_t irqf = spinlock_lock_irqsave(&g_input_lock);
     u32 next = (g_queue_head + 1) % INPUT_QUEUE_SIZE;
     if (next == g_queue_tail) {
@@ -45,6 +60,37 @@ static void queue_push(const input_event_t *evt)
     g_queue[g_queue_head] = *evt;
     g_queue_head = next;
     spinlock_unlock_irqrestore(&g_input_lock, irqf);
+}
+
+/* ── Non-PS/2 input sources ──────────────────────────────────────────────── */
+/*
+ * Drivers on enumerable buses either interrupt or, when their interrupt line
+ * is shared and cannot be claimed safely, register a drain callback that runs
+ * whenever userspace asks for events.
+ */
+#define INPUT_MAX_POLL_SOURCES 4
+static void (*g_poll_sources[INPUT_MAX_POLL_SOURCES])(void);
+static u32    g_poll_source_count = 0;
+
+void input_inject(const input_event_t *evt)
+{
+    if (evt) queue_push(evt);
+}
+
+int input_register_poll_source(void (*fn)(void))
+{
+    if (!fn) return -1;
+    if (g_poll_source_count >= INPUT_MAX_POLL_SOURCES) return -1;
+    g_poll_sources[g_poll_source_count++] = fn;
+    return 0;
+}
+
+/* Never called with g_input_lock held: a source pushes into the same queue. */
+static void input_drain_sources(void)
+{
+    for (u32 i = 0; i < g_poll_source_count; i++) {
+        g_poll_sources[i]();
+    }
 }
 
 /* ── PS/2 controller helpers ─────────────────────────────────────────────── */
@@ -182,6 +228,110 @@ static void keyboard_update_leds(void)
 }
 
 
+/*
+ * keyboard_emit() — translate one AT set-1 key event and queue it.
+ *
+ * Shared by the PS/2 handler and by bus-attached keyboards whose keycodes are
+ * set-1 compatible, so every keyboard goes through the same keymap, the same
+ * modifier tracking and the same Caps/Num Lock rules.
+ *
+ * @code:        scancode with the release bit already stripped
+ * @extended:    true for the 0xE0-prefixed key block
+ * @raw_scancode: value reported to userspace in evt.scancode
+ * @from_ps2:    only a real PS/2 keyboard gets its lock LEDs reprogrammed
+ */
+static void keyboard_emit(u8 code, bool released, bool extended,
+                          u8 raw_scancode, bool from_ps2)
+{
+    u16 keycode = 0;
+
+    if (extended) {
+        keycode = g_scancode_e0[code];
+        if (!keycode) return; /* Ignore unmapped or fake shifts */
+
+        /* Map specific extended modifiers */
+        if (keycode == KEY_RCTRL) {
+            g_ctrl_held = !released;
+        } else if (keycode == KEY_RALT) {
+            g_alt_held = !released;
+        }
+    } else {
+        /* Base scancode processing */
+        keycode = g_shift_held ? g_scancode_shift[code] : g_scancode_base[code];
+
+        /* Update standard modifiers */
+        if (keycode == KEY_LSHIFT || keycode == KEY_RSHIFT) {
+            g_shift_held = !released;
+        } else if (keycode == KEY_LCTRL) {
+            g_ctrl_held = !released;
+        } else if (keycode == KEY_LALT) {
+            g_alt_held = !released;
+        }
+
+        /* Update toggles on PRESSED */
+        if (!released) {
+            bool leds_changed = false;
+            if (keycode == KEY_CAPSLOCK)   { g_capslock   = !g_capslock;   leds_changed = true; }
+            if (keycode == KEY_NUMLOCK)    { g_numlock    = !g_numlock;    leds_changed = true; }
+            if (keycode == KEY_SCROLLLOCK) { g_scrolllock = !g_scrolllock; leds_changed = true; }
+            if (leds_changed && from_ps2) keyboard_update_leds_unlocked();
+        }
+
+        /* Apply Caps Lock on alphabetic characters */
+        bool is_alpha = (keycode >= 'a' && keycode <= 'z') || (keycode >= 'A' && keycode <= 'Z');
+        if (is_alpha) {
+            bool upper = g_capslock ^ g_shift_held;
+            keycode = upper ? (g_scancode_base[code] - 'a' + 'A') : g_scancode_base[code];
+        }
+
+        /* Apply Num Lock on Numpad keys */
+        if (code >= 0x47 && code <= 0x53 && code != 0x4A && code != 0x4E) {
+            bool use_num = g_numlock ^ g_shift_held;
+            if (use_num) {
+                if      (code == 0x47) keycode = '7';
+                else if (code == 0x48) keycode = '8';
+                else if (code == 0x49) keycode = '9';
+                else if (code == 0x4B) keycode = '4';
+                else if (code == 0x4C) keycode = '5';
+                else if (code == 0x4D) keycode = '6';
+                else if (code == 0x4F) keycode = '1';
+                else if (code == 0x50) keycode = '2';
+                else if (code == 0x51) keycode = '3';
+                else if (code == 0x52) keycode = '0';
+                else if (code == 0x53) keycode = '.';
+            }
+        }
+    }
+
+    if (!keycode) return;
+
+    /* Build event */
+    input_event_t evt;
+    __builtin_memset(&evt, 0, sizeof(evt));
+    evt.type     = INPUT_EVENT_KEY;
+    evt.scancode = raw_scancode;
+    evt.keycode  = keycode;
+    evt.flags    = released ? KEY_FLAG_RELEASED : KEY_FLAG_PRESSED;
+
+    if (g_shift_held)  evt.flags |= KEY_FLAG_SHIFT;
+    if (g_ctrl_held)   evt.flags |= KEY_FLAG_CTRL;
+    if (g_alt_held)    evt.flags |= KEY_FLAG_ALT;
+    if (g_capslock)    evt.flags |= KEY_FLAG_CAPS_LOCK;
+    if (g_numlock)     evt.flags |= KEY_FLAG_NUM_LOCK;
+    if (g_scrolllock)  evt.flags |= KEY_FLAG_SCROLL_LOCK;
+
+    cpu_info_t *cpu = smp_get_cpu();
+    evt.timestamp = cpu ? (u32)cpu->ticks : 0;
+
+    queue_push(&evt);
+}
+
+void input_inject_scancode(u8 code, bool pressed, bool extended)
+{
+    keyboard_emit(code & 0x7F, !pressed, extended,
+                  (u8)((code & 0x7F) | (pressed ? 0x00 : 0x80)), false);
+}
+
 /* ── Keyboard IRQ handler (IRQ1 = vector 33) ────────────────────────────────── */
 static void keyboard_irq_handler(pt_regs_t *r, void *ctx)
 {
@@ -231,90 +381,9 @@ static void keyboard_irq_handler(pt_regs_t *r, void *ctx)
             continue;
         }
 
-        bool released = (scancode & 0x80) != 0;
-        u8   code     = scancode & 0x7F;
-        u16  keycode  = 0;
-
-        if (g_e0_state) {
-            g_e0_state = 0;
-            keycode = g_scancode_e0[code];
-            if (!keycode) continue; /* Ignore unmapped or fake shifts */
-
-            /* Map specific extended modifiers */
-            if (keycode == KEY_RCTRL) {
-                g_ctrl_held = !released;
-            } else if (keycode == KEY_RALT) {
-                g_alt_held = !released;
-            }
-        } else {
-            /* Base scancode processing */
-            keycode = g_shift_held ? g_scancode_shift[code] : g_scancode_base[code];
-
-            /* Update standard modifiers */
-            if (keycode == KEY_LSHIFT || keycode == KEY_RSHIFT) {
-                g_shift_held = !released;
-            } else if (keycode == KEY_LCTRL) {
-                g_ctrl_held = !released;
-            } else if (keycode == KEY_LALT) {
-                g_alt_held = !released;
-            }
-
-            /* Update toggles on PRESSED */
-            if (!released) {
-                bool leds_changed = false;
-                if (keycode == KEY_CAPSLOCK)   { g_capslock   = !g_capslock;   leds_changed = true; }
-                if (keycode == KEY_NUMLOCK)    { g_numlock    = !g_numlock;    leds_changed = true; }
-                if (keycode == KEY_SCROLLLOCK) { g_scrolllock = !g_scrolllock; leds_changed = true; }
-                if (leds_changed) keyboard_update_leds_unlocked();
-            }
-
-            /* Apply Caps Lock on alphabetic characters */
-            bool is_alpha = (keycode >= 'a' && keycode <= 'z') || (keycode >= 'A' && keycode <= 'Z');
-            if (is_alpha) {
-                bool upper = g_capslock ^ g_shift_held;
-                keycode = upper ? (g_scancode_base[code] - 'a' + 'A') : g_scancode_base[code];
-            }
-
-            /* Apply Num Lock on Numpad keys */
-            if (code >= 0x47 && code <= 0x53 && code != 0x4A && code != 0x4E) {
-                bool use_num = g_numlock ^ g_shift_held;
-                if (use_num) {
-                    if      (code == 0x47) keycode = '7';
-                    else if (code == 0x48) keycode = '8';
-                    else if (code == 0x49) keycode = '9';
-                    else if (code == 0x4B) keycode = '4';
-                    else if (code == 0x4C) keycode = '5';
-                    else if (code == 0x4D) keycode = '6';
-                    else if (code == 0x4F) keycode = '1';
-                    else if (code == 0x50) keycode = '2';
-                    else if (code == 0x51) keycode = '3';
-                    else if (code == 0x52) keycode = '0';
-                    else if (code == 0x53) keycode = '.';
-                }
-            }
-        }
-
-        if (!keycode) continue;
-
-        /* Build event */
-        input_event_t evt;
-        __builtin_memset(&evt, 0, sizeof(evt));
-        evt.type     = INPUT_EVENT_KEY;
-        evt.scancode = scancode;
-        evt.keycode  = keycode;
-        evt.flags    = released ? KEY_FLAG_RELEASED : KEY_FLAG_PRESSED;
-
-        if (g_shift_held)  evt.flags |= KEY_FLAG_SHIFT;
-        if (g_ctrl_held)   evt.flags |= KEY_FLAG_CTRL;
-        if (g_alt_held)    evt.flags |= KEY_FLAG_ALT;
-        if (g_capslock)    evt.flags |= KEY_FLAG_CAPS_LOCK;
-        if (g_numlock)     evt.flags |= KEY_FLAG_NUM_LOCK;
-        if (g_scrolllock)  evt.flags |= KEY_FLAG_SCROLL_LOCK;
-
-        cpu_info_t *cpu = smp_get_cpu();
-        evt.timestamp = cpu ? (u32)cpu->ticks : 0;
-
-        queue_push(&evt);
+        bool extended = g_e0_state != 0;
+        g_e0_state = 0;
+        keyboard_emit(scancode & 0x7F, (scancode & 0x80) != 0, extended, scancode, true);
     }
 }
 
@@ -495,7 +564,6 @@ static void mouse_init(void)
 }
 
 /* ── Extern: IRQ handler registration from idt.c ─────────────────────────── */
-extern void idt_register_irq(u8 vector, void (*fn)(pt_regs_t *, void *), void *ctx);
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
@@ -589,6 +657,7 @@ void input_init(void)
 int input_poll(input_event_t *out)
 {
     if (!out) return -1;
+    input_drain_sources();
 
     irqflags_t irqf = spinlock_lock_irqsave(&g_input_lock);
     if (g_queue_tail == g_queue_head) {
@@ -604,6 +673,8 @@ int input_poll(input_event_t *out)
 
 u32 input_queue_count(void)
 {
+    input_drain_sources();
+
     irqflags_t irqf = spinlock_lock_irqsave(&g_input_lock);
     u32 h = g_queue_head;
     u32 t = g_queue_tail;

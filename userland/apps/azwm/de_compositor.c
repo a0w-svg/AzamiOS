@@ -366,6 +366,50 @@ int de_comp_handle_message(az_compositor_t *comp, de_comp_state_t *de,
         return 1;
     }
 
+    /* ── System-wide clipboard ────────────────────────────────────────────── */
+
+    case AZ_WM_CLIPBOARD_SET: {
+        az_wm_clipboard_payload_t *pl = AZ_WM_MSG_CLIPBOARD(msg);
+        /* Guard against oversized payload */
+        unsigned int copy_len = pl->len;
+        if (copy_len >= AZ_WM_CLIPBOARD_TEXT_MAX)
+            copy_len = AZ_WM_CLIPBOARD_TEXT_MAX - 1;
+        if (copy_len > sizeof(comp->clipboard_buf) - 1)
+            copy_len = sizeof(comp->clipboard_buf) - 1;
+        memcpy(comp->clipboard_buf, pl->text, copy_len);
+        comp->clipboard_buf[copy_len] = '\0';
+        comp->clipboard_len = copy_len;
+        de_log("[azwm/clipboard] SET");
+        return 0;
+    }
+
+    case AZ_WM_CLIPBOARD_GET: {
+        az_wm_clipboard_payload_t *pl = AZ_WM_MSG_CLIPBOARD(msg);
+        unsigned int reply_chan = pl->reply_chan;
+        if (reply_chan == 0) break;
+
+        /* Build and send reply */
+        az_wm_msg_t reply;
+        memset(&reply, 0, sizeof(reply));
+        reply.type = AZ_WM_CLIPBOARD_DATA;
+        az_wm_clipboard_payload_t *rpl = AZ_WM_MSG_CLIPBOARD(&reply);
+        rpl->len = comp->clipboard_len;
+        memcpy(rpl->text, comp->clipboard_buf, comp->clipboard_len);
+        rpl->text[comp->clipboard_len] = '\0';
+        az_channel_send_nb(reply_chan, (az_ipc_msg_t *)&reply);
+        de_log("[azwm/clipboard] GET replied");
+        return 0;
+    }
+
+    /* ── Desktop toast notifications ───────────────────────────────────── */
+
+    case AZ_WM_NOTIFY: {
+        /* Broadcast the notification to all subscribers so notifyd can
+         * render the toast overlay regardless of who sends it. */
+        broadcast(de, msg);
+        return 0;
+    }
+
     default:
         break;
     }

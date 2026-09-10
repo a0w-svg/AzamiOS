@@ -45,13 +45,10 @@ static void send_dhcp_udp(const dhcp_packet_t *pkt, size_t total_len)
     void *payload = net_buf_put(buf, total_len);
     memcpy(payload, pkt, total_len);
 
-    /* 3. Compute Checksum */
-    ipv4_hdr_t pseudo_ip;
-    memset(pseudo_ip.src_ip, 0, 4);
-    memset(pseudo_ip.dst_ip, 0xFF, 4);
-    udp->checksum = udp_checksum(udp, &pseudo_ip, payload, total_len);
-
-    /* 4. Transmit via IPv4 broadcast */
+    /* 3. Transmit via IPv4 broadcast.
+     * The checksum is left zero: ipv4_send() fills it in once the source
+     * address in the header is final, which is the only point at which the
+     * pseudo-header is known. */
     static const u8 bcast_ip[4] = { 255, 255, 255, 255 };
     ipv4_send(buf, bcast_ip, IP_PROTO_UDP);
 }

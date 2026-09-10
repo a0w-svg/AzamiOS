@@ -29,23 +29,72 @@ void block_dev_init(void)
     pr_debug("[BLOCK] Block device registry initialized.\n");
 }
 
+/* Ceiling on the staging buffer one read()/write() may allocate.  Callers get
+ * a short transfer beyond it, which read(2) and write(2) both allow. */
+#define BLOCK_MAX_XFER (1U << 20)   /* 1 MiB */
+
+/*
+ * Map a byte range onto whole sectors, clamped to something we can allocate
+ * and to the end of the device.
+ *
+ * The sector count and the staging allocation used to be plain 32-bit
+ * arithmetic over a caller-supplied length.  A write() of 8 MiB to /dev/hda
+ * with 512-byte sectors made `count * dev->sector_size` wrap to a small
+ * value, so kzalloc() returned a buffer far smaller than the copy that
+ * followed wrote into it — a heap overflow any process holding the device
+ * open could trigger.  Nothing bounded the range against sector_count
+ * either, so a large offset simply issued reads past the end of the disk.
+ *
+ * Returns the number of bytes the caller should transfer, or 0 at/after EOF.
+ */
+static size_t block_map_range(block_dev_t *dev, u64 offset, size_t len,
+                              u64 *lba_out, u32 *in_sec_out, u32 *count_out)
+{
+    u32 ss = dev->sector_size;
+    if (ss == 0 || len == 0) return 0;
+
+    u64 lba    = offset / ss;
+    u32 in_sec = (u32)(offset % ss);
+
+    if (dev->sector_count && lba >= dev->sector_count) return 0;   /* EOF */
+
+    if (len > BLOCK_MAX_XFER) len = BLOCK_MAX_XFER;
+
+    u64 sectors = ((u64)in_sec + len + ss - 1) / ss;
+
+    if (dev->sector_count) {
+        u64 avail = dev->sector_count - lba;
+        if (sectors > avail) {
+            sectors = avail;
+            u64 max_bytes = sectors * ss - in_sec;
+            if (len > max_bytes) len = (size_t)max_bytes;
+        }
+    }
+    if (sectors == 0 || len == 0) return 0;
+
+    *lba_out   = lba;
+    *in_sec_out = in_sec;
+    *count_out = (u32)sectors;
+    return len;
+}
+
 static s64 block_fops_read(struct file *filp, void *buf, size_t len, u64 *offset)
 {
     block_dev_t *dev = (block_dev_t *)filp->private_data;
     if (!dev || !dev->ops || !dev->ops->read_sectors) return -1;
-    
-    u64 lba = (*offset) / dev->sector_size;
-    u32 in_sector_offset = (*offset) % dev->sector_size;
-    u32 count = (in_sector_offset + len + dev->sector_size - 1) / dev->sector_size;
-    
-    void *sec_buf = kzalloc(count * dev->sector_size);
+
+    u64 lba; u32 in_sector_offset, count;
+    size_t xfer = block_map_range(dev, *offset, len, &lba, &in_sector_offset, &count);
+    if (xfer == 0) return 0;
+
+    void *sec_buf = kzalloc((size_t)count * dev->sector_size);
     if (!sec_buf) return -(s64)ENOMEM;
-    
+
     s64 ret = dev->ops->read_sectors(dev, lba, count, sec_buf);
     if (ret > 0) {
-        s64 copy_len = ret - in_sector_offset;
-        if (copy_len > (s64)len) copy_len = len;
-        
+        s64 copy_len = ret - (s64)in_sector_offset;
+        if (copy_len > (s64)xfer) copy_len = (s64)xfer;
+
         if (copy_len > 0) {
             __builtin_memcpy(buf, (u8*)sec_buf + in_sector_offset, copy_len);
             *offset += copy_len;
@@ -54,7 +103,7 @@ static s64 block_fops_read(struct file *filp, void *buf, size_t len, u64 *offset
             ret = 0; /* Read beyond EOF or error */
         }
     }
-    
+
     kfree(sec_buf);
     return ret;
 }
@@ -63,27 +112,27 @@ static s64 block_fops_write(struct file *filp, const void *buf, size_t len, u64 
 {
     block_dev_t *dev = (block_dev_t *)filp->private_data;
     if (!dev || !dev->ops || !dev->ops->write_sectors) return -1;
-    
-    u64 lba = (*offset) / dev->sector_size;
-    u32 in_sector_offset = (*offset) % dev->sector_size;
-    u32 count = (in_sector_offset + len + dev->sector_size - 1) / dev->sector_size;
-    
-    void *sec_buf = kzalloc(count * dev->sector_size);
+
+    u64 lba; u32 in_sector_offset, count;
+    size_t xfer = block_map_range(dev, *offset, len, &lba, &in_sector_offset, &count);
+    if (xfer == 0) return 0;
+
+    void *sec_buf = kzalloc((size_t)count * dev->sector_size);
     if (!sec_buf) return -(s64)ENOMEM;
-    
+
     /* Read-modify-write if unaligned or partial sector write */
-    if (dev->ops->read_sectors && (in_sector_offset != 0 || len % dev->sector_size != 0)) {
+    if (dev->ops->read_sectors && (in_sector_offset != 0 || xfer % dev->sector_size != 0)) {
         dev->ops->read_sectors(dev, lba, count, sec_buf);
     }
-    
-    __builtin_memcpy((u8*)sec_buf + in_sector_offset, buf, len);
-    
+
+    __builtin_memcpy((u8*)sec_buf + in_sector_offset, buf, xfer);
+
     s64 ret = dev->ops->write_sectors(dev, lba, count, sec_buf);
     if (ret > 0) {
-        *offset += len;
-        ret = len;
+        *offset += xfer;
+        ret = (s64)xfer;
     }
-    
+
     kfree(sec_buf);
     return ret;
 }

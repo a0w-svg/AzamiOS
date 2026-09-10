@@ -113,10 +113,8 @@ static s64 kmsg_write(file_t *filp, const void *buf, size_t len, u64 *offset)
 {
     (void)filp; (void)offset;
     if (!buf || len == 0) return 0;
-    const char *str = (const char *)buf;
-    for (size_t i = 0; i < len; i++) {
-        kputc(str[i]);
-    }
+    extern void console_write(const char *buf, size_t len);
+    console_write((const char *)buf, len);
     return (s64)len;
 }
 
@@ -146,10 +144,8 @@ static s64 console_dev_write(file_t *filp, const void *buf, size_t len, u64 *off
 {
     (void)filp; (void)offset;
     if (!buf || len == 0) return 0;
-    const char *str = (const char *)buf;
-    for (size_t i = 0; i < len; i++) {
-        kputc(str[i]);
-    }
+    extern void console_write(const char *buf, size_t len);
+    console_write((const char *)buf, len);
     return (s64)len;
 }
 

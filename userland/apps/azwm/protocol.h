@@ -115,12 +115,23 @@ typedef struct {
             unsigned char _pad[3];
         } key;
 
-        /* AZ_WM_MOUSE_EVENT: server → client */
+        /*
+         * AZ_WM_MOUSE_EVENT: server → client
+         *
+         * dx/dy are pointer motion, wheel is the scroll wheel — they are not
+         * the same thing and a client that scrolls must read `wheel`, or
+         * simply moving the pointer across it will scroll its content.
+         * `wheel` is positive scrolling down, matching the PS/2 Z delta.
+         *
+         * The wheel field replaces padding, so the payload is the same size
+         * it always was.
+         */
         struct {
             short dx, dy;
             short abs_x, abs_y;
+            short wheel;
             unsigned char buttons;
-            unsigned char _pad[3];
+            unsigned char _pad[1];
         } mouse;
 
         /* AZ_WM_MOVE_WINDOW: client → server */

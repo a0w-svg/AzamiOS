@@ -32,6 +32,26 @@ static u32  g_fb_row    = 0;   /* current text row    (pixels / char height) */
 #define FG_COLOR 0x00E0E0E0  /* Light grey */
 #define BG_COLOR 0x00000000  /* Black */
 
+/*
+ * ── Why the console keeps its own copy of the text ──────────────────────────
+ * Video memory is mapped write-combining: writes stream out in bursts, reads
+ * go straight to the bus one at a time and cost hundreds of times more.  A
+ * console that scrolls by memmove()ing the framebuffer over itself therefore
+ * reads back the entire screen for every line of output, which at 1280x800 is
+ * megabytes of uncached reads per line — slow enough to see as the screen
+ * lurching and flashing while the kernel logs.
+ *
+ * So the character grid lives in ordinary RAM.  Scrolling shifts that (cheap),
+ * and the screen is repainted from it with nothing but sequential writes.  The
+ * framebuffer is write-only from here on.
+ */
+#define CON_MAX_COLS 256
+#define CON_MAX_ROWS 128
+
+static char g_text[CON_MAX_ROWS][CON_MAX_COLS];
+static u32  g_cols = 0;
+static u32  g_rows = 0;
+
 /* ── Init ─────────────────────────────────────────────────────────────────── */
 
 void console_init_early(void)
@@ -49,7 +69,16 @@ void console_init_fb(void *fb_base, u32 width, u32 height, u32 pitch, u8 bpp)
     g_fb_bpp    = bpp;
     g_fb_col    = 0;
     g_fb_row    = 0;
-    g_fb_ready  = true;
+
+    g_cols = width  / FONT_W;
+    g_rows = height / FONT_H;
+    if (g_cols > CON_MAX_COLS) g_cols = CON_MAX_COLS;
+    if (g_rows > CON_MAX_ROWS) g_rows = CON_MAX_ROWS;
+
+    for (u32 r = 0; r < g_rows; r++) {
+        for (u32 c = 0; c < g_cols; c++) g_text[r][c] = ' ';
+    }
+    g_fb_ready = true;
 }
 
 void console_disable_fb(void)
@@ -59,51 +88,124 @@ void console_disable_fb(void)
 
 /* ── Framebuffer character output ─────────────────────────────────────────── */
 
-static void fb_put_pixel(u32 x, u32 y, u32 color)
+static inline const u8 *fb_glyph(char c)
 {
-    u32 bytes_per_pixel = g_fb_bpp / 8;
-    u8 *pixel = g_fb_base + y * g_fb_pitch + x * bytes_per_pixel;
-    pixel[0] = (u8)(color);
-    pixel[1] = (u8)(color >> 8);
-    pixel[2] = (u8)(color >> 16);
-    if (bytes_per_pixel == 4) pixel[3] = 0xFF;
+    u8 idx = (u8)c;
+    return (idx >= 0x20 && idx < 0x7F) ? g_vga_font[idx - 0x20]
+                                       : g_vga_font[0];   /* fallback: space */
 }
 
+static inline void fb_store_pixel(u8 *p, u32 color)
+{
+    if (g_fb_bpp == 32) {
+        *(u32 *)p = color | 0xFF000000u;
+        return;
+    }
+    p[0] = (u8)(color);
+    p[1] = (u8)(color >> 8);
+    p[2] = (u8)(color >> 16);
+}
+
+/* Paint one character cell.  Writes only — never reads video memory. */
 static void fb_draw_char(u32 col, u32 row, char c)
 {
     u32 px = col * FONT_W;
     u32 py = row * FONT_H;
-    u8 idx = (u8)c;
-    const u8 *glyph = (idx >= 0x20 && idx < 0x7F)
-                       ? g_vga_font[idx - 0x20]
-                       : g_vga_font[0];  /* fallback: space */
+    if (px + FONT_W > g_fb_width || py + FONT_H > g_fb_height) return;
 
-    for (u32 row_i = 0; row_i < FONT_H; row_i++) {
-        u8 bits = glyph[row_i];
-        for (u32 bit = 0; bit < FONT_W; bit++) {
-            u32 color = (bits & (0x80 >> bit)) ? FG_COLOR : BG_COLOR;
-            if (px + bit < g_fb_width && py + row_i < g_fb_height)
-                fb_put_pixel(px + bit, py + row_i, color);
+    const u8 *glyph = fb_glyph(c);
+    u32 bytes_pp = g_fb_bpp / 8;
+
+    for (u32 gy = 0; gy < FONT_H; gy++) {
+        u8  bits = glyph[gy];
+        u8 *dst  = g_fb_base + (py + gy) * g_fb_pitch + px * bytes_pp;
+
+        if (g_fb_bpp == 32) {
+            u32 *d32 = (u32 *)dst;
+            for (u32 b = 0; b < FONT_W; b++) {
+                d32[b] = (bits & (0x80 >> b)) ? (FG_COLOR | 0xFF000000u)
+                                              : (BG_COLOR | 0xFF000000u);
+            }
+        } else {
+            for (u32 b = 0; b < FONT_W; b++) {
+                fb_store_pixel(dst + b * bytes_pp,
+                               (bits & (0x80 >> b)) ? FG_COLOR : BG_COLOR);
+            }
+        }
+    }
+}
+
+/* Repaint the whole screen from the text grid, one scanline at a time so the
+ * writes go out in long sequential runs. */
+static void fb_redraw_all(void)
+{
+    u32 bytes_pp = g_fb_bpp / 8;
+
+    for (u32 r = 0; r < g_rows; r++) {
+        for (u32 gy = 0; gy < FONT_H; gy++) {
+            u32  y   = r * FONT_H + gy;
+            u8  *row = g_fb_base + y * g_fb_pitch;
+
+            if (g_fb_bpp == 32) {
+                u32 *d = (u32 *)row;
+                for (u32 c = 0; c < g_cols; c++) {
+                    u8 bits = fb_glyph(g_text[r][c])[gy];
+                    for (u32 b = 0; b < FONT_W; b++) {
+                        *d++ = (bits & (0x80 >> b)) ? (FG_COLOR | 0xFF000000u)
+                                                    : (BG_COLOR | 0xFF000000u);
+                    }
+                }
+                /* The margin left over when the width is not a whole number
+                 * of cells would otherwise keep whatever the bootloader put
+                 * there, in a strip down the side of the text. */
+                for (u32 x = g_cols * FONT_W; x < g_fb_width; x++) {
+                    *d++ = BG_COLOR | 0xFF000000u;
+                }
+            } else {
+                for (u32 c = 0; c < g_cols; c++) {
+                    u8 bits = fb_glyph(g_text[r][c])[gy];
+                    for (u32 b = 0; b < FONT_W; b++) {
+                        fb_store_pixel(row + (c * FONT_W + b) * bytes_pp,
+                                       (bits & (0x80 >> b)) ? FG_COLOR : BG_COLOR);
+                    }
+                }
+                for (u32 x = g_cols * FONT_W; x < g_fb_width; x++) {
+                    fb_store_pixel(row + x * bytes_pp, BG_COLOR);
+                }
+            }
+        }
+    }
+
+    /* Rows below the last full character cell. */
+    for (u32 y = g_rows * FONT_H; y < g_fb_height; y++) {
+        u8 *row = g_fb_base + y * g_fb_pitch;
+        if (g_fb_bpp == 32) {
+            u32 *d = (u32 *)row;
+            for (u32 x = 0; x < g_fb_width; x++) *d++ = BG_COLOR | 0xFF000000u;
+        } else {
+            for (u32 x = 0; x < g_fb_width; x++) {
+                fb_store_pixel(row + x * bytes_pp, BG_COLOR);
+            }
         }
     }
 }
 
 static void fb_scroll(void)
 {
-    u32 scroll_bytes = (g_fb_height - FONT_H) * g_fb_pitch;
-    u8 *src = g_fb_base + g_fb_pitch * FONT_H;
-    memmove(g_fb_base, src, scroll_bytes);
+    if (g_rows == 0) return;
 
-    /* Clear bottom row */
-    u8 *bottom = g_fb_base + scroll_bytes;
-    memset(bottom, 0, FONT_H * g_fb_pitch);
+    /* Shift the text in RAM, then repaint.  The framebuffer is never read. */
+    for (u32 r = 1; r < g_rows; r++) {
+        memcpy(g_text[r - 1], g_text[r], g_cols);
+    }
+    for (u32 c = 0; c < g_cols; c++) g_text[g_rows - 1][c] = ' ';
+
+    fb_redraw_all();
 }
 
 static void fb_putc(char c)
 {
-    if (!g_fb_ready || !g_fb_base) return;
-    u32 char_cols = g_fb_width  / FONT_W;
-    u32 char_rows = g_fb_height / FONT_H;
+    if (!g_fb_ready || !g_fb_base || g_cols == 0 || g_rows == 0) return;
 
     if (c == '\n') {
         g_fb_col = 0;
@@ -111,14 +213,15 @@ static void fb_putc(char c)
     } else if (c == '\r') {
         g_fb_col = 0;
     } else if (c >= 0x20 && c < 0x7F) {
+        g_text[g_fb_row][g_fb_col] = c;
         fb_draw_char(g_fb_col, g_fb_row, c);
         g_fb_col++;
-        if (g_fb_col >= char_cols) { g_fb_col = 0; g_fb_row++; }
+        if (g_fb_col >= g_cols) { g_fb_col = 0; g_fb_row++; }
     }
 
-    if (g_fb_row >= char_rows) {
+    if (g_fb_row >= g_rows) {
         fb_scroll();
-        g_fb_row = char_rows - 1;
+        g_fb_row = g_rows - 1;
     }
 }
 
@@ -181,6 +284,16 @@ void kputs(const char *s)
     irqflags_t irqf = spinlock_lock_irqsave(&g_console_lock);
     while (*s) kputc(*s++);
     kputc('\n');
+    spinlock_unlock_irqrestore(&g_console_lock, irqf);
+}
+
+void console_write(const char *buf, size_t len)
+{
+    if (!buf || len == 0) return;
+    irqflags_t irqf = spinlock_lock_irqsave(&g_console_lock);
+    for (size_t i = 0; i < len; i++) {
+        kputc(buf[i]);
+    }
     spinlock_unlock_irqrestore(&g_console_lock, irqf);
 }
 

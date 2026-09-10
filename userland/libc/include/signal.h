@@ -71,18 +71,93 @@ struct sigaction {
     sigset_t sa_mask;
 };
 
+/* ── Alternate signal stack (sigaltstack) ────────────────────────────────── */
+#define SS_ONSTACK   1
+#define SS_DISABLE   2
+#define MINSIGSTKSZ  2048
+#define SIGSTKSZ     8192
+
+typedef struct {
+    void  *ss_sp;
+    int    ss_flags;
+    size_t ss_size;
+} stack_t;
+
 /* ── Signal manipulation prototypes ───────────────────────────────────────── */
 int kill(int pid, int sig);
 int raise(int sig);
 sighandler_t signal(int signum, sighandler_t handler);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset);
+int sigaltstack(const stack_t *ss, stack_t *old_ss);
 int sigemptyset(sigset_t *set);
 int sigfillset(sigset_t *set);
 int sigaddset(sigset_t *set, int signum);
 int sigdelset(sigset_t *set, int signum);
 int sigismember(const sigset_t *set, int signum);
+int sigisemptyset(const sigset_t *set);
+int sigorset(sigset_t *dest, const sigset_t *left, const sigset_t *right);
+int sigandset(sigset_t *dest, const sigset_t *left, const sigset_t *right);
 int sigpending(sigset_t *set);
 int sigsuspend(const sigset_t *mask);
+
+/* XSI signal manipulation */
+int sighold(int sig);
+int sigrelse(int sig);
+int sigignore(int sig);
+int sigpause(int sig);
+
+/* Diagnostic signal reporting */
+void psignal(int sig, const char *s);
+
+/* ── Queued signals and synchronous waiting ─────────────────────────────── */
+
+#ifndef __union_sigval_defined
+#define __union_sigval_defined
+union sigval {
+    int   sival_int;
+    void *sival_ptr;
+};
+#endif
+
+/* <sys/wait.h> forward-declares this as `struct siginfo`, so the tag matters. */
+struct siginfo {
+    int          si_signo;
+    int          si_errno;
+    int          si_code;
+    int          __pad0;
+    int          si_pid;
+    unsigned int si_uid;
+    union sigval si_value;
+    char         __pad[128 - 32];
+};
+#ifndef __siginfo_t_defined
+#define __siginfo_t_defined
+typedef struct siginfo siginfo_t;
+#endif
+
+void psiginfo(const siginfo_t *pinfo, const char *s);
+
+struct timespec;
+
+/**
+ * sigwaitinfo(set, info) → the signal number accepted, or -1.
+ *
+ * Blocks until one of @set is pending, then removes it from the pending set
+ * instead of running its handler.  The signals in @set should be blocked in
+ * the caller first, or they may be delivered before this can accept them.
+ */
+int sigwaitinfo(const sigset_t *set, siginfo_t *info);
+
+/** sigtimedwait(set, info, timeout) — sigwaitinfo() with a deadline (EAGAIN). */
+int sigtimedwait(const sigset_t *set, siginfo_t *info,
+                 const struct timespec *timeout);
+
+/** sigwait(set, sig) — accept a signal, reporting only its number. */
 int sigwait(const sigset_t *set, int *sig);
+
+/** sigqueue(pid, sig, value) — send a signal with an accompanying value. */
+int sigqueue(int pid, int sig, const union sigval value);
 int siginterrupt(int sig, int flag);
+int signalfd(int fd, const sigset_t *mask, int flags);

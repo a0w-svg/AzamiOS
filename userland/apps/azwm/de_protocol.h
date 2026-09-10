@@ -48,6 +48,14 @@
 #define AZ_WM_SET_STRUT            34  /* Reserve screen edge (panel geometry)      */
 #define AZ_WM_SET_THEME            35  /* Set active system theme                   */
 
+/* Client -> Server: clipboard */
+#define AZ_WM_CLIPBOARD_SET        60  /* Set system-wide clipboard text            */
+#define AZ_WM_CLIPBOARD_GET        61  /* Request current clipboard text            */
+/* Server -> Client: clipboard */
+#define AZ_WM_CLIPBOARD_DATA       62  /* Reply: clipboard text content             */
+/* Client -> Server / Broadcast: desktop notifications */
+#define AZ_WM_NOTIFY               63  /* Send a toast notification                 */
+
 /* Server -> Client (broadcasts) */
 #define AZ_WM_EVT_WINDOW_CREATED   40  /* Broadcast: a new window was created       */
 #define AZ_WM_EVT_WINDOW_DESTROYED 41  /* Broadcast: a window was destroyed         */
@@ -180,3 +188,33 @@ _Static_assert(sizeof(az_wm_evt_created_payload_t)   <= 200, "evt_created payloa
 _Static_assert(sizeof(az_wm_evt_destroyed_payload_t) <= 200, "evt_destroyed payload overflow");
 _Static_assert(sizeof(az_wm_evt_focus_payload_t)     <= 200, "evt_focus payload overflow");
 _Static_assert(sizeof(az_wm_theme_payload_t)         <= 200, "theme payload overflow");
+
+/* ── Clipboard payload (both SET and DATA use the same struct) ──────────── */
+/* Max clipboard text: 195 bytes — leaves 5 bytes for length + NUL.         */
+#define AZ_WM_CLIPBOARD_TEXT_MAX  192
+
+typedef struct {
+    unsigned int  len;                          /* bytes of text (excl. NUL) */
+    char          text[AZ_WM_CLIPBOARD_TEXT_MAX]; /* UTF-8, NUL-terminated   */
+    unsigned int  reply_chan;                   /* For GET: client reply chan */
+} az_wm_clipboard_payload_t;
+
+_Static_assert(sizeof(az_wm_clipboard_payload_t) <= 200, "clipboard payload overflow");
+
+#define AZ_WM_MSG_CLIPBOARD(msg_ptr) \
+    ((az_wm_clipboard_payload_t *)((msg_ptr)->_raw))
+
+/* ── Notification payload ────────────────────────────────────────────────── */
+#define AZ_WM_NOTIFY_TITLE_MAX  48
+#define AZ_WM_NOTIFY_BODY_MAX   144
+
+typedef struct {
+    char title[AZ_WM_NOTIFY_TITLE_MAX];  /* Short heading (NUL-terminated)  */
+    char body[AZ_WM_NOTIFY_BODY_MAX];    /* Message body  (NUL-terminated)  */
+} az_wm_notify_payload_t;
+
+_Static_assert(sizeof(az_wm_notify_payload_t) <= 200, "notify payload overflow");
+
+#define AZ_WM_MSG_NOTIFY(msg_ptr) \
+    ((az_wm_notify_payload_t *)((msg_ptr)->_raw))
+

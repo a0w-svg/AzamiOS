@@ -293,7 +293,6 @@ int e1000_init(void)
 
     /* Register ISR and enable IRQ */
     if (g_e1000_dev.irq > 0) {
-        extern void idt_register_irq(u8 vector, void (*fn)(pt_regs_t *, void *), void *ctx);
         idt_register_irq(g_e1000_dev.irq + 32, e1000_irq_handler, NULL);
         hal_irq_enable(g_e1000_dev.irq, g_e1000_dev.irq + 32);
     }
@@ -308,6 +307,10 @@ int e1000_init(void)
     memset(&ndev, 0, sizeof(ndev));
     strcpy(ndev.name, "e1000");
     memcpy(ndev.mac, g_e1000_dev.mac, 6);
+    /* Left at zero, the interface reported itself as administratively down
+     * with a 0-byte MTU to everything that inspects net_device_t. */
+    ndev.flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+    ndev.mtu = 1500;
     ndev.send = e1000_send_packet;
     ndev.recv = e1000_recv_packet;
     ndev.link_up = e1000_is_link_up;
@@ -321,20 +324,54 @@ int e1000_init(void)
     return 0;
 }
 
+/*
+ * Set while a CPU is inside the drain loop below, and read under
+ * g_e1000_rx_lock.  The loop has to drop the lock across
+ * net_process_incoming() — the whole IP stack runs from there — and when it is
+ * called from thread context (net_poll) that also re-enables interrupts, so a
+ * receive interrupt can land in the middle of the drain and start a second,
+ * nested drain on the same ring.  The nested call returns immediately instead:
+ * the outer loop re-tests the Descriptor Done bit under the lock after every
+ * packet, so it picks up whatever arrived in the meantime and nothing is lost.
+ */
+static bool g_e1000_rx_draining = false;
+
 void e1000_poll_rx(void)
 {
     if (!g_e1000_ready) return;
 
     irqflags_t flags = spinlock_lock_irqsave(&g_e1000_rx_lock);
-    while (g_e1000_dev.rx_descs[g_e1000_dev.rx_cur].status & E1000_RXD_STAT_DD) {
-        u32 cur = g_e1000_dev.rx_cur;
-        u16 len = g_e1000_dev.rx_descs[cur].length;
-        u8 *pkt = g_e1000_dev.rx_buffers[cur];
+    if (g_e1000_rx_draining) {
+        spinlock_unlock_irqrestore(&g_e1000_rx_lock, flags);
+        return;
+    }
+    g_e1000_rx_draining = true;
 
-        u8 local_buf[2048];
-        size_t copy_len = (len < sizeof(local_buf)) ? len : sizeof(local_buf);
-        if (copy_len > 0) {
-            memcpy(local_buf, pkt, copy_len);
+    u8 local_buf[E1000_PKT_BUF_SIZE];
+
+    while (g_e1000_dev.rx_descs[g_e1000_dev.rx_cur].status & E1000_RXD_STAT_DD) {
+        u32 cur    = g_e1000_dev.rx_cur;
+        u8  status = g_e1000_dev.rx_descs[cur].status;
+        u8  errors = g_e1000_dev.rx_descs[cur].errors;
+        u16 len    = g_e1000_dev.rx_descs[cur].length;
+
+        /*
+         * Only a descriptor that both ends a packet and reports no frame error
+         * holds something worth parsing.  Handing up a CRC-failed frame, or the
+         * leading fragment of a packet split across descriptors (which is what
+         * an oversized frame or a receive overrun produces), gives the stack a
+         * truncated header to parse as if it were complete.  The length is
+         * clamped as well: it comes from the device, and the staging buffer is
+         * only as large as the buffer the device was given.
+         */
+        bool deliver = (status & E1000_RXD_STAT_EOP) &&
+                       !(errors & E1000_RXD_ERR_FRAME_ERR_MASK) &&
+                       len >= sizeof(eth_hdr_t);
+
+        size_t copy_len = 0;
+        if (deliver) {
+            copy_len = (len < sizeof(local_buf)) ? len : sizeof(local_buf);
+            memcpy(local_buf, g_e1000_dev.rx_buffers[cur], copy_len);
         }
 
         g_e1000_dev.rx_descs[cur].status = 0;
@@ -348,6 +385,8 @@ void e1000_poll_rx(void)
             flags = spinlock_lock_irqsave(&g_e1000_rx_lock);
         }
     }
+
+    g_e1000_rx_draining = false;
     spinlock_unlock_irqrestore(&g_e1000_rx_lock, flags);
 }
 
@@ -398,9 +437,16 @@ s64 e1000_recv_packet(void *buf, size_t max_len)
         return -(s64)EAGAIN; /* No packet ready */
     }
 
-    u16 len = g_e1000_dev.rx_descs[cur].length;
-    size_t copy_len = (len < max_len) ? len : max_len;
-    memcpy(buf, g_e1000_dev.rx_buffers[cur], copy_len);
+    u8  status = g_e1000_dev.rx_descs[cur].status;
+    u8  errors = g_e1000_dev.rx_descs[cur].errors;
+    u16 len    = g_e1000_dev.rx_descs[cur].length;
+    if (len > E1000_PKT_BUF_SIZE) len = E1000_PKT_BUF_SIZE;
+
+    size_t copy_len = 0;
+    if ((status & E1000_RXD_STAT_EOP) && !(errors & E1000_RXD_ERR_FRAME_ERR_MASK)) {
+        copy_len = (len < max_len) ? len : max_len;
+        memcpy(buf, g_e1000_dev.rx_buffers[cur], copy_len);
+    }
 
     g_e1000_dev.rx_descs[cur].status = 0;
     e1000_write32(E1000_RDT, cur);

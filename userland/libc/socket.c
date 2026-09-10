@@ -62,6 +62,19 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
     return (int)ret;
 }
 
+/* accept4() exists because setting O_NONBLOCK or FD_CLOEXEC with a follow-up
+ * fcntl() is a race: between the accept and the fcntl, a fork() in another
+ * thread leaks the connection into the child. */
+int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags)
+{
+    long ret = syscall4(SYS_accept4, sockfd, (long)addr, (long)addrlen, flags);
+    if (ret < 0) {
+        errno = (int)-ret;
+        return -1;
+    }
+    return (int)ret;
+}
+
 ssize_t send(int sockfd, const void *buf, size_t len, int flags)
 {
     return sendto(sockfd, buf, len, flags, NULL, 0);
@@ -92,24 +105,25 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *
     return (ssize_t)ret;
 }
 
+/* Used to only ever look at msg_iov[0] and fall through to plain
+ * sendto()/recvfrom() — no gather/scatter across the rest of msg_iov[], and
+ * msg_control (SCM_RIGHTS) was silently dropped entirely. The kernel's
+ * sys_sendmsg_impl/sys_recvmsg_impl (kernel/syscall/syscall.c) now do the
+ * real thing — this is a thin, direct forward to them. */
 ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)
 {
     if (!msg) { errno = EINVAL; return -1; }
-    if (msg->msg_iov && msg->msg_iovlen > 0) {
-        return sendto(sockfd, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags,
-                      (const struct sockaddr *)msg->msg_name, msg->msg_namelen);
-    }
-    return 0;
+    long ret = syscall3(SYS_sendmsg, sockfd, (long)msg, flags);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (ssize_t)ret;
 }
 
 ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)
 {
     if (!msg) { errno = EINVAL; return -1; }
-    if (msg->msg_iov && msg->msg_iovlen > 0) {
-        return recvfrom(sockfd, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags,
-                        (struct sockaddr *)msg->msg_name, &msg->msg_namelen);
-    }
-    return 0;
+    long ret = syscall3(SYS_recvmsg, sockfd, (long)msg, flags);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (ssize_t)ret;
 }
 
 int shutdown(int sockfd, int how)

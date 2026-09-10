@@ -12,8 +12,19 @@
 #include <stdbool.h>
 
 /* ── Pixel buffer base address for shared memory window buffers ───────────── */
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/fb.h>
+
 #define SHMEM_WINDOW_BASE  0x50000000UL
 #define SHMEM_WINDOW_STEP  0x01000000UL  /* 16 MB per window */
+
+static inline bool win_has_frame(const az_window_t *win)
+{
+    if (!win || win->title[0] == '\0') return false;
+    if (strcmp(win->title, "AzamiOS App Launcher") == 0) return false;
+    return true;
+}
 
 /* ── Initialization ──────────────────────────────────────────────────────── */
 
@@ -40,6 +51,15 @@ void compositor_init(az_compositor_t *comp,
     comp->frontbuf = frontbuf;
     comp->backbuf  = backbuf;
     comp->hw_page_flip = 0;
+    comp->fb_fd        = -1;
+    comp->fb_yres      = h;
+    comp->vram_buf[0]  = frontbuf;
+    comp->vram_buf[1]  = frontbuf;
+    comp->active_vram_buf = 0;
+    comp->pending[0].valid = 0;
+    comp->pending[1].valid = 0;
+    comp->cursor_rect[0].valid = 0;
+    comp->cursor_rect[1].valid = 0;
 
     comp->list_head = 0; /* NULL */
     comp->list_tail = 0; /* NULL */
@@ -202,7 +222,7 @@ int compositor_create_window(az_compositor_t *comp,
     if (out_shmem_id) *out_shmem_id = (unsigned int)shmem_id;
 
     compositor_focus_window(comp, win);
-    if (win->title[0] != '\0') {
+    if (win_has_frame(win)) {
         compositor_trigger_open_animation(comp, win);
     }
     return (int)win->wid;
@@ -263,7 +283,7 @@ int compositor_find_window_at(az_compositor_t *comp, int sx, int sy)
             continue;
         }
 
-        bool has_frame = (curr->title[0] != '\0');
+        bool has_frame = win_has_frame(curr);
         int wx = curr->x;
         int wy = curr->y;
         int ww = (int)curr->width;
@@ -555,7 +575,7 @@ static void render_window(az_compositor_t *comp, az_window_t *win)
 {
     if (!win->visible || win->wid == 0) return;
 
-    bool has_frame = (win->title[0] != '\0');
+    bool has_frame = win_has_frame(win);
 
     int wx = win->x;
     int wy = win->y;
@@ -931,40 +951,201 @@ static void draw_context_menu(az_compositor_t *comp)
     }
 }
 
-static void compositor_restore_cursor_area(az_compositor_t *comp, int cx, int cy)
+/* ── Presentation ────────────────────────────────────────────────────────── */
+
+static void rect_union(azwm_rect_t *dst, int x0, int y0, int x1, int y1)
+{
+    if (x0 >= x1 || y0 >= y1) return;
+    if (!dst->valid) {
+        dst->x0 = x0; dst->y0 = y0; dst->x1 = x1; dst->y1 = y1;
+        dst->valid = 1;
+        return;
+    }
+    if (x0 < dst->x0) dst->x0 = x0;
+    if (y0 < dst->y0) dst->y0 = y0;
+    if (x1 > dst->x1) dst->x1 = x1;
+    if (y1 > dst->y1) dst->y1 = y1;
+}
+
+static void rect_union_rect(azwm_rect_t *dst, const azwm_rect_t *src)
+{
+    if (src->valid) rect_union(dst, src->x0, src->y0, src->x1, src->y1);
+}
+
+/* The pointer sprite plus the couple of pixels of slack the old code used. */
+static azwm_rect_t cursor_bounds(const az_compositor_t *comp, int cx, int cy)
+{
+    azwm_rect_t r;
+    r.x0 = cx - 2;
+    r.y0 = cy - 2;
+    r.x1 = cx + AZ_WM_CURSOR_W + 2;
+    r.y1 = cy + AZ_WM_CURSOR_H + 2;
+    if (r.x0 < 0) r.x0 = 0;
+    if (r.y0 < 0) r.y0 = 0;
+    if (r.x1 > (int)comp->fb_width)  r.x1 = (int)comp->fb_width;
+    if (r.y1 > (int)comp->fb_height) r.y1 = (int)comp->fb_height;
+    r.valid = (r.x0 < r.x1 && r.y0 < r.y1);
+    return r;
+}
+
+static void copy_rect(az_compositor_t *comp, unsigned int *dst,
+                      const azwm_rect_t *r)
+{
+    if (!r->valid) return;
+    unsigned int pitch_px = comp->fb_pitch / 4;
+    size_t row_bytes = (size_t)(r->x1 - r->x0) * sizeof(unsigned int);
+
+    for (int y = r->y0; y < r->y1; y++) {
+        memcpy(&dst[(unsigned int)y * pitch_px + (unsigned int)r->x0],
+               &comp->backbuf[(unsigned int)y * pitch_px + (unsigned int)r->x0],
+               row_bytes);
+    }
+}
+
+void compositor_enable_page_flip(az_compositor_t *comp, int fb_fd,
+                                 unsigned int *vram, unsigned int yres)
 {
     unsigned int pitch_px = comp->fb_pitch / 4;
-    int ox = cx - 2;
-    int oy = cy - 2;
-    int cw = AZ_WM_CURSOR_W + 4;
-    int ch = AZ_WM_CURSOR_H + 4;
-    
-    for (int y = 0; y < ch; y++) {
-        int sy = oy + y;
-        if (sy < 0) continue;
-        if (sy >= (int)comp->fb_height) break;
-        int sx = ox;
-        int w = cw;
-        if (sx < 0) {
-            w += sx;
-            sx = 0;
-        }
-        if (sx + w > (int)comp->fb_width) w = (int)comp->fb_width - sx;
-        if (w > 0) {
-            memcpy(&comp->frontbuf[(unsigned int)sy * pitch_px + (unsigned int)sx], 
-                   &comp->backbuf[(unsigned int)sy * pitch_px + (unsigned int)sx], 
-                   (size_t)w * sizeof(unsigned int));
+
+    /* Compositing has to happen somewhere other than video memory, or the
+     * second buffer buys nothing. */
+    if (!vram || comp->backbuf == vram || fb_fd < 0) return;
+
+    comp->fb_fd           = fb_fd;
+    comp->fb_yres         = yres;
+    comp->vram_buf[0]     = vram;
+    comp->vram_buf[1]     = vram + (size_t)yres * pitch_px;
+    comp->active_vram_buf = 0;
+    comp->frontbuf        = comp->vram_buf[0];
+    comp->hw_page_flip    = 1;
+
+    /* Neither buffer holds anything yet. */
+    comp->pending[0].valid = comp->pending[1].valid = 0;
+    rect_union(&comp->pending[0], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+    rect_union(&comp->pending[1], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+    comp->cursor_rect[0].valid = comp->cursor_rect[1].valid = 0;
+}
+
+/* Move the scanout to @buf.  The kernel waits for the frame boundary. */
+static int display_pan(az_compositor_t *comp, int buf)
+{
+    struct fb_var_screeninfo var;
+
+    if (comp->fb_fd >= 0 && ioctl(comp->fb_fd, FBIOGET_VSCREENINFO, &var) == 0) {
+        var.xoffset  = 0;
+        var.yoffset  = (unsigned int)buf * comp->fb_yres;
+        var.activate = FB_ACTIVATE_VBL;
+        if (ioctl(comp->fb_fd, FBIOPAN_DISPLAY, &var) == 0) return 0;
+    }
+    /* Older kernels only have the direct flip call. */
+    return az_fb_flip((unsigned int)buf);
+}
+
+/*
+ * Put the composed frame on screen.
+ *
+ * Single-buffered, there is no way to avoid writing to memory the display is
+ * reading, so the copy is kept as small as the damage allows.  Double
+ * buffered, the copy goes into the buffer that is *not* being scanned out and
+ * the swap is a pan at the frame boundary: the screen only ever shows a whole
+ * frame, which is what removes the flicker of a compositor painting live
+ * video memory.
+ */
+static void compositor_present_internal(az_compositor_t *comp, bool recomposited)
+{
+    unsigned int pitch_px = comp->fb_pitch / 4;
+
+    /*
+     * Only a pass that rebuilt the off-screen buffer owes the display
+     * anything.  A pointer move does not touch it, so it adds no debt and
+     * ends up copying just the two small rectangles the pointer left and
+     * landed on — which is what keeps the pointer cheap enough to move at
+     * the refresh rate.
+     *
+     * Whatever is owed goes to *both* buffers: the one about to be drawn
+     * into was last painted two frames ago, so this frame's damage alone
+     * would leave the previous frame's damage unpaid in it.
+     */
+    if (recomposited) {
+        if (comp->has_damage) {
+            int x0 = comp->dirty_min_x < 0 ? 0 : comp->dirty_min_x;
+            int y0 = comp->dirty_min_y < 0 ? 0 : comp->dirty_min_y;
+            int x1 = comp->dirty_max_x > (int)comp->fb_width  ? (int)comp->fb_width  : comp->dirty_max_x;
+            int y1 = comp->dirty_max_y > (int)comp->fb_height ? (int)comp->fb_height : comp->dirty_max_y;
+            rect_union(&comp->pending[0], x0, y0, x1, y1);
+            rect_union(&comp->pending[1], x0, y0, x1, y1);
+        } else {
+            /* Nothing said what changed, so assume all of it did. */
+            rect_union(&comp->pending[0], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+            rect_union(&comp->pending[1], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
         }
     }
+
+    azwm_rect_t new_cursor = cursor_bounds(comp, comp->cursor_x, comp->cursor_y);
+
+    if (comp->hw_page_flip) {
+        int next = 1 - comp->active_vram_buf;
+        unsigned int *dst = comp->vram_buf[next];
+
+        /* What this buffer is owed, plus the pointer left in it two frames
+         * ago — copying over that is what erases it. */
+        azwm_rect_t area = comp->pending[next];
+        rect_union_rect(&area, &comp->cursor_rect[next]);
+        rect_union_rect(&area, &new_cursor);
+
+        copy_rect(comp, dst, &area);
+        desktop_draw_cursor(dst, comp->fb_width, comp->fb_height, pitch_px,
+                            comp->cursor_x, comp->cursor_y);
+
+        comp->pending[next].valid = 0;
+        comp->cursor_rect[next]   = new_cursor;
+
+        if (display_pan(comp, next) == 0) {
+            comp->active_vram_buf = next;
+            comp->frontbuf        = dst;
+        } else {
+            /* The pan failed; this buffer is no longer trustworthy, so give
+             * up on flipping rather than showing a stale half of the screen. */
+            comp->hw_page_flip = 0;
+            comp->frontbuf     = comp->vram_buf[comp->active_vram_buf];
+            rect_union(&comp->pending[0], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+            rect_union(&comp->pending[1], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+        }
+    } else {
+        /* Single-buffered: copy the damage straight to the live scanout. */
+        azwm_rect_t area = comp->pending[0];
+        rect_union_rect(&area, &comp->cursor_rect[0]);
+        rect_union_rect(&area, &new_cursor);
+
+        copy_rect(comp, comp->frontbuf, &area);
+        desktop_draw_cursor(comp->frontbuf, comp->fb_width, comp->fb_height, pitch_px,
+                            comp->cursor_x, comp->cursor_y);
+
+        comp->pending[0].valid = 0;
+        comp->pending[1].valid = 0;
+        comp->cursor_rect[0]   = new_cursor;
+    }
+
+    comp->has_damage  = 0;
+    comp->dirty_min_x = (int)comp->fb_width;
+    comp->dirty_min_y = (int)comp->fb_height;
+    comp->dirty_max_x = 0;
+    comp->dirty_max_y = 0;
+
+    comp->old_cursor_x = comp->cursor_x;
+    comp->old_cursor_y = comp->cursor_y;
+}
+
+void compositor_present(az_compositor_t *comp)
+{
+    compositor_present_internal(comp, true);
 }
 
 void compose_screen(az_compositor_t *comp)
 {
-    unsigned int pitch_px = comp->fb_pitch / 4;
-
     /* ── 1. Clear backbuf only if tail window does not fully cover screen ─ */
     az_window_t *tail = comp->list_tail;
-    bool tail_has_frame = (tail && tail->title[0] != '\0');
+    bool tail_has_frame = win_has_frame(tail);
     bool full_coverage = (tail && tail->visible && tail->wid != 0 && !tail_has_frame &&
                           tail->x <= 0 && tail->y <= 0 &&
                           tail->width >= comp->fb_width && tail->height >= comp->fb_height);
@@ -984,80 +1165,32 @@ void compose_screen(az_compositor_t *comp)
     draw_alt_tab_hud(comp);
     draw_context_menu(comp);
 
-    /* ── 4. Presentation: Hardware Zero-Copy Page Flip or Vectorized Blit ─ */
-    if (comp->hw_page_flip) {
-        int next_buf = 1 - comp->active_vram_buf;
-        if (az_fb_flip((unsigned int)next_buf) == 0) {
-            comp->active_vram_buf = next_buf;
-            comp->frontbuf = comp->vram_buf[comp->active_vram_buf];
-            comp->backbuf  = comp->vram_buf[1 - comp->active_vram_buf];
-
-            /* Draw mouse cursor directly to the newly flipped front buffer */
-            desktop_draw_cursor(comp->frontbuf, comp->fb_width, comp->fb_height, pitch_px,
-                                comp->cursor_x, comp->cursor_y);
-            comp->old_cursor_x = comp->cursor_x;
-            comp->old_cursor_y = comp->cursor_y;
-            comp->has_damage = 0;
-            comp->dirty_min_x = (int)comp->fb_width;
-            comp->dirty_min_y = (int)comp->fb_height;
-            comp->dirty_max_x = 0;
-            comp->dirty_max_y = 0;
-            return;
-        }
-    }
-
-    /* Fallback Double-Buffering: copy damaged rects back buffer → front buffer */
-    int y0 = comp->dirty_min_y < 0 ? 0 : comp->dirty_min_y;
-    int y1 = comp->dirty_max_y > (int)comp->fb_height ? (int)comp->fb_height : comp->dirty_max_y;
-    int x0 = comp->dirty_min_x < 0 ? 0 : comp->dirty_min_x;
-    int x1 = comp->dirty_max_x > (int)comp->fb_width ? (int)comp->fb_width : comp->dirty_max_x;
-
-    if (x0 < x1 && y0 < y1 && (x1 - x0 < (int)comp->fb_width || y1 - y0 < (int)comp->fb_height)) {
-        size_t row_bytes = (size_t)(x1 - x0) * sizeof(unsigned int);
-        for (int y = y0; y < y1; y++) {
-            unsigned int *src_row = &comp->backbuf[y * pitch_px + x0];
-            unsigned int *dst_row = &comp->frontbuf[y * pitch_px + x0];
-            memcpy(dst_row, src_row, row_bytes);
-        }
-    } else {
-        size_t total_bytes = (size_t)pitch_px * comp->fb_height * sizeof(unsigned int);
-        memcpy(comp->frontbuf, comp->backbuf, total_bytes);
-    }
-
-    comp->has_damage = 0;
-    comp->dirty_min_x = (int)comp->fb_width;
-    comp->dirty_min_y = (int)comp->fb_height;
-    comp->dirty_max_x = 0;
-    comp->dirty_max_y = 0;
-
-    /* Draw mouse cursor directly to frontbuf */
-    desktop_draw_cursor(comp->frontbuf, comp->fb_width, comp->fb_height, pitch_px,
-                        comp->cursor_x, comp->cursor_y);
-    comp->old_cursor_x = comp->cursor_x;
-    comp->old_cursor_y = comp->cursor_y;
-
+    /*
+     * ── 4. Presentation ───────────────────────────────────────────────
+     * Everything above is redrawn from scratch, but only the regions the
+     * damage box names actually come out different — the rest re-renders to
+     * identical pixels.  Presenting that box is therefore both correct and
+     * far cheaper than the screen.  A pass that reports no damage at all is
+     * the exception and is presented whole.
+     */
+    compositor_present_internal(comp, true);
 }
 
+/*
+ * A pointer move changes almost nothing, so it presents the same way a full
+ * frame does — the damage bookkeeping already narrows the copy to the two
+ * small rectangles the pointer left and landed on.
+ */
 void compositor_update_cursor(az_compositor_t *comp)
 {
-    unsigned int pitch_px = comp->fb_pitch / 4;
-    
-    /* 1. Restore old cursor region from backbuf to frontbuf */
-    compositor_restore_cursor_area(comp, comp->old_cursor_x, comp->old_cursor_y);
-    
-    /* 2. Draw new cursor to frontbuf */
-    desktop_draw_cursor(comp->frontbuf, comp->fb_width, comp->fb_height, pitch_px,
-                        comp->cursor_x, comp->cursor_y);
-    
-    comp->old_cursor_x = comp->cursor_x;
-    comp->old_cursor_y = comp->cursor_y;
+    compositor_present_internal(comp, false);
 }
 
 /* ── Animation Engine ────────────────────────────────────────────────────── */
 
 void compositor_trigger_open_animation(az_compositor_t *comp, az_window_t *win)
 {
-    if (!win || win->title[0] == '\0') return;
+    if (!win_has_frame(win)) return;
     win->anim_state    = AZWM_ANIM_OPEN;
     win->anim_step     = 0;
     win->anim_target_x = win->x;

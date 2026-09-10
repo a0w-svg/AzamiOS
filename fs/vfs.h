@@ -103,6 +103,7 @@ typedef struct super_operations {
     void (*write_inode)(struct inode *inode);
     void (*put_super)(struct super_block *sb);
     s64 (*statfs)(struct super_block *sb, struct statfs *buf);
+    s64 (*sync_fs)(struct super_block *sb);   /* flush this volume's buffered writes */
 } super_operations_t;
 
 /* --------------------------------------------------------------------------
@@ -130,6 +131,9 @@ typedef struct inode_operations {
     s64 (*rename)(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry);
     s64 (*symlink)(struct inode *dir, struct dentry *dentry, const char *symname);
     s64 (*readlink)(struct dentry *dentry, char *buf, size_t buflen);
+    /* Hard link: attach @dentry in @dir to the inode @old_dentry already
+     * names. Distinct from ->symlink, which makes a new inode holding a path. */
+    s64 (*link)(struct inode *dir, struct dentry *old_dentry, struct dentry *dentry);
 } inode_operations_t;
 
 /* --------------------------------------------------------------------------
@@ -138,6 +142,7 @@ typedef struct inode_operations {
 typedef struct inode {
     u64 i_ino;
     u32 i_mode;
+    u32 i_nlink;   /* Hard links to this inode; 0 means "filesystem has none" */
     u32 i_uid;
     u32 i_gid;
     u64 i_size;
@@ -168,16 +173,40 @@ typedef struct dentry {
 
 /* --------------------------------------------------------------------------
  * File Operations
+ *
+ * BUFFER CONTRACT — read the next paragraph before implementing one of these.
+ *
+ * `buf` / `dirent_buf` in read, write and readdir are KERNEL pointers. The
+ * syscall layer stages every transfer through a kernel buffer of its own and
+ * performs the copy to and from userspace itself (see sys_read_impl() and
+ * sys_write_impl()); by the time an fop is called there is no user pointer
+ * left to validate. Implementations therefore use plain memcpy(). Calling
+ * copy_to_user()/copy_from_user() in one of these does not merely add a
+ * redundant check — it fails, because the kernel address it is handed sits
+ * above the user-space limit those helpers enforce, so the op returns -EFAULT
+ * on every call. Nine drivers did exactly that (/dev/fb0, evdev, DRM events,
+ * i2c-dev, virtio-console, the watchdog, memfd, signalfd, timerfd) and none of
+ * their read/write paths had ever succeeded.
+ *
+ * `ioctl` is the exception: `arg` is passed through untouched and IS a user
+ * pointer whenever the command carries one, so ioctl handlers must use
+ * copy_to_user()/copy_from_user().
  * -------------------------------------------------------------------------- */
 typedef struct file_operations {
+    /* buf: kernel pointer (see contract above) */
     s64 (*read)(struct file *filp, void *buf, size_t len, u64 *offset);
     s64 (*write)(struct file *filp, const void *buf, size_t len, u64 *offset);
     s64 (*readdir)(struct file *filp, void *dirent_buf, size_t len, u64 *offset); /* For getdents64 */
+    /* arg: user pointer when the command carries one — use copy_*_user() */
     s64 (*ioctl)(struct file *filp, u32 cmd, u64 arg);
     s64 (*mmap)(struct file *filp, virt_addr_t vaddr, size_t len, u32 prot, u32 flags, u64 offset);
     s64 (*open)(struct inode *inode, struct file *filp);
     s64 (*release)(struct inode *inode, struct file *filp);
     int (*poll)(struct file *filp);
+    /* posix_fadvise(2)/readahead(2): a hint, never an error to ignore. */
+    s64 (*fadvise)(struct file *filp, u64 offset, u64 len, int advice);
+    /* fallocate(2): reserve backing blocks for [offset, offset+len). */
+    s64 (*fallocate)(struct file *filp, int mode, u64 offset, u64 len);
 } file_operations_t;
 
 /* --------------------------------------------------------------------------
@@ -217,6 +246,26 @@ s64 vfs_register_fs(file_system_type_t *fs);
 /** vfs_mount() — Mount a filesystem. */
 s64 vfs_mount(const char *source, const char *target, const char *fstype, void *data);
 
+/** vfs_umount() — Unmount a filesystem at target. */
+s64 vfs_umount(const char *target, int flags);
+
+/** vfs_sync_all() — Flush every filesystem's cached writes to stable storage.
+ *  Backs sync(2) and the pre-reboot flush. */
+void vfs_sync_all(void);
+
+/** vfs_sync_fs(sb) — Flush one mounted filesystem. Backs fsync(2)/fdatasync(2)/
+ *  syncfs(2), which have no business stalling on unrelated volumes. */
+s64 vfs_sync_fs(struct super_block *sb);
+
+/** vfs_fadvise(file, offset, len, advice) — POSIX_FADV_* hint for a file range.
+ *  Backs posix_fadvise(2) and readahead(2). Returns 0 when the filesystem has
+ *  no fadvise handler (the hint is simply dropped). */
+s64 vfs_fadvise(file_t *file, u64 offset, u64 len, int advice);
+
+/** vfs_fallocate(file, mode, offset, len) — back fallocate(2). Filesystems that
+ *  implement it reserve real blocks; the rest fall back to extending i_size. */
+s64 vfs_fallocate(file_t *file, int mode, u64 offset, u64 len);
+
 /* Dentry Cache functions */
 dentry_t *dcache_alloc(dentry_t *parent, const char *name);
 void dcache_add(dentry_t *dentry);
@@ -238,6 +287,7 @@ s64 vfs_close(file_t *file);
 s64 vfs_read(file_t *file, void *buf, size_t size);
 s64 vfs_write(file_t *file, const void *buf, size_t size);
 s64 vfs_lseek(file_t *file, s64 offset, int whence);
+s64 vfs_link(const char *oldpath, const char *newpath);
 s64 vfs_stat(const char *path, struct stat *statbuf);
 s64 vfs_lstat(const char *path, struct stat *statbuf);
 s64 vfs_fstat(file_t *file, struct stat *statbuf);
@@ -254,6 +304,10 @@ s64 vfs_fchmod(file_t *file, u32 mode);
 s64 vfs_chown(const char *path, u32 uid, u32 gid);
 s64 vfs_lchown(const char *path, u32 uid, u32 gid);
 s64 vfs_fchown(file_t *file, u32 uid, u32 gid);
+/* atime/mtime as (u64)-1 means "leave unchanged" (same convention as the
+ * uid/gid parameters above). See the definition in fs/vfs.c for details. */
+s64 vfs_utimes(const char *path, u64 atime, u64 mtime);
+s64 vfs_futimes(file_t *file, u64 atime, u64 mtime);
 s64 vfs_statfs(const char *path, struct statfs *buf);
 s64 vfs_fstatfs(file_t *file, struct statfs *buf);
 

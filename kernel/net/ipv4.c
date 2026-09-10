@@ -13,6 +13,8 @@
 #include "../../include/azami/ipv4.h"
 #include "../../include/azami/icmp.h"
 #include "../../include/azami/arp.h"
+#include "../../include/azami/udp.h"
+#include "../../include/azami/tcp.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
 #include "../../kernel/lib/string.h"
 
@@ -225,6 +227,39 @@ int ipv4_send(net_buf_t *buf, const u8 dst_ip[4], u8 protocol)
     memcpy(ip->dst_ip, dst_ip, 4);
     ip->checksum = net_checksum(ip, sizeof(ipv4_hdr_t));
 
+    /*
+     * The UDP and TCP checksums cover a pseudo-header built from the final
+     * source and destination addresses, so they can only be computed once the
+     * IP header exists — which is here.  A transport that computed one from
+     * its own guess at the source address would be wrong whenever that guess
+     * differed from what this function actually wrote: the DHCP client, for
+     * one, always assumes 0.0.0.0, so every packet it sent after an address
+     * was configured carried a checksum for the wrong pseudo-header and was
+     * silently dropped by the peer.
+     */
+    size_t l4_len = buf->len - sizeof(ipv4_hdr_t);
+    if (protocol == IP_PROTO_UDP && l4_len >= sizeof(udp_hdr_t)) {
+        udp_hdr_t *udp = (udp_hdr_t *)((u8 *)ip + sizeof(ipv4_hdr_t));
+        size_t udp_len = ntohs(udp->length);
+        if (udp_len >= sizeof(udp_hdr_t) && udp_len <= l4_len) {
+            udp->checksum = 0;
+            udp->checksum = udp_checksum(udp, ip, (const u8 *)udp + sizeof(udp_hdr_t),
+                                         udp_len - sizeof(udp_hdr_t));
+        }
+    } else if (protocol == IP_PROTO_TCP && l4_len >= sizeof(tcp_hdr_t)) {
+        tcp_hdr_t *tcp = (tcp_hdr_t *)((u8 *)ip + sizeof(ipv4_hdr_t));
+        /* tcp_checksum() now covers whatever header the segment declares, so
+         * a segment carrying options gets a correct checksum instead of being
+         * skipped and sent out with whatever was in the field. */
+        size_t hdr_len = (size_t)((tcp->data_offset >> 4) * 4);
+        if (hdr_len >= sizeof(tcp_hdr_t) && hdr_len <= l4_len) {
+            tcp->checksum = 0;
+            tcp->checksum = tcp_checksum(tcp, ip, hdr_len,
+                                         (const u8 *)tcp + hdr_len,
+                                         l4_len - hdr_len);
+        }
+    }
+
     /* 2. Direct Loopback Bypass (No Ethernet / ARP needed) */
     if (is_loopback) {
         net_loopback_input(buf);
@@ -312,14 +347,65 @@ void ipv4_input(net_buf_t *buf)
         return;
     }
 
-    u8 host_ip[4];
+    /*
+     * total_len — not buf->len — is where the datagram ends.
+     *
+     * Ethernet pads every frame out to a 60-byte minimum, so a received buffer
+     * is routinely longer than the packet inside it.  Nothing used to trim it,
+     * and the transports that size their payload from buf->len rather than
+     * from their own length field inherited the padding: TCP summed it into
+     * the segment checksum, so every minimum-size segment — a bare ACK, SYN,
+     * FIN or RST is 54 bytes on the wire and therefore always padded — failed
+     * validation and was dropped, which is most of a connection's traffic.
+     */
+    size_t total_len = ntohs(ip->total_len);
+    if (total_len < ihl_bytes || total_len > buf->len) {
+        pr_debug("[IPv4] Bad total_len %zu (ihl=%zu, have=%zu), dropping.\n",
+                 total_len, ihl_bytes, buf->len);
+        net_buf_free(buf);
+        return;
+    }
+    net_buf_trim(buf, total_len);
+
+    /*
+     * Fragments are dropped rather than handed up half-parsed.  There is no
+     * reassembly engine here, and a non-first fragment carries no transport
+     * header at all — passing one to tcp_input()/udp_input() would have them
+     * read the payload as though it were a header.
+     */
+    u16 frag = ntohs(ip->frag_offset);
+    if ((frag & IP_FLAG_MF) || (frag & IP_FRAG_OFF_MASK)) {
+        pr_debug("[IPv4] Fragmented datagram (off=%u, MF=%u) — no reassembly, dropping.\n",
+                 (unsigned)(frag & IP_FRAG_OFF_MASK), (unsigned)!!(frag & IP_FLAG_MF));
+        net_buf_free(buf);
+        return;
+    }
+
+    u8 host_ip[4], host_mask[4];
     net_get_ip(host_ip);
+    net_get_netmask(host_mask);
 
     /* Accept packets for our IP, loopback 127.x.x.x, broadcast, or during DHCP setup */
     bool is_unconfigured = (host_ip[0] == 0 && host_ip[1] == 0 && host_ip[2] == 0 && host_ip[3] == 0);
     bool is_loop = (ip->dst_ip[0] == 127);
-    bool is_bcast = (ip->dst_ip[0] == 255 && ip->dst_ip[1] == 255 && ip->dst_ip[2] == 255 && ip->dst_ip[3] == 255) || (ip->dst_ip[3] == 255);
     bool is_for_us = (memcmp(ip->dst_ip, host_ip, 4) == 0);
+
+    /*
+     * Broadcast is either the limited broadcast 255.255.255.255 or *our*
+     * subnet's directed broadcast.  The old test accepted any address whose
+     * last octet was 255, which on a /16 or wider is an ordinary unicast
+     * address belonging to some other host.
+     */
+    bool is_bcast = (ip->dst_ip[0] == 255 && ip->dst_ip[1] == 255 &&
+                     ip->dst_ip[2] == 255 && ip->dst_ip[3] == 255);
+    if (!is_bcast && !is_unconfigured) {
+        bool directed = true;
+        for (int k = 0; k < 4; k++) {
+            u8 want = (u8)((host_ip[k] & host_mask[k]) | (u8)~host_mask[k]);
+            if (ip->dst_ip[k] != want) { directed = false; break; }
+        }
+        is_bcast = directed;
+    }
 
     if (!is_unconfigured && !is_loop && !is_bcast && !is_for_us) {
         net_buf_free(buf);
@@ -342,8 +428,11 @@ void ipv4_input(net_buf_t *buf)
     } else if (ip_copy.protocol == IP_PROTO_TCP) {
         tcp_input(buf, &ip_copy);
     } else {
-        /* Protocol Unreachable */
-        icmp_send_dest_unreach(&ip_copy, buf->data, ICMP_CODE_PROTO_UNREACH);
+        /* Protocol Unreachable.  buf->data is what is left after the header
+         * was pulled, and for a 20-byte datagram that is nothing at all —
+         * hence the explicit length: the quoted-payload copy used to read a
+         * fixed 8 bytes off the end of the heap allocation. */
+        icmp_send_dest_unreach(&ip_copy, buf->data, buf->len, ICMP_CODE_PROTO_UNREACH);
         net_buf_free(buf);
     }
 }

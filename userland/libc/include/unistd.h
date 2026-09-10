@@ -73,6 +73,30 @@ int fsync(int fd);
 int fdatasync(int fd);
 void sync(void);
 int syncfs(int fd);
+
+/* ── Linux system administration calls ───────────────────────────────────── */
+
+/**
+ * vhangup() — send SIGHUP to every process in the caller's session, revoking
+ * their controlling terminal. getty(8) calls this between logins so the next
+ * user cannot inherit a descriptor onto the previous user's terminal.
+ * Requires CAP_SYS_TTY_CONFIG.
+ */
+int vhangup(void);
+
+/**
+ * pivot_root() — make @new_root the root filesystem and move the old root to
+ * @put_old, which must lie under @new_root. Used by an initramfs to hand over
+ * to the real root. Requires CAP_SYS_ADMIN.
+ */
+int pivot_root(const char *new_root, const char *put_old);
+
+/**
+ * process_mrelease() — release the address space of a process that is already
+ * exiting, identified by a pidfd. Lets an OOM handler reclaim memory without
+ * waiting for the dying process to be reaped. @flags must be 0.
+ */
+int process_mrelease(int pidfd, unsigned int flags);
 ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out, off_t *off_out, size_t len, unsigned int flags);
 ssize_t readahead(int fd, off_t offset, size_t count);
 int sync_file_range(int fd, off_t offset, off_t nbytes, unsigned int flags);
@@ -123,3 +147,8 @@ int nice(int inc);
 /* Timing / Sleeping */
 unsigned int sleep(unsigned int seconds);
 int usleep(unsigned long usec);
+
+/* Linux Extensions */
+int pidfd_open(pid_t pid, unsigned int flags);
+int pidfd_send_signal(int pidfd, int sig, const void *info, unsigned int flags);
+int memfd_create(const char *name, unsigned int flags);

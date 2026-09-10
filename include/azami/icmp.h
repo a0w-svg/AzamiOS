@@ -31,5 +31,7 @@
 void icmp_init(void);
 void icmp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr);
 s64  icmp_send_echo(const u8 target_ip[4], u16 id, u16 seq, const void *payload, size_t payload_len);
-void icmp_send_dest_unreach(const ipv4_hdr_t *orig_ip, const void *orig_data, u8 code);
-void icmp_send_time_exceeded(const ipv4_hdr_t *orig_ip, const void *orig_data);
+void icmp_send_dest_unreach(const ipv4_hdr_t *orig_ip, const void *orig_data,
+                            size_t orig_data_len, u8 code);
+void icmp_send_time_exceeded(const ipv4_hdr_t *orig_ip, const void *orig_data,
+                             size_t orig_data_len);

@@ -51,3 +51,12 @@ u32 smp_cpu_count(void);
 
 /** smp_send_reschedule(cpu_id) — Send IPI to force rescheduling on a remote CPU. */
 void smp_send_reschedule(u32 cpu_id);
+
+/** smp_send_ipi(cpu_id, vector) — Send an arbitrary fixed IPI to a remote CPU.
+ *  A no-op for the calling CPU itself and for ids that are not online. */
+void smp_send_ipi(u32 cpu_id, u8 vector);
+
+/** Set to true by the BSP once early init is complete; APs spin on this before
+ *  starting their LAPIC timer and entering the scheduler (see smp.c). */
+extern volatile bool g_smp_sched_active;
+

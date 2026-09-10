@@ -27,3 +27,17 @@ bin/
 *.swp
 *~
 .DS_Store
+
+# Linux binary port pipeline (tools/linux) — downloaded sources and build
+# output. `make linux` regenerates all of it; nothing here belongs in git.
+tools/linux/dl/
+tools/linux/src/
+
+# Canonical uapi headers (include/azami/uapi/) copied into libc's include
+# tree by userland/Makefile's uapi-sync so self-hosted native builds see them
+# under /usr/include too. Regenerated on every build; never hand-edit or
+# commit the copy — edit include/azami/uapi/*.h instead.
+userland/libc/include/azami/uapi/
+tools/linux/musl/
+tools/linux/out/
+tools/linux/log/

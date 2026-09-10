@@ -44,6 +44,7 @@ void *net_buf_reserve(net_buf_t *buf, size_t len);
 void *net_buf_put(net_buf_t *buf, size_t len);
 void *net_buf_push(net_buf_t *buf, size_t len);
 void *net_buf_pull(net_buf_t *buf, size_t len);
+void  net_buf_trim(net_buf_t *buf, size_t len);
 
 /* Thread-safe queue operations */
 void       net_buf_queue_init(net_buf_queue_t *q);

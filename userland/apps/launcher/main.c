@@ -461,18 +461,20 @@ int main(int argc, char **argv)
     int win_y = (int)(sh - TASKBAR_H - MODAL_H) / 2;
     if (win_y < 20) win_y = 20;
 
-    if (uk_window_connect(&g_win, "", win_x, win_y, MODAL_W, MODAL_H,
+    if (uk_window_connect(&g_win, "AzamiOS App Launcher", win_x, win_y, MODAL_W, MODAL_H,
                           LAUNCHER_MAP, SERVER_CHAN) < 0) {
         de_log("[launcher] FATAL: Failed to create window");
         sys_exit(1);
     }
 
     uk_set_zorder(&g_win, AZ_WM_ZORDER_TOP);
+    az_set_timer(g_win.client_chan, 100, 0);
     update_filter();
     draw_launcher();
 
     az_ipc_msg_t raw_msg;
     az_wm_msg_t *msg = (az_wm_msg_t *)&raw_msg;
+    static unsigned int g_open_ticks = 0;
 
     de_log("[launcher] Entering event loop.");
 
@@ -553,10 +555,17 @@ int main(int argc, char **argv)
             break;
         }
 
+        case AZ_WM_TIMER_TICK: {
+            g_open_ticks++;
+            break;
+        }
+
         case AZ_WM_FOCUS_CHANGE: {
             if (!msg->focus.focused && !g_launching) {
-                g_launching = 1;
-                sys_exit(0);
+                if (g_open_ticks > 3) {
+                    g_launching = 1;
+                    sys_exit(0);
+                }
             }
             break;
         }

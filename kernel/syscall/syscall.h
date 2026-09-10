@@ -47,3 +47,16 @@ void syscall_init(void);
  * Returns the descriptor, or -EMFILE when the table is full.
  */
 s64 syscall_install_fd(struct process *proc, void *file, u8 fd_flags);
+
+/**
+ * fd_table_release(proc) — detach and release every descriptor @proc still
+ * holds, as part of tearing the process down.
+ *
+ * Each slot is cleared under the fd-table lock, so a cross-process fget() on
+ * another CPU (pidfd_getfd(2) reaching into this table) either takes a
+ * reference to the live file before it is closed here, or sees an empty slot —
+ * never a pointer that is mid-free. The vfs_close()/object dereference for each
+ * detached entry then runs outside the lock. Idempotent and safe to call from
+ * more than one teardown path racing on the same table.
+ */
+void fd_table_release(struct process *proc);

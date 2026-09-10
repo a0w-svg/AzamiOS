@@ -44,21 +44,51 @@ static s64 loopback_send(const void *data, size_t len)
     return (s64)len;
 }
 
-u16 net_checksum(const void *data, size_t len)
+/*
+ * The Internet checksum, accumulated a byte at a time.
+ *
+ * Reading the data through a u16 pointer would be faster but is undefined
+ * behaviour — the buffers are packed protocol headers, and the compiler is
+ * entitled to assume a u16 read cannot alias the struct stores that produced
+ * them.  It acts on that: at -O2 the stores building a pseudo-header were
+ * sunk past the summation loop, so the checksum was computed over stale
+ * stack and every UDP datagram left with a wrong checksum.  Byte reads are
+ * always allowed to alias, so this form means what it says at any -O level.
+ *
+ * Words are assembled little-endian and the folded result is stored without
+ * a byte swap.  That is self-consistent: RFC 1071 notes the sum may be
+ * computed in either byte order provided the result is stored in the order
+ * it was computed.
+ *
+ * Only the final region may have an odd length: a partial sum resumed after
+ * an odd-length region would misalign every subsequent word.
+ */
+u32 net_checksum_partial(const void *data, size_t len, u32 sum)
 {
-    const u16 *ptr = (const u16 *)data;
-    u32 sum = 0;
+    const u8 *p = (const u8 *)data;
+
     while (len > 1) {
-        sum += *ptr++;
+        sum += (u32)p[0] | ((u32)p[1] << 8);
+        p   += 2;
         len -= 2;
     }
     if (len > 0) {
-        sum += *(const u8 *)ptr;
+        sum += (u32)p[0];
     }
+    return sum;
+}
+
+u16 net_checksum_fold(u32 sum)
+{
     while (sum >> 16) {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     return (u16)(~sum);
+}
+
+u16 net_checksum(const void *data, size_t len)
+{
+    return net_checksum_fold(net_checksum_partial(data, len, 0));
 }
 
 int net_register_device(const net_device_t *dev)
@@ -335,32 +365,74 @@ s64 net_send_raw(const void *data, size_t len)
     return -1;
 }
 
+/*
+ * Is this frame addressed to us?
+ *
+ * The NICs are brought up in promiscuous mode, so on anything but QEMU's
+ * private user network the ring also contains frames belonging to other
+ * hosts on the segment.  Nothing filtered them, which meant a neighbour's
+ * TCP traffic reached tcp_input() and was answered with a RST, and their
+ * ARP exchanges rewrote our cache.  Accept broadcast, any multicast group
+ * (the driver has no group list of its own), and the MAC of any interface
+ * we registered — a second NIC's address is still ours.
+ */
+static bool eth_addressed_to_us(const u8 dst[ETH_ALEN])
+{
+    if (dst[0] & 0x01) return true;   /* multicast, and broadcast with it */
+
+    for (int i = 0; i < g_net_dev_count; i++) {
+        if (memcmp(g_net_devs[i].mac, dst, ETH_ALEN) == 0) return true;
+    }
+    return memcmp(g_host_mac, dst, ETH_ALEN) == 0;
+}
+
 void net_process_incoming(const u8 *pkt, size_t len)
 {
     if (!pkt || len < sizeof(eth_hdr_t)) return;
     const eth_hdr_t *eth = (const eth_hdr_t *)pkt;
     u16 ethertype = ntohs(eth->ethertype);
 
+    net_device_t *dev = g_primary_dev;
+
+    if (!eth_addressed_to_us(eth->dst)) {
+        if (dev) dev->stats.rx_dropped++;
+        return;
+    }
+
+    if (dev) {
+        dev->stats.rx_packets++;
+        dev->stats.rx_bytes += len;
+    }
+
     if (ethertype == ETH_P_ARP) {
         arp_input(pkt, len);
     } else if (ethertype == ETH_P_IP) {
         size_t ip_len = len - sizeof(eth_hdr_t);
+        if (ip_len < sizeof(ipv4_hdr_t)) return;
+
         net_buf_t *buf = net_buf_alloc(ip_len + 32);
-        if (!buf) return;
+        if (!buf) {
+            if (dev) dev->stats.rx_dropped++;
+            return;
+        }
 
         void *payload = net_buf_put(buf, ip_len);
         memcpy(payload, pkt + sizeof(eth_hdr_t), ip_len);
+        buf->protocol = ETH_P_IP;
+        buf->dev = dev;
         ipv4_input(buf);
     }
 }
 
 __attribute__((weak)) void e1000_poll_rx(void) {}
 __attribute__((weak)) void virtio_net_poll(void) {}
+__attribute__((weak)) void rtl8139_poll_rx(void) {}
 
 void net_poll(void)
 {
     e1000_poll_rx();
     virtio_net_poll();
+    rtl8139_poll_rx();
 }
 
 s64 net_send_icmp_ping(const u8 target_ip[4], u16 seq)

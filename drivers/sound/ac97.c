@@ -19,7 +19,6 @@
 #include "../../hal/irq.h"
 #include "../../kernel/uaccess.h"
 
-extern void idt_register_irq(u8 vector, void (*handler)(pt_regs_t *, void *), void *ctx);
 extern int devfs_register_device(const char *name, file_operations_t *fops, void *private_data);
 
 static u32 g_nam_bar = 0;

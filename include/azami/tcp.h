@@ -127,4 +127,5 @@ void        tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr);
 void        tcp_timer_tick(void);
 bool        tcp_poll_in(tcp_sock_t *sock);
 bool        tcp_poll_out(tcp_sock_t *sock);
-u16         tcp_checksum(const tcp_hdr_t *tcp, const ipv4_hdr_t *ip, const void *payload, size_t payload_len);
+u16         tcp_checksum(const tcp_hdr_t *tcp, const ipv4_hdr_t *ip, size_t header_len,
+                         const void *payload, size_t payload_len);

@@ -12,9 +12,32 @@
 
 size_t strlen(const char *s)
 {
-    size_t len = 0;
-    while (s && *s++) len++;
-    return len;
+    if (!s) return 0;
+    const char *p = s;
+
+    /* Align to 8-byte boundary */
+    while ((uintptr_t)p & 7) {
+        if (*p == '\0') return (size_t)(p - s);
+        p++;
+    }
+
+    /* Process 8 bytes per iteration using SWAR zero-byte detection */
+    const unsigned long *lp = (const unsigned long *)p;
+    for (;;) {
+        unsigned long w = *lp++;
+        unsigned long zeros = (w - 0x0101010101010101UL) & ~w & 0x8080808080808080UL;
+        if (zeros) {
+            const char *cp = (const char *)(lp - 1);
+            if (cp[0] == '\0') return (size_t)(cp - s);
+            if (cp[1] == '\0') return (size_t)(cp - s + 1);
+            if (cp[2] == '\0') return (size_t)(cp - s + 2);
+            if (cp[3] == '\0') return (size_t)(cp - s + 3);
+            if (cp[4] == '\0') return (size_t)(cp - s + 4);
+            if (cp[5] == '\0') return (size_t)(cp - s + 5);
+            if (cp[6] == '\0') return (size_t)(cp - s + 6);
+            return (size_t)(cp - s + 7);
+        }
+    }
 }
 
 size_t strnlen(const char *s, size_t maxlen)
@@ -80,6 +103,28 @@ char *strncat(char *dest, const char *src, size_t n)
 int strcmp(const char *s1, const char *s2)
 {
     if (!s1 || !s2) { if (s1 == s2) return 0; return s1 ? 1 : -1; }
+    if (s1 == s2) return 0;
+
+    /* If both strings share 8-byte alignment, compare 8 bytes at a time */
+    if ((((uintptr_t)s1 ^ (uintptr_t)s2) & 7) == 0) {
+        while ((uintptr_t)s1 & 7) {
+            if (*s1 != *s2 || *s1 == '\0')
+                return *(const unsigned char *)s1 - *(const unsigned char *)s2;
+            s1++; s2++;
+        }
+        const unsigned long *lp1 = (const unsigned long *)s1;
+        const unsigned long *lp2 = (const unsigned long *)s2;
+        for (;;) {
+            unsigned long w1 = *lp1;
+            unsigned long w2 = *lp2;
+            unsigned long zeros = (w1 - 0x0101010101010101UL) & ~w1 & 0x8080808080808080UL;
+            if (w1 != w2 || zeros) break;
+            lp1++; lp2++;
+        }
+        s1 = (const char *)lp1;
+        s2 = (const char *)lp2;
+    }
+
     while (*s1 && (*s1 == *s2)) { s1++; s2++; }
     return *(const unsigned char *)s1 - *(const unsigned char *)s2;
 }
@@ -298,6 +343,7 @@ void *memset(void *dest, int c, size_t n)
     size_t qwords = n >> 3;
     size_t bytes  = n & 7;
 
+    __asm__ volatile("cld" : : : "cc");
     if (qwords > 0) {
         __asm__ volatile(
             "rep stosq"
@@ -325,6 +371,7 @@ void *memcpy(void *dest, const void *src, size_t n)
     size_t qwords = n >> 3;
     size_t bytes  = n & 7;
 
+    __asm__ volatile("cld" : : : "cc");
     if (qwords > 0) {
         __asm__ volatile(
             "rep movsq"
@@ -360,17 +407,38 @@ void *memmove(void *dest, const void *src, size_t n)
             "cld"
             : "+D"(d), "+S"(s), "+c"(n)
             :
-            : "memory"
+            : "memory", "cc"
         );
+        return dest;
     }
-    return dest;
 }
 
 int memcmp(const void *s1, const void *s2, size_t n)
 {
+    if (s1 == s2 || n == 0) return 0;
     const unsigned char *p1 = (const unsigned char *)s1;
     const unsigned char *p2 = (const unsigned char *)s2;
-    while (n--) { if (*p1 != *p2) return (int)*p1 - (int)*p2; p1++; p2++; }
+
+    /* Align to 8-byte boundary if both pointers share alignment */
+    if ((((uintptr_t)p1 ^ (uintptr_t)p2) & 7) == 0) {
+        while (((uintptr_t)p1 & 7) && n > 0) {
+            if (*p1 != *p2) return (int)*p1 - (int)*p2;
+            p1++; p2++; n--;
+        }
+        const unsigned long *lp1 = (const unsigned long *)p1;
+        const unsigned long *lp2 = (const unsigned long *)p2;
+        while (n >= 8) {
+            if (*lp1 != *lp2) break;
+            lp1++; lp2++; n -= 8;
+        }
+        p1 = (const unsigned char *)lp1;
+        p2 = (const unsigned char *)lp2;
+    }
+
+    while (n--) {
+        if (*p1 != *p2) return (int)*p1 - (int)*p2;
+        p1++; p2++;
+    }
     return 0;
 }
 
@@ -463,10 +531,14 @@ size_t strlcpy(char *dst, const char *src, size_t size)
 
 size_t strlcat(char *dst, const char *src, size_t size)
 {
-    size_t dstlen = strlen(dst);
+    /* strlcat must not read past size bytes of dst — use strnlen to bound
+     * the scan in case dst is not null-terminated within the buffer. */
+    size_t dstlen = strnlen(dst, size);
     size_t srclen = strlen(src);
     if (dstlen >= size) return size + srclen;
-    size_t copylen = (dstlen + srclen >= size) ? size - dstlen - 1 : srclen;
+    /* Guard against size_t overflow when computing total length needed. */
+    size_t avail = size - dstlen - 1;
+    size_t copylen = (srclen > avail) ? avail : srclen;
     memcpy(dst + dstlen, src, copylen);
     dst[dstlen + copylen] = '\0';
     return dstlen + srclen;
@@ -664,6 +736,85 @@ int wctomb(char *s, wchar_t wc)
     return (int)wcrtomb(s, wc, NULL);
 }
 
+/* wcschr/wcsrchr/wcscat/wcsncat/wmemchr/wmemcmp/wmemcpy/wmemmove/wmemset
+ * were declared in wchar.h but never defined here — any caller referencing
+ * one got an undefined-reference link error. Direct transliterations of
+ * their strchr/strrchr/strcat/strncat/memchr/memcmp/memcpy/memmove/memset
+ * counterparts above, just over wchar_t instead of char. */
+
+wchar_t *wcschr(const wchar_t *s, wchar_t c)
+{
+    if (!s) return 0;
+    while (*s) { if (*s == c) return (wchar_t *)s; s++; }
+    return (c == 0) ? (wchar_t *)s : 0;
+}
+
+wchar_t *wcsrchr(const wchar_t *s, wchar_t c)
+{
+    if (!s) return 0;
+    const wchar_t *last = 0;
+    while (*s) { if (*s == c) last = s; s++; }
+    return (c == 0) ? (wchar_t *)s : (wchar_t *)last;
+}
+
+wchar_t *wcscat(wchar_t *dest, const wchar_t *src)
+{
+    wchar_t *d = dest;
+    while (*d) d++;
+    while ((*d++ = *src++) != 0);
+    return dest;
+}
+
+wchar_t *wcsncat(wchar_t *dest, const wchar_t *src, size_t n)
+{
+    wchar_t *d = dest;
+    while (*d) d++;
+    while (n-- && *src) *d++ = *src++;
+    *d = 0;
+    return dest;
+}
+
+wchar_t *wmemchr(const wchar_t *s, wchar_t c, size_t n)
+{
+    while (n--) { if (*s == c) return (wchar_t *)s; s++; }
+    return 0;
+}
+
+int wmemcmp(const wchar_t *s1, const wchar_t *s2, size_t n)
+{
+    while (n--) {
+        if (*s1 != *s2) return (*s1 < *s2) ? -1 : 1;
+        s1++; s2++;
+    }
+    return 0;
+}
+
+wchar_t *wmemcpy(wchar_t *dest, const wchar_t *src, size_t n)
+{
+    wchar_t *d = dest;
+    while (n--) *d++ = *src++;
+    return dest;
+}
+
+wchar_t *wmemmove(wchar_t *dest, const wchar_t *src, size_t n)
+{
+    if (dest == src || n == 0) return dest;
+    if (dest < src || dest >= src + n) {
+        return wmemcpy(dest, src, n);
+    }
+    wchar_t *d = dest + n;
+    const wchar_t *s = src + n;
+    while (n--) *--d = *--s;
+    return dest;
+}
+
+wchar_t *wmemset(wchar_t *s, wchar_t c, size_t n)
+{
+    wchar_t *p = s;
+    while (n--) *p++ = c;
+    return s;
+}
+
 void *rawmemchr(const void *s, int c)
 {
     const unsigned char *p = (const unsigned char *)s;
@@ -699,6 +850,11 @@ int timingsafe_bcmp(const void *b1, const void *b2, size_t n)
         res |= p1[i] ^ p2[i];
     }
     return res;
+}
+
+void *mempcpy(void *dest, const void *src, size_t n)
+{
+    return (void *)((char *)memcpy(dest, src, n) + n);
 }
 
 

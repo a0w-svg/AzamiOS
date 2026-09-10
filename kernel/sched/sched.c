@@ -6,6 +6,11 @@
 #define DEBUG 0
 #include <azami/debug.h>
 #include "sched.h"
+#include "../ptrace.h"
+#include "../syscall/syscall.h"   /* fd_table_release() */
+#include "../perf/perf.h"
+#include "../perf/ktrace.h"
+#include "../security/security.h"
 #include "../mm/kmalloc.h"
 #include "../mm/pmm.h"
 #include "../object/object.h"
@@ -14,9 +19,11 @@
 #include "../../arch/x86_64/cpu/smp.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
 #include "../../arch/x86_64/cpu/msr.h"
+#include "../../arch/x86_64/cpu/cpu.h"
 #include "../../drivers/char/console.h"
 #include "../../include/azami/defs.h"
 #include "../../fs/vfs.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 
 
 static spinlock_t g_sched_lock = SPINLOCK_INIT;
@@ -26,30 +33,58 @@ static process_t *g_kernel_proc = NULL;
 static u32 g_next_pid = 1;
 static u32 g_next_tid = 1;
 
+/* CFS min_vruntime: monotonically-advancing floor equal to the largest
+ * vruntime ever dequeued as the run-queue head. Threads are enqueued with
+ * their vruntime clamped up to this floor.
+ *
+ * Without it, a thread joining the queue with a stale-low vruntime — a brand
+ * new thread (thread_create_ex sets vruntime = 0) or one that just woke from a
+ * long sleep/block — sorts ahead of every running thread and keeps the CPU
+ * until it accumulates their vruntime. On a box that has been up a while the
+ * running threads sit at (ticks_run * priority), so "catching up" means many
+ * seconds of exclusive CPU: new and just-woken threads starve everything else.
+ *
+ * Guarded by g_sched_lock (every enqueue_ready/dequeue_ready caller holds it). */
+static u64 g_min_vruntime = 0;
+
 static void enqueue_ready(thread_t *t);
 
 /* Sleep queue is kept sorted by sleep_end_ticks (ascending) for O(1) tick scan */
 static thread_t *g_sleep_queue = NULL;
 u64 g_system_ticks = 0;
 
-static thread_t *g_idle_threads[16] = {NULL};
+static thread_t *g_idle_threads[SMP_MAX_CPUS] = {NULL};
 
 /* Per-CPU idle bitmask: bit i is set when CPU i is running its idle thread.
  * Allows enqueue_ready() to find an idle CPU in O(1) via __builtin_ctzll(). */
 static volatile u64 g_idle_cpu_mask = 0;
 
 static void sleep_queue_insert_sorted(thread_t *t); /* forward decl */
+static void notify_waiter_locked(process_t *parent, int sig); /* forward decl */
 
 void sched_post_switch(void)
 {
     cpu_info_t *cpu = smp_get_cpu();
     if (!cpu) return;
 
+    /* Close out the outgoing task's hardware counters and open the incoming
+     * one's. This runs in the *new* thread on the core both of them ran on,
+     * which is what makes the counter delta attributable to exactly one task.
+     * Before the lock below, because cpu->prev_thread is cleared there. */
+    perf_sched_switch(cpu->prev_thread ? cpu->prev_thread->proc : NULL,
+                      cpu->current_thread ? cpu->current_thread->proc : NULL);
+
     if (cpu->current_thread && cpu->current_thread->proc) {
-        wrmsr(MSR_FS_BASE, cpu->current_thread->proc->fs_base);
-        wrmsr(MSR_KERNEL_GS_BASE, cpu->current_thread->proc->gs_base);
+        /* Per-thread TLS base when the thread set one (CLONE_SETTLS); otherwise
+         * the process-wide base (single-threaded / main thread). */
+        thread_t *ct = cpu->current_thread;
+        u64 base = ct->fs_base ? ct->fs_base : ct->proc->fs_base;
+        if (g_fsgsbase_enabled) wrfsbase(base);
+        else wrmsr(MSR_FS_BASE, base);
+        wrmsr(MSR_KERNEL_GS_BASE, ct->proc->gs_base);
     } else {
-        wrmsr(MSR_FS_BASE, 0);
+        if (g_fsgsbase_enabled) wrfsbase(0);
+        else wrmsr(MSR_FS_BASE, 0);
         wrmsr(MSR_KERNEL_GS_BASE, 0);
     }
 
@@ -70,9 +105,11 @@ void sched_post_switch(void)
                 }
                 if (all_dead) {
                     prev->proc->is_zombie = true;
-                    if (prev->proc->parent && prev->proc->parent->wait_thread) {
-                        enqueue_ready(prev->proc->parent->wait_thread);
-                        prev->proc->parent->wait_thread = NULL;
+                    notify_waiter_locked(prev->proc->parent, SIGCHLD);
+                    if (prev->proc->tracer_pid && (!prev->proc->parent || prev->proc->parent->pid != prev->proc->tracer_pid)) {
+                        for (process_t *tr = g_process_list; tr; tr = tr->next) {
+                            if (tr->pid == prev->proc->tracer_pid) { notify_waiter_locked(tr, SIGCHLD); break; }
+                        }
                     }
                 }
             }
@@ -102,8 +139,8 @@ void sched_post_switch(void)
 }
 
 /* Telemetry Stats */
-static u64 g_cpu_idle_ticks[16] = {0};
-static u64 g_cpu_active_ticks[16] = {0};
+static u64 g_cpu_idle_ticks[SMP_MAX_CPUS] = {0};
+static u64 g_cpu_active_ticks[SMP_MAX_CPUS] = {0};
 
 u32 sched_get_process_count(void)
 {
@@ -120,13 +157,13 @@ u32 sched_get_process_count(void)
 
 u64 sched_get_idle_ticks(u32 cpu_id)
 {
-    if (cpu_id >= 16) return 0;
+    if (cpu_id >= SMP_MAX_CPUS) return 0;
     return g_cpu_idle_ticks[cpu_id];
 }
 
 u64 sched_get_active_ticks(u32 cpu_id)
 {
-    if (cpu_id >= 16) return 0;
+    if (cpu_id >= SMP_MAX_CPUS) return 0;
     return g_cpu_active_ticks[cpu_id];
 }
 
@@ -134,6 +171,66 @@ u64 sched_get_active_ticks(u32 cpu_id)
 extern void switch_to_asm(u64 *old_rsp, u64 new_rsp);
 extern void fpu_save_asm(void *fpu_state);
 extern void fpu_restore_asm(const void *fpu_state);
+extern void xsave_save_asm(void *area, u64 mask);
+extern void xsave_restore_asm(const void *area, u64 mask);
+extern void xsaveopt_save_asm(void *area, u64 mask);
+extern void xsavec_save_asm(void *area, u64 mask);
+extern u8   g_osxsave_enabled;      /* set in vmm_init() */
+extern u8   g_xsave_variant;        /* XSAVE_VARIANT_*, chosen at boot */
+extern u64  g_xcr0_mask;            /* XCR0 actually programmed; RFBM for XSAVE/XRSTOR */
+
+/* SIMD context save/restore. When XSAVE is available we save exactly the state
+ * components in XCR0 (x87 + SSE, plus AVX / AVX-512 / PKRU where the CPU has
+ * them — see g_xcr0_mask); otherwise we fall back to FXSAVE (x87 + SSE only).
+ *
+ * Which save instruction we use is decided once at boot and never re-examined
+ * per switch: XSAVEC packs the image and skips components the CPU has but we
+ * did not enable, XSAVEOPT elides components untouched since the last restore
+ * from this same address, and plain XSAVE writes the full standard layout.
+ * All three are read back by XRSTOR, which distinguishes the layouts from the
+ * XCOMP_BV bit the save instruction wrote — so the restore path is shared.
+ *
+ * The per-thread area is only 16-byte aligned by kmalloc, so we bump the
+ * pointer up to the 64-byte boundary XSAVE requires. Passing a bit not in XCR0
+ * as the XRSTOR RFBM is #GP, so the mask must be g_xcr0_mask, never a literal.
+ *
+ * The XSAVEOPT variant is only sound because a thread's area is allocated with
+ * the thread and never reused for anything else: the modified-optimisation
+ * tracks the *address* the state was last restored from. */
+#define FPU_ALIGN(p)     ((void *)(((uintptr_t)(p) + 63) & ~(uintptr_t)63))
+
+static inline void fpu_save(fpu_state_t *fs)
+{
+    void *a = FPU_ALIGN(fs->buffer);
+    if (!g_osxsave_enabled) { fpu_save_asm(a); return; }
+    switch (g_xsave_variant) {
+        case XSAVE_VARIANT_XSAVEC:   xsavec_save_asm(a, g_xcr0_mask);   break;
+        case XSAVE_VARIANT_XSAVEOPT: xsaveopt_save_asm(a, g_xcr0_mask); break;
+        default:                     xsave_save_asm(a, g_xcr0_mask);    break;
+    }
+}
+
+static inline void fpu_restore(const fpu_state_t *fs)
+{
+    void *a = FPU_ALIGN(fs->buffer);
+    if (g_osxsave_enabled) xsave_restore_asm(a, g_xcr0_mask);
+    else                   fpu_restore_asm(a);
+}
+
+/* Prepare a fresh thread's SIMD area. A zeroed area is "init state" for the
+ * x87/SSE/AVX *register* components under XRSTOR, but MXCSR is NOT covered by
+ * XSTATE_BV: XRSTOR always reloads it from the legacy image (offset 24) when
+ * the restore mask includes SSE/AVX. A zero MXCSR unmasks every SIMD FP
+ * exception, so with CR4.OSXMMEXCPT set the first inexact mulsd/addsd in user
+ * code traps as #XM. Seed FCW/MXCSR in the legacy image on both paths. */
+static inline void fpu_area_init(fpu_state_t *fs)
+{
+    u8 *a = (u8 *)FPU_ALIGN(fs->buffer);
+    __builtin_memset(fs->buffer, 0, sizeof fs->buffer);
+    *(u16 *)(a + 0)  = 0x037F;    /* FCW:        default rounding, all masked */
+    *(u32 *)(a + 24) = 0x1F80;    /* MXCSR:      all SIMD FP exceptions masked */
+    *(u32 *)(a + 28) = 0x0000FFBF;/* MXCSR_MASK: standard writable-bit mask   */
+}
 
 thread_t *sched_current_thread(void)
 {
@@ -151,6 +248,12 @@ static void enqueue_ready(thread_t *t)
 {
     t->state = THREAD_READY;
     t->next = NULL;
+
+    /* Clamp up to the run-queue floor so a stale-low vruntime cannot starve
+     * the queue (see g_min_vruntime). This is a no-op for a thread that was
+     * just preempted — it ran, so its vruntime already sits at or above the
+     * floor — and only bites the new/just-woken case it is meant to fix. */
+    if (t->vruntime < g_min_vruntime) t->vruntime = g_min_vruntime;
 
     if (!g_ready_queue || t->vruntime < g_ready_queue->vruntime) {
         t->next = g_ready_queue;
@@ -181,6 +284,9 @@ static thread_t *dequeue_ready(void)
     thread_t *t = g_ready_queue;
     g_ready_queue = t->next;
     t->next = NULL;
+    /* The queue is sorted ascending, so the head is the minimum: advance the
+     * floor to it. Monotone by construction — never walks backwards. */
+    if (t->vruntime > g_min_vruntime) g_min_vruntime = t->vruntime;
     return t;
 }
 
@@ -204,10 +310,20 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     }
     proc->cwd[0] = '/';
     proc->cwd[1] = '\0';
+    proc->root[0] = '/';   /* unconfined until chroot(2) says otherwise */
+    proc->root[1] = '\0';
     proc->exit_code = 0;
     proc->is_zombie = false;
+    proc->last_cpu  = (u32)-1;   /* has not run anywhere yet */
     proc->wait_thread = NULL;
     proc->umask = 022; /* POSIX-02: default file creation mask */
+    proc->pkey_alloc_map = 0x1; /* key 0 is the default key, always taken */
+
+    /* Seed the capability sets. kzalloc left euid == 0, so a plain new process
+     * starts fully privileged exactly as it did before capabilities existed;
+     * fork() immediately overwrites these from the parent in proc_clone_attrs(),
+     * and execve() re-derives them in security_caps_on_exec(). */
+    security_caps_init(proc, proc->pid <= 1);
 
     irqf = spinlock_lock_irqsave(&g_sched_lock);
     proc->next = g_process_list;
@@ -217,43 +333,94 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     return proc;
 }
 
+static process_t *sched_find_reaper(process_t *child)
+{
+    process_t *p = child ? child->parent : NULL;
+    while (p) {
+        if (p->child_subreaper && !p->is_zombie) return p;
+        p = p->parent;
+    }
+    process_t *curr = g_process_list;
+    while (curr) {
+        if ((curr->pid == 1 || curr->pid == 2) && !curr->is_zombie) return curr;
+        curr = curr->next;
+    }
+    return NULL;
+}
+
 void proc_destroy(process_t *proc)
 {
     if (!proc) return;
 
+    /* Backstop for a process that never ran sys_exit_impl — one killed by a
+     * signal, or torn down on a failed fork. Without this its tracees would
+     * stay parked in a ptrace-stop with no tracer left to resume them. Must run
+     * before the lock is taken: ptrace_release() takes it itself. */
+    ptrace_release(proc);
+
+    /* Likewise for any perf event still following this pid: its final count is
+     * already complete (the last context switch away from it folded the delta
+     * in), but the event must stop matching the pid before the number can be
+     * handed to a new process. */
+    perf_process_exit(proc);
+
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    process_t *reaper = sched_find_reaper(proc);
     process_t **pproc = &g_process_list;
     while (*pproc) {
         if (*pproc == proc) {
             *pproc = proc->next;
         } else {
             if ((*pproc)->parent == proc) {
-                (*pproc)->parent = NULL;
+                (*pproc)->parent = reaper;
+                if ((*pproc)->is_zombie && reaper && reaper->wait_thread) {
+                    enqueue_ready(reaper->wait_thread);
+                    reaper->wait_thread = NULL;
+                }
             }
             pproc = &(*pproc)->next;
         }
     }
     spinlock_unlock_irqrestore(&g_sched_lock, irqf);
 
+    /* @proc is now off g_process_list, so proc_get_by_pid() can no longer take
+     * a new reference to it. One taken on another CPU just before the unlink
+     * may still be live, though — wait the brief moment for it to drain before
+     * anything below starts freeing what that caller is reading. */
+    while (__atomic_load_n(&proc->hold_count, __ATOMIC_SEQ_CST))
+        sched_yield();
+
     /* Close IPC channels */
     extern void ipc_channel_close_all(process_t *proc);
     ipc_channel_close_all(proc);
+
+    /* Release System V IPC state (shm attachments, SEM_UNDO adjustments) and
+     * any POSIX timers this process still owns. */
+    extern void sysvipc_process_exit(process_t *proc);
+    extern void ktimer_process_exit(process_t *proc);
+    extern void mqueue_drop_proc(u32 pid);
+    sysvipc_process_exit(proc);
+    ktimer_process_exit(proc);
+    /* A POSIX message queue holds one notification registration at a time.
+     * Leaving a dead pid in it would lock every other process out of
+     * mq_notify() on that queue for the lifetime of the system. */
+    mqueue_drop_proc(proc->pid);
+
+    /* POSIX: a reaped child's CPU time is charged to its parent. */
+    if (proc->parent) {
+        proc->parent->cutime_ticks += proc->utime_ticks + proc->cutime_ticks;
+        proc->parent->cstime_ticks += proc->stime_ticks + proc->cstime_ticks;
+    }
 
     /* Unmap shared memory */
     extern void ipc_shmem_unmap_all(process_t *proc);
     ipc_shmem_unmap_all(proc);
 
-    /* Close handles and open file descriptors */
-    for (int i = 0; i < 64; i++) {
-        if (proc->handle_table[i]) {
-            vfs_close((file_t *)proc->handle_table[i]);
-            proc->handle_table[i] = NULL;
-        }
-        if (proc->obj_handle_table[i]) {
-            extern s64 az_handle_close(process_t *proc, s64 handle_id);
-            az_handle_close(proc, i);
-        }
-    }
+    /* Close handles and open file descriptors. Clears each slot under the
+     * fd-table lock so a concurrent (possibly cross-process) fget() cannot race
+     * a file_t into use as it is freed; also covers a late sys_exit /
+     * sched_exit_thread cleanup without double-closing. */
+    fd_table_release(proc);
 
     extern void vma_reset(process_t *p);
     vma_reset(proc);
@@ -275,10 +442,10 @@ extern void thread_entry_trampoline(void);
  * corrupting whatever the HHDM aliased underneath. Physical pages need not be
  * contiguous.
  *
- * VA slots are handed out MONOTONICALLY and never recycled: this kernel has no
- * cross-CPU TLB shootdown, so re-pointing a live kernel VA at a fresh physical
- * page would leave stale global TLB entries on other CPUs. A retired slot's
- * stale entries are harmless because nothing ever touches that VA again. When
+ * VA slots are recycled through a small free list. That is only safe because
+ * unmapping now performs a cross-CPU TLB shootdown (arch/x86_64/mm/tlb.c):
+ * without one, re-pointing a live kernel VA at a fresh physical page would
+ * leave other CPUs holding stale *global* translations to the old frame. When
  * the window is exhausted we fall back to a plain contiguous HHDM stack.
  *
  * The window lives inside the HHDM's PML4 entry (index 256), far past real RAM
@@ -295,20 +462,48 @@ extern void thread_entry_trampoline(void);
                              (u64)KSTACK_MAX_SLOTS * KSTACK_SLOT_PAGES * PAGE_SIZE)
 
 static spinlock_t g_kstack_lock = SPINLOCK_INIT;
-static u64        g_kstack_next;   /* monotonic slot index */
+static u64        g_kstack_next;   /* high-water mark for never-used slots */
+
+/* Freed guarded-slot indices, recycled ahead of bumping g_kstack_next so a
+ * long-lived system with high thread churn keeps getting guard-page-protected
+ * stacks instead of falling through to the unguarded fallback. */
+#define KSTACK_FREE_CACHE  1024
+static u32 g_kstack_free_list[KSTACK_FREE_CACHE];
+static u32 g_kstack_free_count;
 
 /* Returns the VA of the lowest mapped stack page (the guard page sits at
  * base - PAGE_SIZE), or 0 on out-of-memory. */
 static u64 kstack_alloc(void)
 {
     irqflags_t f = spinlock_lock_irqsave(&g_kstack_lock);
-    u64 slot = g_kstack_next;
-    if (slot < KSTACK_MAX_SLOTS) g_kstack_next++;
+    u64 slot;
+    if (g_kstack_free_count > 0) {
+        slot = g_kstack_free_list[--g_kstack_free_count];
+        /* BUG-3 hardening: kstack_free() validates before pushing, but if memory
+         * corruption has altered g_kstack_free_count or the array itself, catch
+         * it here and fail loudly rather than silently using the unguarded fallback
+         * which would map physical pages at an arbitrary kernel VA. */
+        if (unlikely(slot >= KSTACK_MAX_SLOTS)) {
+            /* BUG-N fix: a corrupt free-list entry must not silently degrade to an
+             * unguarded stack — that defeats the entire guard-page safety model.
+             * PANIC loudly so the memory corruption is surfaced immediately. */
+            PANIC("[SCHED] BUG: corrupt kstack free-list entry %u — memory corruption detected",
+                    (unsigned)slot);
+        }
+    } else {
+        slot = g_kstack_next;
+        if (slot < KSTACK_MAX_SLOTS) g_kstack_next++;
+    }
     spinlock_unlock_irqrestore(&g_kstack_lock, f);
 
     if (slot >= KSTACK_MAX_SLOTS) {
+        /* Unguarded fallback — should be unreachable now that slots recycle,
+         * but still zero it so a stale-data leak can't ride along. */
         phys_addr_t phys = pmm_alloc_pages(KSTACK_PAGES);
-        return phys ? (u64)PHYS_TO_VIRT(phys) : 0;
+        if (!phys) return 0;
+        u64 base = (u64)PHYS_TO_VIRT(phys);
+        hw_clear_pages((void *)base, (size_t)KSTACK_PAGES);
+        return base;
     }
 
     u64 slot_base  = KSTACK_AREA_BASE + slot * (u64)KSTACK_SLOT_PAGES * PAGE_SIZE;
@@ -328,7 +523,7 @@ static u64 kstack_alloc(void)
             return 0;
         }
         /* Zero the freshly mapped stack page (kzalloc-equivalent hygiene). */
-        __builtin_memset((void *)va, 0, PAGE_SIZE);
+        hw_clear_page((void *)va);
     }
     return stack_base;
 }
@@ -338,12 +533,25 @@ static void kstack_free(u64 stack_base)
     if (!stack_base) return;
 
     if (stack_base >= KSTACK_AREA_BASE && stack_base < KSTACK_AREA_END) {
-        for (int p = 0; p < KSTACK_PAGES; p++) {
-            u64 va = stack_base + (u64)p * PAGE_SIZE;
-            phys_addr_t phys = vmm_translate(vmm_kernel_space(), va);
-            vmm_unmap(vmm_kernel_space(), va);
-            if (phys) pmm_free_page(phys);
-        }
+        /* Collect the frames first, then tear the whole stack down in one go:
+         * vmm_unmap_range() shoots the range down across every CPU once,
+         * rather than once per page. The frames are ours to release (the VMM
+         * only auto-frees user pages), so they come back after that. */
+        phys_addr_t phys[KSTACK_PAGES];
+        for (int p = 0; p < KSTACK_PAGES; p++)
+            phys[p] = vmm_translate(vmm_kernel_space(), stack_base + (u64)p * PAGE_SIZE);
+
+        vmm_unmap_range(vmm_kernel_space(), stack_base, KSTACK_PAGES, false);
+
+        for (int p = 0; p < KSTACK_PAGES; p++)
+            if (phys[p]) pmm_free_page(phys[p]);
+        /* Recycle the slot index (guard page stays unmapped). */
+        u64 slot = (stack_base - (u64)KSTACK_GUARD_PAGES * PAGE_SIZE - KSTACK_AREA_BASE)
+                   / ((u64)KSTACK_SLOT_PAGES * PAGE_SIZE);
+        irqflags_t f = spinlock_lock_irqsave(&g_kstack_lock);
+        if (slot < KSTACK_MAX_SLOTS && g_kstack_free_count < KSTACK_FREE_CACHE)
+            g_kstack_free_list[g_kstack_free_count++] = (u32)slot;
+        spinlock_unlock_irqrestore(&g_kstack_lock, f);
     } else {
         pmm_free_pages(VIRT_TO_PHYS(stack_base), KSTACK_PAGES);
     }
@@ -355,7 +563,7 @@ thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool
     if (!t) return NULL;
 
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
-    t->tid = g_next_tid++;
+    t->tid = (proc && proc->threads == NULL) ? proc->pid : g_next_tid++;
     spinlock_unlock_irqrestore(&g_sched_lock, irqf);
 
     t->proc = proc ? proc : g_kernel_proc;
@@ -377,9 +585,8 @@ thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool
     t->proc->threads = t;
     spinlock_unlock_irqrestore(&g_sched_lock, irqf);
 
-    /* Initialize default clean x87 / SSE control state */
-    *(u16 *)&t->fpu_state.buffer[0] = 0x037F;  /* FCW default */
-    *(u32 *)&t->fpu_state.buffer[24] = 0x1F80; /* MXCSR default */
+    /* Initialize a clean x87 / SSE / AVX save area for this thread. */
+    fpu_area_init(&t->fpu_state);
 
     /* Build initial register context on the kernel stack */
     u64 *sp = (u64 *)t->kernel_stack_top;
@@ -440,21 +647,46 @@ static void idle_loop(void *arg)
 {
     (void)arg;
     cpu_info_t *cpu = smp_get_cpu();
+    bool have_id = cpu && cpu->cpu_id < 64;
+    u64 mybit = have_id ? (1ULL << cpu->cpu_id) : 0;
+
     for (;;) {
-        if (g_ready_queue) {
-        /* Clear idle bit before yielding so enqueue_ready doesn't IPI us again */
-        if (cpu && cpu->cpu_id < 64)
-            __atomic_and_fetch((u64 *)&g_idle_cpu_mask, ~(1ULL << cpu->cpu_id), __ATOMIC_RELAXED);
-        sched_yield();
+        /* BUG-13: read g_ready_queue atomically — a plain load is a data race
+         * on non-TSO ISAs (x86 TSO makes it safe today, but C UB travels). */
+        if (__atomic_load_n(&g_ready_queue, __ATOMIC_ACQUIRE)) {
+            /* Clear idle bit before yielding so enqueue_ready doesn't IPI us again */
+            if (have_id)
+                __atomic_and_fetch((u64 *)&g_idle_cpu_mask, ~mybit, __ATOMIC_RELAXED);
+            sched_yield();
+            continue;
         }
-        /* Mark this CPU as idle so enqueue_ready can find and wake us */
-        if (cpu && cpu->cpu_id < 64)
-            __atomic_or_fetch((u64 *)&g_idle_cpu_mask, (1ULL << cpu->cpu_id), __ATOMIC_RELAXED);
-        cpu_sti();
-        cpu_hlt();
-        /* After wakeup (HLT returns), clear idle bit immediately */
-        if (cpu && cpu->cpu_id < 64)
-            __atomic_and_fetch((u64 *)&g_idle_cpu_mask, ~(1ULL << cpu->cpu_id), __ATOMIC_RELAXED);
+
+        /* Publish "CPU idle" so enqueue_ready() will send us a wakeup IPI. The
+         * atomic OR is a full barrier on x86. */
+        if (have_id)
+            __atomic_or_fetch((u64 *)&g_idle_cpu_mask, mybit, __ATOMIC_RELAXED);
+
+        /* Re-check with interrupts masked: a thread enqueued in the window
+         * before our idle bit became visible could have had its wakeup IPI
+         * skipped by enqueue_ready(). Catch it here instead of sleeping on it. */
+        cpu_cli();
+        /* Arm the wake-up watch on the run queue head *before* the final test,
+         * so a thread enqueued in the gap still breaks us out of the wait. On a
+         * CPU without MONITOR/MWAIT this is a no-op and the STI;HLT below
+         * provides the same guarantee via the wake-up IPI. */
+        cpu_idle_arm(&g_ready_queue);
+        if (__atomic_load_n(&g_ready_queue, __ATOMIC_ACQUIRE)) {
+            if (have_id)
+                __atomic_and_fetch((u64 *)&g_idle_cpu_mask, ~mybit, __ATOMIC_RELAXED);
+            cpu_sti();
+            continue;
+        }
+        /* Parks the core until an interrupt or a store to the monitored line;
+         * re-enables interrupts in the same uninterruptible window HLT needs. */
+        cpu_idle_wait();
+
+        if (have_id)
+            __atomic_and_fetch((u64 *)&g_idle_cpu_mask, ~mybit, __ATOMIC_RELAXED);
     }
 }
 
@@ -492,6 +724,16 @@ static void sched_reaper_loop(void *arg)
             }
 
             if (all_zombie) {
+                /* A syscall on another CPU holds a counted reference to this
+                 * process. Leave it linked and its threads intact; a later
+                 * sweep reaps it once the reference drops. (Read under
+                 * g_sched_lock, which proc_get_by_pid() also holds while it
+                 * raises the count.) */
+                if (__atomic_load_n(&proc->hold_count, __ATOMIC_SEQ_CST)) {
+                    pproc = &proc->next;
+                    continue;
+                }
+
                 /* If it has a live parent waiting, keep it so waitpid can collect the exit status */
                 if (proc->parent && !proc->parent->is_zombie) {
                     proc->is_zombie = true;
@@ -502,11 +744,16 @@ static void sched_reaper_loop(void *arg)
                 /* Remove process from list */
                 *pproc = proc->next;
                 
-                /* Orphan children to prevent dangling parent pointers */
+                /* Reparent children to subreaper to prevent dangling parent pointers */
+                process_t *reaper = sched_find_reaper(proc);
                 process_t *child = g_process_list;
                 while (child) {
                     if (child->parent == proc) {
-                        child->parent = NULL;
+                        child->parent = reaper;
+                        if (child->is_zombie && reaper && reaper->wait_thread) {
+                            enqueue_ready(reaper->wait_thread);
+                            reaper->wait_thread = NULL;
+                        }
                     }
                     child = child->next;
                 }
@@ -558,12 +805,12 @@ void sched_init(void)
 {
     g_kernel_proc = proc_create("AzamiOS-Kernel", vmm_kernel_space());
 
-    /* Create per-CPU idle threads — g_idle_threads is sized for 16 CPUs.
-     * WARN-5 fix: guard against systems reporting more than 16 CPUs. */
+    /* One idle thread per CPU. g_idle_threads is sized for SMP_MAX_CPUS; clamp
+     * to that (the per-CPU idle bitmask is a u64, so SMP_MAX_CPUS <= 64). */
     u32 cpu_count = smp_cpu_count();
-    if (cpu_count > 16) {
-        pr_debug("[SCHED] WARNING: %u CPUs detected, clamping idle threads to 16.\n", cpu_count);
-        cpu_count = 16;
+    if (cpu_count > SMP_MAX_CPUS) {
+        pr_debug("[SCHED] WARNING: %u CPUs detected, clamping to %u.\n", cpu_count, SMP_MAX_CPUS);
+        cpu_count = SMP_MAX_CPUS;
     }
     for (u32 i = 0; i < cpu_count; i++) {
         thread_t *idle = thread_create(g_kernel_proc, (uintptr_t)idle_loop, 0, true);
@@ -597,6 +844,7 @@ void sched_start(void)
     spinlock_lock(&g_sched_lock);
     next->state = THREAD_RUNNING;
     cpu->current_thread = next;
+    next->cpu_id = cpu->cpu_id;   /* keep t->cpu_id live so a kill IPI can find it */
     spinlock_unlock(&g_sched_lock);
 
     /* Set TSS kernel stack pointer for ring 3 -> ring 0 transitions */
@@ -608,7 +856,7 @@ void sched_start(void)
         vmm_switch(next->proc->pml4_phys);
     }
 
-    fpu_restore_asm(&next->fpu_state);
+    fpu_restore(&next->fpu_state);
 
     /* Jump into the first thread's stack */
     __asm__ volatile(
@@ -640,35 +888,55 @@ void sched_yield(void)
     }
 
     if (prev == next) {
-        prev->state = THREAD_RUNNING;
+        if (prev->state != THREAD_DYING) prev->state = THREAD_RUNNING;
         spinlock_unlock_irqrestore(&g_sched_lock, irqf);
         return;
     }
 
-    prev->state = THREAD_READY;
+    /* A thread marked THREAD_DYING by sched_kill_process (possibly from another
+     * CPU) must keep that state through the switch so sched_post_switch turns it
+     * into a ZOMBIE — never demote it back to READY/RUNNING. */
+    if (prev->state != THREAD_DYING)
+        prev->state = THREAD_READY;
     /* Enqueue moved to sched_post_switch to prevent SMP race */
 
     next->state = THREAD_RUNNING;
     cpu->current_thread = next;
+    next->cpu_id = cpu->cpu_id;   /* keep t->cpu_id live so a kill IPI can find it */
 
     gdt_set_rsp0(cpu->cpu_id, next->kernel_stack_top);
     cpu->kernel_rsp0 = next->kernel_stack_top;
+
+    /* Save the live FS_BASE for the outgoing thread.
+     * Convention: t->fs_base != 0 means the thread set its own TLS base
+     * (via CLONE_SETTLS or arch_prctl); 0 means it inherits proc->fs_base.
+     * NOTE: this means a thread that explicitly set FS_BASE=0 via arch_prctl
+     * will have its per-thread override silently promoted to proc->fs_base.
+     * A has_thread_fs_base flag would fix this cleanly — tracked as TODO(T-01). */
+    if (prev && prev->proc) {
+        u64 cur_fs = g_fsgsbase_enabled ? rdfsbase() : rdmsr(MSR_FS_BASE);
+        if (prev->fs_base) prev->fs_base = cur_fs;
+        else prev->proc->fs_base = cur_fs;
+    }
 
     if (next->proc && next->proc->pml4_phys && (read_cr3() & VMM_PHYS_MASK) != next->proc->pml4_phys) {
         vmm_switch(next->proc->pml4_phys);
     }
     if (next->proc) {
-        wrmsr(MSR_FS_BASE, next->proc->fs_base);
+        u64 next_fs = next->fs_base ? next->fs_base : next->proc->fs_base;
+        if (g_fsgsbase_enabled) wrfsbase(next_fs);
+        else wrmsr(MSR_FS_BASE, next_fs);
         wrmsr(MSR_KERNEL_GS_BASE, next->proc->gs_base);
     } else {
-        wrmsr(MSR_FS_BASE, 0);
+        if (g_fsgsbase_enabled) wrfsbase(0);
+        else wrmsr(MSR_FS_BASE, 0);
         wrmsr(MSR_KERNEL_GS_BASE, 0);
     }
 
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
-    fpu_save_asm(&prev->fpu_state);
-    fpu_restore_asm(&next->fpu_state);
+    fpu_save(&prev->fpu_state);
+    fpu_restore(&next->fpu_state);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
     if (irqf & (1 << 9)) cpu_sti();
@@ -676,7 +944,6 @@ void sched_yield(void)
 
 void sched_tick(pt_regs_t *regs)
 {
-    (void)regs;
     
     /* Acknowledge the timer interrupt immediately so the LAPIC can send more
      * even if we context switch away from this thread. */
@@ -695,14 +962,23 @@ void sched_tick(pt_regs_t *regs)
         current_ticks = __atomic_load_n(&g_system_ticks, __ATOMIC_RELAXED);
     }
 
+    KTRACE_CALL("sched_tick", current_ticks);
+
     cpu->ticks++;
     thread_t *curr = cpu->current_thread;
     curr->vruntime += curr->priority;
 
     if (curr->proc == g_kernel_proc || curr == g_idle_threads[cpu->cpu_id]) {
-        if (cpu->cpu_id < 16) g_cpu_idle_ticks[cpu->cpu_id]++;
+        if (cpu->cpu_id < SMP_MAX_CPUS) g_cpu_idle_ticks[cpu->cpu_id]++;
     } else {
-        if (cpu->cpu_id < 16) g_cpu_active_ticks[cpu->cpu_id]++;
+        if (cpu->cpu_id < SMP_MAX_CPUS) g_cpu_active_ticks[cpu->cpu_id]++;
+
+        /* POSIX process accounting: charge the tick to the running process,
+         * split by the privilege level the timer interrupted. */
+        if (curr->proc) {
+            if ((regs->cs & 3) == 3) curr->proc->utime_ticks++;
+            else                     curr->proc->stime_ticks++;
+        }
     }
 
     /* Wake up sleeping threads and check preemption */
@@ -720,7 +996,7 @@ void sched_tick(pt_regs_t *regs)
     bool should_preempt = (g_ready_queue && (curr == g_idle_threads[cpu->cpu_id] || g_ready_queue->vruntime < curr->vruntime));
     spinlock_unlock(&g_sched_lock);
 
-    if (should_preempt) {
+    if (should_preempt || curr->state == THREAD_DYING) {
         cpu->needs_reschedule = true;
     }
 }
@@ -729,7 +1005,11 @@ void sched_check_reschedule(void)
 {
     cpu_info_t *cpu = smp_get_cpu();
     if (!cpu) return;
-    if (cpu->needs_reschedule) {
+    thread_t *cur = cpu->current_thread;
+    /* Also yield unconditionally if the running thread has been marked DYING
+     * (e.g. by SIGKILL from another CPU, delivered via the reschedule IPI):
+     * it must leave the CPU so sched_post_switch can zombify it. */
+    if (cpu->needs_reschedule || (cur && cur->state == THREAD_DYING)) {
         cpu->needs_reschedule = false;
         sched_yield();
     }
@@ -755,13 +1035,21 @@ void sched_block(thread_state_t new_state)
     thread_t *prev = cpu->current_thread;
 
     if (prev->state == THREAD_READY) {
+        /* BUG-I fix: a concurrent sched_unblock() raced us and set state to
+         * THREAD_READY before we could block.  Abort the block, but also clear
+         * unblock_pending so a *future* sched_block() call isn't spuriously
+         * skipped by a stale flag. */
         prev->state = THREAD_RUNNING;
+        prev->unblock_pending = false;
         spinlock_unlock_irqrestore(&g_sched_lock, irqf);
         return;
     }
 
-    prev->state = pending_state;
-    prev->unblock_pending = false;
+    /* Don't let a block request bury a pending kill — see sched_yield. */
+    if (prev->state != THREAD_DYING) {
+        prev->state = pending_state;
+        prev->unblock_pending = false;
+    }
     barrier();
 
     thread_t *next = dequeue_ready();
@@ -770,13 +1058,14 @@ void sched_block(thread_state_t new_state)
     }
 
     if (prev == next) {
-        prev->state = THREAD_RUNNING;
+        if (prev->state != THREAD_DYING) prev->state = THREAD_RUNNING;
         spinlock_unlock_irqrestore(&g_sched_lock, irqf);
         return;
     }
 
     next->state = THREAD_RUNNING;
     cpu->current_thread = next;
+    next->cpu_id = cpu->cpu_id;   /* keep t->cpu_id live so a kill IPI can find it */
 
     gdt_set_rsp0(cpu->cpu_id, next->kernel_stack_top);
     cpu->kernel_rsp0 = next->kernel_stack_top;
@@ -787,8 +1076,8 @@ void sched_block(thread_state_t new_state)
 
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
-    fpu_save_asm(&prev->fpu_state);
-    fpu_restore_asm(&next->fpu_state);
+    fpu_save(&prev->fpu_state);
+    fpu_restore(&next->fpu_state);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
     if (irqf & (1 << 9)) cpu_sti();
@@ -807,23 +1096,27 @@ void sched_sleep(u64 ticks)
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
     
     thread_t *prev = cpu->current_thread;
-    prev->sleep_end_ticks = g_system_ticks + ticks;
-    prev->state = THREAD_SLEEPING_PENDING;
-    prev->unblock_pending = false;
-    
+    /* Don't let a sleep request bury a pending kill — see sched_yield. */
+    if (prev->state != THREAD_DYING) {
+        prev->sleep_end_ticks = g_system_ticks + ticks;
+        prev->state = THREAD_SLEEPING_PENDING;
+        prev->unblock_pending = false;
+    }
+
     thread_t *next = dequeue_ready();
     if (!next) {
         next = g_idle_threads[cpu->cpu_id];
     }
 
     if (prev == next) {
-        prev->state = THREAD_RUNNING;
+        if (prev->state != THREAD_DYING) prev->state = THREAD_RUNNING;
         spinlock_unlock_irqrestore(&g_sched_lock, irqf);
         return;
     }
     
     next->state = THREAD_RUNNING;
     cpu->current_thread = next;
+    next->cpu_id = cpu->cpu_id;   /* keep t->cpu_id live so a kill IPI can find it */
     
     gdt_set_rsp0(cpu->cpu_id, next->kernel_stack_top);
     cpu->kernel_rsp0 = next->kernel_stack_top;
@@ -834,8 +1127,8 @@ void sched_sleep(u64 ticks)
     
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
-    fpu_save_asm(&prev->fpu_state);
-    fpu_restore_asm(&next->fpu_state);
+    fpu_save(&prev->fpu_state);
+    fpu_restore(&next->fpu_state);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
     if (irqf & (1 << 9)) cpu_sti();
@@ -857,25 +1150,33 @@ static void sleep_queue_insert_sorted(thread_t *t)
     curr->next = t;
 }
 
+/* Unlink @t from the sorted sleep queue if it is on it. Caller holds
+ * g_sched_lock. Factored out because every path that has to make a sleeping
+ * thread runnable early — unblock, kill, and now the job-control stop — needs
+ * exactly this walk, and four hand-copied versions of it is four chances to
+ * drop a node. */
+static void sleep_queue_remove_locked(thread_t *t)
+{
+    thread_t *curr = g_sleep_queue, *prev = NULL;
+    while (curr) {
+        if (curr == t) {
+            if (prev) prev->next = curr->next;
+            else      g_sleep_queue = curr->next;
+            curr->next = NULL;
+            return;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+}
+
 void sched_unblock(thread_t *t)
 {
     if (!t) return;
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
     if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
         /* If sleeping, remove from sleep queue */
-        if (t->state == THREAD_SLEEPING) {
-            thread_t *curr = g_sleep_queue;
-            thread_t *prev = NULL;
-            while (curr) {
-                if (curr == t) {
-                    if (prev) prev->next = curr->next;
-                    else g_sleep_queue = curr->next;
-                    break;
-                }
-                prev = curr;
-                curr = curr->next;
-            }
-        }
+        if (t->state == THREAD_SLEEPING) sleep_queue_remove_locked(t);
         enqueue_ready(t);
     } else if (t->state == THREAD_BLOCKED_PENDING || t->state == THREAD_SLEEPING_PENDING) {
         t->unblock_pending = true;
@@ -883,6 +1184,297 @@ void sched_unblock(thread_t *t)
         t->state = THREAD_READY; /* Signal sched_block to abort */
     }
     spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+}
+
+/* ============================================================================
+ * Job-control stop / resume
+ *
+ * A stopped process is not a new scheduler state: every one of its threads is
+ * simply parked in THREAD_BLOCKED inside sched_stop_current()'s loop, with
+ * thread_t::stopped set so the resume path can tell those threads apart from
+ * ones blocked on I/O. Doing it this way means the stop rides on the same
+ * block/unblock/kill machinery that is already exercised by every syscall,
+ * instead of adding a state that all six switch statements in this file would
+ * have to learn about — and SIGKILL keeps working on a stopped process for
+ * free, because sched_kill_process() already handles THREAD_BLOCKED.
+ *
+ * The one thing a stop cannot do is interrupt kernel code that never returns
+ * to ring 3. Threads park at the ring-3 boundary, so a thread that is inside a
+ * blocking syscall stops only once that syscall returns. sched_request_stop()
+ * therefore also ORs the stop signal into sig_pending: every blocking loop in
+ * this kernel already breaks out on `sig_pending & ~sig_blocked` with -EINTR,
+ * so that one line is what makes a process blocked in read(2) stoppable at all.
+ * ========================================================================= */
+
+/* Post @sig to @parent on behalf of @child and wake it out of wait4(2).
+ * Caller holds g_sched_lock. */
+static void notify_waiter_locked(process_t *parent, int sig)
+{
+    if (!parent || parent->is_zombie) return;
+
+    /* SIGCHLD's default action is ignore, so only queue it when the parent
+     * actually installed a handler — otherwise the bit would sit in
+     * sig_pending forever and make every -EINTR test in the kernel fire. */
+    if (sig > 0 && sig < _NSIG) {
+        sighandler_t h = parent->sigactions[sig].sa_handler;
+        if (h != SIG_IGN && h != SIG_DFL)
+            __atomic_or_fetch(&parent->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+    }
+
+    thread_t *w = parent->wait_thread;
+    if (!w) return;
+    parent->wait_thread = NULL;
+    switch (w->state) {
+    case THREAD_SLEEPING:
+        sleep_queue_remove_locked(w);
+        enqueue_ready(w);
+        break;
+    case THREAD_BLOCKED:
+        enqueue_ready(w);
+        break;
+    case THREAD_BLOCKED_PENDING:
+    case THREAD_SLEEPING_PENDING:
+        w->unblock_pending = true;
+        break;
+    case THREAD_RUNNING:
+        w->state = THREAD_READY;   /* make a racing sched_block() abort */
+        break;
+    default:
+        break;
+    }
+}
+
+void sched_notify_parent(process_t *p, int sig)
+{
+    if (!p) return;
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    notify_waiter_locked(p->parent, sig);
+    if (p->tracer_pid && (!p->parent || p->parent->pid != p->tracer_pid)) {
+        for (process_t *tr = g_process_list; tr; tr = tr->next) {
+            if (tr->pid == p->tracer_pid) { notify_waiter_locked(tr, sig); break; }
+        }
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+}
+
+/* Nudge every thread of @p towards its next ring-3 exit. Caller holds the lock. */
+static void poke_threads_locked(process_t *p)
+{
+    for (thread_t *t = p->threads; t; t = t->proc_next) {
+        switch (t->state) {
+        case THREAD_SLEEPING:
+            sleep_queue_remove_locked(t);
+            enqueue_ready(t);
+            break;
+        case THREAD_BLOCKED:
+            enqueue_ready(t);
+            break;
+        case THREAD_BLOCKED_PENDING:
+        case THREAD_SLEEPING_PENDING:
+            t->unblock_pending = true;
+            break;
+        case THREAD_RUNNING:
+            if (t->cpu_id != smp_current_cpu_id()) smp_send_reschedule(t->cpu_id);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static void request_stop_locked(process_t *p, int sig, u32 kind)
+{
+    if (!p || p->is_zombie) return;
+    p->stop_signal   = sig;
+    p->stop_notified = false;
+    p->cont_pending  = false;
+    __atomic_store_n(&p->stop_state, kind, __ATOMIC_RELEASE);
+
+    /* POSIX: a stop discards a SIGCONT that has not been acted on yet. */
+    __atomic_and_fetch(&p->sig_pending, ~(1ULL << SIGCONT), __ATOMIC_SEQ_CST);
+
+    /* See the note above: this is what breaks a thread out of a blocking
+     * syscall. sched_stop_current() clears the bit again as it parks, so the
+     * signal is never also *delivered*. */
+    if (sig > 0 && sig < _NSIG)
+        __atomic_or_fetch(&p->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+
+    poke_threads_locked(p);
+}
+
+void sched_request_stop(process_t *p, int sig, u32 kind)
+{
+    if (!p) return;
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    request_stop_locked(p, sig, kind);
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+}
+
+bool sched_resume_process(process_t *p, bool cont_report)
+{
+    if (!p) return false;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    bool was_stopped = (p->stop_state != PROC_STOP_NONE);
+    __atomic_store_n(&p->stop_state, PROC_STOP_NONE, __ATOMIC_RELEASE);
+    p->stop_notified = false;
+
+    /* POSIX: continuing discards every stop signal still pending. */
+    __atomic_and_fetch(&p->sig_pending,
+                       ~((1ULL << SIGSTOP) | (1ULL << SIGTSTP) |
+                         (1ULL << 21 /*SIGTTIN*/) | (1ULL << 22 /*SIGTTOU*/)),
+                       __ATOMIC_SEQ_CST);
+
+    if (was_stopped && cont_report) p->cont_pending = true;
+
+    /* Only the threads actually parked in the stop — waking a thread blocked
+     * on I/O here would hand its syscall a spurious early return. */
+    for (thread_t *t = p->threads; t; t = t->proc_next) {
+        if (!t->stopped) continue;
+        if (t->state == THREAD_BLOCKED)              enqueue_ready(t);
+        else if (t->state == THREAD_BLOCKED_PENDING) t->unblock_pending = true;
+        else if (t->state == THREAD_RUNNING)         t->state = THREAD_READY;
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+
+    if (was_stopped && cont_report) sched_notify_parent(p, SIGCHLD);
+    return was_stopped;
+}
+
+void sched_stop_current(void)
+{
+    process_t *p = sched_current_process();
+    thread_t  *t = sched_current_thread();
+    if (!p || !t) return;
+
+    /* The signal that asked for the stop was only ever a wake-up device; it
+     * must not also run its own disposition once we resume. */
+    if (p->stop_signal > 0 && p->stop_signal < _NSIG)
+        __atomic_and_fetch(&p->sig_pending, ~(1ULL << p->stop_signal),
+                           __ATOMIC_SEQ_CST);
+
+    while (__atomic_load_n(&p->stop_state, __ATOMIC_ACQUIRE) != PROC_STOP_NONE) {
+        if (t->state == THREAD_DYING || p->is_zombie) break;
+        t->stopped = true;
+        barrier();
+        /* Announce only once we are genuinely parked. A tracer woken before
+         * that could PTRACE_GETREGS a frame the tracee is still running on,
+         * and a tracer woken by a stop it then fails to observe would block in
+         * wait4(2) with nothing left to wake it. */
+        sched_notify_parent(p, SIGCHLD);
+        sched_block(THREAD_BLOCKED_PENDING);
+        barrier();
+        t->stopped = false;
+    }
+    t->stopped = false;
+
+    /* Woken by a fatal signal rather than a resume: sched_kill_process()
+     * deliberately did not mark us THREAD_DYING (a parked, blocked thread that
+     * is marked DYING never runs again), so the exit is ours to take. */
+    if (p->term_signal != 0 && !p->is_zombie && t->state != THREAD_DYING)
+        sched_exit_thread();
+}
+
+/* exit_group(2): mark every *other* thread of the current process DYING so the
+ * whole process winds down, not just the caller. Blocked/sleeping siblings are
+ * requeued so they get scheduled, notice DYING, and zombify; running siblings on
+ * other CPUs are poked. The caller then falls through to its own thread exit.
+ * Unlike sched_kill_process() this leaves term_signal alone — exit_group is a
+ * normal (WIFEXITED) exit, not a signal death. */
+void sched_exit_group_mark(void)
+{
+    cpu_info_t *cpu = smp_get_cpu();
+    if (!cpu || !cpu->current_thread || !cpu->current_thread->proc) return;
+    thread_t *self = cpu->current_thread;
+    process_t *proc = self->proc;
+    if (proc == g_kernel_proc) return;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    for (thread_t *t = proc->threads; t; t = t->proc_next) {
+        if (t == self || t->state == THREAD_DYING || t->state == THREAD_ZOMBIE)
+            continue;
+
+        if (t->state == THREAD_RUNNING ||
+            t->state == THREAD_BLOCKED_PENDING ||
+            t->state == THREAD_SLEEPING_PENDING) {
+            /* BUG-AH fix: On a CPU right now (or mid-switch in _PENDING) — can't
+             * abandon or free its stack yet. Mark DYING and poke its CPU; it
+             * zombifies itself on the way out via sched_post_switch and wakes waitpid. */
+            t->state = THREAD_DYING;
+            if (t->cpu_id != smp_current_cpu_id())
+                smp_send_reschedule(t->cpu_id);
+            continue;
+        }
+
+        /* Off every CPU (READY / BLOCKED / SLEEPING / *_PENDING). Its suspended
+         * kernel stack will simply be abandoned — no CPU will switch_to it
+         * again — so promote straight to ZOMBIE for the reaper to free. */
+        if (t->state == THREAD_READY) {
+            for (thread_t **pp = &g_ready_queue; *pp; pp = &(*pp)->next)
+                if (*pp == t) { *pp = t->next; break; }
+        } else if (t->state == THREAD_SLEEPING) {
+            for (thread_t **pp = &g_sleep_queue; *pp; pp = &(*pp)->next)
+                if (*pp == t) { *pp = t->next; break; }
+        }
+        t->state = THREAD_ZOMBIE;
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+}
+
+void sched_dethread_wait(void)
+{
+    thread_t *self = sched_current_thread();
+    if (!self || !self->proc) return;
+
+    for (u64 spins = 0; spins < 200000000ULL; spins++) {
+        bool all_gone = true;
+        irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+        for (thread_t *t = self->proc->threads; t; t = t->proc_next) {
+            if (t != self && t->state != THREAD_ZOMBIE) { all_gone = false; break; }
+        }
+        spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+        if (all_gone) return;
+        cpu_pause();
+    }
+    /* Timed out (should be unreachable). Proceeding is still safer than looping
+     * forever; the stuck sibling is DYING and off userspace. */
+}
+
+void sched_dethread_reap(void)
+{
+    thread_t *self = sched_current_thread();
+    if (!self || !self->proc) return;
+    process_t *proc = self->proc;
+
+    /* Collect dead sibling threads under the lock, then free them after
+     * releasing it.  kstack_free() calls vmm_unmap_range() → tlb_shootdown_all()
+     * which sends IPIs and spins waiting for remote CPUs to acknowledge.  Those
+     * CPUs may be in a timer or reschedule ISR that tries to acquire g_sched_lock,
+     * so holding that lock while waiting for them causes a deadlock. */
+    thread_t *to_free = NULL;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    thread_t **tp = &proc->threads;
+    while (*tp) {
+        thread_t *t = *tp;
+        if (t != self) {
+            *tp = t->proc_next;
+            /* Reuse proc_next as a temporary free-list link */
+            t->proc_next = to_free;
+            to_free = t;
+        } else {
+            tp = &t->proc_next;
+        }
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+
+    /* Now free stacks and thread structs without holding any lock. */
+    while (to_free) {
+        thread_t *next = to_free->proc_next;
+        kstack_free(to_free->kernel_stack_base);
+        kfree(to_free);
+        to_free = next;
+    }
 }
 
 void sched_exit_thread(void)
@@ -894,6 +1486,12 @@ void sched_exit_thread(void)
     }
 
     thread_t *prev = cpu->current_thread;
+
+    /* CLONE_CHILD_CLEARTID, while this thread's address space is still the
+     * live one. musl's pthread_exit unlinks itself from the thread list under
+     * __thread_list_lock and then relies on this write-and-wake to release it,
+     * so skipping it wedges the next joiner rather than the exiting thread. */
+    thread_clear_child_tid(prev);
 
     /* Pre-clean handles outside sched_lock if this is the last thread in the process */
     if (prev->proc && prev->proc != g_kernel_proc) {
@@ -907,20 +1505,8 @@ void sched_exit_thread(void)
         }
         spinlock_unlock_irqrestore(&g_sched_lock, irqf_chk);
 
-        if (is_last) {
-            for (int i = 0; i < 64; i++) {
-                if (prev->proc->handle_table[i]) {
-                    file_t *f = (file_t *)prev->proc->handle_table[i];
-                    prev->proc->handle_table[i] = NULL;
-                    vfs_close(f);
-                }
-                if (prev->proc->obj_handle_table[i]) {
-                    az_object_t *obj = prev->proc->obj_handle_table[i];
-                    prev->proc->obj_handle_table[i] = NULL;
-                    az_object_dereference(obj);
-                }
-            }
-        }
+        if (is_last)
+            fd_table_release(prev->proc);   /* clears slots under the fd lock */
     }
 
     cpu_cli();
@@ -935,6 +1521,7 @@ void sched_exit_thread(void)
 
     next->state = THREAD_RUNNING;
     cpu->current_thread = next;
+    next->cpu_id = cpu->cpu_id;   /* keep t->cpu_id live so a kill IPI can find it */
 
     gdt_set_rsp0(cpu->cpu_id, next->kernel_stack_top);
     cpu->kernel_rsp0 = next->kernel_stack_top;
@@ -945,7 +1532,7 @@ void sched_exit_thread(void)
 
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
-    fpu_restore_asm(&next->fpu_state);
+    fpu_restore(&next->fpu_state);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
     /* Should never reach here — prev is ZOMBIE */
@@ -961,11 +1548,16 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
     for (;;) {
         irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
         bool has_children = false;
-        process_t *zombie_child = NULL;
+        process_t *zombie_child  = NULL;
+        process_t *stopped_child = NULL;
+        process_t *cont_child    = NULL;
 
         process_t *p = g_process_list;
         while (p) {
-            if (p->parent == curr_proc) {
+            /* ptrace(2) makes the tracer a second waiter: it collects its
+             * tracee's stops (and its death) even when it is not the parent. */
+            bool is_tracee = (p->tracer_pid != 0 && p->tracer_pid == curr_proc->pid);
+            if (p->parent == curr_proc || is_tracee) {
                 /* POSIX waitpid pid argument:
                  *   -1  : any child
                  *    0  : any child in the caller's process group
@@ -983,14 +1575,45 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
                         zombie_child = p;
                         break;
                     }
+                    /* Only a process that has actually parked counts as
+                     * stopped — see sched_stop_current(). A ptrace-stop is
+                     * always reported to the tracer; a job-control stop needs
+                     * WUNTRACED, exactly as Linux has it. */
+                    if (!stopped_child && !p->stop_notified &&
+                        p->stop_state != PROC_STOP_NONE &&
+                        (is_tracee || (options & WUNTRACED))) {
+                        for (thread_t *t = p->threads; t; t = t->proc_next) {
+                            if (t->stopped) { stopped_child = p; break; }
+                        }
+                    }
+                    if (!cont_child && p->cont_pending && (options & WCONTINUED))
+                        cont_child = p;
                 }
             }
             p = p->next;
         }
 
+        if (zombie_child &&
+            __atomic_load_n(&zombie_child->hold_count, __ATOMIC_SEQ_CST)) {
+            /* A syscall on another CPU holds a counted reference to this child.
+             * Do not unlink or free it yet — behave as if it were not reapable
+             * on this pass. */
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            if (options & WNOHANG) return 0;
+            sched_yield();
+            continue;
+        }
+
         if (zombie_child) {
             s32 child_pid = (s32)zombie_child->pid;
-            int exit_val = zombie_child->exit_code;
+            int exit_val  = zombie_child->exit_code;
+            /* BUG-1 hardening: snapshot volatile fields while the lock is still
+             * held. zombie_child is already unlinked from g_process_list before
+             * the lock drops, so the reaper cannot race us — but snapshotting
+             * here makes the invariant explicit and survives future refactoring
+             * that might store process pointers outside the list (e.g. a pid
+             * hash table) and thus re-open the race window. */
+            int term_sig  = zombie_child->term_signal;
 
             /* Remove zombie child from process list */
             process_t **pp = &g_process_list;
@@ -1001,20 +1624,38 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
                 }
                 pp = &(*pp)->next;
             }
+            /* BUG-Q fix: verify every thread is genuinely ZOMBIE before freeing.
+             * proc->is_zombie is set by sched_post_switch only after all threads
+             * have transitioned to THREAD_ZOMBIE and no CPU holds prev_thread on
+             * any of them, so this check should always pass — but be defensive
+             * against future code changes that relax that invariant. */
+            thread_t *t = zombie_child->threads;
+            bool safe_to_free = true;
+            while (t) {
+                if (t->state != THREAD_ZOMBIE) { safe_to_free = false; break; }
+                t = t->proc_next;
+            }
+            if (!safe_to_free) {
+                /* A thread hasn't finished its context switch yet; yield and
+                 * retry so we don't UAF a kernel stack still in use on another CPU. */
+                spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+                sched_yield();
+                continue;
+            }
             spinlock_unlock_irqrestore(&g_sched_lock, irqf);
 
             if (status) {
                 /* POSIX wait status: WIFSIGNALED when a signal killed the
                  * child (low 7 bits = WTERMSIG), otherwise WIFEXITED with
                  * WEXITSTATUS in bits 8-15. */
-                if (zombie_child->term_signal)
-                    *status = zombie_child->term_signal & 0x7f;
+                if (term_sig)
+                    *status = term_sig & 0x7f;
                 else
                     *status = (exit_val & 0xFF) << 8;
             }
 
             /* Free child threads and process */
-            thread_t *t = zombie_child->threads;
+            t = zombie_child->threads;
             while (t) {
                 thread_t *next_t = t->proc_next;
                 kstack_free(t->kernel_stack_base);
@@ -1027,12 +1668,37 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
             return (s64)child_pid;
         }
 
+        if (stopped_child) {
+            s32 child_pid = (s32)stopped_child->pid;
+            /* Linux wait-status encoding for a stop: 0x7f in the low byte,
+             * the signal in the next. A ptrace event rides in the byte above
+             * that, which is how PTRACE_EVENT_EXEC and friends are told apart
+             * from a plain SIGTRAP stop. */
+            int sig = (stopped_child->stop_state == PROC_STOP_PTRACE)
+                      ? stopped_child->ptrace_stop_sig : stopped_child->stop_signal;
+            int ev  = (stopped_child->stop_state == PROC_STOP_PTRACE)
+                      ? (int)stopped_child->ptrace_event : 0;
+            if (sig <= 0) sig = SIGSTOP;
+            stopped_child->stop_notified = true;
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            if (status) *status = (((sig & 0xff) | (ev << 8)) << 8) | 0x7f;
+            return (s64)child_pid;
+        }
+
+        if (cont_child) {
+            s32 child_pid = (s32)cont_child->pid;
+            cont_child->cont_pending = false;
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            if (status) *status = 0xffff;   /* WIFCONTINUED */
+            return (s64)child_pid;
+        }
+
         if (!has_children) {
             spinlock_unlock_irqrestore(&g_sched_lock, irqf);
             return -(s64)ECHILD;
         }
 
-        if (options & 1 /* WNOHANG */) {
+        if (options & WNOHANG) {
             spinlock_unlock_irqrestore(&g_sched_lock, irqf);
             return 0;
         }
@@ -1047,7 +1713,7 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
         curr_proc->wait_thread = curr_thread;
         spinlock_unlock_irqrestore(&g_sched_lock, irqf);
 
-        sched_block(THREAD_BLOCKED);
+        sched_block(THREAD_BLOCKED_PENDING); /* BUG-X fix: must be _PENDING variant */
 
         irqf = spinlock_lock_irqsave(&g_sched_lock);
         if (curr_proc->wait_thread == curr_thread) {
@@ -1055,6 +1721,48 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
         }
         spinlock_unlock_irqrestore(&g_sched_lock, irqf);
     }
+}
+
+process_t *sched_get_process_by_pid(u32 pid)
+{
+    if (pid == 0) return NULL;
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    process_t *target = NULL;
+    for (process_t *p = g_process_list; p; p = p->next) {
+        if (p->pid == pid) {
+            target = p;
+            break;
+        }
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    return target;
+}
+
+process_t *proc_get_by_pid(u32 pid)
+{
+    if (pid == 0) return NULL;
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    process_t *target = NULL;
+    for (process_t *p = g_process_list; p; p = p->next) {
+        if (p->pid == pid) { target = p; break; }
+    }
+    /* A zombie is on its way out; callers that want to act on a process never
+     * want one, and refusing here keeps every teardown path's hold_count check
+     * on the simple side. */
+    if (target && target->is_zombie) target = NULL;
+    if (target) __atomic_add_fetch(&target->hold_count, 1, __ATOMIC_SEQ_CST);
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    return target;
+}
+
+void proc_get_locked(process_t *p)
+{
+    if (p) __atomic_add_fetch(&p->hold_count, 1, __ATOMIC_SEQ_CST);
+}
+
+void proc_put(process_t *p)
+{
+    if (p) __atomic_sub_fetch(&p->hold_count, 1, __ATOMIC_SEQ_CST);
 }
 
 s64 sched_kill_process(u32 pid, int sig)
@@ -1068,6 +1776,13 @@ s64 sched_kill_process(u32 pid, int sig)
             target = p;
             break;
         }
+        for (thread_t *th = p->threads; th; th = th->proc_next) {
+            if (th->tid == pid) {
+                target = p;
+                break;
+            }
+        }
+        if (target) break;
     }
 
     if (!target) {
@@ -1080,7 +1795,73 @@ s64 sched_kill_process(u32 pid, int sig)
         return 0; /* Signal 0: check existence */
     }
 
-    if (sig > 0 && sig < _NSIG) {
+    /* ── Job control ─────────────────────────────────────────────────────
+     * Handled before the disposition lookup below, because a stop signal does
+     * not terminate and SIGCONT has a side effect that runs whether or not a
+     * handler is installed. Until this existed SIGSTOP fell all the way to the
+     * fatal path and killed its target — which is why signal.c used to say
+     * there was no stopped process state to enter. */
+    if (sig == SIGCONT) {
+        bool was_stopped = (target->stop_state != PROC_STOP_NONE);
+        __atomic_store_n(&target->stop_state, PROC_STOP_NONE, __ATOMIC_RELEASE);
+        target->stop_notified = false;
+        /* POSIX: continuing discards every stop signal still pending. */
+        __atomic_and_fetch(&target->sig_pending,
+                           ~((1ULL << SIGSTOP) | (1ULL << SIGTSTP) |
+                             (1ULL << 21 /*SIGTTIN*/) | (1ULL << 22 /*SIGTTOU*/)),
+                           __ATOMIC_SEQ_CST);
+        if (was_stopped) {
+            target->cont_pending = true;
+            for (thread_t *t = target->threads; t; t = t->proc_next) {
+                if (!t->stopped) continue;
+                if (t->state == THREAD_BLOCKED)              enqueue_ready(t);
+                else if (t->state == THREAD_BLOCKED_PENDING) t->unblock_pending = true;
+                else if (t->state == THREAD_RUNNING)         t->state = THREAD_READY;
+            }
+            notify_waiter_locked(target->parent, SIGCHLD);
+        }
+        /* The resume happens either way; the *disposition* still applies, so a
+         * process with a SIGCONT handler falls through to have it queued. */
+        sighandler_t ch = target->sigactions[SIGCONT].sa_handler;
+        if (ch == SIG_DFL || ch == SIG_IGN) {
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            return 0;
+        }
+    }
+
+    if (sig == SIGSTOP || sig == SIGTSTP ||
+        sig == 21 /*SIGTTIN*/ || sig == 22 /*SIGTTOU*/) {
+        sighandler_t sh = target->sigactions[sig].sa_handler;
+        /* SIGSTOP is unconditional; the other three stop only while their
+         * disposition is still the default. */
+        if (sig == SIGSTOP || sh == SIG_DFL) {
+            /* When someone is tracing, the same stop belongs to the tracer:
+             * it is the tracer that will be woken, and it is PTRACE_CONT — not
+             * SIGCONT — that ends it. Recording which kind of stop this is
+             * makes wait4() report it as a ptrace-stop and /proc show 't
+             * (tracing stop)' instead of 'T (stopped)'. This is the path a
+             * tracee's own raise(SIGSTOP) takes to hand over control. */
+            u32 kind = PROC_STOP_JOB;
+            if (target->tracer_pid) {
+                kind = PROC_STOP_PTRACE;
+                target->ptrace_stop_sig = sig;
+                target->ptrace_event    = 0;
+            }
+            request_stop_locked(target, sig, kind);
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            return 0;
+        }
+        if (sh == SIG_IGN) {
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            return 0;
+        }
+        /* Custom handler: fall through and queue it like any other signal. */
+    }
+
+    /* BUG-S fix: SIGKILL and SIGSTOP cannot be caught, ignored, or blocked
+     * per POSIX.  Exclude them BEFORE checking the handler so that a corrupted
+     * sigactions table cannot make SIGKILL a no-op. */
+    if (sig > 0 && sig < _NSIG && sig != SIGKILL && sig != SIGSTOP) {
         sighandler_t handler = target->sigactions[sig].sa_handler;
         if (handler == SIG_IGN) {
             spinlock_unlock_irqrestore(&g_sched_lock, irqf);
@@ -1091,26 +1872,33 @@ s64 sched_kill_process(u32 pid, int sig)
                 spinlock_unlock_irqrestore(&g_sched_lock, irqf);
                 return 0; /* Default action is ignore */
             }
+            /*
+             * POSIX: a blocked signal stays pending; its action is taken when
+             * it is unblocked, or consumed by sigwait()/sigtimedwait().  Only
+             * SIGKILL and SIGSTOP ignore the mask.  Without this a process
+             * that blocked, say, SIGUSR2 would be killed by it anyway.
+             */
+            if (sig != 9 /* SIGKILL */ && sig != 19 /* SIGSTOP */ &&
+                (target->sig_blocked & (1ULL << sig))) {
+                __atomic_or_fetch(&target->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+                spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+                return 0;
+            }
         } else {
             /* Custom handler registered */
-            target->sig_pending |= (1ULL << sig);
+            __atomic_or_fetch(&target->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
             /* Wake up blocked/sleeping threads to handle signal */
             for (thread_t *t = target->threads; t; t = t->proc_next) {
                 if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
-                    if (t->state == THREAD_SLEEPING) {
-                        thread_t *curr_s = g_sleep_queue;
-                        thread_t *prev_s = NULL;
-                        while (curr_s) {
-                            if (curr_s == t) {
-                                if (prev_s) prev_s->next = curr_s->next;
-                                else g_sleep_queue = curr_s->next;
-                                break;
-                            }
-                            prev_s = curr_s;
-                            curr_s = curr_s->next;
-                        }
-                    }
+                    if (t->state == THREAD_SLEEPING) sleep_queue_remove_locked(t);
                     enqueue_ready(t);
+                } else if (t->state == THREAD_BLOCKED_PENDING ||
+                           t->state == THREAD_SLEEPING_PENDING) {
+                    /* BUG-6: thread is mid-switch (between sched_block and
+                     * sched_post_switch). Setting unblock_pending causes
+                     * sched_post_switch to enqueue_ready() it instead of
+                     * blocking, so the signal is never silently lost. */
+                    t->unblock_pending = true;
                 } else if (t->state == THREAD_RUNNING && t->cpu_id != smp_current_cpu_id()) {
                     smp_send_reschedule(t->cpu_id);
                 }
@@ -1126,47 +1914,68 @@ s64 sched_kill_process(u32 pid, int sig)
     target->term_signal = sig;
     target->exit_code = 128 + sig;
 
+    /* A stopped process has to be let out of the stop before it can die. Its
+     * threads are parked in THREAD_BLOCKED inside sched_stop_current(), and a
+     * blocked thread marked THREAD_DYING is never scheduled again, so it would
+     * never reach sched_post_switch() to be zombified. Clearing stop_state and
+     * making those threads runnable lets each one fall out of the stop loop and
+     * take the exit in its own context — see sched_stop_current().
+     *
+     * The test is thread_t::stopped, not the process's stop_state: a SIGCONT
+     * that arrived moments earlier clears stop_state while its threads are
+     * still parked, and gating on the process flag would leave exactly those
+     * threads marked DYING and blocked forever. */
+    __atomic_store_n(&target->stop_state, PROC_STOP_NONE, __ATOMIC_RELEASE);
+
     for (thread_t *t = target->threads; t; t = t->proc_next) {
-        if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING ||
-            t->state == THREAD_BLOCKED_PENDING || t->state == THREAD_SLEEPING_PENDING) {
+        if (t->stopped) {
+            if (t->state == THREAD_BLOCKED)              enqueue_ready(t);
+            else if (t->state == THREAD_BLOCKED_PENDING) t->unblock_pending = true;
+            else if (t->state == THREAD_RUNNING)         t->state = THREAD_READY;
+            continue;
+        }
+        if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
             /* Remove from sleep queue if sleeping */
-            if (t->state == THREAD_SLEEPING) {
-                thread_t *curr_s = g_sleep_queue;
-                thread_t *prev_s = NULL;
-                while (curr_s) {
-                    if (curr_s == t) {
-                        if (prev_s) prev_s->next = curr_s->next;
-                        else g_sleep_queue = curr_s->next;
-                        break;
-                    }
-                    prev_s = curr_s;
-                    curr_s = curr_s->next;
-                }
-            }
-            /* Transition directly to DYING so sched_post_switch won't re-enqueue */
-            t->state = THREAD_DYING;
+            if (t->state == THREAD_SLEEPING) sleep_queue_remove_locked(t);
+            /* Thread is descheduled and off-CPU; promote straight to ZOMBIE */
+            t->state = THREAD_ZOMBIE;
         } else if (t->state == THREAD_READY) {
             /* Remove from ready queue */
-            thread_t *curr_r = g_ready_queue;
-            thread_t *prev_r = NULL;
-            while (curr_r) {
-                if (curr_r == t) {
-                    if (prev_r) prev_r->next = curr_r->next;
-                    else g_ready_queue = curr_r->next;
+            for (thread_t **pp = &g_ready_queue; *pp; pp = &(*pp)->next) {
+                if (*pp == t) {
+                    *pp = t->next;
                     break;
                 }
-                prev_r = curr_r;
-                curr_r = curr_r->next;
             }
+            t->state = THREAD_ZOMBIE;
+        } else if (t->state == THREAD_BLOCKED_PENDING || t->state == THREAD_SLEEPING_PENDING) {
+            /* Mid-switch on a CPU: mark DYING so sched_post_switch zombifies it */
             t->state = THREAD_DYING;
         } else if (t->state == THREAD_RUNNING) {
-            /* Running on another CPU — set DYING, IPI to force reschedule */
+            /* Running on a CPU: mark DYING; if on another CPU, poke it */
             t->state = THREAD_DYING;
             if (t->cpu_id != smp_current_cpu_id()) {
                 smp_send_reschedule(t->cpu_id);
             }
         }
         /* THREAD_DYING / THREAD_ZOMBIE: already on the way out, leave as-is */
+    }
+
+    bool all_dead = true;
+    for (thread_t *t = target->threads; t; t = t->proc_next) {
+        if (t->state != THREAD_ZOMBIE) {
+            all_dead = false;
+            break;
+        }
+    }
+    if (all_dead) {
+        target->is_zombie = true;
+        notify_waiter_locked(target->parent, SIGCHLD);
+        if (target->tracer_pid && (!target->parent || target->parent->pid != target->tracer_pid)) {
+            for (process_t *tr = g_process_list; tr; tr = tr->next) {
+                if (tr->pid == target->tracer_pid) { notify_waiter_locked(tr, SIGCHLD); break; }
+            }
+        }
     }
 
     bool self_killed = (target == sched_current_process());
@@ -1179,25 +1988,62 @@ s64 sched_kill_process(u32 pid, int sig)
     return 0;
 }
 
+process_t *sched_kernel_process(void)
+{
+    return g_kernel_proc;
+}
+
 process_t *sched_get_process_list(void)
 {
     return g_process_list;
 }
 
-static irqflags_t g_sched_proc_irqf[16];
+bool sched_proc_ident(u32 pid, struct proc_ident *out)
+{
+    bool found = false;
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    for (process_t *p = g_process_list; p; p = p->next) {
+        if (p->pid != pid) continue;
+        out->pid       = p->pid;
+        out->ppid      = p->parent ? p->parent->pid : 0;
+        out->uid       = p->uid;
+        out->gid       = p->gid;
+        out->euid      = p->euid;
+        out->egid      = p->egid;
+        out->suid      = p->suid;
+        out->sgid      = p->sgid;
+        out->pml4_phys = p->pml4_phys;
+        out->is_zombie = p->is_zombie;
+        found = true;
+        break;
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    return found;
+}
+
+static irqflags_t g_sched_proc_irqf[SMP_MAX_CPUS];
 
 void sched_lock(void)
 {
     u32 cpu_id = smp_current_cpu_id();
-    if (cpu_id >= 16) cpu_id = 0;
+    if (cpu_id >= SMP_MAX_CPUS) cpu_id = 0;
+    /* BUG-V: sched_lock is NOT reentrant.  A second call on the same CPU
+     * overwrites g_sched_proc_irqf[cpu_id] (losing the outer IRQ save) and
+     * deadlocks on the ticket lock.  Catch this immediately in debug builds. */
+    BUG_ON(g_sched_proc_irqf[cpu_id] & (1UL << 63)); /* sentinel: top bit set = locked */
     g_sched_proc_irqf[cpu_id] = spinlock_lock_irqsave(&g_sched_lock);
+    /* Mark slot in-use so a nested call trips the BUG_ON above. */
+    g_sched_proc_irqf[cpu_id] |= (1UL << 63);
 }
 
 void sched_unlock(void)
 {
     u32 cpu_id = smp_current_cpu_id();
-    if (cpu_id >= 16) cpu_id = 0;
-    spinlock_unlock_irqrestore(&g_sched_lock, g_sched_proc_irqf[cpu_id]);
+    if (cpu_id >= SMP_MAX_CPUS) cpu_id = 0;
+    /* Clear the in-use sentinel bit before restoring flags. */
+    irqflags_t flags = g_sched_proc_irqf[cpu_id] & ~(1UL << 63);
+    g_sched_proc_irqf[cpu_id] = 0;
+    spinlock_unlock_irqrestore(&g_sched_lock, flags);
 }
 
 u64 sched_get_ticks(void)

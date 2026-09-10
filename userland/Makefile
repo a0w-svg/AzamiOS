@@ -4,10 +4,11 @@ LD = $(CROSS_PREFIX)ld
 AR = $(CROSS_PREFIX)ar
 
 CFLAGS = -std=c11 -ffreestanding -fno-stack-protector -fno-pie -fno-pic -m64 \
-         -Wall -Wextra -Wno-unused-parameter -O2 \
+         -Wall -Wextra -Wno-unused-parameter -O3 -pipe \
+         -ffunction-sections -fdata-sections \
          -I. -Ilibc/include -Iapps/shared -Iapps/azwm
 
-LDFLAGS = -T ../scripts/user.ld -nostdlib -z max-page-size=0x1000
+LDFLAGS = -T ../scripts/user.ld -nostdlib -z max-page-size=0x1000 --gc-sections
 
 BUILD_DIR = build
 BIN_DIR   = $(BUILD_DIR)/bin
@@ -27,10 +28,17 @@ SBIN_APPS = \
     $(SBIN_DIR)/ping.elf \
     $(SBIN_DIR)/dmesg.elf \
     $(SBIN_DIR)/netstat.elf \
-    $(SBIN_DIR)/dhcpcd.elf
+    $(SBIN_DIR)/dhcpcd.elf \
+    $(SBIN_DIR)/notifyd.elf \
+    $(SBIN_DIR)/lockscreen.elf
 
 BIN_APPS = \
     $(BIN_DIR)/sh.elf \
+    $(BIN_DIR)/strace.elf \
+    $(BIN_DIR)/ktrace.elf \
+    $(BIN_DIR)/sem_test.elf \
+    $(BIN_DIR)/lock.elf \
+    $(BIN_DIR)/ptraceperf.elf \
     $(BIN_DIR)/ls.elf \
     $(BIN_DIR)/cat.elf \
     $(BIN_DIR)/echo.elf \
@@ -148,6 +156,7 @@ BIN_APPS = \
     $(BIN_DIR)/chroot.elf \
     $(BIN_DIR)/nice.elf \
     $(BIN_DIR)/renice.elf \
+    $(BIN_DIR)/ionice.elf \
     $(BIN_DIR)/killall.elf \
     $(BIN_DIR)/pgrep.elf \
     $(BIN_DIR)/losetup.elf \
@@ -159,6 +168,8 @@ BIN_APPS = \
     $(BIN_DIR)/file.elf \
     $(BIN_DIR)/pstree.elf \
     $(BIN_DIR)/lsof.elf \
+    $(BIN_DIR)/ipcs.elf \
+    $(BIN_DIR)/ipcrm.elf \
     $(BIN_DIR)/taskset.elf \
     $(BIN_DIR)/iostat.elf \
     $(BIN_DIR)/lsblk.elf \
@@ -179,8 +190,45 @@ skeleton:
 
 libc: skeleton libc/libc.a
 
-libc/libc.a libc/crt0.o:
+# Canonical syscall-number/errno headers (include/azami/uapi/*.h) copied into
+# libc's own include tree so #include "azami/uapi/..." resolves the same way
+# whether libc is built here by the cross-compiler or self-hosted on a
+# running AzamiOS (which only ever sees libc/include, never the repo root —
+# see the `toolchain`/build.sh staging below). Never hand-edit the copies:
+# they are regenerated from ../include/azami/uapi on every build and are not
+# tracked in git (see .gitignore). scripts/check_uapi_sync.sh verifies a
+# stale copy is never silently relied on.
+UAPI_SRCS := $(wildcard ../include/azami/uapi/*.h)
+UAPI_COPIES := $(patsubst ../include/azami/uapi/%,libc/include/azami/uapi/%,$(UAPI_SRCS))
+
+libc/include/azami/uapi/%.h: ../include/azami/uapi/%.h
+	@mkdir -p libc/include/azami/uapi
+	cp $< $@
+
+.PHONY: uapi-sync
+uapi-sync: $(UAPI_COPIES)
+
+# The archive's real inputs, so make knows when to recurse.
+#
+# This rule used to carry no prerequisites at all. Once libc.a existed make
+# considered it up to date forever and never re-entered libc/, so editing a
+# libc source changed nothing: every app kept linking the stale archive and the
+# only way to pick up a fix was to delete libc.a by hand. Listing the sources
+# here also means the apps, which depend on libc.a, relink exactly when the
+# library actually changed and not on every build. libc/Makefile does its own
+# -MMD header tracking behind this.
+LIBC_SRCS := $(wildcard libc/*.c) $(wildcard libc/*.asm) $(wildcard libc/include/*.h) \
+             $(wildcard libc/include/*/*.h) libc/Makefile
+
+# One recipe, one target: naming both artefacts on a single non-pattern rule
+# makes GNU make treat it as two independent rules with the same recipe, and
+# under -j it then runs two sub-makes into libc/ at once — they raced on
+# libc.a and left a truncated archive ("file format not recognized").
+libc/libc.a: $(UAPI_COPIES) $(LIBC_SRCS)
 	$(MAKE) -C libc
+
+libc/crt0.o: libc/libc.a
+	@:
 
 toolchain: skeleton libc
 	@rm -rf $(BUILD_DIR)/home/a0wsvg $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 2>/dev/null || true
@@ -289,6 +337,8 @@ apps: $(SBIN_APPS) $(BIN_APPS)
 etc: skeleton
 	@echo "root:x:0:0:root:/root:/bin/sh.elf" > $(BUILD_DIR)/etc/passwd
 	@echo "azami:x:1000:1000:Azami User:/home/azami:/bin/sh.elf" >> $(BUILD_DIR)/etc/passwd
+	@echo "root:4813494d137e1631bba301d5acab6e7bb7aa74ce1185d456565ef51d737677b2:19000:0:99999:7:::" > $(BUILD_DIR)/etc/shadow
+	@echo "azami:f58bf0947db3ff9d404be3b7fca4251831d8f2c4dd0b618cfcce7b7a2fcd11ac:19000:0:99999:7:::" >> $(BUILD_DIR)/etc/shadow
 	@echo "root:x:0:" > $(BUILD_DIR)/etc/group
 	@echo "wheel:x:10:root,azami" >> $(BUILD_DIR)/etc/group
 	@echo "users:x:100:azami" >> $(BUILD_DIR)/etc/group
@@ -331,13 +381,13 @@ LIBC_DIR=/usr/src/libc\n\
 cd "$LIBC_DIR"\n\
 echo "=== Building AzamiOS libc with native GCC 14.2.0 ==="\n\
 CFLAGS="-std=c11 -ffreestanding -fno-stack-protector -fno-pie -fno-pic -m64 -O2 -I. -Iinclude"\n\
-SRCS="syscall.c stdio.c stdlib.c string.c ctype.c dirent.c time.c math.c az_ipc.c signal.c mman.c pthread.c termios.c resource.c getopt.c acl.c x11.c socket.c netdb.c pwd.c grp.c regex.c fnmatch.c glob.c spawn.c syslog.c search.c"\n\
+SRCS="syscall.c stdio.c stdlib.c string.c ctype.c dirent.c time.c math.c az_ipc.c signal.c mman.c pthread.c termios.c resource.c getopt.c acl.c x11.c socket.c netdb.c pwd.c grp.c regex.c fnmatch.c glob.c spawn.c syslog.c search.c tls.c"\n\
 echo "  Compiling C sources..."\n\
 gcc $CFLAGS -c $SRCS\n\
 echo "  Assembling crt0.asm..."\n\
 nasm -f elf64 crt0.asm -o crt0.o\n\
 echo "  Archiving libc.a..."\n\
-ar rcs libc.a syscall.o stdio.o stdlib.o string.o ctype.o dirent.o time.o math.o az_ipc.o signal.o mman.o pthread.o termios.o resource.o getopt.o acl.o x11.o socket.o netdb.o pwd.o grp.o regex.o fnmatch.o glob.o spawn.o syslog.o search.o\n\
+ar rcs libc.a syscall.o stdio.o stdlib.o string.o ctype.o dirent.o time.o math.o az_ipc.o signal.o mman.o pthread.o termios.o resource.o getopt.o acl.o x11.o socket.o netdb.o pwd.o grp.o regex.o fnmatch.o glob.o spawn.o syslog.o search.o tls.o\n\
 echo "  Installing to /usr/lib /lib /lib64 ..."\n\
 cp libc.a  /usr/lib/libc.a  2>/dev/null || true\n\
 cp libc.a  /usr/lib/libm.a  2>/dev/null || true\n\
@@ -380,6 +430,28 @@ $(SBIN_DIR)/init.elf: apps/init/main.c libc/libc.a libc/crt0.o | skeleton
 	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/init.o
 	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/init.o libc/libc.a -o $@
 
+# ptrace(2) / perf_event_open(2) regression probe. Runs standalone (exits with
+# the verdict) or as PID 1 in a headless test boot.
+$(BIN_DIR)/strace.elf: apps/strace/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/strace.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/strace.o libc/libc.a -o $@
+
+$(BIN_DIR)/ktrace.elf: apps/ktrace/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ktrace.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ktrace.o libc/libc.a -o $@
+
+$(BIN_DIR)/sem_test.elf: apps/sem_test/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sem_test.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sem_test.o libc/libc.a -o $@
+
+$(BIN_DIR)/lock.elf: apps/lock/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/lock.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/lock.o libc/libc.a -o $@
+
+$(BIN_DIR)/ptraceperf.elf: apps/ptraceperf/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ptraceperf.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ptraceperf.o libc/libc.a -o $@
+
 $(SBIN_DIR)/sessiond.elf: apps/sessiond/main.c libc/libc.a libc/crt0.o | skeleton
 	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sessiond.o
 	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sessiond.o libc/libc.a -o $@
@@ -394,6 +466,14 @@ $(SBIN_DIR)/azwm.elf: apps/azwm/main.c apps/azwm/compositor.c apps/azwm/de_compo
 $(SBIN_DIR)/wallpaper.elf: apps/wallpaper/main.c libc/libc.a libc/crt0.o | skeleton
 	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/wallpaper.o
 	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/wallpaper.o libc/libc.a -o $@
+
+$(SBIN_DIR)/notifyd.elf: apps/notifyd/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/notifyd.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/notifyd.o libc/libc.a -o $@
+
+$(SBIN_DIR)/lockscreen.elf: apps/lockscreen/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/lockscreen.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/lockscreen.o libc/libc.a -o $@
 
 $(SBIN_DIR)/taskbar.elf: apps/taskbar/main.c libc/libc.a libc/crt0.o | skeleton
 	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/taskbar.o
@@ -905,6 +985,10 @@ $(BIN_DIR)/renice.elf: apps/renice/main.c libc/libc.a libc/crt0.o | skeleton
 	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/renice.o
 	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/renice.o libc/libc.a -o $@
 
+$(BIN_DIR)/ionice.elf: apps/ionice/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ionice.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ionice.o libc/libc.a -o $@
+
 $(BIN_DIR)/killall.elf: apps/killall/main.c libc/libc.a libc/crt0.o | skeleton
 	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/killall.o
 	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/killall.o libc/libc.a -o $@
@@ -944,6 +1028,14 @@ $(BIN_DIR)/file.elf: apps/file/main.c libc/libc.a libc/crt0.o | skeleton
 $(BIN_DIR)/pstree.elf: apps/pstree/main.c libc/libc.a libc/crt0.o | skeleton
 	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/pstree.o
 	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/pstree.o libc/libc.a -o $@
+
+$(BIN_DIR)/ipcs.elf: apps/ipcs/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ipcs.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ipcs.o libc/libc.a -o $@
+
+$(BIN_DIR)/ipcrm.elf: apps/ipcrm/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ipcrm.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ipcrm.o libc/libc.a -o $@
 
 $(BIN_DIR)/lsof.elf: apps/lsof/main.c libc/libc.a libc/crt0.o | skeleton
 	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/lsof.o

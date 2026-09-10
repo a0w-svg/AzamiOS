@@ -90,9 +90,19 @@ void            srand48(long seedval);
 unsigned short *seed48(unsigned short seed16v[3]);
 void            lcong48(unsigned short param[7]);
 
+/* CSPRNG (BSD extension) — kernel-backed via getentropy(2) */
+unsigned int arc4random(void);
+unsigned int arc4random_uniform(unsigned int upper_bound);
+void         arc4random_buf(void *buf, size_t nbytes);
+/* Deprecated seeding hooks — no-ops: the pool lives in the kernel. */
+void         arc4random_stir(void);
+void         arc4random_addrandom(unsigned char *dat, int datlen);
+
 /* Searching and sorting */
 void  qsort(void *base, size_t nmemb, size_t size,
             int (*compar)(const void *, const void *));
+void  qsort_r(void *base, size_t nmemb, size_t size,
+              int (*compar)(const void *, const void *, void *), void *arg);
 void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
               int (*compar)(const void *, const void *));
 

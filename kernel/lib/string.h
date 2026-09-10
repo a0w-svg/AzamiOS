@@ -21,3 +21,20 @@ char  *strrchr(const char *s, int c);
 char  *strdup(const char *s);
 int    snprintf(char *buf, size_t size, const char *fmt, ...);
 int    vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap);
+
+/*
+ * scnprintf()/vscnprintf() — like snprintf(), but return the number of
+ * characters *actually written* (excluding the NUL) rather than the number
+ * that would have been written had the buffer been large enough.
+ *
+ * snprintf()'s C99 return value makes the common accumulator idiom
+ *
+ *     n += snprintf(buf + n, len - n, ...);
+ *
+ * silently unsafe: once one call truncates, `n` runs past `len` and every
+ * subsequent length computation is wrong — and a caller that treats the final
+ * `n` as "bytes in buf" reads off the end of the buffer.  Use scnprintf() for
+ * any such loop; `n` then never exceeds `len - 1`.
+ */
+int    scnprintf(char *buf, size_t size, const char *fmt, ...);
+int    vscnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap);

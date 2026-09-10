@@ -31,7 +31,41 @@ static block_header_t *g_block_head = NULL;
 static block_header_t *g_block_tail = NULL; /* BUG-11: tail pointer for O(1) append */
 static void *g_heap_top = NULL;
 
-void *malloc(size_t size)
+/* Guards g_block_head/g_block_tail/g_heap_top and every block header's
+ * fields against concurrent access from multiple threads.
+ *
+ * This allocator had no locking at all until pthread_create() became real
+ * (Phase 1 of the libc hardening work): every new thread's own startup
+ * (thread_startup_trampoline() -> __init_thread_tls() in pthread.c) calls
+ * malloc() to build its TLS block, so as of that change *every*
+ * pthread_create() races this allocator against whatever the parent thread
+ * is doing — not a corner case an app has to opt into. Same
+ * test-and-set/yield spinlock pattern as pthread.c's pthread_spin_lock().
+ * A malloc-free critical section is a hard invariant of this file: nothing
+ * under the lock may itself call malloc/free/realloc, or it deadlocks
+ * against itself (see how realloc() below avoids calling the public
+ * malloc()/free() while holding the lock). */
+static int g_malloc_lock = 0;
+
+static void malloc_lock(void)
+{
+    int spin = 0;
+    while (__sync_lock_test_and_set(&g_malloc_lock, 1)) {
+        if (++spin < 100) {
+            __asm__ volatile("pause");
+        } else {
+            syscall0(SYS_AZ_YIELD);
+            spin = 0;
+        }
+    }
+}
+
+static void malloc_unlock(void)
+{
+    __sync_lock_release(&g_malloc_lock);
+}
+
+static void *malloc_unlocked(size_t size)
 {
     if (size == 0) return NULL;
     size_t aligned_size = (size + 15) & ~15UL;
@@ -51,6 +85,7 @@ void *malloc(size_t size)
                 split->next = curr->next;
                 split->prev = curr;
                 if (curr->next) curr->next->prev = split;
+                else g_block_tail = split;
                 curr->next = split;
                 curr->size = aligned_size;
             }
@@ -96,6 +131,14 @@ void *malloc(size_t size)
     return (void *)(new_block + 1);
 }
 
+void *malloc(size_t size)
+{
+    malloc_lock();
+    void *p = malloc_unlocked(size);
+    malloc_unlock();
+    return p;
+}
+
 void *calloc(size_t nmemb, size_t size)
 {
     size_t total = nmemb * size;
@@ -105,37 +148,46 @@ void *calloc(size_t nmemb, size_t size)
     return ptr;
 }
 
+static void free_unlocked(void *ptr);
 void free(void *ptr);
 
+/* realloc() holds the lock for its entire body and calls the *_unlocked
+ * helpers directly rather than the public malloc()/free() — those take the
+ * same lock themselves, and this lock isn't recursive. */
 void *realloc(void *ptr, size_t size)
 {
     if (!ptr) return malloc(size);
     if (size == 0) { free(ptr); return NULL; }
 
+    malloc_lock();
+
     /* Check if pointer was allocated via aligned_alloc */
     if (((size_t *)ptr)[-2] == ALIGNED_BLOCK_MAGIC) {
         void *raw = ((void **)ptr)[-1];
         block_header_t *hdr = ((block_header_t *)raw) - 1;
-        if (hdr->magic != BLOCK_MAGIC) return NULL;
+        if (hdr->magic != BLOCK_MAGIC) { malloc_unlock(); return NULL; }
 
         size_t old_size = hdr->size;
         if (size <= old_size) {
+            malloc_unlock();
             return ptr;
         }
 
-        void *new_ptr = malloc(size);
+        void *new_ptr = malloc_unlocked(size);
         if (new_ptr) {
             memcpy(new_ptr, ptr, old_size);
-            free(ptr);
+            free_unlocked(ptr);
         }
+        malloc_unlock();
         return new_ptr;
     }
 
     block_header_t *hdr = ((block_header_t *)ptr) - 1;
-    if (hdr->magic != BLOCK_MAGIC) return NULL;
+    if (hdr->magic != BLOCK_MAGIC) { malloc_unlock(); return NULL; }
 
     size_t old_size = hdr->size;
     if (size <= old_size) {
+        malloc_unlock();
         return ptr;
     }
 
@@ -151,26 +203,34 @@ void *realloc(void *ptr, size_t size)
             hdr->size = aligned_size;
             /* Update tail if this was the tail */
             if (g_block_tail == hdr) { /* still the tail */ }
+            malloc_unlock();
             return ptr;
         }
     }
 
-    void *new_ptr = malloc(size);
+    void *new_ptr = malloc_unlocked(size);
     if (new_ptr) {
         memcpy(new_ptr, ptr, old_size);
-        free(ptr);
+        free_unlocked(ptr);
     }
+    malloc_unlock();
     return new_ptr;
 }
 
 void free(void *ptr)
 {
     if (!ptr) return;
+    malloc_lock();
+    free_unlocked(ptr);
+    malloc_unlock();
+}
 
+static void free_unlocked(void *ptr)
+{
     /* Check if pointer was allocated via aligned_alloc */
     if (((size_t *)ptr)[-2] == ALIGNED_BLOCK_MAGIC) {
         void *raw = ((void **)ptr)[-1];
-        free(raw);
+        free_unlocked(raw);
         return;
     }
 
@@ -614,26 +674,165 @@ static void _qsort_swap(char *a, char *b, size_t size)
     }
 }
 
+typedef int (*_cmp_r_fn)(const void *, const void *, void *);
+
+/* Sift base[start] down through the max-heap that occupies base[0..end). */
+static void _heap_sift(char *base, size_t size, size_t start, size_t end,
+                       _cmp_r_fn cmp, void *arg)
+{
+    for (size_t root = start;;) {
+        size_t child = 2 * root + 1;
+        if (child >= end) break;
+        if (child + 1 < end &&
+            cmp(base + child * size, base + (child + 1) * size, arg) < 0)
+            child++;
+        if (cmp(base + root * size, base + child * size, arg) >= 0) break;
+        _qsort_swap(base + root * size, base + child * size, size);
+        root = child;
+    }
+}
+
+/* Heapsort — the O(n log n) worst-case fallback the introsort guard drops to. */
+static void _heapsort(char *base, size_t n, size_t size, _cmp_r_fn cmp, void *arg)
+{
+    for (size_t start = n / 2; start-- > 0; )
+        _heap_sift(base, size, start, n, cmp, arg);
+    for (size_t end = n; end-- > 1; ) {
+        _qsort_swap(base, base + end * size, size);
+        _heap_sift(base, size, 0, end, cmp, arg);
+    }
+}
+
+/*
+ * Shared sort core for qsort() and qsort_r() — an introsort.
+ *
+ *   - median-of-three pivot, so sorted / reverse-sorted input avoids O(n^2);
+ *   - Hoare partitioning, which walks through runs of equal keys instead of
+ *     piling them on one side (all-equal input was O(n^2) in the old Lomuto
+ *     version);
+ *   - recurse into the smaller partition, loop on the larger — stack depth
+ *     O(log n), not O(n);
+ *   - when quicksort recursion exceeds 2*floor(log2 n), the partition split
+ *     has gone bad too many times: fall back to heapsort for a hard
+ *     O(n log n) ceiling on adversarial input;
+ *   - insertion sort for short spans.
+ */
+#define QSORT_SMALL 12
+
+static void _qsort_core(char *base, size_t nmemb, size_t size,
+                        _cmp_r_fn cmp, void *arg, int depth)
+{
+    while (nmemb > QSORT_SMALL) {
+        if (depth-- <= 0) {
+            _heapsort(base, nmemb, size, cmp, arg);
+            return;
+        }
+
+        char *lo  = base;
+        char *mid = base + (nmemb / 2) * size;
+        char *hi  = base + (nmemb - 1) * size;
+
+        /* Order lo <= mid <= hi, then move the median into lo as the pivot. */
+        if (cmp(lo, mid, arg) > 0)  _qsort_swap(lo, mid, size);
+        if (cmp(lo, hi, arg) > 0)   _qsort_swap(lo, hi, size);
+        if (cmp(mid, hi, arg) > 0)  _qsort_swap(mid, hi, size);
+        _qsort_swap(lo, mid, size);
+
+        char *i = lo;
+        char *j = hi + size;
+        for (;;) {
+            do { i += size; } while (i <= hi && cmp(i, lo, arg) < 0);
+            do { j -= size; } while (cmp(j, lo, arg) > 0);
+            if (i >= j) break;
+            _qsort_swap(i, j, size);
+        }
+        _qsort_swap(lo, j, size);            /* pivot to its final slot */
+
+        size_t left_n  = (size_t)((j - lo) / size);
+        size_t right_n = nmemb - left_n - 1;
+        char  *right   = j + size;
+
+        if (left_n < right_n) {
+            _qsort_core(lo, left_n, size, cmp, arg, depth);
+            base = right; nmemb = right_n;
+        } else {
+            _qsort_core(right, right_n, size, cmp, arg, depth);
+            base = lo; nmemb = left_n;
+        }
+    }
+
+    for (size_t k = 1; k < nmemb; k++) {
+        char *cur = base + k * size;
+        for (char *p = cur; p > base && cmp(p - size, p, arg) > 0; p -= size)
+            _qsort_swap(p - size, p, size);
+    }
+}
+
+static int _qsort_depth_limit(size_t n)
+{
+    int k = 0;
+    while (n > 1) { n >>= 1; k++; }
+    return 2 * k + 1;
+}
+
+static int _qsort_cmp_shim(const void *a, const void *b, void *arg)
+{
+    return ((int (*)(const void *, const void *))arg)(a, b);
+}
+
 void qsort(void *base, size_t nmemb, size_t size,
            int (*compar)(const void *, const void *))
 {
-    if (nmemb < 2 || size == 0 || !base) return;
-
-    char *b = (char *)base;
-    char *pivot = b + (nmemb - 1) * size;
-    size_t i = 0;
-
-    for (size_t j = 0; j < nmemb - 1; j++) {
-        if (compar(b + j * size, pivot) <= 0) {
-            if (i != j) _qsort_swap(b + i * size, b + j * size, size);
-            i++;
-        }
-    }
-    _qsort_swap(b + i * size, pivot, size);
-
-    if (i > 1) qsort(b, i, size, compar);
-    if (nmemb - i - 1 > 1) qsort(b + (i + 1) * size, nmemb - i - 1, size, compar);
+    if (nmemb < 2 || size == 0 || !base || !compar) return;
+    _qsort_core((char *)base, nmemb, size, _qsort_cmp_shim, (void *)compar,
+                _qsort_depth_limit(nmemb));
 }
+
+void qsort_r(void *base, size_t nmemb, size_t size,
+             int (*compar)(const void *, const void *, void *), void *arg)
+{
+    if (nmemb < 2 || size == 0 || !base || !compar) return;
+    _qsort_core((char *)base, nmemb, size, compar, arg, _qsort_depth_limit(nmemb));
+}
+
+/* ── CSPRNG (arc4random family) — kernel-backed, no userspace state ──────── */
+
+void arc4random_buf(void *buf, size_t nbytes)
+{
+    unsigned char *p = (unsigned char *)buf;
+    while (nbytes) {
+        size_t chunk = nbytes > 256 ? 256 : nbytes;   /* getentropy(2) cap */
+        if (getentropy(p, chunk) != 0) {
+            /* The kernel CSPRNG never fails in practice; degrade rather than
+             * hand back an uninitialised buffer if it somehow does. */
+            for (size_t i = 0; i < chunk; i++) p[i] = (unsigned char)rand();
+        }
+        p += chunk;
+        nbytes -= chunk;
+    }
+}
+
+unsigned int arc4random(void)
+{
+    unsigned int v;
+    arc4random_buf(&v, sizeof(v));
+    return v;
+}
+
+unsigned int arc4random_uniform(unsigned int upper_bound)
+{
+    if (upper_bound < 2) return 0;
+    /* Rejection sampling to avoid modulo bias. */
+    unsigned int min = (unsigned int)(-upper_bound) % upper_bound;
+    unsigned int r;
+    do { r = arc4random(); } while (r < min);
+    return r % upper_bound;
+}
+
+/* The pool is the kernel CSPRNG, reseeded by the kernel; these BSD-era hooks
+ * that let a program stir in its own entropy are obsolete and do nothing. */
+void arc4random_stir(void) { }
+void arc4random_addrandom(unsigned char *dat, int datlen) { (void)dat; (void)datlen; }
 
 /* ── Environment & Process ───────────────────────────────────────────────── */
 
@@ -768,41 +967,264 @@ void __assert_fail(const char *expr, const char *file, int line, const char *fun
     abort();
 }
 
-static struct lconv s_posix_lconv = {
-    .decimal_point     = ".",
-    .thousands_sep     = "",
-    .grouping          = "",
-    .int_curr_symbol   = "",
-    .currency_symbol   = "",
-    .mon_decimal_point = "",
-    .mon_thousands_sep = "",
-    .mon_grouping      = "",
-    .positive_sign     = "",
-    .negative_sign     = "",
-    .int_frac_digits   = 127,
-    .frac_digits       = 127,
-    .p_cs_precedes     = 127,
-    .p_sep_by_space    = 127,
-    .n_cs_precedes     = 127,
-    .n_sep_by_space    = 127,
-    .p_sign_posn       = 127,
-    .n_sign_posn       = 127,
+/* ── Built-in locale table ─────────────────────────────────────────────────
+ *
+ * Each entry describes the formatting rules for one named locale.  Only the
+ * fields that differ between locales need to be non-empty; the rest default
+ * to the POSIX C-locale values.
+ *
+ * Supported names:
+ *   "C", "POSIX"            — ISO C locale (decimal point = ".", no grouping)
+ *   "en_US", "en_US.UTF-8"  — US English   (decimal ".", thousands ",")
+ *   "de_DE", "de_DE.UTF-8"  — German       (decimal ",", thousands ".")
+ *   "fr_FR", "fr_FR.UTF-8"  — French       (decimal ",", thousands "\xc2\xa0" NBSP)
+ * ─────────────────────────────────────────────────────────────────────────── */
+typedef struct {
+    const char *names[4];   /* NULL-terminated list of alternate names */
+    /* numeric */
+    const char *decimal_point;
+    const char *thousands_sep;
+    const char *grouping;
+    /* monetary */
+    const char *int_curr_symbol;
+    const char *currency_symbol;
+    const char *mon_decimal_point;
+    const char *mon_thousands_sep;
+    const char *mon_grouping;
+    const char *positive_sign;
+    const char *negative_sign;
+    char        frac_digits;
+    char        int_frac_digits;
+    char        p_cs_precedes;
+    char        p_sep_by_space;
+    char        n_cs_precedes;
+    char        n_sep_by_space;
+    char        p_sign_posn;
+    char        n_sign_posn;
+} locale_entry_t;
+
+#define CHAR_MAX_VAL 127
+
+static const locale_entry_t s_locales[] = {
+    /* C / POSIX */
+    {
+        .names           = { "C", "POSIX", "C.UTF-8", NULL },
+        .decimal_point   = ".",  .thousands_sep   = "",    .grouping        = "",
+        .int_curr_symbol = "",   .currency_symbol = "",
+        .mon_decimal_point = "", .mon_thousands_sep = "",  .mon_grouping    = "",
+        .positive_sign   = "",   .negative_sign   = "",
+        .frac_digits = CHAR_MAX_VAL, .int_frac_digits = CHAR_MAX_VAL,
+        .p_cs_precedes = CHAR_MAX_VAL, .p_sep_by_space = CHAR_MAX_VAL,
+        .n_cs_precedes = CHAR_MAX_VAL, .n_sep_by_space = CHAR_MAX_VAL,
+        .p_sign_posn = CHAR_MAX_VAL, .n_sign_posn = CHAR_MAX_VAL,
+    },
+    /* en_US */
+    {
+        .names             = { "en_US", "en_US.UTF-8", "en_US.utf8", NULL },
+        .decimal_point     = ".",    .thousands_sep   = ",",  .grouping = "\3",
+        .int_curr_symbol   = "USD ", .currency_symbol = "$",
+        .mon_decimal_point = ".",    .mon_thousands_sep = ",", .mon_grouping = "\3",
+        .positive_sign     = "",     .negative_sign   = "-",
+        .frac_digits = 2, .int_frac_digits = 2,
+        .p_cs_precedes = 1, .p_sep_by_space = 0,
+        .n_cs_precedes = 1, .n_sep_by_space = 0,
+        .p_sign_posn = 1, .n_sign_posn = 1,
+    },
+    /* de_DE */
+    {
+        .names             = { "de_DE", "de_DE.UTF-8", "de_DE.utf8", NULL },
+        .decimal_point     = ",",    .thousands_sep   = ".", .grouping = "\3",
+        .int_curr_symbol   = "EUR ", .currency_symbol = "\xe2\x82\xac", /* UTF-8 € */
+        .mon_decimal_point = ",",    .mon_thousands_sep = ".", .mon_grouping = "\3",
+        .positive_sign     = "",     .negative_sign   = "-",
+        .frac_digits = 2, .int_frac_digits = 2,
+        .p_cs_precedes = 0, .p_sep_by_space = 1,
+        .n_cs_precedes = 0, .n_sep_by_space = 1,
+        .p_sign_posn = 1, .n_sign_posn = 1,
+    },
+    /* fr_FR */
+    {
+        .names             = { "fr_FR", "fr_FR.UTF-8", "fr_FR.utf8", NULL },
+        .decimal_point     = ",",    .thousands_sep   = "\xc2\xa0", /* NBSP */
+        .grouping          = "\3",
+        .int_curr_symbol   = "EUR ", .currency_symbol = "\xe2\x82\xac",
+        .mon_decimal_point = ",",    .mon_thousands_sep = "\xc2\xa0",
+        .mon_grouping      = "\3",
+        .positive_sign     = "",     .negative_sign   = "-",
+        .frac_digits = 2, .int_frac_digits = 2,
+        .p_cs_precedes = 0, .p_sep_by_space = 1,
+        .n_cs_precedes = 0, .n_sep_by_space = 1,
+        .p_sign_posn = 1, .n_sign_posn = 1,
+    },
 };
+#define LOCALE_COUNT ((int)(sizeof(s_locales) / sizeof(s_locales[0])))
+
+/* Active locale per-category: all start at index 0 (C locale) */
+static int s_lc_cat[LC_ALL + 1];  /* indexed by LC_CTYPE .. LC_ALL */
+
+/* lconv active for LC_NUMERIC / LC_MONETARY categories */
+static struct lconv s_active_lconv;
+
+/* Opaque locale_t object; used by newlocale/uselocale */
+struct _az_locale_obj {
+    int locale_idx;    /* index into s_locales[] */
+    int category_mask;
+};
+
+
+/* Rebuild s_active_lconv from the current category selections */
+static void _rebuild_lconv(void)
+{
+    int ni = s_lc_cat[LC_NUMERIC];
+    int mi = s_lc_cat[LC_MONETARY];
+    if (ni < 0 || ni >= LOCALE_COUNT) ni = 0;
+    if (mi < 0 || mi >= LOCALE_COUNT) mi = 0;
+
+    const locale_entry_t *n = &s_locales[ni];
+    const locale_entry_t *m = &s_locales[mi];
+
+    s_active_lconv.decimal_point       = (char *)n->decimal_point;
+    s_active_lconv.thousands_sep       = (char *)n->thousands_sep;
+    s_active_lconv.grouping            = (char *)n->grouping;
+    s_active_lconv.int_curr_symbol     = (char *)m->int_curr_symbol;
+    s_active_lconv.currency_symbol     = (char *)m->currency_symbol;
+    s_active_lconv.mon_decimal_point   = (char *)m->mon_decimal_point;
+    s_active_lconv.mon_thousands_sep   = (char *)m->mon_thousands_sep;
+    s_active_lconv.mon_grouping        = (char *)m->mon_grouping;
+    s_active_lconv.positive_sign       = (char *)m->positive_sign;
+    s_active_lconv.negative_sign       = (char *)m->negative_sign;
+    s_active_lconv.int_frac_digits     = m->int_frac_digits;
+    s_active_lconv.frac_digits         = m->frac_digits;
+    s_active_lconv.p_cs_precedes       = m->p_cs_precedes;
+    s_active_lconv.p_sep_by_space      = m->p_sep_by_space;
+    s_active_lconv.n_cs_precedes       = m->n_cs_precedes;
+    s_active_lconv.n_sep_by_space      = m->n_sep_by_space;
+    s_active_lconv.p_sign_posn         = m->p_sign_posn;
+    s_active_lconv.n_sign_posn         = m->n_sign_posn;
+    /* POSIX.1-2008 int_* fields from monetary locale */
+    s_active_lconv.int_p_cs_precedes   = m->p_cs_precedes;
+    s_active_lconv.int_n_cs_precedes   = m->n_cs_precedes;
+    s_active_lconv.int_p_sep_by_space  = m->p_sep_by_space;
+    s_active_lconv.int_n_sep_by_space  = m->n_sep_by_space;
+    s_active_lconv.int_p_sign_posn     = m->p_sign_posn;
+    s_active_lconv.int_n_sign_posn     = m->n_sign_posn;
+}
+
+/* Look up locale name in the table; returns index, or -1 if not found */
+static int _find_locale(const char *name)
+{
+    if (!name || !*name) return 0;  /* empty string → "C" */
+    for (int i = 0; i < LOCALE_COUNT; i++) {
+        for (int j = 0; s_locales[i].names[j]; j++) {
+            if (strcmp(s_locales[i].names[j], name) == 0) return i;
+        }
+    }
+    return -1;  /* not found */
+}
 
 char *setlocale(int category, const char *locale)
 {
-    (void)category;
-    static char s_locale_c[] = "C";
-    if (!locale || !*locale || strcmp(locale, "C") == 0 || strcmp(locale, "POSIX") == 0) {
-        return s_locale_c;
+    /* Query mode: locale == NULL → return current name */
+    if (!locale) {
+        int idx = 0;
+        if (category >= LC_CTYPE && category <= LC_MESSAGES)
+            idx = s_lc_cat[category];
+        else if (category == LC_ALL)
+            idx = s_lc_cat[LC_ALL];
+        if (idx < 0 || idx >= LOCALE_COUNT) idx = 0;
+        return (char *)s_locales[idx].names[0];
     }
-    return s_locale_c;
+
+    int new_idx = _find_locale(locale);
+    if (new_idx < 0) return NULL;  /* unsupported locale → error */
+
+    if (category == LC_ALL) {
+        for (int c = LC_CTYPE; c <= LC_MESSAGES; c++)
+            s_lc_cat[c] = new_idx;
+        s_lc_cat[LC_ALL] = new_idx;
+    } else if (category >= LC_CTYPE && category <= LC_MESSAGES) {
+        s_lc_cat[category] = new_idx;
+        /* Recompute LC_ALL: pick LC_ALL_IDX only if all cats agree */
+        int all_same = s_lc_cat[LC_CTYPE];
+        for (int c = LC_NUMERIC; c <= LC_MESSAGES; c++)
+            if (s_lc_cat[c] != all_same) { all_same = -1; break; }
+        s_lc_cat[LC_ALL] = (all_same >= 0) ? all_same : 0;
+    } else {
+        return NULL;
+    }
+
+    _rebuild_lconv();
+    return (char *)s_locales[new_idx].names[0];
 }
 
 struct lconv *localeconv(void)
 {
-    return &s_posix_lconv;
+    /* Ensure initialised (first call before any setlocale) */
+    static int s_inited = 0;
+    if (!s_inited) { _rebuild_lconv(); s_inited = 1; }
+    return &s_active_lconv;
 }
+
+/* ── POSIX.1-2008 locale_t API ────────────────────────────────────────────── */
+
+locale_t newlocale(int category_mask, const char *locale, locale_t base)
+{
+    int idx = _find_locale(locale);
+    if (idx < 0) return (locale_t)0;  /* NULL = error */
+
+    struct _az_locale_obj *obj;
+    if (base && base != LC_GLOBAL_LOCALE) {
+        obj = base;
+        obj->category_mask |= category_mask;
+    } else {
+        obj = (struct _az_locale_obj *)malloc(sizeof(struct _az_locale_obj));
+        if (!obj) return (locale_t)0;
+        obj->category_mask = category_mask;
+    }
+    /* The new locale overrides the requested categories */
+    if (category_mask) obj->locale_idx = idx;
+    return obj;
+}
+
+locale_t uselocale(locale_t newloc)
+{
+    /* We use a single global; per-thread locale_t is a future extension */
+    static locale_t s_current = (locale_t)0;
+    locale_t old = s_current ? s_current : LC_GLOBAL_LOCALE;
+
+    if (newloc && newloc != LC_GLOBAL_LOCALE) {
+        s_current = newloc;
+        /* Apply to the global setlocale state */
+        if (newloc->locale_idx >= 0 && newloc->locale_idx < LOCALE_COUNT) {
+            setlocale(LC_ALL, s_locales[newloc->locale_idx].names[0]);
+        }
+    } else if (newloc == LC_GLOBAL_LOCALE) {
+        s_current = (locale_t)0;
+    }
+    return old;
+}
+
+locale_t duplocale(locale_t locobj)
+{
+    if (!locobj) return (locale_t)0;
+    struct _az_locale_obj *obj = (struct _az_locale_obj *)malloc(
+        sizeof(struct _az_locale_obj));
+    if (!obj) return (locale_t)0;
+    if (locobj == LC_GLOBAL_LOCALE) {
+        obj->locale_idx    = s_lc_cat[LC_ALL];
+        obj->category_mask = LC_ALL_MASK;
+    } else {
+        *obj = *locobj;
+    }
+    return obj;
+}
+
+void freelocale(locale_t locobj)
+{
+    if (!locobj || locobj == LC_GLOBAL_LOCALE) return;
+    free(locobj);
+}
+
 
 char *realpath(const char *path, char *resolved_path)
 {

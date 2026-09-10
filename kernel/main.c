@@ -19,7 +19,7 @@
  * ============================================================================ */
 
 #define DEBUG 1
-#include <azami/debug.h>
+#include "../include/azami/debug.h"
 #include "../include/azami/types.h"
 #include "../include/azami/defs.h"
 #include "panic.h"
@@ -31,6 +31,7 @@
 #include "../drivers/acpi/acpi.h"
 #include "../drivers/acpi/ioapic.h"
 #include "../drivers/sound/ac97.h"
+#include "../drivers/gpu/drm/drm_core.h"
 
 /* Architecture layer */
 #include "../arch/x86_64/boot/limine_req.h"
@@ -48,12 +49,17 @@
 #include "sched/elf.h"
 #include "lib/string.h"
 #include "ipc/ipc.h"
+#include "ipc/sysvipc.h"
+#include "ipc/mqueue.h"
+#include "ktimer.h"
 #include "../fs/vfs.h"
 #include "../fs/ext2/ext2.h"
+#include "../fs/tmpfs.h"
 #include "../drivers/block/block.h"
 #include "security/security.h"
 #include "object/object.h"
 #include "../hal/hal.h"
+#include "../drivers/base/base.h"
 #include "../arch/x86_64/cpu/smp.h"
 #include "../arch/x86_64/cpu/lapic.h"
 
@@ -170,14 +176,43 @@ void kernel_main(void)
     /* ── Step 11: SMP & Local APIC ───────────────────────────────────────── */
     smp_init();
 
+    /* ── Performance counters ────────────────────────────────────────────
+     * After smp_init(), because programming a counter is per-logical-processor
+     * and pmu_sync_local() needs this core's id from the per-CPU block. */
+    extern void pmu_init(void);
+    extern void perf_init(void);
+    extern void ktrace_init(void);
+    pmu_init();
+    perf_init();
+    ktrace_init();
+
     /* ── Step 12: CFS Scheduler & Process/Thread Manager ─────────────────── */
     sched_init();
+
+    /* Heap reaper: hands fully-free slab pages back to the PMM on a timer.
+     * Needs the scheduler — it runs as a kernel thread. */
+    kmalloc_start_reaper();
 
     /* ── Step 13: Inter-Process Communication (IPC) ──────────────────────── */
     ipc_init();
 
+    /* System V IPC (XSI shared memory, semaphores, message queues) and the
+     * POSIX per-process timer engine.  The timer engine needs the scheduler,
+     * which is up by now, because it runs as a kernel thread. */
+    sysvipc_init();
+    /* POSIX message queues are independent of the System V table above; they
+     * only need the fd layer, which the scheduler has already brought up. */
+    mqueue_init();
+    extern void posix_sem_init(void);
+    posix_sem_init();
+    ktimer_init();
+
     /* ── Step 13b: Input Subsystem (PS/2 Keyboard + Mouse) ────────────────── */
     input_init();
+
+    /* Linux input UAPI on top of it (/dev/input/event0). */
+    extern void evdev_init(void);
+    evdev_init();
 
     /* ── Step 14: Virtual File System (VFS) & Block Device Layer ─────────── */
     vfs_init();
@@ -212,7 +247,14 @@ void kernel_main(void)
     extern void devpts_init(void);
     devpts_init();
 
+    /* ── tmpfs: RAM-backed volatile filesystem ("/tmp") ──────────────────── */
+    tmpfs_init();
+
     ext2_init();
+
+    /* ── squashfs: read-only compressed filesystem ────────────────────────── */
+    extern void squashfs_init(void);
+    squashfs_init();
 
     /* ── Step 15: NT-Style Object Manager Namespace ──────────────────────── */
     az_object_manager_init();
@@ -221,8 +263,38 @@ void kernel_main(void)
     acl_init();
 
     /* ── Step 16: Hardware Abstraction Layer (Device Tree + PCI) ──────────── */
+    driver_core_init();
     hal_init();
+
+    /* Driver model: the platform bus declares the fixed PC/AT devices, the
+     * PCI bus adopts everything the HAL enumerated, and /dev/kevent starts
+     * publishing the hotplug events both of them generate. */
+    platform_bus_init();
+    pci_bus_init();
+    uevent_init();
+
+    /* Drivers that bind through the driver model instead of scanning the bus
+     * themselves.  Registration order does not matter — the core probes the
+     * devices already enumerated above. */
+    extern void virtio_input_init(void);
+    extern void virtio_console_init(void);
+    extern void i6300esb_init(void);
+    extern void virtio_balloon_init(void);
+    extern void i2c_core_init(void);
+    extern void i801_init(void);
+    virtio_input_init();
+    virtio_console_init();
+    i6300esb_init();
+    virtio_balloon_init();
+
+    /* I2C/SMBus: the core registers the class, then controllers bind to it. */
+    i2c_core_init();
+    i801_init();
     block_ahci_init();
+
+    /* NVMe controllers (PCI class 0x01 subclass 0x08 prog-if 0x02). */
+    extern void block_nvme_init(void);
+    block_nvme_init();
 
     extern int fdc_init(void);
     fdc_init();
@@ -256,20 +328,21 @@ void kernel_main(void)
     bga_init();
     extern void fbdev_init(void);
     fbdev_init();
-    extern void drm_init(void);
-    drm_init();
+    drm_subsystem_init();
     ac97_init();
     extern void sb16_init(void);
     sb16_init();
     extern void loop_init(void);
     loop_init();
 
-    /* Initialize Network Interface Drivers & Stack */
-    if (e1000_init() == 0 || rtl8139_init() == 0) {
-        net_init();
-    } else {
-        net_init();
-    }
+    /* Initialize Network Interface Drivers & Stack.
+     * Probe order is precedence order: the first interface to register becomes
+     * the stack's primary one, so the faster NICs are tried first and the
+     * NE2000 only takes over when nothing else is present. */
+    extern void ne2k_pci_init(void);
+    if (e1000_init() != 0) rtl8139_init();
+    ne2k_pci_init();
+    net_init();
 
     /* Load initrd.ext2 module as ramdisk and mount */
     struct limine_file *initrd = az_boot_initrd();
@@ -315,6 +388,14 @@ void kernel_main(void)
         }
     } else {
         pr_debug("[INITRD] No initrd module passed by Limine.\n");
+    }
+
+    /* Mount tmpfs at /tmp so processes get a writable RAM scratch area */
+    vfs_mkdir("/tmp", 01777);
+    if (vfs_mount("tmpfs", "/tmp", "tmpfs", NULL) == 0) {
+        pr_debug("[TMPFS] Mounted tmpfs at /tmp\n");
+    } else {
+        pr_debug("[TMPFS] Warning: failed to mount tmpfs at /tmp\n");
     }
 
     vfs_mkdir("/hdd", 0755);

@@ -76,6 +76,10 @@ int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags);
 int chmod(const char *path, mode_t mode);
 int fchmod(int fd, mode_t mode);
 int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags);
+/* fchmodat2(): the same call with its flags argument passed to the kernel
+ * instead of dropped. AT_SYMLINK_NOFOLLOW is reported unsupported rather than
+ * silently ignored. */
+int fchmodat2(int dirfd, const char *pathname, mode_t mode, int flags);
 int mkdir(const char *pathname, mode_t mode);
 int mkdirat(int dirfd, const char *pathname, mode_t mode);
 int mknod(const char *pathname, mode_t mode, dev_t dev);

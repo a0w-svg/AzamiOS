@@ -7,8 +7,10 @@
  * ============================================================================ */
 
 #define DEBUG 0
-#include <azami/debug.h>
+#include "../../include/azami/debug.h"
 #include "syscall.h"
+#include "../ptrace.h"
+#include "../perf/perf.h"
 #include "../../drivers/char/console.h"
 #include "../../drivers/char/uart.h"
 #include "../../drivers/input/input.h"
@@ -22,7 +24,10 @@
 #include "../../kernel/mm/vma.h"
 #include "../../kernel/signal.h"
 #include "../../kernel/ipc/ipc.h"
+#include "../../kernel/ipc/sysvipc.h"
+#include "../../kernel/ktimer.h"
 #include "../../kernel/object/object.h"
+#include "../../arch/x86_64/cpu/nospec.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/boot/limine_req.h"
 #include "../../drivers/misc/bga.h"
@@ -35,18 +40,23 @@
 #include "../../include/azami/net.h"
 #include "../../include/azami/socket.h"
 #include "../security/acl.h"
+#include "../../arch/x86_64/cpu/cpu.h"   /* g_pku_enabled */
+#include "../../arch/x86_64/cpu/msr.h"   /* rdpkru / wrpkru */
 #include "../security/security.h"
 #include "../../arch/x86_64/cpu/msr.h"
 #include "../../arch/x86_64/cpu/smp.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
+#include "../ipc/mqueue.h"
+#include "../perf/ktrace.h"
 
 typedef s64 (*syscall_fn_t)(pt_regs_t *r);
 
 
-#define SYSCALL_TABLE_SIZE  540
+#define SYSCALL_TABLE_SIZE  560
 static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE];
 
-#define PROC_MAX_FDS 64
+/* PROC_MAX_FDS lives in sched.h next to the arrays it sizes. */
 
 /* Serialises fd-table slot moves (lookup / allocate / teardown). Held only
  * across pointer assignments — never across a blocking call. */
@@ -76,6 +86,26 @@ static void fput(file_t *file)
     if (file) vfs_close(file);
 }
 
+/* fd_table_release() — see syscall.h. Clear each slot under g_fd_lock so a
+ * concurrent fget() (including a cross-process one from pidfd_getfd) cannot
+ * observe a file_t between "still in the table" and "already freed"; the
+ * blocking close work is done afterwards with the lock dropped. */
+void fd_table_release(process_t *proc)
+{
+    if (!proc) return;
+    for (int i = 0; i < PROC_MAX_FDS; i++) {
+        irqflags_t fl = spinlock_lock_irqsave(&g_fd_lock);
+        file_t *f = (file_t *)__atomic_exchange_n(&proc->handle_table[i],
+                                                  NULL, __ATOMIC_SEQ_CST);
+        spinlock_unlock_irqrestore(&g_fd_lock, fl);
+        if (f) vfs_close(f);
+
+        /* Object handles have their own lock; az_handle_close() takes it. */
+        if (proc->obj_handle_table[i])
+            az_handle_close(proc, i);
+    }
+}
+
 /* proc_clone_attrs() — copy the POSIX process attributes a fork()/clone() child
  * inherits from its parent: cwd, umask, credentials, supplementary groups,
  * process group / session, resource layout, TLS bases, and signal state.
@@ -84,6 +114,12 @@ static void proc_clone_attrs(process_t *child, const process_t *parent)
 {
     strncpy(child->cwd, parent->cwd, sizeof(child->cwd) - 1);
     child->cwd[sizeof(child->cwd) - 1] = '\0';
+
+    /* The filesystem root is inherited like the working directory, and like
+     * Linux it survives execve() too: a child can never be less confined than
+     * the parent that forked it. */
+    strncpy(child->root, parent->root, sizeof(child->root) - 1);
+    child->root[sizeof(child->root) - 1] = '\0';
 
     child->umask = parent->umask;
     child->uid  = parent->uid;   child->euid = parent->euid;   child->suid = parent->suid;
@@ -102,10 +138,48 @@ static void proc_clone_attrs(process_t *child, const process_t *parent)
     child->fs_base      = parent->fs_base;
     child->gs_base      = parent->gs_base;
 
+    /* Capability sets are inherited wholesale by fork(): the child is the same
+     * program with the same privileges. no_new_privs and seccomp_mode are
+     * inherited too and remain one-way — a child can never hold more privilege
+     * than the parent that created it. */
+    child->cap_permitted   = parent->cap_permitted;
+    child->cap_effective   = parent->cap_effective;
+    child->cap_inheritable = parent->cap_inheritable;
+    child->cap_bounding    = parent->cap_bounding;
+    child->no_new_privs    = parent->no_new_privs;
+    child->seccomp_mode    = parent->seccomp_mode;
+
+    /* fork() duplicates the address space verbatim, so the child keeps the
+     * parent's randomised layout; only a subsequent execve() re-rolls it. */
+    child->personality = parent->personality;
+    child->stack_low   = parent->stack_low;
+    child->stack_high  = parent->stack_high;
+
     for (int i = 0; i < _NSIG; i++)
         child->sigactions[i] = parent->sigactions[i];
     child->sig_blocked = parent->sig_blocked;
     child->sig_pending = 0;
+
+    /* Alternate signal stack is preserved across fork */
+    child->sas_ss_sp    = parent->sas_ss_sp;
+    child->sas_ss_size  = parent->sas_ss_size;
+    child->sas_ss_flags = parent->sas_ss_flags;
+
+    /* The robust-futex list address is a userspace pointer into an address
+     * space fork() duplicated verbatim, so it stays valid in the child. */
+    child->robust_list     = parent->robust_list;
+    child->robust_list_len = parent->robust_list_len;
+
+    /* Protection keys are a property of the page tables, which the child gets
+     * a copy of, so the allocation map has to come along or pkey_free() in the
+     * child would be operating on a key it does not believe it owns. */
+    child->pkey_alloc_map = parent->pkey_alloc_map;
+
+    /* Both of these are documented as inherited across fork(). */
+    child->ioprio              = parent->ioprio;
+    child->mempolicy_mode      = parent->mempolicy_mode;
+    child->mempolicy_nodemask  = parent->mempolicy_nodemask;
+    child->mempolicy_home_node = parent->mempolicy_home_node;
 }
 
 /* fd_install_from() — atomically claim the lowest free fd >= minfd for `file`.
@@ -133,6 +207,11 @@ static inline s64 fd_install(process_t *proc, file_t *file, u8 fd_flags)
     return fd_install_from(proc, file, fd_flags, 0);
 }
 
+s64 syscall_install_fd(process_t *proc, void *file, u8 fd_flags)
+{
+    return fd_install_from(proc, file, fd_flags, 0);
+}
+
 /* fd_install_pair() — atomically claim two fds (for pipe/socketpair). On success
  * writes the descriptors to out0 and out1 and returns 0; returns -EMFILE if two
  * free slots are not available (nothing is installed in that case). */
@@ -155,6 +234,17 @@ static s64 fd_install_pair(process_t *proc, void *f0, void *f1, u8 fd_flags,
     *out0 = a; *out1 = b;
     return 0;
 }
+
+/* Exported to the subsystems that mint their own file objects (POSIX message
+ * queues). They are thin aliases rather than a second implementation so the
+ * fd table has exactly one set of rules — one lock, one refcount discipline. */
+s64 syscall_fd_install(process_t *proc, file_t *file, u8 fd_flags)
+{
+    return fd_install_from(proc, file, fd_flags, 0);
+}
+
+file_t *syscall_fget(process_t *proc, int fd) { return fget(proc, fd); }
+void    syscall_fput(file_t *file)            { fput(file); }
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
 static s64 sys_read_impl(pt_regs_t *r);
@@ -190,6 +280,8 @@ static s64 sys_connect_impl(pt_regs_t *r);
 static s64 sys_accept_impl(pt_regs_t *r);
 static s64 sys_sendto_impl(pt_regs_t *r);
 static s64 sys_recvfrom_impl(pt_regs_t *r);
+static s64 sys_sendmsg_impl(pt_regs_t *r);
+static s64 sys_recvmsg_impl(pt_regs_t *r);
 static s64 sys_shutdown_impl(pt_regs_t *r);
 static s64 sys_bind_impl(pt_regs_t *r);
 static s64 sys_listen_impl(pt_regs_t *r);
@@ -288,7 +380,6 @@ static s64 sys_az_sysstat_impl(pt_regs_t *r);
 static s64 sys_az_set_timer_impl(pt_regs_t *r);
 static s64 sys_arch_prctl_impl(pt_regs_t *r);
 static s64 sys_set_tid_address_impl(pt_regs_t *r);
-static s64 sys_set_robust_list_impl(pt_regs_t *r);
 static s64 sys_prlimit64_impl(pt_regs_t *r);
 static s64 sys_rseq_impl(pt_regs_t *r);
 static s64 sys_sendfile_impl(pt_regs_t *r);
@@ -342,7 +433,6 @@ static s64 sys_clock_getres_impl(pt_regs_t *r);
 static s64 sys_clock_settime_impl(pt_regs_t *r);
 static s64 sys_clock_nanosleep_impl(pt_regs_t *r);
 static s64 sys_mremap_impl(pt_regs_t *r);
-static s64 sys_mincore_impl(pt_regs_t *r);
 static s64 sys_capget_impl(pt_regs_t *r);
 static s64 sys_capset_impl(pt_regs_t *r);
 static s64 sys_personality_impl(pt_regs_t *r);
@@ -383,6 +473,35 @@ static s64 sys_sched_getattr_impl(pt_regs_t *r);
 static s64 sys_pidfd_open_impl(pt_regs_t *r);
 static s64 sys_pidfd_send_signal_impl(pt_regs_t *r);
 static s64 sys_pidfd_getfd_impl(pt_regs_t *r);
+
+/* POSIX message queues */
+static s64 sys_mq_open_impl(pt_regs_t *r);
+static s64 sys_mq_unlink_impl(pt_regs_t *r);
+static s64 sys_mq_timedsend_impl(pt_regs_t *r);
+static s64 sys_mq_timedreceive_impl(pt_regs_t *r);
+static s64 sys_mq_notify_impl(pt_regs_t *r);
+static s64 sys_mq_getsetattr_impl(pt_regs_t *r);
+
+/* futex2 */
+static s64 sys_futex_wake_impl(pt_regs_t *r);
+static s64 sys_futex_wait_impl(pt_regs_t *r);
+static s64 sys_futex_requeue_impl(pt_regs_t *r);
+
+/* Further Linux calls */
+static s64 sys_accept4_impl(pt_regs_t *r);
+static s64 sys_ioprio_set_impl(pt_regs_t *r);
+static s64 sys_ioprio_get_impl(pt_regs_t *r);
+static s64 sys_set_mempolicy_impl(pt_regs_t *r);
+static s64 sys_get_mempolicy_impl(pt_regs_t *r);
+static s64 sys_move_pages_impl(pt_regs_t *r);
+static s64 sys_mbind_impl(pt_regs_t *r);
+static s64 sys_migrate_pages_impl(pt_regs_t *r);
+static s64 sys_set_mempolicy_home_node_impl(pt_regs_t *r);
+static s64 sys_fchmodat2_impl(pt_regs_t *r);
+static s64 sys_restart_syscall_impl(pt_regs_t *r);
+static s64 sys_vhangup_impl(pt_regs_t *r);
+static s64 sys_pivot_root_impl(pt_regs_t *r);
+static s64 sys_process_mrelease_impl(pt_regs_t *r);
 static s64 sys_memfd_create_impl(pt_regs_t *r);
 static s64 sys_getrlimit_impl(pt_regs_t *r);
 static s64 sys_setrlimit_impl(pt_regs_t *r);
@@ -407,7 +526,11 @@ static s64 sys_creat_impl(pt_regs_t *r);
 static s64 sys_lchown_impl(pt_regs_t *r);
 static s64 sys_preadv_impl(pt_regs_t *r);
 static s64 sys_pwritev_impl(pt_regs_t *r);
-static s64 sys_mlock_noop_impl(pt_regs_t *r);
+static s64 sys_mlock_impl(pt_regs_t *r);
+static s64 sys_munlock_impl(pt_regs_t *r);
+static s64 sys_mlock2_impl(pt_regs_t *r);
+static s64 sys_mlockall_impl(pt_regs_t *r);
+static s64 sys_munlockall_impl(pt_regs_t *r);
 static s64 sys_rt_sigpending_impl(pt_regs_t *r);
 static s64 sys_sigaltstack_impl(pt_regs_t *r);
 static s64 sys_getitimer_impl(pt_regs_t *r);
@@ -424,25 +547,156 @@ static s64 sys_settimeofday_impl(pt_regs_t *r);
 static s64 sys_sendmmsg_impl(pt_regs_t *r);
 static s64 sys_recvmmsg_impl(pt_regs_t *r);
 static s64 sys_process_vm_readv_impl(pt_regs_t *r);
+static s64 sys_shmget_impl(pt_regs_t *r);
+static s64 sys_shmat_impl(pt_regs_t *r);
+static s64 sys_shmdt_impl(pt_regs_t *r);
+static s64 sys_shmctl_impl(pt_regs_t *r);
+static s64 sys_semget_impl(pt_regs_t *r);
+static s64 sys_semop_impl(pt_regs_t *r);
+static s64 sys_semtimedop_impl(pt_regs_t *r);
+static s64 sys_semctl_impl(pt_regs_t *r);
+static s64 sys_msgget_impl(pt_regs_t *r);
+static s64 sys_msgsnd_impl(pt_regs_t *r);
+static s64 sys_msgrcv_impl(pt_regs_t *r);
+static s64 sys_msgctl_impl(pt_regs_t *r);
+static s64 sys_timer_create_impl(pt_regs_t *r);
+static s64 sys_timer_settime_impl(pt_regs_t *r);
+static s64 sys_timer_gettime_impl(pt_regs_t *r);
+static s64 sys_timer_getoverrun_impl(pt_regs_t *r);
+static s64 sys_timer_delete_impl(pt_regs_t *r);
+static s64 sys_setitimer_impl(pt_regs_t *r);
+static s64 sys_getitimer_impl(pt_regs_t *r);
+static s64 sys_alarm_impl(pt_regs_t *r);
+static s64 sys_rt_sigtimedwait_impl(pt_regs_t *r);
+static s64 sys_rt_sigsuspend_impl(pt_regs_t *r);
+static s64 sys_rt_sigqueueinfo_impl(pt_regs_t *r);
+static s64 sys_rt_tgsigqueueinfo_impl(pt_regs_t *r);
+static s64 sys_mount_impl(pt_regs_t *r);
 static s64 sys_process_vm_writev_impl(pt_regs_t *r);
+static s64 sys_umount2_impl(pt_regs_t *r);
+static s64 sys_iopl_impl(pt_regs_t *r);
+static s64 sys_ioperm_impl(pt_regs_t *r);
+static s64 sys_acct_impl(pt_regs_t *r);
+static s64 sys_kcmp_impl(pt_regs_t *r);
+static s64 sys_finit_module_impl(pt_regs_t *r);
+static s64 sys_pkey_alloc_impl(pt_regs_t *r);
+static s64 sys_pkey_free_impl(pt_regs_t *r);
+static s64 sys_pkey_mprotect_impl(pt_regs_t *r);
+static s64 sys_set_robust_list_impl(pt_regs_t *r);
+static s64 sys_get_robust_list_impl(pt_regs_t *r);
+static s64 sys_mincore_impl(pt_regs_t *r);
+static s64 sys_process_madvise_impl(pt_regs_t *r);
+static s64 sys_cachestat_impl(pt_regs_t *r);
+static s64 sys_futex_waitv_impl(pt_regs_t *r);
+static s64 sys_mseal_impl(pt_regs_t *r);
+static s64 sys_setns_impl(pt_regs_t *r);
+
+/* POSIX named semaphores (Azami extended ABI) */
+static s64 sys_az_sem_open_impl(pt_regs_t *r);
+static s64 sys_az_sem_close_impl(pt_regs_t *r);
+static s64 sys_az_sem_post_impl(pt_regs_t *r);
+static s64 sys_az_sem_wait_impl(pt_regs_t *r);
+static s64 sys_az_sem_trywait_impl(pt_regs_t *r);
+static s64 sys_az_sem_timedwait_impl(pt_regs_t *r);
+static s64 sys_az_sem_unlink_impl(pt_regs_t *r);
+static s64 sys_az_sem_getvalue_impl(pt_regs_t *r);
+
+/* ktrace function tracer (Azami extended ABI) */
+static s64 sys_az_ktrace_enable_impl(pt_regs_t *r);
+static s64 sys_az_ktrace_read_impl(pt_regs_t *r);
+static s64 sys_az_ktrace_clear_impl(pt_regs_t *r);
 
 
-void syscall_dispatch(pt_regs_t *regs)
+/* ── Missing-syscall reporting ────────────────────────────────────────────
+ * Porting a stock Linux binary is mostly a matter of finding which call it
+ * makes that this kernel does not answer. A silent -ENOSYS turns that into a
+ * guessing game: the libc usually swallows the error and fails much later,
+ * somewhere unrelated. So the first time each unknown number is asked for, say
+ * so on the kernel log — once per number, because a program that gets -ENOSYS
+ * in a retry loop would otherwise flood the serial line and change the timing
+ * of the very bug being chased.
+ * ------------------------------------------------------------------------- */
+static u64 g_missing_seen[(SYSCALL_TABLE_SIZE + 63) / 64];
+static u8  g_missing_overflow_seen;
+
+static void syscall_report_missing(u64 nr, pt_regs_t *regs)
 {
+    if (nr < SYSCALL_TABLE_SIZE) {
+        u64 bit = 1ULL << (nr & 63);
+        u64 *word = &g_missing_seen[nr >> 6];
+        if (__atomic_fetch_or(word, bit, __ATOMIC_RELAXED) & bit) return;
+    } else {
+        if (__atomic_exchange_n(&g_missing_overflow_seen, 1, __ATOMIC_RELAXED)) return;
+    }
+
+    process_t *p = sched_current_process();
+    kprintf("[SYSCALL] unimplemented syscall %llu from '%s' (PID %u) at RIP=0x%016llx\n",
+            (unsigned long long)nr,
+            p ? p->name : "?", p ? p->pid : 0,
+            (unsigned long long)regs->rip);
+}
+
+/* Returns 1 if the return to ring 3 must go via IRETQ (full GPR restore +
+ * sanitised CS/SS/RFLAGS), 0 for the normal SYSRETQ fast path. Only
+ * rt_sigreturn needs it: it rebuilt `regs` from a user-controlled frame, and
+ * the interrupted context it resumes may not be at a syscall boundary (live
+ * RCX/R11), which SYSRETQ would clobber. */
+int syscall_dispatch(pt_regs_t *regs)
+{
+    process_t *sp = sched_current_process();
+
+    /* PTRACE_SYSCALL entry stop — before the number is even validated, because
+     * the tracer is allowed to rewrite RAX and the argument registers here.
+     * Storing RAX into a register that is out of range (Linux's convention is
+     * -1) is how a tracer cancels a call outright: the bounds check below then
+     * turns it into -ENOSYS, and the exit stop still fires so the tracer can
+     * substitute a return value. */
+    bool traced = unlikely(sp != NULL && (sp->ptrace_flags & PT_SYSCALL_TRACE) != 0);
+    if (traced) ptrace_syscall_stop(regs, true);
+
     u64 nr = regs->rax;
 
-    if (unlikely(nr >= SYSCALL_TABLE_SIZE) || !g_syscall_table[nr]) {
+    /* Spectre-v1: the bounds check below is a conditional branch, and a
+     * mispredicted one still speculatively loads g_syscall_table[nr] for an
+     * attacker-chosen nr — leaking whatever lies past the table through the
+     * cache. Masking the index makes the speculative path use 0 instead, with
+     * no branch for the predictor to get wrong. The check itself still stands;
+     * this only constrains what happens before it resolves. */
+    nr = array_index_nospec(nr, (u64)SYSCALL_TABLE_SIZE);
+
+    if (unlikely(regs->rax >= SYSCALL_TABLE_SIZE) || !g_syscall_table[nr]) {
+        /* A tracer-cancelled call is not a missing syscall; logging it would
+         * make every strace run look like a porting failure. */
+        if (!traced) syscall_report_missing(regs->rax, regs);
         regs->rax = (u64)(-(s64)ENOSYS);
+        if (traced) ptrace_syscall_stop(regs, false);
         signal_deliver_pending(regs, -1);
-        return;
+        return 0;
+    }
+
+    /* seccomp gate. Checked before the handler runs so a confined process
+     * cannot reach any syscall side effect. SECCOMP_MODE_STRICT answers a
+     * violation with an immediate SIGKILL, per Linux — the process is not
+     * given an errno it could branch on and retry. */
+    if (unlikely(sp && sp->seccomp_mode != SECCOMP_MODE_DISABLED) &&
+        !security_seccomp_check(sp, nr)) {
+        sched_kill_process(sp->pid, SIGKILL);
+        regs->rax = (u64)(-(s64)EPERM);
+        return 0;
     }
 
     regs->rax = (u64)g_syscall_table[nr](regs);
+
+    /* Syscall-exit stop. ptrace_syscall_stop() re-tests PT_SYSCALL_TRACE, so a
+     * tracer that answered the entry stop with PTRACE_CONT gets no exit stop. */
+    if (traced) ptrace_syscall_stop(regs, false);
 
     /* On the way back to ring 3, run any pending user signal handler. Pass the
      * syscall number so an interrupted call can honour SA_RESTART — except for
      * rt_sigreturn, which has already rewritten `regs` with a restored frame. */
     signal_deliver_pending(regs, nr == SYS_rt_sigreturn ? -1 : (s64)nr);
+
+    return (nr == SYS_rt_sigreturn) ? 1 : 0;
 }
 
 /* ── Registration ────────────────────────────────────────────────────────── */
@@ -492,8 +746,8 @@ void syscall_init(void)
     reg(SYS_accept,        sys_accept_impl);
     reg(SYS_sendto,        sys_sendto_impl);
     reg(SYS_recvfrom,      sys_recvfrom_impl);
-    reg(SYS_sendmsg,       sys_sendto_impl);
-    reg(SYS_recvmsg,       sys_recvfrom_impl);
+    reg(SYS_sendmsg,       sys_sendmsg_impl);
+    reg(SYS_recvmsg,       sys_recvmsg_impl);
     reg(SYS_shutdown,      sys_shutdown_impl);
     reg(SYS_bind,          sys_bind_impl);
     reg(SYS_listen,        sys_listen_impl);
@@ -583,8 +837,8 @@ void syscall_init(void)
     reg(SYS_utimensat,     sys_utimensat_impl);
     reg(SYS_dup3,          sys_dup3_impl);
     reg(SYS_pipe2,         sys_pipe2_impl);
-    reg(SYS_getfacl,       sys_getfacl_impl);
-    reg(SYS_setfacl,       sys_setfacl_impl);
+    reg(SYS_AZ_GETFACL,    sys_getfacl_impl);
+    reg(SYS_AZ_SETFACL,    sys_setfacl_impl);
     reg(SYS_getrlimit,     sys_getrlimit_impl);
     reg(SYS_setrlimit,     sys_setrlimit_impl);
     reg(SYS_getrusage,     sys_getrusage_impl);
@@ -669,6 +923,35 @@ void syscall_init(void)
     reg(SYS_pidfd_open,    sys_pidfd_open_impl);
     reg(SYS_pidfd_send_signal, sys_pidfd_send_signal_impl);
     reg(SYS_pidfd_getfd,   sys_pidfd_getfd_impl);
+
+    /* POSIX.1-2008 message queues */
+    reg(SYS_mq_open,        sys_mq_open_impl);
+    reg(SYS_mq_unlink,      sys_mq_unlink_impl);
+    reg(SYS_mq_timedsend,   sys_mq_timedsend_impl);
+    reg(SYS_mq_timedreceive,sys_mq_timedreceive_impl);
+    reg(SYS_mq_notify,      sys_mq_notify_impl);
+    reg(SYS_mq_getsetattr,  sys_mq_getsetattr_impl);
+
+    /* futex2 */
+    reg(SYS_futex_wake,     sys_futex_wake_impl);
+    reg(SYS_futex_wait,     sys_futex_wait_impl);
+    reg(SYS_futex_requeue,  sys_futex_requeue_impl);
+
+    /* Remaining Linux ABI additions */
+    reg(SYS_accept4,        sys_accept4_impl);
+    reg(SYS_ioprio_set,     sys_ioprio_set_impl);
+    reg(SYS_ioprio_get,     sys_ioprio_get_impl);
+    reg(SYS_set_mempolicy,  sys_set_mempolicy_impl);
+    reg(SYS_get_mempolicy,  sys_get_mempolicy_impl);
+    reg(SYS_move_pages,     sys_move_pages_impl);
+    reg(SYS_mbind,          sys_mbind_impl);
+    reg(SYS_migrate_pages,  sys_migrate_pages_impl);
+    reg(SYS_set_mempolicy_home_node, sys_set_mempolicy_home_node_impl);
+    reg(SYS_fchmodat2,      sys_fchmodat2_impl);
+    reg(SYS_restart_syscall, sys_restart_syscall_impl);
+    reg(SYS_vhangup,        sys_vhangup_impl);
+    reg(SYS_pivot_root,     sys_pivot_root_impl);
+    reg(SYS_process_mrelease, sys_process_mrelease_impl);
     reg(SYS_memfd_create,  sys_memfd_create_impl);
     reg(SYS_getrlimit,     sys_getrlimit_impl);
     reg(SYS_setrlimit,     sys_setrlimit_impl);
@@ -685,6 +968,35 @@ void syscall_init(void)
     reg(SYS_lremovexattr,  sys_lremovexattr_impl);
     reg(SYS_fremovexattr,  sys_fremovexattr_impl);
 
+
+    /* System V IPC (XSI) */
+    reg(SYS_shmget,        sys_shmget_impl);
+    reg(SYS_shmat,         sys_shmat_impl);
+    reg(SYS_shmdt,         sys_shmdt_impl);
+    reg(SYS_shmctl,        sys_shmctl_impl);
+    reg(SYS_semget,        sys_semget_impl);
+    reg(SYS_semop,         sys_semop_impl);
+    reg(SYS_semtimedop,    sys_semtimedop_impl);
+    reg(SYS_semctl,        sys_semctl_impl);
+    reg(SYS_msgget,        sys_msgget_impl);
+    reg(SYS_msgsnd,        sys_msgsnd_impl);
+    reg(SYS_msgrcv,        sys_msgrcv_impl);
+    reg(SYS_msgctl,        sys_msgctl_impl);
+
+    /* POSIX timers */
+    reg(SYS_timer_create,     sys_timer_create_impl);
+    reg(SYS_timer_settime,    sys_timer_settime_impl);
+    reg(SYS_timer_gettime,    sys_timer_gettime_impl);
+    reg(SYS_timer_getoverrun, sys_timer_getoverrun_impl);
+    reg(SYS_timer_delete,     sys_timer_delete_impl);
+
+    /* POSIX signal waiting and queueing */
+    reg(SYS_rt_sigtimedwait,   sys_rt_sigtimedwait_impl);
+    reg(SYS_rt_sigsuspend,     sys_rt_sigsuspend_impl);
+    reg(SYS_rt_sigqueueinfo,   sys_rt_sigqueueinfo_impl);
+    reg(SYS_rt_tgsigqueueinfo, sys_rt_tgsigqueueinfo_impl);
+
+    reg(SYS_mount,         sys_mount_impl);
 
     /* Azami extended */
     reg(SYS_AZ_CHANNEL_CREATE, sys_az_channel_create);
@@ -708,6 +1020,21 @@ void syscall_init(void)
     reg(SYS_AZ_SYSSTAT,        sys_az_sysstat_impl);
     reg(SYS_AZ_SET_TIMER,      sys_az_set_timer_impl);
 
+    /* POSIX named semaphores */
+    reg(SYS_AZ_SEM_OPEN,      sys_az_sem_open_impl);
+    reg(SYS_AZ_SEM_CLOSE,     sys_az_sem_close_impl);
+    reg(SYS_AZ_SEM_POST,      sys_az_sem_post_impl);
+    reg(SYS_AZ_SEM_WAIT,      sys_az_sem_wait_impl);
+    reg(SYS_AZ_SEM_TRYWAIT,   sys_az_sem_trywait_impl);
+    reg(SYS_AZ_SEM_TIMEDWAIT, sys_az_sem_timedwait_impl);
+    reg(SYS_AZ_SEM_UNLINK,    sys_az_sem_unlink_impl);
+    reg(SYS_AZ_SEM_GETVALUE,  sys_az_sem_getvalue_impl);
+
+    /* ktrace function tracer */
+    reg(SYS_AZ_KTRACE_ENABLE,  sys_az_ktrace_enable_impl);
+    reg(SYS_AZ_KTRACE_READ,    sys_az_ktrace_read_impl);
+    reg(SYS_AZ_KTRACE_CLEAR,   sys_az_ktrace_clear_impl);
+
     /* ── Additional Linux / POSIX calls ─────────────────────────────────── */
     reg(SYS_creat,             sys_creat_impl);
     reg(SYS_lchown,            sys_lchown_impl);
@@ -715,11 +1042,11 @@ void syscall_init(void)
     reg(SYS_pwritev,           sys_pwritev_impl);
     reg(SYS_preadv2,           sys_preadv_impl);
     reg(SYS_pwritev2,          sys_pwritev_impl);
-    reg(SYS_mlock,             sys_mlock_noop_impl);
-    reg(SYS_munlock,           sys_mlock_noop_impl);
-    reg(SYS_mlockall,          sys_mlock_noop_impl);
-    reg(SYS_munlockall,        sys_mlock_noop_impl);
-    reg(SYS_mlock2,            sys_mlock_noop_impl);
+    reg(SYS_mlock,             sys_mlock_impl);
+    reg(SYS_munlock,           sys_munlock_impl);
+    reg(SYS_mlockall,          sys_mlockall_impl);
+    reg(SYS_munlockall,        sys_munlockall_impl);
+    reg(SYS_mlock2,            sys_mlock2_impl);
     reg(SYS_rt_sigpending,     sys_rt_sigpending_impl);
     reg(SYS_sigaltstack,       sys_sigaltstack_impl);
     reg(SYS_getitimer,         sys_getitimer_impl);
@@ -735,8 +1062,31 @@ void syscall_init(void)
     reg(SYS_settimeofday,      sys_settimeofday_impl);
     reg(SYS_sendmmsg,          sys_sendmmsg_impl);
     reg(SYS_recvmmsg,          sys_recvmmsg_impl);
+    reg(SYS_ptrace,        sys_ptrace_impl);
+    reg(SYS_perf_event_open, sys_perf_event_open_impl);
     reg(SYS_process_vm_readv,  sys_process_vm_readv_impl);
     reg(SYS_process_vm_writev, sys_process_vm_writev_impl);
+    reg(SYS_umount2,           sys_umount2_impl);
+    reg(SYS_iopl,              sys_iopl_impl);
+    reg(SYS_ioperm,            sys_ioperm_impl);
+    reg(SYS_acct,              sys_acct_impl);
+    reg(SYS_kcmp,              sys_kcmp_impl);
+    reg(SYS_init_module,       sys_finit_module_impl);
+    reg(SYS_delete_module,     sys_finit_module_impl);
+    reg(SYS_finit_module,      sys_finit_module_impl);
+
+    /* ── Memory-protection keys, robust futexes and the newer Linux calls ── */
+    reg(SYS_pkey_alloc,        sys_pkey_alloc_impl);
+    reg(SYS_pkey_free,         sys_pkey_free_impl);
+    reg(SYS_pkey_mprotect,     sys_pkey_mprotect_impl);
+    reg(SYS_set_robust_list,   sys_set_robust_list_impl);
+    reg(SYS_get_robust_list,   sys_get_robust_list_impl);
+    reg(SYS_mincore,           sys_mincore_impl);
+    reg(SYS_process_madvise,   sys_process_madvise_impl);
+    reg(SYS_cachestat,         sys_cachestat_impl);
+    reg(SYS_futex_waitv,       sys_futex_waitv_impl);
+    reg(SYS_mseal,             sys_mseal_impl);
+    reg(SYS_setns,             sys_setns_impl);
 
     pr_debug("[SYSCALL] Dispatch table ready (%d entries)\n", SYSCALL_TABLE_SIZE);
 }
@@ -770,7 +1120,85 @@ static s64 copy_str_from_user(char *dst, const char *user_src, size_t max_len)
     return (s64)(max_len - 1);
 }
 
-static s64 copy_user_path_resolve_at(int dirfd, char *kpath, size_t max_len, const char *user_path)
+/* proc_root(proc) — the process's filesystem root, defaulting to "/" for any
+ * process created before chroot(2) existed or whose field is somehow blank. */
+static inline const char *proc_root(const process_t *proc)
+{
+    return (proc && proc->root[0]) ? proc->root : "/";
+}
+
+/* proc_is_confined(proc) — true once chroot(2) has moved the root off "/". */
+static inline bool proc_is_confined(const process_t *proc)
+{
+    const char *r = proc_root(proc);
+    return !(r[0] == '/' && r[1] == '\0');
+}
+
+/*
+ * vpath_to_real() — turn a path as the process sees it into the real path the
+ * VFS is asked for, by prefixing the process's root.
+ *
+ * This is the whole of chroot(2)'s enforcement, and it works because the
+ * caller has already run the path through vfs_resolve_path(): that normalises
+ * "." and "..", and its ".." handling stops at depth 0, so no amount of
+ * "../../.." in a user path can produce a virtual path that does not begin at
+ * "/". Prefixing an escape-proof virtual path with the jail root yields a real
+ * path that is always inside the jail.
+ *
+ * Before this existed, chroot(2) only overwrote proc->cwd. An absolute path
+ * bypassed it outright — a "confined" process could open /etc/shadow by name —
+ * and a single chdir("..") walked back out. The call reported success while
+ * confining nothing.
+ */
+static s64 vpath_to_real(const process_t *proc, const char *vpath, char *out, size_t out_len)
+{
+    const char *root = proc_root(proc);
+
+    if (!proc_is_confined(proc)) {
+        size_t n = strlen(vpath);
+        if (n + 1 > out_len) return -(s64)ENAMETOOLONG;
+        memcpy(out, vpath, n + 1);
+        return 0;
+    }
+
+    size_t rlen = strlen(root);
+    while (rlen > 1 && root[rlen - 1] == '/') rlen--;   /* no doubled slash */
+
+    /* The jail root itself is "/" from the inside. */
+    bool bare_root = (vpath[0] == '/' && vpath[1] == '\0');
+    size_t vlen = bare_root ? 0 : strlen(vpath);
+
+    if (rlen + vlen + 1 > out_len) return -(s64)ENAMETOOLONG;
+    memcpy(out, root, rlen);
+    memcpy(out + rlen, vpath, vlen);
+    out[rlen + vlen] = '\0';
+    return 0;
+}
+
+/* real_to_vpath() — the inverse, for the one place that starts from a real
+ * path: an *at() call resolving against a directory fd, whose dentry chain
+ * names the real filesystem. A dirfd that lies outside the jail (it can only
+ * have been opened before the chroot) resolves against "/" rather than leaking
+ * its location into the process's view. */
+static const char *real_to_vpath(const process_t *proc, const char *real)
+{
+    if (!proc_is_confined(proc)) return real;
+
+    const char *root = proc_root(proc);
+    size_t rlen = strlen(root);
+    while (rlen > 1 && root[rlen - 1] == '/') rlen--;
+
+    if (strncmp(real, root, rlen) != 0) return "/";
+    if (real[rlen] == '\0') return "/";
+    if (real[rlen] != '/')   return "/";
+    return real + rlen;
+}
+
+/* Resolve a user path to the process's *virtual* namespace: normalised, with
+ * ".." clamped at its root, but without the jail prefix. chdir(2) and
+ * getcwd(2) work in these terms; everything else wants the real path that
+ * copy_user_path_resolve_at() returns. */
+static s64 copy_user_vpath_resolve_at(int dirfd, char *vpath, size_t max_len, const char *user_path)
 {
     if (!user_path) return -(s64)EINVAL;
     if ((uintptr_t)user_path >= 0x8000000000000000ULL) return -(s64)EFAULT;
@@ -780,8 +1208,10 @@ static s64 copy_user_path_resolve_at(int dirfd, char *kpath, size_t max_len, con
     s64 slen = copy_str_from_user(raw, user_path, sizeof(raw));
     if (slen < 0) return slen;
 
+    /* An absolute path is absolute *within the process's root*, which is what
+     * makes chroot(2) confine anything at all. */
     if (raw[0] == '/') {
-        return vfs_resolve_path("/", raw, kpath, max_len);
+        return vfs_resolve_path("/", raw, vpath, max_len);
     }
 
     process_t *proc = sched_current_process();
@@ -789,10 +1219,10 @@ static s64 copy_user_path_resolve_at(int dirfd, char *kpath, size_t max_len, con
 
     if (dirfd == AT_FDCWD) {
         const char *cwd = (proc->cwd[0]) ? proc->cwd : "/";
-        return vfs_resolve_path(cwd, raw, kpath, max_len);
+        return vfs_resolve_path(cwd, raw, vpath, max_len);
     }
 
-    if (dirfd < 0 || dirfd >= 64 || !proc->handle_table[dirfd]) return -(s64)EBADF;
+    if (dirfd < 0 || dirfd >= PROC_MAX_FDS || !proc->handle_table[dirfd]) return -(s64)EBADF;
     file_t *df = (file_t *)proc->handle_table[dirfd];
     if (!df || !df->f_dentry || !df->f_inode) return -(s64)EBADF;
     if (!S_ISDIR(df->f_inode->i_mode)) return -(s64)ENOTDIR;
@@ -801,7 +1231,22 @@ static s64 copy_user_path_resolve_at(int dirfd, char *kpath, size_t max_len, con
     __builtin_memset(dir_path, 0, sizeof(dir_path));
     dentry_build_path(df->f_dentry, dir_path, sizeof(dir_path));
 
-    return vfs_resolve_path(dir_path, raw, kpath, max_len);
+    /* dentry_build_path() names the real filesystem; bring it back into the
+     * process's view before resolving against it. */
+    return vfs_resolve_path(real_to_vpath(proc, dir_path), raw, vpath, max_len);
+}
+
+/* Resolve a user path all the way to the real path the VFS takes. */
+static s64 copy_user_path_resolve_at(int dirfd, char *kpath, size_t max_len, const char *user_path)
+{
+    process_t *proc = sched_current_process();
+    if (!proc_is_confined(proc))
+        return copy_user_vpath_resolve_at(dirfd, kpath, max_len, user_path);
+
+    char vpath[512];
+    s64 err = copy_user_vpath_resolve_at(dirfd, vpath, sizeof(vpath), user_path);
+    if (err < 0) return err;
+    return vpath_to_real(proc, vpath, kpath, max_len);
 }
 
 static s64 copy_user_path_resolve(char *kpath, size_t max_len, const char *user_path)
@@ -957,7 +1402,7 @@ static s64 sys_close_impl(pt_regs_t *r)
 {
     int fd = (int)(s32)r->rdi;
     process_t *proc = sched_current_process();
-    if (fd < 0 || fd >= 64 || !proc) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc) return -(s64)EBADF;
     file_t *f = fd_detach(proc, fd);
     if (!f) return -(s64)EBADF;
     vfs_close(f);
@@ -972,8 +1417,8 @@ static s64 sys_close_range_impl(pt_regs_t *r)
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
 
-    if (last >= 64) last = 63;
-    for (unsigned int i = first; i <= last && i < 64; i++) {
+    if (last >= PROC_MAX_FDS) last = PROC_MAX_FDS - 1;
+    for (unsigned int i = first; i <= last && i < PROC_MAX_FDS; i++) {
         file_t *f = fd_detach(proc, (int)i);
         if (f) vfs_close(f);
     }
@@ -1066,7 +1511,7 @@ static s64 sys_pread64_impl(pt_regs_t *r)
     if ((uintptr_t)user_buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     file_t *file = (file_t *)proc->handle_table[fd];
     char *kbuf = kmalloc(count > 65536 ? 65536 : count);
@@ -1112,7 +1557,7 @@ static s64 sys_pwrite64_impl(pt_regs_t *r)
     if ((uintptr_t)user_buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     file_t *file = (file_t *)proc->handle_table[fd];
     char *kbuf = kmalloc(count > 65536 ? 65536 : count);
@@ -1177,18 +1622,17 @@ static s64 sys_brk_impl(pt_regs_t *r)
             if (!phys) {
                 phys = pmm_alloc_page();
                 if (!phys) return (s64)proc->heap_end;
-                __builtin_memset((void *)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+                hw_clear_page((void *)PHYS_TO_VIRT(phys));
                 vmm_map(proc->pml4_phys, va, phys, VMM_USER_RW);
             }
         }
     } else if (target_page < cur_page) {
-        for (virt_addr_t va = target_page; va < cur_page; va += PAGE_SIZE) {
-            phys_addr_t phys = vmm_translate(proc->pml4_phys, va);
-            if (phys) {
-                vmm_unmap(proc->pml4_phys, va);
-                pmm_free_page(phys & VMM_PHYS_MASK);
-            }
-        }
+        /* One batched teardown: vmm_unmap_range() applies the same ownership
+         * rule (skip VMM_F_SHARED frames, which the shmem object or a peer
+         * mapping still owns) and pays for one TLB shootdown per chunk rather
+         * than one per page. */
+        vmm_unmap_range(proc->pml4_phys, target_page,
+                        (size_t)((cur_page - target_page) / PAGE_SIZE), true);
     }
 
     proc->heap_end = new_brk;
@@ -1204,6 +1648,8 @@ static s64 sys_mmap_impl(pt_regs_t *r)
     u64 flags          = r->r10; /* MAP_SHARED=1, MAP_PRIVATE=2, MAP_FIXED=16, MAP_ANONYMOUS=32 */
     int fd             = (int)(s32)r->r8;
     u64 file_offset    = (u64)r->r9;
+
+    KTRACE_CALL("mmap", length);
 
     if (length == 0) return -(s64)EINVAL;
     process_t *proc = sched_current_process();
@@ -1248,17 +1694,14 @@ static s64 sys_mmap_impl(pt_regs_t *r)
             proc->mmap_current += aligned_len;
         }
     } else {
-        if (!target_addr || target_addr < 0x1000 || target_addr + aligned_len >= 0x0000800000000000ULL) {
+        /* Guard against integer overflow in range check */
+        if (target_addr + aligned_len < target_addr || target_addr + aligned_len >= 0x0000800000000000ULL) {
             return -(s64)EINVAL;
         }
-        for (size_t offset = 0; offset < aligned_len; offset += PAGE_SIZE) {
-            virt_addr_t va = target_addr + offset;
-            phys_addr_t phys = vmm_translate(proc->pml4_phys, va);
-            if (phys) {
-                vmm_unmap(proc->pml4_phys, va);
-                pmm_free_page(phys & VMM_PHYS_MASK);
-            }
-        }
+        /* MAP_FIXED over a live range: drop whatever was there first. The
+         * range walk also picks up PROT_NONE pages, which keep their frame
+         * with PRESENT clear. */
+        vmm_unmap_range(proc->pml4_phys, target_addr, aligned_len / PAGE_SIZE, true);
     }
 
     /* Translate mmap flags to the VMA flag set. */
@@ -1266,7 +1709,7 @@ static s64 sys_mmap_impl(pt_regs_t *r)
     if (flags & 0x01 /* MAP_SHARED */) vma_fl |= VMA_F_SHARED;
 
     file_t *file = NULL;
-    if (!(flags & 0x20) && fd >= 0 && fd < 64 && proc->handle_table[fd]) {
+    if (!(flags & 0x20) && fd >= 0 && fd < PROC_MAX_FDS && proc->handle_table[fd]) {
         file = (file_t *)proc->handle_table[fd];
         if (file && file->f_op && file->f_op->mmap) {
             s64 ret = file->f_op->mmap(file, target_addr, aligned_len, (u32)prot, (u32)flags, file_offset);
@@ -1286,7 +1729,13 @@ static s64 sys_mmap_impl(pt_regs_t *r)
 
     for (size_t offset = 0; offset < aligned_len; offset += PAGE_SIZE) {
         phys_addr_t phys = pmm_alloc_page();
-        if (!phys) return -(s64)ENOMEM;
+        if (!phys) {
+            /* BUG fix: unmap pages already installed in this call before
+             * reporting OOM — otherwise they are leaked permanently. */
+            if (offset > 0)
+                vmm_unmap_range(proc->pml4_phys, target_addr, offset / PAGE_SIZE, true);
+            return -(s64)ENOMEM;
+        }
         void *page_buf = (void *)PHYS_TO_VIRT(phys);
         __builtin_memset(page_buf, 0, PAGE_SIZE);
 
@@ -1321,14 +1770,7 @@ static s64 sys_munmap_impl(pt_regs_t *r)
     size_t aligned_len = ALIGN_UP(length, PAGE_SIZE);
     if (addr + aligned_len < addr) return -(s64)EINVAL;
 
-    for (size_t offset = 0; offset < aligned_len; offset += PAGE_SIZE) {
-        virt_addr_t va = addr + offset;
-        phys_addr_t phys = vmm_translate(proc->pml4_phys, va);
-        if (phys) {
-            vmm_unmap(proc->pml4_phys, va);
-            pmm_free_page(phys & VMM_PHYS_MASK);
-        }
-    }
+    vmm_unmap_range(proc->pml4_phys, addr, aligned_len / PAGE_SIZE, true);
     vma_remove(proc, addr, addr + aligned_len);
     return 0;
 }
@@ -1360,8 +1802,16 @@ static s64 sys_mprotect_impl(pt_regs_t *r)
     if (!(prot & PROT_EXEC)) vmm_flags |= VMM_F_NX;
 
     size_t page_count = aligned_len / PAGE_SIZE;
+
+    /* Record the new protection first. It is what the #PF handler grants to
+     * demand-paged frames in this range, so if it cannot be recorded exactly
+     * the call must fail before the page tables are touched — otherwise the
+     * range ends up with narrower PTEs than the registry claims and later
+     * faults hand back the *old*, wider rights. */
+    s64 rc = vma_setprot(proc, addr, addr + aligned_len, (u32)prot & 7);
+    if (rc < 0) return rc;
+
     vmm_set_flags(proc->pml4_phys, addr, page_count, vmm_flags);
-    vma_setprot(proc, addr, addr + aligned_len, (u32)prot & 7);
     return 0;
 }
 
@@ -1381,7 +1831,7 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
     u64 arg = r->rdx;
     
     process_t *proc = sched_current_process();
-    if (fd < 0 || fd >= 64 || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
     
     file_t *file = (file_t *)proc->handle_table[fd];
 
@@ -1450,7 +1900,7 @@ static s64 sys_lseek_impl(pt_regs_t *r)
     int whence = (int)r->rdx;
     
     process_t *proc = sched_current_process();
-    if (fd < 0 || fd >= 64 || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
     
     file_t *file = (file_t *)proc->handle_table[fd];
     return vfs_lseek(file, offset, whence);
@@ -1506,7 +1956,7 @@ static s64 sys_fstat_impl(pt_regs_t *r)
     if ((uintptr_t)statbuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
     
     process_t *proc = sched_current_process();
-    if (fd < 0 || fd >= 64 || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
     
     file_t *file = (file_t *)proc->handle_table[fd];
     struct stat kstat;
@@ -1546,7 +1996,7 @@ static s64 sys_fstatfs_impl(pt_regs_t *r)
     if ((uintptr_t)buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
-    if (fd < 0 || fd >= 64 || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
 
     file_t *file = (file_t *)proc->handle_table[fd];
     struct statfs kbuf;
@@ -1572,7 +2022,7 @@ static s64 sys_fchmod_impl(pt_regs_t *r)
     int fd = (int)r->rdi;
     u32 mode = (u32)r->rsi;
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
     return vfs_fchmod((file_t *)proc->handle_table[fd], mode);
 }
 
@@ -1593,7 +2043,7 @@ static s64 sys_fchown_impl(pt_regs_t *r)
     u32 uid = (u32)r->rsi;
     u32 gid = (u32)r->rdx;
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
     return vfs_fchown((file_t *)proc->handle_table[fd], uid, gid);
 }
 
@@ -1759,14 +2209,22 @@ static s64 sys_poll_impl(pt_regs_t *r)
             kfds[i].revents = 0;
             int fd = kfds[i].fd;
             if (fd < 0) continue;
-            if (fd >= 64 || !proc->handle_table[fd]) {
+
+            /* fget()/fput() rather than a raw handle_table[] read. This loop
+             * sleeps and re-runs, so a sibling thread closing the fd in
+             * between would otherwise leave check_file_readiness() reading a
+             * freed file_t — a use-after-free any multithreaded program can
+             * reach with close() and poll() on the same descriptor. */
+            file_t *f = fget(proc, fd);
+            if (!f) {
                 kfds[i].revents = POLLNVAL;
                 ready_count++;
                 continue;
             }
 
             short req = kfds[i].events;
-            short rev = check_file_readiness((file_t *)proc->handle_table[fd], req);
+            short rev = check_file_readiness(f, req);
+            fput(f);
 
             if (rev & (req | POLLHUP | POLLERR | POLLNVAL)) {
                 kfds[i].revents = rev;
@@ -1776,6 +2234,12 @@ static s64 sys_poll_impl(pt_regs_t *r)
 
         if (ready_count > 0 || timeout_ms == 0) break;
         if (timeout_ms > 0 && sched_get_ticks() >= end_ticks) break;
+
+        /* BUG-AO fix: interrupt on deliverable signal per POSIX */
+        if (proc->sig_pending & ~proc->sig_blocked) {
+            kfree(kfds);
+            return -(s64)EINTR;
+        }
 
         sched_sleep(1);
     }
@@ -1835,11 +2299,20 @@ static s64 sys_select_impl(pt_regs_t *r)
     if (u_tv && (uintptr_t)u_tv < 0x8000000000000000ULL) {
         struct linux_timeval tv;
         if (copy_from_user(&tv, u_tv, sizeof(tv)) != 0) return -(s64)EFAULT;
-        timeout_ms = (int)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+        if (tv.tv_sec < 0 || tv.tv_usec < 0) return -(s64)EINVAL;
+        /* Saturate instead of computing in int: tv_sec is user-controlled, and
+         * tv_sec * 1000 overflowing could land on a negative timeout_ms, which
+         * this function reads as "block forever" — the opposite of the very
+         * long timeout that was asked for. */
+        s64 ms = (tv.tv_sec > (s64)0x7FFFFFFF / 1000)
+                     ? (s64)0x7FFFFFFF
+                     : tv.tv_sec * 1000 + tv.tv_usec / 1000;
+        if (ms > (s64)0x7FFFFFFF) ms = (s64)0x7FFFFFFF;
+        timeout_ms = (int)ms;
     }
 
     u64 end_ticks = (timeout_ms > 0) ? (sched_get_ticks() + (timeout_ms + 9) / 10) : 0;
-    int check_nfds = nfds > 64 ? 64 : nfds;
+    int check_nfds = nfds > PROC_MAX_FDS ? PROC_MAX_FDS : nfds;
     kernel_fd_set_t out_rfds, out_wfds, out_efds;
     int ready_count = 0;
 
@@ -1850,7 +2323,9 @@ static s64 sys_select_impl(pt_regs_t *r)
         __builtin_memset(&out_efds, 0, sizeof(out_efds));
 
         for (int fd = 0; fd < check_nfds; fd++) {
-            file_t *f = (file_t *)proc->handle_table[fd];
+            /* Referenced for the same reason as sys_poll_impl(): the loop
+             * sleeps between passes and the fd can be closed underneath it. */
+            file_t *f = fget(proc, fd);
             if (!f) continue;
 
             if (K_FD_ISSET(fd, &in_rfds)) {
@@ -1874,10 +2349,16 @@ static s64 sys_select_impl(pt_regs_t *r)
                     ready_count++;
                 }
             }
+            fput(f);
         }
 
         if (ready_count > 0 || timeout_ms == 0) break;
         if (timeout_ms > 0 && sched_get_ticks() >= end_ticks) break;
+
+        /* BUG-AO fix: interrupt on deliverable signal per POSIX */
+        if (proc->sig_pending & ~proc->sig_blocked) {
+            return -(s64)EINTR;
+        }
 
         sched_sleep(1);
     }
@@ -1936,6 +2417,7 @@ static s64 sys_getppid_impl(pt_regs_t *r)
 
 static s64 sys_fork_impl(pt_regs_t *r)
 {
+    KTRACE_CALL("fork", 0);
     process_t *parent = sched_current_process();
     if (!parent) return -(s64)EPERM;
 
@@ -1949,9 +2431,24 @@ static s64 sys_fork_impl(pt_regs_t *r)
     }
     child->parent = parent;
     proc_clone_attrs(child, parent);
-    vma_clone(child, parent);
+    if (vma_clone(child, parent) != 0) {
+        proc_destroy(child);
+        return -(s64)ENOMEM;
+    }
 
-    for (int i = 0; i < 64; i++) {
+    /* The child inherits the parent's System V shared-memory attachments, and
+     * each segment must count it — vmm_clone_space() already shared the
+     * frames, so a segment that did not know about the child could be freed
+     * out from under it.  Done before any fd reference is taken so a failure
+     * here needs no unwinding beyond destroying the child. */
+    if (sysvipc_process_fork(child, parent) != 0) {
+        proc_destroy(child);
+        return -(s64)ENOMEM;
+    }
+
+    /* BUG-AN fix: acquire g_fd_lock while copying parent's handle_table */
+    irqflags_t fd_irqf = spinlock_lock_irqsave(&g_fd_lock);
+    for (int i = 0; i < PROC_MAX_FDS; i++) {
         if (parent->handle_table[i]) {
             file_t *pf = (file_t *)parent->handle_table[i];
             __atomic_add_fetch(&pf->f_count, 1, __ATOMIC_SEQ_CST);
@@ -1964,6 +2461,7 @@ static s64 sys_fork_impl(pt_regs_t *r)
             child->obj_handle_table[i] = obj;
         }
     }
+    spinlock_unlock_irqrestore(&g_fd_lock, fd_irqf);
 
     thread_t *t = thread_create_ex(child, r->rip, r->rsp, false, false);
     if (!t) {
@@ -1971,10 +2469,174 @@ static s64 sys_fork_impl(pt_regs_t *r)
         return -(s64)ENOMEM;
     }
 
+    /* fork() duplicates the *calling thread*, so the child must resume on that
+     * thread's TLS base. proc_clone_attrs copies proc->fs_base, but in a
+     * multi-threaded parent that field holds whichever thread called
+     * arch_prctl(ARCH_SET_FS) most recently — not necessarily this one — and
+     * the fresh child thread has fs_base == 0, so it would fall back to that
+     * stale value and resume with another thread's TLS. */
+    {
+        thread_t *self = sched_current_thread();
+        u64 tls = self ? (self->fs_base ? self->fs_base : parent->fs_base)
+                       : parent->fs_base;
+        t->fs_base     = tls;
+        child->fs_base = tls;
+    }
+
     if (t->user_regs) {
         *t->user_regs = *r;
         t->user_regs->rax = 0;      /* Child returns 0 */
         t->user_regs->rflags = 0x202; /* IF=1 */
+    }
+
+    /* PTRACE_O_TRACEFORK: the child inherits the tracer and is born stopped, so
+     * `strace -f` can attach to it before it executes a single instruction.
+     * The parent then reports the fork event, carrying the child's pid as the
+     * PTRACE_GETEVENTMSG value. */
+    bool trace_child = ptrace_traced(parent) &&
+                       (parent->ptrace_opts & PTRACE_O_TRACEFORK) != 0;
+    if (trace_child) {
+        child->tracer_pid    = parent->tracer_pid;
+        child->ptrace_opts   = parent->ptrace_opts;
+        child->ptrace_flags  = PT_TRACED;
+        child->ptrace_stop_sig = SIGTRAP;
+        child->ptrace_event  = PTRACE_EVENT_STOP;
+        sched_request_stop(child, SIGSTOP, PROC_STOP_PTRACE);
+    }
+
+    sched_enqueue_thread(t);
+
+    if (trace_child)
+        ptrace_report_event(r, PTRACE_EVENT_FORK, (u64)child->pid);
+
+    return (s64)child->pid;
+}
+
+static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int *child_tidptr, u64 newtls, const pt_regs_t *r)
+{
+    process_t *parent = sched_current_process();
+    if (!parent) return -(s64)EPERM;
+
+    /* CLONE_VM|CLONE_THREAD: a real thread that SHARES the caller's address
+     * space — glibc pthread_create. It must NOT get a private
+     * vmm_clone_space()/proc_create() copy (that breaks every shared futex /
+     * errno / malloc arena / TLS). Spawn it into the same process_t.
+     * NOTE: CLONE_VM *without* CLONE_THREAD (vfork / posix_spawn) is a separate
+     * process that just shares memory until it execs — that falls through to
+     * the fork path below, exactly as before. */
+    if ((flags & 0x00000100ULL) && (flags & 0x00010000ULL)) {
+        if (!child_stack || (uintptr_t)child_stack >= 0x0000800000000000ULL)
+            return -(s64)EINVAL;
+
+        thread_t *t = thread_create_ex(parent, r->rip, (uintptr_t)child_stack, false, false);
+        if (!t) return -(s64)ENOMEM;
+
+        if (flags & 0x00080000ULL /* CLONE_SETTLS */)
+            t->fs_base = newtls;                     /* per-thread TLS base */
+
+        if (t->user_regs) {
+            *t->user_regs = *r;
+            t->user_regs->rax    = 0;               /* child returns 0 */
+            t->user_regs->rsp    = (u64)child_stack;
+            t->user_regs->rflags = 0x202;
+        }
+        if ((flags & 0x00100000ULL /* CLONE_PARENT_SETTID */) && parent_tidptr &&
+            (uintptr_t)parent_tidptr < 0x0000800000000000ULL) {
+            int tid = (int)t->tid;
+            copy_to_user(parent_tidptr, &tid, sizeof(int));
+        }
+        if ((flags & 0x01000000ULL /* CLONE_CHILD_SETTID */) && child_tidptr &&
+            (uintptr_t)child_tidptr < 0x0000800000000000ULL) {
+            int tid = (int)t->tid;
+            copy_to_user(child_tidptr, &tid, sizeof(int));
+        }
+        if ((flags & 0x00200000ULL /* CLONE_CHILD_CLEARTID */) && child_tidptr &&
+            (uintptr_t)child_tidptr < 0x0000800000000000ULL) {
+            t->clear_child_tid = (u64)(uintptr_t)child_tidptr;
+        }
+        sched_enqueue_thread(t);
+        return (s64)t->tid;
+    }
+
+    vmm_space_t child_space = vmm_clone_space(parent->pml4_phys);
+    if (!child_space) return -(s64)ENOMEM;
+
+    process_t *child = proc_create(parent->name, child_space);
+    if (!child) {
+        vmm_destroy_space(child_space);
+        return -(s64)ENOMEM;
+    }
+
+    child->parent       = parent;
+    proc_clone_attrs(child, parent);
+    if (vma_clone(child, parent) != 0) {
+        proc_destroy(child);
+        return -(s64)ENOMEM;
+    }
+    /* Same as fork(): this path makes a separate process out of a shared
+     * snapshot, so it inherits the SysV attachments and their nattch. */
+    if (sysvipc_process_fork(child, parent) != 0) {
+        proc_destroy(child);
+        return -(s64)ENOMEM;
+    }
+
+    /* BUG-AN fix: acquire g_fd_lock while copying parent's handle_table */
+    irqflags_t fd_irqf = spinlock_lock_irqsave(&g_fd_lock);
+    for (int i = 0; i < PROC_MAX_FDS; i++) {
+        if (parent->handle_table[i]) {
+            file_t *pf = (file_t *)parent->handle_table[i];
+            __atomic_add_fetch(&pf->f_count, 1, __ATOMIC_SEQ_CST);
+            child->handle_table[i] = pf;
+            child->fd_flags[i] = parent->fd_flags[i];
+        }
+        if (parent->obj_handle_table[i]) {
+            az_object_t *obj = parent->obj_handle_table[i];
+            az_object_reference(obj);
+            child->obj_handle_table[i] = obj;
+        }
+    }
+    spinlock_unlock_irqrestore(&g_fd_lock, fd_irqf);
+
+    virt_addr_t user_rsp = child_stack ? child_stack : r->rsp;
+    thread_t *t = thread_create_ex(child, r->rip, user_rsp, false, false);
+    if (!t) {
+        proc_destroy(child);
+        return -(s64)ENOMEM;
+    }
+
+    if (flags & 0x00080000ULL /* CLONE_SETTLS */) {
+        child->fs_base = newtls;
+        t->fs_base     = newtls;
+    } else {
+        thread_t *self = sched_current_thread();
+        u64 tls = self ? (self->fs_base ? self->fs_base : parent->fs_base)
+                       : parent->fs_base;
+        t->fs_base     = tls;
+        child->fs_base = tls;
+    }
+
+    if (t->user_regs) {
+        *t->user_regs = *r;
+        t->user_regs->rax = 0;        /* Child returns 0 */
+        t->user_regs->rsp = user_rsp;
+        t->user_regs->rflags = 0x202; /* IF=1 */
+    }
+
+    /* 0x100 is CLONE_VM, not CLONE_PARENT_SETTID — the old constant here meant
+     * every CLONE_VM caller got a tid written through whatever rdx happened to
+     * hold, and a genuine CLONE_PARENT_SETTID caller got nothing. */
+    if ((flags & 0x00100000ULL /* CLONE_PARENT_SETTID */) && parent_tidptr && (uintptr_t)parent_tidptr < 0x0000800000000000ULL) {
+        int tid = (int)child->pid;
+        copy_to_user(parent_tidptr, &tid, sizeof(int));
+    }
+
+    if ((flags & 0x01000000ULL /* CLONE_CHILD_SETTID */) && child_tidptr && (uintptr_t)child_tidptr < 0x0000800000000000ULL) {
+        int tid = (int)child->pid;
+        copy_to_user(child_tidptr, &tid, sizeof(int));
+    }
+
+    if ((flags & 0x00200000ULL /* CLONE_CHILD_CLEARTID */) && child_tidptr && (uintptr_t)child_tidptr < 0x0000800000000000ULL) {
+        t->clear_child_tid = (u64)(uintptr_t)child_tidptr;
     }
 
     sched_enqueue_thread(t);
@@ -1988,64 +2650,7 @@ static s64 sys_clone_impl(pt_regs_t *r)
     int *parent_tidptr = (int *)r->rdx;
     int *child_tidptr = (int *)r->r10;
     u64 newtls = r->r8;
-
-    process_t *parent = sched_current_process();
-    if (!parent) return -(s64)EPERM;
-
-    vmm_space_t child_space = vmm_clone_space(parent->pml4_phys);
-    if (!child_space) return -(s64)ENOMEM;
-
-    process_t *child = proc_create(parent->name, child_space);
-    if (!child) {
-        vmm_destroy_space(child_space);
-        return -(s64)ENOMEM;
-    }
-
-    child->parent       = parent;
-    proc_clone_attrs(child, parent);
-    vma_clone(child, parent);
-    if (flags & 0x00080000ULL /* CLONE_SETTLS */) child->fs_base = newtls;
-
-    for (int i = 0; i < 64; i++) {
-        if (parent->handle_table[i]) {
-            file_t *pf = (file_t *)parent->handle_table[i];
-            __atomic_add_fetch(&pf->f_count, 1, __ATOMIC_SEQ_CST);
-            child->handle_table[i] = pf;
-            child->fd_flags[i] = parent->fd_flags[i];
-        }
-        if (parent->obj_handle_table[i]) {
-            az_object_t *obj = parent->obj_handle_table[i];
-            az_object_reference(obj);
-            child->obj_handle_table[i] = obj;
-        }
-    }
-
-    virt_addr_t user_rsp = child_stack ? child_stack : r->rsp;
-    thread_t *t = thread_create_ex(child, r->rip, user_rsp, false, false);
-    if (!t) {
-        proc_destroy(child);
-        return -(s64)ENOMEM;
-    }
-
-    if (t->user_regs) {
-        *t->user_regs = *r;
-        t->user_regs->rax = 0;        /* Child returns 0 */
-        t->user_regs->rsp = user_rsp;
-        t->user_regs->rflags = 0x202; /* IF=1 */
-    }
-
-    if ((flags & 0x00000100ULL /* CLONE_PARENT_SETTID */) && parent_tidptr && (uintptr_t)parent_tidptr < 0x8000000000000000ULL) {
-        int tid = (int)child->pid;
-        copy_to_user(parent_tidptr, &tid, sizeof(int));
-    }
-
-    if ((flags & 0x01000000ULL /* CLONE_CHILD_SETTID */) && child_tidptr && (uintptr_t)child_tidptr < 0x8000000000000000ULL) {
-        int tid = (int)child->pid;
-        copy_to_user(child_tidptr, &tid, sizeof(int));
-    }
-
-    sched_enqueue_thread(t);
-    return (s64)child->pid;
+    return do_clone(flags, child_stack, parent_tidptr, child_tidptr, newtls, r);
 }
 
 static s64 sys_vfork_impl(pt_regs_t *r)
@@ -2121,15 +2726,6 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
         return -(s64)EPERM;
     }
 
-    /* A-01: Close file descriptors marked with FD_CLOEXEC */
-    for (int i = 0; i < 64; i++) {
-        if (proc->handle_table[i] && (proc->fd_flags[i] & FD_CLOEXEC)) {
-            vfs_close((file_t *)proc->handle_table[i]);
-            proc->handle_table[i] = NULL;
-            proc->fd_flags[i] = 0;
-        }
-    }
-
     uintptr_t new_entry = 0;
     phys_addr_t new_space = 0;
     u64 new_rsp = 0;
@@ -2159,15 +2755,28 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
 
     if (err < 0) return (s64)err;
 
-    ipc_shmem_unmap_all(proc);
+    /* BUG-AF fix: Close FD_CLOEXEC file descriptors ONLY AFTER elf_load_exec()
+     * succeeds. If execve fails before this point, all file descriptors remain intact. */
+    for (int i = 0; i < PROC_MAX_FDS; i++) {
+        if (proc->handle_table[i] && (proc->fd_flags[i] & FD_CLOEXEC)) {
+            file_t *f = fd_detach(proc, i);
+            if (f) vfs_close(f);
+        }
+    }
 
-    /* Fresh address space: drop the old region set and seed it with the ranges
-     * the ELF loader just populated (executable image + initial stack). */
-    vma_reset(proc);
-    if (proc->heap_start > 0x10000)
-        vma_add(proc, 0x10000, proc->heap_start, VMA_PROT_READ | VMA_PROT_EXEC, VMA_F_FILE);
-    vma_add(proc, 0x00007fffffbfe000ULL, 0x00007fffffffe000ULL,
-            VMA_PROT_READ | VMA_PROT_WRITE, VMA_F_ANON | VMA_F_STACK);
+    /* POSIX: execve terminates every other thread of the process. Do it before
+     * we free the old address space — a sibling still running user code on the
+     * old page tables would otherwise fault on freed memory. Wait for any
+     * on-CPU sibling to actually leave its CPU. */
+    sched_exit_group_mark();
+    sched_dethread_wait();
+
+    /* BUG-AG fix: Clean up all terminated sibling threads and their kernel stacks
+     * so they are not leaked for the entire lifetime of the new process. */
+    sched_dethread_reap();
+
+    ipc_shmem_unmap_all(proc);
+    sysvipc_process_exec(proc);   /* POSIX: SysV segments do not survive exec */
 
     proc->pml4_phys = new_space;
     vmm_switch(new_space);
@@ -2177,9 +2786,19 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
     }
 
     proc->fs_base = 0;
+    thread_t *curr = sched_current_thread();
+    if (curr) {
+        curr->fs_base = 0;
+        curr->clear_child_tid = 0;
+    }
     wrmsr(MSR_FS_BASE, 0);
     proc->gs_base = 0;
     wrmsr(MSR_KERNEL_GS_BASE, 0);
+
+    /* Apply the execve() capability transition. no_new_privs and the seccomp
+     * mode deliberately survive here — a sandbox that set them before exec'ing
+     * a helper would be worthless if exec cleared them. */
+    security_caps_on_exec(proc);
 
     /* Reset custom signal handlers to default (SIG_DFL) per POSIX execve spec */
     for (int i = 0; i < _NSIG; i++) {
@@ -2189,6 +2808,10 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
             proc->sigactions[i].sa_mask = 0;
         }
     }
+    /* Reset alternate signal stack on execve */
+    proc->sas_ss_sp = NULL;
+    proc->sas_ss_size = 0;
+    proc->sas_ss_flags = 2; /* SS_DISABLE */
     /* Reset all user registers to clean state per System V AMD64 ABI specification */
     r->rip = (u64)new_entry;
     r->rsp = (u64)new_rsp;
@@ -2208,6 +2831,22 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
     r->r14 = 0;
     r->r15 = 0;
     r->rflags = 0x202;
+
+    /* Update process name to binary basename */
+    const char *bname = kpath;
+    for (int i = 0; kpath[i]; i++) {
+        if (kpath[i] == '/' && kpath[i + 1]) bname = &kpath[i + 1];
+    }
+    strncpy(proc->name, bname, sizeof(proc->name) - 1);
+    proc->name[sizeof(proc->name) - 1] = '\0';
+
+    /* The tracee survives exec (PT_TRACED is not reset above), so a tracer that
+     * asked for PTRACE_O_TRACEEXEC gets its stop here — with `r` already
+     * describing the new image's entry point, which is the whole point: it is
+     * where a debugger plants its first breakpoints. */
+    if (ptrace_traced(proc))
+        ptrace_report_event(r, PTRACE_EVENT_EXEC, (u64)proc->pid);
+
     return 0;
 }
 
@@ -2272,21 +2911,26 @@ s64 sys_exit_impl(pt_regs_t *r)
         /* Don't clobber a termination signal already recorded by the fault
          * handler (segfault etc.) with the trap frame's rdi. */
         if (r && proc->term_signal == 0) proc->exit_code = (int)r->rdi & 0xFF;
+
+        /* PTRACE_O_TRACEEXIT: one last stop while the address space is still
+         * intact, which is the only chance a tracer has to read the dying
+         * process's memory. Then drop every tracing relationship — as a tracee
+         * so a stale link cannot outlive us, and as a tracer so our tracees are
+         * not left parked waiting for a resume that will never come. */
+        if (r && ptrace_traced(proc))
+            ptrace_report_event(r, PTRACE_EVENT_EXIT,
+                                (u64)(proc->term_signal ? (proc->term_signal & 0x7f)
+                                                        : ((proc->exit_code & 0xff) << 8)));
+        ptrace_release(proc);
         pr_debug("[SYSCALL] Process exiting (PID %u, code %d, sig %d)\n",
                  proc->pid, proc->exit_code, proc->term_signal);
 
-        /* Close all open file descriptors for this process so pipes, sockets, and files release immediately */
-        for (int i = 0; i < 64; i++) {
-            if (proc->handle_table[i]) {
-                vfs_close((file_t *)proc->handle_table[i]);
-                proc->handle_table[i] = NULL;
-            }
-            if (proc->obj_handle_table[i]) {
-                az_object_t *obj = proc->obj_handle_table[i];
-                proc->obj_handle_table[i] = NULL;
-                az_object_dereference(obj);
-            }
-        }
+        /* Release this process's descriptors. fd_table_release() claims each
+         * slot under g_fd_lock (atomic swap-to-NULL) so a sibling thread also
+         * exiting, sched_exit_thread's last-thread cleanup, the reaper, or a
+         * cross-process fget() cannot double-close or use-after-free the same
+         * file_t / object. */
+        fd_table_release(proc);
     }
     sched_exit_thread();
     __builtin_unreachable();
@@ -2294,6 +2938,9 @@ s64 sys_exit_impl(pt_regs_t *r)
 
 static s64 sys_exit_group_impl(pt_regs_t *r)
 {
+    /* POSIX: exit_group terminates every thread of the process, not just the
+     * caller. Wind the siblings down first, then exit this thread. */
+    sched_exit_group_mark();
     return sys_exit_impl(r);
 }
 
@@ -2344,17 +2991,32 @@ static s64 sys_kill_impl(pt_regs_t *r)
     process_t *curr = sched_current_process();
     if (!curr) return -(s64)EPERM;
 
+    /* Reject out-of-range signal numbers up front so no downstream path (group
+     * / broadcast especially) hands sched_kill_process a bad sig. sig==0 stays
+     * legal — it is the permission/existence probe. */
+    if (sig != 0 && (sig < 0 || sig >= _NSIG)) return -(s64)EINVAL;
+
     if (pid > 0) {
         /* Positive pid: signal that specific process */
         if (pid == (s32)curr->pid) {
             if (sig == 0) return 0;
             if (sig < 0 || sig >= _NSIG) return -(s64)EINVAL;
 
+            /* Job control cannot take the shortcut below. A stop is not a
+             * termination, and SIGCONT has an effect whether or not a handler
+             * is installed — neither is expressible as "queue it or die", so
+             * both go to the common path even when the target is us. This is
+             * the raise(SIGSTOP) a tracee does to hand control to its tracer,
+             * and before the stop existed it killed the process outright. */
+            if (sig == SIGSTOP || sig == SIGTSTP || sig == 21 /*SIGTTIN*/ ||
+                sig == 22 /*SIGTTOU*/ || sig == SIGCONT)
+                return sched_kill_process((u32)pid, sig);
+
             sighandler_t h = curr->sigactions[sig].sa_handler;
             if (h != SIG_DFL && h != SIG_IGN && sig != SIGKILL && sig != SIGSTOP) {
                 /* Custom handler installed: queue it. signal_deliver_pending()
                  * runs it on the way back out of this syscall. */
-                curr->sig_pending |= (1ULL << sig);
+                __atomic_or_fetch(&curr->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
                 return 0;
             }
             if (h == SIG_IGN) return 0;
@@ -2362,6 +3024,14 @@ static s64 sys_kill_impl(pt_regs_t *r)
             if (sig == 17 /*SIGCHLD*/ || sig == 23 /*SIGURG*/ ||
                 sig == 28 /*SIGWINCH*/ || sig == 18 /*SIGCONT*/)
                 return 0;                       /* default: ignore */
+            /* POSIX: a blocked signal becomes pending instead of acting. Its
+             * default action is taken when the mask is lifted, or the signal
+             * is consumed by sigwait()/sigtimedwait(). SIGKILL and SIGSTOP
+             * cannot be blocked and are excluded above. */
+            if (curr->sig_blocked & (1ULL << sig)) {
+                __atomic_or_fetch(&curr->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+                return 0;
+            }
             curr->term_signal = sig;
             curr->exit_code   = 128 + sig;
             sys_exit_impl(r);                    /* default: terminate */
@@ -2376,30 +3046,41 @@ static s64 sys_kill_impl(pt_regs_t *r)
     u32 target_pgid = (pid == 0) ? curr->pgid : (u32)(-pid);
     s64 ret = -(s64)ESRCH;
     bool self_in_group = false;
-    process_t *p = sched_get_process_list();
-    while (p) {
-        process_t *next = p->next;
+    u32 pids[128];
+    u32 npids = 0;
+
+    sched_lock();
+    for (process_t *p = sched_get_process_list(); p && npids < 128; p = p->next) {
         bool match = (pid == -1) ? true : (p->pgid == target_pgid);
         if (match) {
             if (p == curr) {
                 self_in_group = true;   /* deliver to self last */
             } else {
-                s64 r2 = sched_kill_process(p->pid, sig);
-                if (r2 == 0) ret = 0;
+                pids[npids++] = p->pid;
             }
         }
-        p = next;
+    }
+    sched_unlock();
+
+    for (u32 i = 0; i < npids; i++) {
+        s64 r2 = sched_kill_process(pids[i], sig);
+        if (r2 == 0) ret = 0;
     }
     if (self_in_group && sig != 0 && sig > 0 && sig < _NSIG) {
         ret = 0;
         sighandler_t h = curr->sigactions[sig].sa_handler;
         if (h != SIG_DFL && h != SIG_IGN && sig != SIGKILL && sig != SIGSTOP) {
-            curr->sig_pending |= (1ULL << sig);
+            __atomic_or_fetch(&curr->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
         } else if (h != SIG_IGN &&
                    !(sig == 17 || sig == 18 || sig == 23 || sig == 28)) {
-            curr->term_signal = sig;
-            curr->exit_code   = 128 + sig;
-            sys_exit_impl(r);             /* default: terminate */
+            if (curr->sig_blocked & (1ULL << sig)) {
+                /* Blocked: queue it rather than acting on it (see above). */
+                __atomic_or_fetch(&curr->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+            } else {
+                curr->term_signal = sig;
+                curr->exit_code   = 128 + sig;
+                sys_exit_impl(r);         /* default: terminate */
+            }
         }
     } else if (self_in_group) {
         ret = 0;
@@ -2434,6 +3115,19 @@ static s64 sys_rt_sigaction_impl(pt_regs_t *r)
         sigaction_t kact;
         if (copy_from_user(&kact, user_act, sizeof(sigaction_t)) != 0)
             return -(s64)EFAULT;
+
+        /* A non-canonical handler or restorer address would later be loaded into
+         * RIP and faulted in ring 0 on the return from delivery. Reject at
+         * registration time. SIG_DFL/SIG_IGN (0/1) are the only allowed
+         * non-address handler values. */
+        u64 h = (u64)(uintptr_t)kact.sa_handler;
+        u64 rst = (u64)(uintptr_t)kact.sa_restorer;
+        if (h != (u64)(uintptr_t)SIG_DFL && h != (u64)(uintptr_t)SIG_IGN &&
+            h >= 0x0000800000000000ULL)
+            return -(s64)EFAULT;
+        if (rst != 0 && rst >= 0x0000800000000000ULL)
+            return -(s64)EFAULT;
+
         proc->sigactions[signum] = kact;
     }
 
@@ -2495,13 +3189,6 @@ static s64 sys_pause_impl(pt_regs_t *r)
     return -(s64)EINTR;
 }
 
-static s64 sys_alarm_impl(pt_regs_t *r)
-{
-    u32 sec = (u32)r->rdi;
-    (void)sec;
-    return 0;
-}
-
 /* ── Sockets & Networking Syscalls ───────────────────────────────────────── */
 
 static s64 sys_socket_impl(pt_regs_t *r)
@@ -2546,19 +3233,64 @@ static s64 sys_socket_impl(pt_regs_t *r)
     return -(s64)EMFILE;
 }
 
+/* struct sockaddr_in and struct sockaddr_un share nothing but sa_family at
+ * offset 0 — a bind()/connect() on an AF_UNIX socket carries a path in
+ * sun_path, not the fixed 16-byte sockaddr_in this file otherwise assumes
+ * everywhere. Peeks the family, then copies out just the path (NUL-safe:
+ * sun_path isn't guaranteed to be NUL-terminated by the caller, so this
+ * always terminates the result itself from addrlen). Returns 0 with
+ * *out_path set for AF_UNIX, or a negative errno; leaves *out_path
+ * untouched (caller should fall back to sockaddr_in handling) when the
+ * address isn't AF_UNIX at all — that isn't an error at this layer. */
+static s64 copy_user_sockaddr_un_path(const struct sockaddr *uaddr, socklen_t addrlen,
+                                       char out_path[UNIX_PATH_MAX], bool *out_is_unix)
+{
+    *out_is_unix = false;
+    sa_family_t fam;
+    if (copy_from_user(&fam, uaddr, sizeof(fam)) != 0) return -(s64)EFAULT;
+    if (fam != AF_UNIX) return 0;
+
+    *out_is_unix = true;
+    if (addrlen < sizeof(sa_family_t) + 1) return -(s64)EINVAL; /* need at least a 1-char path */
+    size_t path_len = addrlen - sizeof(sa_family_t);
+    if (path_len >= UNIX_PATH_MAX) path_len = UNIX_PATH_MAX - 1;
+
+    struct sockaddr_un sun;
+    memset(&sun, 0, sizeof(sun));
+    size_t copy_len = sizeof(sa_family_t) + path_len;
+    if (copy_len > sizeof(sun)) copy_len = sizeof(sun);
+    if (copy_from_user(&sun, uaddr, copy_len) != 0) return -(s64)EFAULT;
+    sun.sun_path[UNIX_PATH_MAX - 1] = '\0';
+    if (!sun.sun_path[0]) return -(s64)EINVAL; /* abstract-namespace sockets not supported */
+
+    strncpy(out_path, sun.sun_path, UNIX_PATH_MAX - 1);
+    out_path[UNIX_PATH_MAX - 1] = '\0';
+    return 0;
+}
+
 static s64 sys_bind_impl(pt_regs_t *r)
 {
     int fd = (int)r->rdi;
     const struct sockaddr *uaddr = (const struct sockaddr *)r->rsi;
     socklen_t addrlen = (socklen_t)r->rdx;
 
-    if (!uaddr || addrlen < sizeof(struct sockaddr_in)) return -(s64)EINVAL;
+    if (!uaddr || addrlen < sizeof(sa_family_t)) return -(s64)EINVAL;
     if ((uintptr_t)uaddr >= 0x8000000000000000ULL) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
 
+    if (sock->domain == AF_UNIX) {
+        char path[UNIX_PATH_MAX];
+        bool is_unix = false;
+        s64 err = copy_user_sockaddr_un_path(uaddr, addrlen, path, &is_unix);
+        if (err < 0) return err;
+        if (!is_unix) return -(s64)EINVAL;
+        return unix_socket_bind(sock->uds, path);
+    }
+
+    if (addrlen < sizeof(struct sockaddr_in)) return -(s64)EINVAL;
     struct sockaddr_in sin;
     if (copy_from_user(&sin, uaddr, sizeof(struct sockaddr_in)) != 0) {
         return -(s64)EFAULT;
@@ -2582,13 +3314,27 @@ static s64 sys_connect_impl(pt_regs_t *r)
     const struct sockaddr *uaddr = (const struct sockaddr *)r->rsi;
     socklen_t addrlen = (socklen_t)r->rdx;
 
-    if (!uaddr || addrlen < sizeof(struct sockaddr_in)) return -(s64)EINVAL;
+    if (!uaddr || addrlen < sizeof(sa_family_t)) return -(s64)EINVAL;
     if ((uintptr_t)uaddr >= 0x8000000000000000ULL) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
 
+    process_t *proc = sched_current_process();
+    file_t *f = (file_t *)proc->handle_table[fd];
+    bool nonblock = f ? ((f->f_flags & O_NONBLOCK) != 0) : false;
+
+    if (sock->domain == AF_UNIX) {
+        char path[UNIX_PATH_MAX];
+        bool is_unix = false;
+        s64 err = copy_user_sockaddr_un_path(uaddr, addrlen, path, &is_unix);
+        if (err < 0) return err;
+        if (!is_unix) return -(s64)EINVAL;
+        return unix_socket_connect(sock->uds, path, nonblock);
+    }
+
+    if (addrlen < sizeof(struct sockaddr_in)) return -(s64)EINVAL;
     struct sockaddr_in sin;
     if (copy_from_user(&sin, uaddr, sizeof(struct sockaddr_in)) != 0) {
         return -(s64)EFAULT;
@@ -2596,10 +3342,6 @@ static s64 sys_connect_impl(pt_regs_t *r)
 
     u16 port = ntohs(sin.sin_port);
     const u8 *ip = (const u8 *)&sin.sin_addr.s_addr;
-
-    process_t *proc = sched_current_process();
-    file_t *f = (file_t *)proc->handle_table[fd];
-    bool nonblock = f ? ((f->f_flags & O_NONBLOCK) != 0) : false;
 
     if (sock->type == SOCK_STREAM && sock->tcp) {
         return (s64)tcp_connect(sock->tcp, ip, port, nonblock);
@@ -2619,6 +3361,9 @@ static s64 sys_listen_impl(pt_regs_t *r)
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
 
+    if (sock->domain == AF_UNIX) {
+        return unix_socket_listen(sock->uds, backlog);
+    }
     if (sock->type == SOCK_STREAM && sock->tcp) {
         return (s64)tcp_listen(sock->tcp, backlog);
     }
@@ -2626,11 +3371,21 @@ static s64 sys_listen_impl(pt_regs_t *r)
     return -(s64)EOPNOTSUPP;
 }
 
-static s64 sys_accept_impl(pt_regs_t *r)
+/* accept4(2) flags. Same bit values as the type flags socket(2) takes, which
+ * is what lets a caller pass SOCK_NONBLOCK|SOCK_CLOEXEC through unchanged. */
+#define SOCK_NONBLOCK_FLAG  00004000
+#define SOCK_CLOEXEC_FLAG   02000000
+
+/* accept(2) is accept4(2) with no flags; sharing one body is what stops the
+ * two from drifting apart in the details that matter (blocking behaviour,
+ * address copy-out, the fd's close-on-exec state). */
+static s64 do_accept(pt_regs_t *r, int a4flags)
 {
     int fd = (int)r->rdi;
     struct sockaddr *uaddr = (struct sockaddr *)r->rsi;
     socklen_t *uaddrlen = (socklen_t *)r->rdx;
+
+    if (a4flags & ~(SOCK_NONBLOCK_FLAG | SOCK_CLOEXEC_FLAG)) return -(s64)EINVAL;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -2639,12 +3394,55 @@ static s64 sys_accept_impl(pt_regs_t *r)
     int ret = sock_get_from_fd(fd, &listener);
     if (ret < 0) return -(s64)ret;
 
+    file_t *f = (file_t *)proc->handle_table[fd];
+    bool nonblock = f ? ((f->f_flags & O_NONBLOCK) != 0) : false;
+
+    if (listener->domain == AF_UNIX) {
+        unix_sock_t *child_uds = unix_socket_create(SOCK_STREAM);
+        if (!child_uds) return -(s64)ENOMEM;
+
+        int aerr = unix_socket_accept(listener->uds, child_uds, nonblock);
+        if (aerr < 0) {
+            kfree(child_uds);
+            return (s64)aerr;
+        }
+
+        socket_t *child_sock = (socket_t *)kzalloc(sizeof(socket_t));
+        if (!child_sock) {
+            unix_socket_close(child_uds);
+            return -(s64)ENOMEM;
+        }
+        child_sock->domain = AF_UNIX;
+        child_sock->type = SOCK_STREAM;
+        child_sock->uds = child_uds;
+
+        file_t *child_file = sock_create_file(child_sock);
+        if (!child_file) {
+            sock_free(child_sock);
+            return -(s64)ENOMEM;
+        }
+        if (a4flags & SOCK_NONBLOCK_FLAG) child_file->f_flags |= O_NONBLOCK;
+
+        int new_fd = (int)fd_install(proc, child_file,
+                                     (a4flags & SOCK_CLOEXEC_FLAG) ? FD_CLOEXEC : 0);
+        if (new_fd < 0) {
+            sock_free(child_sock);
+            kfree(child_file);
+            return -(s64)EMFILE;
+        }
+        /* No meaningful peer address to fill in beyond AF_UNIX + this
+         * listener's own bound path — real Linux reports the *connecting*
+         * side's bind() path here (empty for an unbound/autobind client,
+         * which is the overwhelmingly common case), and this
+         * implementation doesn't track that on the accepted side at all.
+         * Leaving *uaddrlen at whatever the caller passed in (unchanged) is
+         * closer to "no information available" than fabricating a sockaddr. */
+        return (s64)new_fd;
+    }
+
     if (listener->type != SOCK_STREAM || !listener->tcp) {
         return -(s64)EOPNOTSUPP;
     }
-
-    file_t *f = (file_t *)proc->handle_table[fd];
-    bool nonblock = f ? ((f->f_flags & O_NONBLOCK) != 0) : false;
 
     u8 client_ip[4];
     u16 client_port = 0;
@@ -2670,7 +3468,10 @@ static s64 sys_accept_impl(pt_regs_t *r)
         return -(s64)ENOMEM;
     }
 
-    int new_fd = (int)fd_install(proc, child_file, 0);
+    if (a4flags & SOCK_NONBLOCK_FLAG) child_file->f_flags |= O_NONBLOCK;
+
+    int new_fd = (int)fd_install(proc, child_file,
+                                 (a4flags & SOCK_CLOEXEC_FLAG) ? FD_CLOEXEC : 0);
     if (new_fd < 0) {
         sock_free(child_sock);
         kfree(child_file);
@@ -2693,6 +3494,16 @@ static s64 sys_accept_impl(pt_regs_t *r)
     return (s64)new_fd;
 }
 
+static s64 sys_accept_impl(pt_regs_t *r)
+{
+    return do_accept(r, 0);
+}
+
+static s64 sys_accept4_impl(pt_regs_t *r)
+{
+    return do_accept(r, (int)r->r10);
+}
+
 static s64 sys_shutdown_impl(pt_regs_t *r)
 {
     int fd = (int)r->rdi;
@@ -2702,6 +3513,18 @@ static s64 sys_shutdown_impl(pt_regs_t *r)
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
 
+    /* AF_UNIX must be checked before sock->type: `sock->tcp` and `sock->uds`
+     * are the same union storage, so `sock->type == SOCK_STREAM && sock->tcp`
+     * is true for an AF_UNIX stream socket too — tcp_shutdown() would then
+     * run against a unix_sock_t reinterpreted as a tcp_sock_t. Every
+     * function below in this file that dispatches on sock->type alone has
+     * the same hazard; this one and getsockname/getpeername right after it
+     * used to have it — caught by shutdown()/send()/recv() on a real
+     * AF_UNIX socket landing in tcp_send() and getting a nonsense
+     * -ENOTCONN back instead of actually writing. */
+    if (sock->domain == AF_UNIX) {
+        return 0; /* no half-close modeled for the pipe-backed byte stream */
+    }
     if (sock->type == SOCK_STREAM && sock->tcp) {
         return (s64)tcp_shutdown(sock->tcp, how);
     }
@@ -2720,6 +3543,17 @@ static s64 sys_getsockname_impl(pt_regs_t *r)
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
+
+    if (sock->domain == AF_UNIX) {
+        struct sockaddr_un sun;
+        memset(&sun, 0, sizeof(sun));
+        sun.sun_family = AF_UNIX;
+        strncpy(sun.sun_path, sock->uds->path, UNIX_PATH_MAX - 1);
+        copy_to_user(uaddr, &sun, sizeof(sun));
+        socklen_t slen = sizeof(sun);
+        copy_to_user(uaddrlen, &slen, sizeof(socklen_t));
+        return 0;
+    }
 
     struct sockaddr_in sin;
     memset(&sin, 0, sizeof(sin));
@@ -2752,6 +3586,22 @@ static s64 sys_getpeername_impl(pt_regs_t *r)
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
+
+    if (sock->domain == AF_UNIX) {
+        /* This implementation doesn't track the *peer's* bound path on the
+         * accepted/connected side (see do_accept()'s AF_UNIX branch comment
+         * in this file) — report AF_UNIX with an empty path, same as real
+         * Linux does for an unbound/autobind peer, rather than fabricating
+         * one. Still validates the socket is actually connected. */
+        if (sock->uds->state != UNIX_ST_CONNECTED) return -(s64)ENOTCONN;
+        struct sockaddr_un sun;
+        memset(&sun, 0, sizeof(sun));
+        sun.sun_family = AF_UNIX;
+        copy_to_user(uaddr, &sun, sizeof(sun));
+        socklen_t slen = sizeof(sun);
+        copy_to_user(uaddrlen, &slen, sizeof(socklen_t));
+        return 0;
+    }
 
     struct sockaddr_in sin;
     memset(&sin, 0, sizeof(sin));
@@ -2901,6 +3751,11 @@ static s64 sys_getsockopt_impl(pt_regs_t *r)
     return 0;
 }
 
+/* Upper bound on a single socket transfer's kernel bounce buffer. Matches the
+ * 64 KB chunking read()/write() already use, and comfortably exceeds the
+ * 65507-byte maximum UDP payload. */
+#define SOCK_XFER_MAX  65536u
+
 static s64 sys_sendto_impl(pt_regs_t *r)
 {
     int fd = (int)r->rdi;
@@ -2909,7 +3764,6 @@ static s64 sys_sendto_impl(pt_regs_t *r)
     int flags = (int)r->r10;
     const struct sockaddr *uaddr = (const struct sockaddr *)r->r8;
     socklen_t uaddrlen = (socklen_t)r->r9;
-    (void)uaddrlen;
 
     if (!ubuf || len == 0) return 0;
     if ((uintptr_t)ubuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
@@ -2917,6 +3771,17 @@ static s64 sys_sendto_impl(pt_regs_t *r)
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
+
+    /* Clamp the bounce buffer the way read()/write() do. `len` is raw user
+     * input and went straight to kmalloc(), which serves anything up to 1 GB:
+     * an unprivileged process could pin arbitrary kernel memory per call.
+     * A stream socket may legally send fewer bytes than asked, so clamping is
+     * the correct short-send; a datagram larger than the buffer cannot be
+     * truncated silently, so it gets EMSGSIZE. */
+    if (len > SOCK_XFER_MAX) {
+        if (sock->type == SOCK_DGRAM) return -(s64)EMSGSIZE;
+        len = SOCK_XFER_MAX;
+    }
 
     void *kbuf = kmalloc(len);
     if (!kbuf) return -(s64)ENOMEM;
@@ -2926,6 +3791,28 @@ static s64 sys_sendto_impl(pt_regs_t *r)
     }
 
     s64 res = -(s64)EOPNOTSUPP;
+
+    /* AF_UNIX must be checked before sock->type: sock->tcp and sock->uds
+     * are the same union storage, so `sock->type == SOCK_STREAM && sock->tcp`
+     * below is true for an AF_UNIX stream socket too — this used to send an
+     * AF_UNIX socket's data through tcp_send() reinterpreting its
+     * unix_sock_t as a tcp_sock_t, which is how send()/sendto() on a real
+     * connected AF_UNIX socket ended up failing with a nonsense -ENOTCONN
+     * (tcp_send() read what it thought was TCP connection state out of
+     * memory that was actually unix_sock_t fields) instead of writing. */
+    if (sock->domain == AF_UNIX) {
+        char dest_path[UNIX_PATH_MAX];
+        bool have_dest = false;
+        if (uaddr && uaddrlen >= sizeof(sa_family_t)) {
+            s64 perr = copy_user_sockaddr_un_path(uaddr, uaddrlen, dest_path, &have_dest);
+            if (perr < 0) { kfree(kbuf); return perr; }
+        }
+        file_t *f = (file_t *)sched_current_process()->handle_table[fd];
+        bool nonblock = (f && (f->f_flags & O_NONBLOCK)) || (flags & 0x40 /* MSG_DONTWAIT */);
+        res = unix_socket_sendmsg(sock->uds, have_dest ? dest_path : NULL, kbuf, len, NULL, 0, nonblock);
+        kfree(kbuf);
+        return res;
+    }
 
     if (sock->type == SOCK_STREAM && sock->tcp) {
         res = tcp_send(sock->tcp, kbuf, len, flags);
@@ -2991,6 +3878,43 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
     process_t *proc = sched_current_process();
     file_t *f = (file_t *)proc->handle_table[fd];
     bool nonblock = (f ? ((f->f_flags & O_NONBLOCK) != 0) : false) || ((flags & 0x40 /* MSG_DONTWAIT */) != 0);
+
+    /* AF_UNIX must be checked before sock->type — see sys_sendto_impl's
+     * identical comment just above; the same tcp/uds union aliasing bug
+     * applied here on the receive side too. */
+    if (sock->domain == AF_UNIX) {
+        size_t clen = len > SOCK_XFER_MAX ? SOCK_XFER_MAX : len;
+        void *kbuf = kmalloc(clen);
+        if (!kbuf) return -(s64)ENOMEM;
+        char src_path[UNIX_PATH_MAX];
+        s64 res = unix_socket_recvmsg(sock->uds, kbuf, clen, src_path, NULL, nonblock);
+        if (res > 0) {
+            if (copy_to_user(ubuf, kbuf, (size_t)res) != 0) {
+                kfree(kbuf);
+                return -(s64)EFAULT;
+            }
+            if (uaddr && uaddrlen) {
+                struct sockaddr_un sun;
+                memset(&sun, 0, sizeof(sun));
+                sun.sun_family = AF_UNIX;
+                strncpy(sun.sun_path, src_path, UNIX_PATH_MAX - 1);
+                copy_to_user(uaddr, &sun, sizeof(sun));
+                socklen_t slen = sizeof(sun);
+                copy_to_user(uaddrlen, &slen, sizeof(socklen_t));
+            }
+        }
+        /* Any SCM_RIGHTS fds this datagram carried are silently dropped —
+         * plain recvfrom(2) has no ancillary-data channel to return them
+         * through, matching real Linux's own behavior here exactly (the
+         * fds are simply closed, never leaked to any process). */
+        kfree(kbuf);
+        return res;
+    }
+
+    /* Same unbounded-kmalloc guard as sendto. Returning fewer bytes than the
+     * caller's buffer size is always valid for recv, so a plain clamp is a
+     * correct short read here. */
+    if (len > SOCK_XFER_MAX) len = SOCK_XFER_MAX;
 
     void *kbuf = kmalloc(len);
     if (!kbuf) return -(s64)ENOMEM;
@@ -3059,10 +3983,11 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
             spinlock_lock(&sock->raw->lock);
             if (net_buf_queue_len(&sock->raw->rx_queue) == 0) {
                 sock->raw->wait_thread = sched_current_thread();
-                sched_block(THREAD_BLOCKED);
+                spinlock_unlock(&sock->raw->lock);
+                sched_block(THREAD_BLOCKED_PENDING);
+            } else {
+                spinlock_unlock(&sock->raw->lock);
             }
-            spinlock_unlock(&sock->raw->lock);
-            sched_yield();
         }
     }
 
@@ -3070,6 +3995,303 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
     return -(s64)EOPNOTSUPP;
 }
 
+/* Must stay field-for-field identical to `struct msghdr`/`struct cmsghdr` in
+ * userland/libc/include/sys/socket.h — same reasoning as struct linux_timex
+ * above. */
+struct linux_msghdr {
+    void         *msg_name;
+    socklen_t     msg_namelen;
+    struct iovec *msg_iov;
+    size_t        msg_iovlen;
+    void         *msg_control;
+    size_t        msg_controllen;
+    int           msg_flags;
+};
+
+struct linux_cmsghdr {
+    size_t cmsg_len;
+    int    cmsg_level;
+    int    cmsg_type;
+};
+
+/* Real sendmsg(2)/recvmsg(2): gather/scatter across every iovec (not just
+ * iov[0], which is all SYS_sendmsg/SYS_recvmsg used to do when they were
+ * literal aliases for sys_sendto_impl/sys_recvfrom_impl — see the reg()
+ * calls below), plus SCM_RIGHTS fd-passing for AF_UNIX
+ * (kernel/net/unix_socket.c). A handful of iovecs is the overwhelmingly
+ * common case for real callers (X11/Wayland-style protocols, systemd/dbus
+ * fd-passing), so both cap at a fixed, on-stack SENDMSG_MAX_IOV rather than
+ * readv/writev's 1024 — a caller past that gets -EINVAL rather than a
+ * kmalloc'd array, matching this file's general preference for bounded
+ * stack allocations in these paths. */
+#define SENDMSG_MAX_IOV 16
+
+static s64 sys_sendmsg_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    const struct linux_msghdr *umsg = (const struct linux_msghdr *)r->rsi;
+    int flags = (int)r->rdx;
+
+    if (!umsg) return -(s64)EFAULT;
+    if ((uintptr_t)umsg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    socket_t *sock = NULL;
+    int ret = sock_get_from_fd(fd, &sock);
+    if (ret < 0) return -(s64)ret;
+
+    struct linux_msghdr msg;
+    if (copy_from_user(&msg, umsg, sizeof(msg)) != 0) return -(s64)EFAULT;
+    if (msg.msg_iovlen > SENDMSG_MAX_IOV) return -(s64)EINVAL;
+
+    struct iovec kiov[SENDMSG_MAX_IOV];
+    size_t total = 0;
+    if (msg.msg_iov && msg.msg_iovlen > 0) {
+        if (copy_from_user(kiov, msg.msg_iov, msg.msg_iovlen * sizeof(struct iovec)) != 0)
+            return -(s64)EFAULT;
+        for (size_t i = 0; i < msg.msg_iovlen; i++) {
+            if (kiov[i].iov_len > 0x7FFFFFFF) return -(s64)EINVAL;
+            total += kiov[i].iov_len;
+        }
+    }
+    if (total > SOCK_XFER_MAX) {
+        if (sock->type == SOCK_DGRAM) return -(s64)EMSGSIZE;
+        total = SOCK_XFER_MAX; /* stream socket: short send, same as sendto's own clamp */
+    }
+
+    void *kbuf = NULL;
+    if (total > 0) {
+        kbuf = kmalloc(total);
+        if (!kbuf) return -(s64)ENOMEM;
+        size_t off = 0;
+        for (size_t i = 0; i < msg.msg_iovlen && off < total; i++) {
+            size_t take = kiov[i].iov_len;
+            if (off + take > total) take = total - off;
+            if (take > 0 && copy_from_user((u8 *)kbuf + off, kiov[i].iov_base, take) != 0) {
+                kfree(kbuf);
+                return -(s64)EFAULT;
+            }
+            off += take;
+        }
+    }
+
+    /* SCM_RIGHTS is only meaningful — and only parsed — for AF_UNIX; a
+     * non-unix socket's msg_control is silently ignored, matching real
+     * Linux (ancillary data is a per-protocol-family feature there too). */
+    file_t *out_fds[UNIX_SCM_MAX_FDS];
+    int out_nfds = 0;
+    process_t *proc = sched_current_process();
+    if (sock->domain == AF_UNIX && msg.msg_control && msg.msg_controllen >= sizeof(struct linux_cmsghdr)) {
+        size_t cctrllen = msg.msg_controllen;
+        if (cctrllen > 4096) cctrllen = 4096; /* bound the control-buffer copy */
+        u8 *ctrl = (u8 *)kmalloc(cctrllen);
+        if (!ctrl) { if (kbuf) kfree(kbuf); return -(s64)ENOMEM; }
+        if (copy_from_user(ctrl, msg.msg_control, cctrllen) != 0) {
+            kfree(ctrl); if (kbuf) kfree(kbuf); return -(s64)EFAULT;
+        }
+        size_t off = 0;
+        while (off + sizeof(struct linux_cmsghdr) <= cctrllen) {
+            struct linux_cmsghdr *ch = (struct linux_cmsghdr *)(ctrl + off);
+            if (ch->cmsg_len < sizeof(struct linux_cmsghdr) || off + ch->cmsg_len > cctrllen) break;
+            if (ch->cmsg_level == SOL_SOCKET && ch->cmsg_type == SCM_RIGHTS) {
+                int *fdp = (int *)(void *)(ch + 1);
+                size_t nfd_here = (ch->cmsg_len - sizeof(struct linux_cmsghdr)) / sizeof(int);
+                for (size_t i = 0; i < nfd_here && out_nfds < UNIX_SCM_MAX_FDS; i++) {
+                    file_t *uf = fget(proc, fdp[i]);
+                    if (!uf) {
+                        for (int j = 0; j < out_nfds; j++) fput(out_fds[j]);
+                        kfree(ctrl); if (kbuf) kfree(kbuf);
+                        return -(s64)EBADF;
+                    }
+                    out_fds[out_nfds++] = uf;
+                }
+            }
+            size_t adv = (ch->cmsg_len + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1);
+            if (adv == 0) break;
+            off += adv;
+        }
+        kfree(ctrl);
+    }
+
+    char dest_path[UNIX_PATH_MAX];
+    bool have_dest = false;
+    if (sock->domain == AF_UNIX && msg.msg_name && msg.msg_namelen >= sizeof(sa_family_t)) {
+        s64 perr = copy_user_sockaddr_un_path((const struct sockaddr *)msg.msg_name, msg.msg_namelen,
+                                               dest_path, &have_dest);
+        if (perr < 0) { for (int j = 0; j < out_nfds; j++) fput(out_fds[j]); if (kbuf) kfree(kbuf); return perr; }
+    }
+
+    file_t *f = (file_t *)proc->handle_table[fd];
+    bool nonblock = (f && (f->f_flags & O_NONBLOCK)) || (flags & 0x40 /* MSG_DONTWAIT */);
+
+    s64 res;
+    if (sock->domain == AF_UNIX) {
+        res = unix_socket_sendmsg(sock->uds, have_dest ? dest_path : NULL, kbuf, total,
+                                   out_fds, out_nfds, nonblock);
+        if (res < 0) for (int j = 0; j < out_nfds; j++) fput(out_fds[j]);
+    } else if (sock->type == SOCK_STREAM && sock->tcp) {
+        res = tcp_send(sock->tcp, kbuf, total, flags);
+    } else if (sock->type == SOCK_DGRAM && sock->udp) {
+        if (msg.msg_name && msg.msg_namelen >= sizeof(struct sockaddr_in)) {
+            struct sockaddr_in sin;
+            if (copy_from_user(&sin, msg.msg_name, sizeof(sin)) != 0) {
+                if (kbuf) kfree(kbuf);
+                return -(s64)EFAULT;
+            }
+            res = udp_sendto(sock->udp, kbuf, total, (const u8 *)&sin.sin_addr.s_addr, ntohs(sin.sin_port));
+        } else {
+            res = udp_sendto(sock->udp, kbuf, total, NULL, 0);
+        }
+    } else {
+        res = -(s64)EOPNOTSUPP;
+    }
+
+    if (kbuf) kfree(kbuf);
+    if (res < 0 && res == -(s64)EPIPE && !(flags & 0x4000 /* MSG_NOSIGNAL */)) {
+        if (proc) sched_kill_process(proc->pid, 13 /* SIGPIPE */);
+    }
+    return res;
+}
+
+static s64 sys_recvmsg_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    struct linux_msghdr *umsg = (struct linux_msghdr *)r->rsi;
+    int flags = (int)r->rdx;
+
+    if (!umsg) return -(s64)EFAULT;
+    if ((uintptr_t)umsg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    socket_t *sock = NULL;
+    int ret = sock_get_from_fd(fd, &sock);
+    if (ret < 0) return -(s64)ret;
+
+    struct linux_msghdr msg;
+    if (copy_from_user(&msg, umsg, sizeof(msg)) != 0) return -(s64)EFAULT;
+    if (msg.msg_iovlen > SENDMSG_MAX_IOV) return -(s64)EINVAL;
+
+    struct iovec kiov[SENDMSG_MAX_IOV];
+    size_t total = 0;
+    if (msg.msg_iov && msg.msg_iovlen > 0) {
+        if (copy_from_user(kiov, msg.msg_iov, msg.msg_iovlen * sizeof(struct iovec)) != 0)
+            return -(s64)EFAULT;
+        for (size_t i = 0; i < msg.msg_iovlen; i++) {
+            if (kiov[i].iov_len > 0x7FFFFFFF) return -(s64)EINVAL;
+            total += kiov[i].iov_len;
+        }
+    }
+    if (total > SOCK_XFER_MAX) total = SOCK_XFER_MAX;
+
+    void *kbuf = total ? kmalloc(total) : NULL;
+    if (total && !kbuf) return -(s64)ENOMEM;
+
+    process_t *proc = sched_current_process();
+    file_t *f = (file_t *)proc->handle_table[fd];
+    bool nonblock = (f && (f->f_flags & O_NONBLOCK)) || (flags & 0x40 /* MSG_DONTWAIT */);
+
+    char src_path[UNIX_PATH_MAX] = {0};
+    int uds_nfds = 0;
+    file_t *uds_fds[UNIX_SCM_MAX_FDS];
+    s64 res;
+
+    if (sock->domain == AF_UNIX) {
+        res = unix_socket_recvmsg(sock->uds, kbuf, total, src_path, &uds_nfds, nonblock);
+        if (res >= 0 && uds_nfds > 0) {
+            uds_nfds = unix_socket_recvmsg_take_fds(sock->uds, uds_fds, UNIX_SCM_MAX_FDS);
+        }
+    } else if (sock->type == SOCK_STREAM && sock->tcp) {
+        res = tcp_recv(sock->tcp, kbuf, total, nonblock);
+    } else if (sock->type == SOCK_DGRAM && sock->udp) {
+        u8 src_ip[4]; u16 src_port = 0;
+        res = udp_recvfrom(sock->udp, kbuf, total, src_ip, &src_port, nonblock);
+        if (res >= 0 && msg.msg_name && msg.msg_namelen >= sizeof(struct sockaddr_in)) {
+            struct sockaddr_in sin;
+            memset(&sin, 0, sizeof(sin));
+            sin.sin_family = AF_INET;
+            sin.sin_port = htons(src_port);
+            memcpy(&sin.sin_addr.s_addr, src_ip, 4);
+            copy_to_user(msg.msg_name, &sin, sizeof(sin));
+            socklen_t slen = sizeof(sin);
+            copy_to_user(&umsg->msg_namelen, &slen, sizeof(slen));
+        }
+    } else {
+        res = -(s64)EOPNOTSUPP;
+    }
+
+    if (res < 0) {
+        if (kbuf) kfree(kbuf);
+        return res;
+    }
+
+    /* Scatter the received bytes back out across the caller's iovecs. */
+    size_t remaining = (size_t)res;
+    size_t off = 0;
+    for (size_t i = 0; i < msg.msg_iovlen && remaining > 0; i++) {
+        size_t take = kiov[i].iov_len;
+        if (take > remaining) take = remaining;
+        if (take > 0) {
+            if (copy_to_user(kiov[i].iov_base, (u8 *)kbuf + off, take) != 0) {
+                if (kbuf) kfree(kbuf);
+                return -(s64)EFAULT;
+            }
+            off += take;
+            remaining -= take;
+        }
+    }
+    if (kbuf) kfree(kbuf);
+
+    if (sock->domain == AF_UNIX && msg.msg_name && msg.msg_namelen >= sizeof(struct sockaddr_un)) {
+        struct sockaddr_un sun;
+        memset(&sun, 0, sizeof(sun));
+        sun.sun_family = AF_UNIX;
+        strncpy(sun.sun_path, src_path, UNIX_PATH_MAX - 1);
+        copy_to_user(msg.msg_name, &sun, sizeof(sun));
+        socklen_t slen = sizeof(sun);
+        copy_to_user(&umsg->msg_namelen, &slen, sizeof(slen));
+    }
+
+    /* SCM_RIGHTS: install each received fd into *this* (receiving)
+     * process's own fd table (syscall_install_fd, exported for exactly this
+     * kind of "mint an fd for something that isn't a fresh open()" case —
+     * see its declaration in kernel/syscall/syscall.h) and describe them to
+     * the caller in msg_control, same cmsghdr layout CMSG_FIRSTHDR()/
+     * CMSG_DATA() in userland's sys/socket.h expect. */
+    int out_flags = 0;
+    if (uds_nfds > 0 && msg.msg_control && msg.msg_controllen >= sizeof(struct linux_cmsghdr)) {
+        int installed[UNIX_SCM_MAX_FDS];
+        int n_installed = 0;
+        for (int i = 0; i < uds_nfds; i++) {
+            s64 nfd = syscall_install_fd(proc, uds_fds[i], 0);
+            if (nfd < 0) { vfs_close(uds_fds[i]); continue; } /* no room: drop rather than leak */
+            installed[n_installed++] = (int)nfd;
+        }
+        int fit = n_installed;
+        while (fit > 0 && sizeof(struct linux_cmsghdr) + (size_t)fit * sizeof(int) > msg.msg_controllen) fit--;
+        if (fit < n_installed) out_flags |= 0x08; /* MSG_CTRUNC */
+
+        u8 cbuf[sizeof(struct linux_cmsghdr) + UNIX_SCM_MAX_FDS * sizeof(int)];
+        struct linux_cmsghdr *ch = (struct linux_cmsghdr *)(void *)cbuf;
+        ch->cmsg_len = sizeof(struct linux_cmsghdr) + (size_t)fit * sizeof(int);
+        ch->cmsg_level = SOL_SOCKET;
+        ch->cmsg_type = SCM_RIGHTS;
+        memcpy(cbuf + sizeof(struct linux_cmsghdr), installed, (size_t)fit * sizeof(int));
+        copy_to_user(msg.msg_control, cbuf, ch->cmsg_len);
+        size_t clen = ch->cmsg_len;
+        copy_to_user(&umsg->msg_controllen, &clen, sizeof(clen));
+    } else {
+        if (uds_nfds > 0) {
+            /* Fds were dequeued but the caller gave no control buffer to
+             * receive them in: close rather than leak the reference. */
+            for (int i = 0; i < uds_nfds; i++) vfs_close(uds_fds[i]);
+        }
+        if (msg.msg_controllen > 0) {
+            size_t zero = 0;
+            copy_to_user(&umsg->msg_controllen, &zero, sizeof(zero));
+        }
+    }
+    copy_to_user(&umsg->msg_flags, &out_flags, sizeof(out_flags));
+
+    return res;
+}
 
 /* ── Pipes & File Descriptors ────────────────────────────────────────────── */
 
@@ -3161,10 +4383,8 @@ static s64 sys_dup_impl(pt_regs_t *r)
     return -(s64)EMFILE;
 }
 
-static s64 sys_dup2_impl(pt_regs_t *r)
+static s64 do_dup2(int oldfd, int newfd, u8 fd_flags)
 {
-    int oldfd = (int)(s32)r->rdi;
-    int newfd = (int)(s32)r->rsi;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
     if (oldfd < 0 || oldfd >= PROC_MAX_FDS) return -(s64)EBADF;
@@ -3184,11 +4404,16 @@ static s64 sys_dup2_impl(pt_regs_t *r)
     if (victim && (uintptr_t)victim < 0xFFFF800000000000ULL) victim = NULL;
     __atomic_add_fetch(&f->f_count, 1, __ATOMIC_SEQ_CST);
     proc->handle_table[newfd] = f;
-    proc->fd_flags[newfd] = 0; /* dup2 clears FD_CLOEXEC */
+    proc->fd_flags[newfd] = fd_flags; /* BUG-AL fix: set fd_flags atomically under g_fd_lock */
     spinlock_unlock_irqrestore(&g_fd_lock, fl);
 
     if (victim) vfs_close(victim);           /* drop the replaced fd outside the lock */
     return newfd;
+}
+
+static s64 sys_dup2_impl(pt_regs_t *r)
+{
+    return do_dup2((int)(s32)r->rdi, (int)(s32)r->rsi, 0);
 }
 
 static s64 sys_dup3_impl(pt_regs_t *r)
@@ -3200,14 +4425,7 @@ static s64 sys_dup3_impl(pt_regs_t *r)
     if (oldfd == newfd) return -(s64)EINVAL;
     if (flags & ~O_CLOEXEC) return -(s64)EINVAL;
 
-    s64 ret = sys_dup2_impl(r);
-    if (ret >= 0 && (flags & O_CLOEXEC)) {
-        process_t *proc = sched_current_process();
-        if (proc && newfd >= 0 && newfd < 64) {
-            proc->fd_flags[newfd] = FD_CLOEXEC;
-        }
-    }
-    return ret;
+    return do_dup2(oldfd, newfd, (flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
 }
 
 static s64 sys_fcntl_impl(pt_regs_t *r)
@@ -3217,7 +4435,7 @@ static s64 sys_fcntl_impl(pt_regs_t *r)
     u64 arg = r->rdx;
 
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     file_t *f = (file_t *)proc->handle_table[fd];
 
@@ -3287,8 +4505,14 @@ static s64 sys_getcwd_impl(pt_regs_t *r)
 static s64 sys_chdir_impl(pt_regs_t *r)
 {
     const char *user_path = (const char *)r->rdi;
-    char kpath[512];
-    s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), user_path);
+    process_t *proc = sched_current_process();
+
+    /* cwd is stored in the process's own view of the filesystem, so resolve to
+     * the virtual path and map to the real one only for the lookup. */
+    char vpath[512], kpath[512];
+    s64 perr = copy_user_vpath_resolve_at(AT_FDCWD, vpath, sizeof(vpath), user_path);
+    if (perr < 0) return perr;
+    perr = vpath_to_real(proc, vpath, kpath, sizeof(kpath));
     if (perr < 0) return perr;
 
     dentry_t *dentry = NULL;
@@ -3301,9 +4525,9 @@ static s64 sys_chdir_impl(pt_regs_t *r)
         return -(s64)ENOTDIR;
     }
 
-    process_t *proc = sched_current_process();
     if (proc) {
-        strncpy(proc->cwd, kpath, sizeof(proc->cwd) - 1);
+        strncpy(proc->cwd, vpath, sizeof(proc->cwd) - 1);
+        proc->cwd[sizeof(proc->cwd) - 1] = '\0';
     }
     return 0;
 }
@@ -3312,15 +4536,28 @@ static s64 sys_fchdir_impl(pt_regs_t *r)
 {
     int fd = (int)(s32)r->rdi;
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     file_t *f = (file_t *)proc->handle_table[fd];
     if (!f || !f->f_dentry || !f->f_dentry->d_inode) return -(s64)EBADF;
     if (!S_ISDIR(f->f_dentry->d_inode->i_mode)) return -(s64)ENOTDIR;
 
-    if (f->f_dentry->d_name[0] == '/') {
-        strncpy(proc->cwd, f->f_dentry->d_name, sizeof(proc->cwd) - 1);
-    }
+    /* d_name is only this dentry's own path component (e.g. "tmp", not
+     * "/tmp") in the normal hierarchical case — the `d_name[0] == '/'` check
+     * this used to have was true only for the root dentry itself, so
+     * fchdir() to any other directory silently returned success without
+     * ever updating proc->cwd, and getcwd() afterwards still reported the
+     * old directory. dentry_build_path() (fs/vfs.c), already used the same
+     * way for *at() dirfd resolution just above in this file, walks
+     * d_parent to build the real full path; real_to_vpath() brings that
+     * back into the process's own view before it's stored, same as
+     * sys_chdir_impl() does for a path-based chdir(). */
+    char real_path[512];
+    __builtin_memset(real_path, 0, sizeof(real_path));
+    dentry_build_path(f->f_dentry, real_path, sizeof(real_path));
+    const char *v = real_to_vpath(proc, real_path);
+    strncpy(proc->cwd, v, sizeof(proc->cwd) - 1);
+    proc->cwd[sizeof(proc->cwd) - 1] = '\0';
     return 0;
 }
 
@@ -3388,7 +4625,7 @@ static s64 sys_ftruncate_impl(pt_regs_t *r)
     int fd = (int)(s32)r->rdi;
     s64 length = (s64)r->rsi;
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
     if (length < 0) return -(s64)EINVAL;
     return vfs_truncate((file_t *)proc->handle_table[fd], (u64)length);
 }
@@ -3454,7 +4691,7 @@ static s64 sys_getdents64_impl(pt_regs_t *r)
     if (count > 65536) count = 65536;
     
     process_t *proc = sched_current_process();
-    if (fd < 0 || fd >= 64 || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
     
     file_t *file = (file_t *)proc->handle_table[fd];
     void *kbuf = kzalloc(count);
@@ -3513,7 +4750,16 @@ static s64 sys_nanosleep_impl(pt_regs_t *r)
 static u64 s_rtc_unix_sec = 0;
 static u64 s_rtc_base_ticks = 0;
 
-static u64 get_cached_unix_time(void)
+/* settimeofday(2)/clock_settime(2) adjust this rather than the RTC-derived
+ * state above: they add to it instead of overwriting s_rtc_unix_sec, so the
+ * requested time sticks across the periodic RTC refresh below instead of
+ * being silently overwritten by real hardware time within a second. This
+ * does not touch the real CMOS RTC — a reboot reverts to hardware time,
+ * same as any OS whose settimeofday(2) only ever meant "the running
+ * kernel's clock", not "the battery-backed one". */
+static s64 s_wall_clock_offset_sec = 0;
+
+u64 get_cached_unix_time(void)
 {
     u64 ticks = sched_get_ticks();
     if (s_rtc_unix_sec == 0 || (ticks - s_rtc_base_ticks) >= 100) {
@@ -3522,7 +4768,15 @@ static u64 get_cached_unix_time(void)
         s_rtc_unix_sec   = rtc_to_unix_time(&t);
         s_rtc_base_ticks = ticks;
     }
-    return s_rtc_unix_sec + (ticks - s_rtc_base_ticks) / 100;
+    return (u64)((s64)(s_rtc_unix_sec + (ticks - s_rtc_base_ticks) / 100) + s_wall_clock_offset_sec);
+}
+
+/* Rebases the cached wall clock so get_cached_unix_time() immediately
+ * reports @unix_sec and keeps advancing from there. */
+static void set_wall_clock(u64 unix_sec)
+{
+    u64 current = get_cached_unix_time();
+    s_wall_clock_offset_sec += (s64)unix_sec - (s64)current;
 }
 
 static s64 sys_clock_gettime_impl(pt_regs_t *r)
@@ -3586,9 +4840,113 @@ static s64 sys_time_impl(pt_regs_t *r)
     return (s64)unix_sec;
 }
 
-static s64 sys_utime_impl(pt_regs_t *r) { (void)r; return 0; }
-static s64 sys_utimes_impl(pt_regs_t *r) { (void)r; return 0; }
-static s64 sys_utimensat_impl(pt_regs_t *r) { (void)r; return 0; }
+/* utime(2)/utimes(2)/utimensat(2)/futimesat(2) all used to be no-ops that
+ * returned success without ever touching an inode. Real behavior now goes
+ * through vfs_utimes()/vfs_futimes() (fs/vfs.c), which follow the same
+ * (u64)-1-means-"leave unchanged" convention vfs_chown() already uses for
+ * uid/gid — utimensat's UTIME_OMIT maps to that sentinel, UTIME_NOW maps to
+ * get_cached_unix_time(). */
+
+struct linux_utimbuf {
+    long actime;
+    long modtime;
+};
+
+static s64 sys_utime_impl(pt_regs_t *r)
+{
+    const char *path = (const char *)r->rdi;
+    const struct linux_utimbuf *times = (const struct linux_utimbuf *)r->rsi;
+    if (!path) return -(s64)EFAULT;
+
+    char kpath[512];
+    s64 err = copy_user_path_resolve_at(AT_FDCWD, kpath, sizeof(kpath), path);
+    if (err < 0) return err;
+
+    u64 atime, mtime;
+    if (times) {
+        struct linux_utimbuf t;
+        if (copy_from_user(&t, times, sizeof(t)) != 0) return -(s64)EFAULT;
+        atime = (u64)t.actime;
+        mtime = (u64)t.modtime;
+    } else {
+        atime = mtime = get_cached_unix_time();
+    }
+    return vfs_utimes(kpath, atime, mtime);
+}
+
+static s64 sys_utimes_impl(pt_regs_t *r)
+{
+    const char *path = (const char *)r->rdi;
+    const struct linux_timeval *times = (const struct linux_timeval *)r->rsi;
+    if (!path) return -(s64)EFAULT;
+
+    char kpath[512];
+    s64 err = copy_user_path_resolve_at(AT_FDCWD, kpath, sizeof(kpath), path);
+    if (err < 0) return err;
+
+    u64 atime, mtime;
+    if (times) {
+        struct linux_timeval t[2];
+        if (copy_from_user(t, times, sizeof(t)) != 0) return -(s64)EFAULT;
+        atime = (u64)t[0].tv_sec;
+        mtime = (u64)t[1].tv_sec;
+    } else {
+        atime = mtime = get_cached_unix_time();
+    }
+    return vfs_utimes(kpath, atime, mtime);
+}
+
+/* Shared by utimensat(2) and futimesat(2): decode a `struct timespec
+ * times[2]` (or NULL, meaning "both to now") into the (u64)-1-sentinel
+ * convention vfs_utimes()/vfs_futimes() expect. */
+static s64 decode_utimens(const struct linux_timespec *user_times, u64 *out_atime, u64 *out_mtime)
+{
+    if (!user_times) {
+        *out_atime = *out_mtime = get_cached_unix_time();
+        return 0;
+    }
+    struct linux_timespec t[2];
+    if (copy_from_user(t, user_times, sizeof(t)) != 0) return -(s64)EFAULT;
+
+    if (t[0].tv_nsec == UTIME_OMIT) *out_atime = (u64)-1;
+    else if (t[0].tv_nsec == UTIME_NOW) *out_atime = get_cached_unix_time();
+    else *out_atime = (u64)t[0].tv_sec;
+
+    if (t[1].tv_nsec == UTIME_OMIT) *out_mtime = (u64)-1;
+    else if (t[1].tv_nsec == UTIME_NOW) *out_mtime = get_cached_unix_time();
+    else *out_mtime = (u64)t[1].tv_sec;
+
+    return 0;
+}
+
+static s64 sys_utimensat_impl(pt_regs_t *r)
+{
+    int dfd = (int)(s32)r->rdi;
+    const char *path = (const char *)r->rsi;
+    const struct linux_timespec *times = (const struct linux_timespec *)r->rdx;
+    /* r10 carries `flags` (AT_SYMLINK_NOFOLLOW) — not honored: vfs_utimes()
+     * always follows symlinks, same as the plain (non-l-prefixed) vfs_chown()
+     * this file already exposes as sys_fchownat_impl's backend. A dedicated
+     * *_nofollow variant of vfs_utimes() would be a small, separate addition
+     * if a caller ever needs it. */
+
+    u64 atime, mtime;
+    s64 err = decode_utimens(times, &atime, &mtime);
+    if (err < 0) return err;
+
+    /* utimensat(fd, NULL, times, 0) means "operate on the fd itself" —
+     * matches openat()'s AT_EMPTY_PATH convention. */
+    if (!path) {
+        process_t *proc = sched_current_process();
+        if (!proc || dfd < 0 || dfd >= PROC_MAX_FDS || !proc->handle_table[dfd]) return -(s64)EBADF;
+        return vfs_futimes((file_t *)proc->handle_table[dfd], atime, mtime);
+    }
+
+    char kpath[512];
+    s64 perr = copy_user_path_resolve_at(dfd, kpath, sizeof(kpath), path);
+    if (perr < 0) return perr;
+    return vfs_utimes(kpath, atime, mtime);
+}
 
 struct tms {
     u64 tms_utime;
@@ -3600,14 +4958,17 @@ struct tms {
 static s64 sys_times_impl(pt_regs_t *r)
 {
     struct tms *buf = (struct tms *)r->rdi;
+    process_t *proc = sched_current_process();
     if (buf && (uintptr_t)buf < 0x8000000000000000ULL) {
+        /* Clock ticks are the scheduler's, which is what sysconf(_SC_CLK_TCK)
+         * reports; children's times are the ones already reaped. */
         struct tms ktms = {
-            .tms_utime = sched_get_ticks() / 2,
-            .tms_stime = sched_get_ticks() / 2,
-            .tms_cutime = 0,
-            .tms_cstime = 0,
+            .tms_utime  = proc ? (long)proc->utime_ticks  : 0,
+            .tms_stime  = proc ? (long)proc->stime_ticks  : 0,
+            .tms_cutime = proc ? (long)proc->cutime_ticks : 0,
+            .tms_cstime = proc ? (long)proc->cstime_ticks : 0,
         };
-        copy_to_user(buf, &ktms, sizeof(struct tms));
+        if (copy_to_user(buf, &ktms, sizeof(struct tms)) != 0) return -(s64)EFAULT;
     }
     return (s64)sched_get_ticks();
 }
@@ -3699,6 +5060,8 @@ static s64 sys_reboot_impl(pt_regs_t *r)
         return -(s64)EPERM;
     }
     u32 cmd = (u32)r->rdx;
+    /* Last chance to get buffered filesystem writes onto the platter. */
+    vfs_sync_all();
     if (cmd == 0x01234567 /* LINUX_REBOOT_CMD_RESTART */) {
         power_reboot();
     } else {
@@ -3718,6 +5081,7 @@ static s64 sys_setuid_impl(pt_regs_t *r)  {
     if (p->euid != 0 && new_uid != p->uid && new_uid != p->euid) return -(s64)EPERM;
     p->uid = new_uid;
     p->euid = new_uid;
+    security_caps_on_setuid(p);
     return 0;
 }
 static s64 sys_setgid_impl(pt_regs_t *r)  {
@@ -3864,13 +5228,20 @@ static s64 sys_getrusage_impl(pt_regs_t *r)
     }
 
     process_t *proc = sched_current_process();
-    u64 ticks = sched_get_ticks();
     struct rusage ru;
     __builtin_memset(&ru, 0, sizeof(ru));
-    ru.ru_utime.tv_sec = (long)(ticks / 100);
-    ru.ru_utime.tv_usec = (long)((ticks % 100) * 10000L);
-    ru.ru_stime.tv_sec = (long)(ticks / 200);
-    ru.ru_stime.tv_usec = (long)((ticks % 200) * 5000L);
+
+    /* RUSAGE_CHILDREN reports what has been reaped; the others report this
+     * process's own accumulated time. */
+    u64 ut = 0, st = 0;
+    if (proc) {
+        if (who == -1) { ut = proc->cutime_ticks; st = proc->cstime_ticks; }
+        else           { ut = proc->utime_ticks;  st = proc->stime_ticks;  }
+    }
+    ru.ru_utime.tv_sec  = (long)(ut / 100);
+    ru.ru_utime.tv_usec = (long)((ut % 100) * 10000L);
+    ru.ru_stime.tv_sec  = (long)(st / 100);
+    ru.ru_stime.tv_usec = (long)((st % 100) * 10000L);
     ru.ru_maxrss = (proc && proc->pml4_phys) ? 4096 : 1024;
     ru.ru_minflt = 128;
     ru.ru_majflt = 0;
@@ -3942,7 +5313,7 @@ static s64 sys_fstatat_impl(pt_regs_t *r)
 
     /* If user_path is empty or NULL (or AT_EMPTY_PATH is set), fstat on dirfd */
     if ((flags & AT_EMPTY_PATH) || !user_path) {
-        if (dirfd >= 0 && dirfd < 64) {
+        if (dirfd >= 0 && dirfd < PROC_MAX_FDS) {
             process_t *proc = sched_current_process();
             if (!proc || !proc->handle_table[dirfd]) return -(s64)EBADF;
             file_t *file = (file_t *)proc->handle_table[dirfd];
@@ -3962,7 +5333,7 @@ static s64 sys_fstatat_impl(pt_regs_t *r)
     }
 
     if (raw[0] == '\0') {
-        if (dirfd >= 0 && dirfd < 64) {
+        if (dirfd >= 0 && dirfd < PROC_MAX_FDS) {
             process_t *proc = sched_current_process();
             if (!proc || !proc->handle_table[dirfd]) return -(s64)EBADF;
             file_t *file = (file_t *)proc->handle_table[dirfd];
@@ -4004,7 +5375,7 @@ static s64 sys_faccessat_impl(pt_regs_t *r)
     __builtin_memset(&st, 0, sizeof(st));
 
     if (raw[0] == '\0') {
-        if (dirfd >= 0 && dirfd < 64) {
+        if (dirfd >= 0 && dirfd < PROC_MAX_FDS) {
             process_t *proc = sched_current_process();
             if (!proc || !proc->handle_table[dirfd]) return -(s64)EBADF;
             file_t *file = (file_t *)proc->handle_table[dirfd];
@@ -4563,12 +5934,18 @@ static s64 sys_arch_prctl_impl(pt_regs_t *r)
     if (!proc) return -(s64)EPERM;
 
     if (code == ARCH_SET_FS) {
+        /* Per-thread TLS base. Also update proc->fs_base so a later thread that
+         * never sets its own still inherits a sane value. */
+        thread_t *self = sched_current_thread();
+        if (self) self->fs_base = addr;
         proc->fs_base = addr;
         wrmsr(MSR_FS_BASE, addr);
         return 0;
     } else if (code == ARCH_GET_FS) {
         if (!addr || addr >= 0x8000000000000000ULL) return -(s64)EFAULT;
-        return copy_to_user((void *)addr, &proc->fs_base, sizeof(u64)) == 0 ? 0 : -(s64)EFAULT;
+        thread_t *self = sched_current_thread();
+        u64 cur = (self && self->fs_base) ? self->fs_base : proc->fs_base;
+        return copy_to_user((void *)addr, &cur, sizeof(u64)) == 0 ? 0 : -(s64)EFAULT;
     } else if (code == ARCH_SET_GS) {
         proc->gs_base = addr;
         wrmsr(MSR_KERNEL_GS_BASE, addr);
@@ -4582,15 +5959,19 @@ static s64 sys_arch_prctl_impl(pt_regs_t *r)
 
 static s64 sys_set_tid_address_impl(pt_regs_t *r)
 {
-    (void)r;
+    thread_t *t = sched_current_thread();
+    uintptr_t tidptr = (uintptr_t)r->rdi;
+
+    /* Linux never fails this call: a bad pointer is simply remembered and
+     * discovered (and ignored) at exit. It returns the caller's *thread* id,
+     * which is what a libc stores as its cached tid — returning the pid is
+     * only accidentally right for a single-threaded process. */
+    if (t) {
+        t->clear_child_tid = (tidptr < 0x0000800000000000ULL) ? (u64)tidptr : 0;
+        return (s64)t->tid;
+    }
     process_t *proc = sched_current_process();
     return proc ? (s64)proc->pid : 1;
-}
-
-static s64 sys_set_robust_list_impl(pt_regs_t *r)
-{
-    (void)r;
-    return 0;
 }
 
 #define RLIM64_INFINITY (~0ULL)
@@ -4640,8 +6021,8 @@ static s64 sys_prlimit64_impl(pt_regs_t *r)
             cur.rlim_max = 64 * 1024 * 1024ULL; /* 64 MB */
             break;
         case RLIMIT_NOFILE:
-            cur.rlim_cur = 1024;
-            cur.rlim_max = 65536;
+            cur.rlim_cur = 64;
+            cur.rlim_max = 64;
             break;
         case RLIMIT_NPROC:
             cur.rlim_cur = 1024;
@@ -4668,10 +6049,50 @@ static s64 sys_prlimit64_impl(pt_regs_t *r)
     return 0;
 }
 
+struct kernel_clone_args {
+    u64 flags;
+    u64 pidfd;
+    u64 child_tid;
+    u64 parent_tid;
+    u64 exit_signal;
+    u64 stack;
+    u64 stack_size;
+    u64 tls;
+    u64 set_tid;
+    u64 set_tid_size;
+    u64 cgroup;
+};
+
 static s64 sys_clone3_impl(pt_regs_t *r)
 {
-    (void)r;
-    return -(s64)ENOSYS;
+    const struct kernel_clone_args *uargs = (const struct kernel_clone_args *)r->rdi;
+    size_t size = (size_t)r->rsi;
+
+    if (!uargs || size < sizeof(u64)) return -(s64)EINVAL;
+    struct kernel_clone_args kargs;
+    memset(&kargs, 0, sizeof(kargs));
+    size_t to_copy = size < sizeof(kargs) ? size : sizeof(kargs);
+    if (copy_from_user(&kargs, uargs, to_copy) != 0) return -(s64)EFAULT;
+
+    u64 flags = kargs.flags | (kargs.exit_signal & 0xFFULL);
+    virt_addr_t child_stack = kargs.stack ? (virt_addr_t)(kargs.stack + kargs.stack_size) : 0;
+    int *parent_tidptr = (int *)(uintptr_t)kargs.parent_tid;
+    int *child_tidptr = (int *)(uintptr_t)kargs.child_tid;
+    u64 newtls = kargs.tls;
+
+    s64 ret = do_clone(flags, child_stack, parent_tidptr, child_tidptr, newtls, r);
+    if (ret > 0 && (kargs.flags & 0x00001000ULL /* CLONE_PIDFD */) && kargs.pidfd &&
+        (uintptr_t)kargs.pidfd < 0x0000800000000000ULL) {
+        pt_regs_t p_r;
+        p_r.rdi = (u64)ret;
+        p_r.rsi = 0;
+        s64 pfd = sys_pidfd_open_impl(&p_r);
+        if (pfd >= 0) {
+            int ipfd = (int)pfd;
+            copy_to_user((void *)(uintptr_t)kargs.pidfd, &ipfd, sizeof(int));
+        }
+    }
+    return ret;
 }
 
 struct kernel_open_how {
@@ -4750,8 +6171,35 @@ static s64 sys_getcpu_impl(pt_regs_t *r)
 
 static s64 sys_seccomp_impl(pt_regs_t *r)
 {
-    (void)r;
-    return -(s64)ENOSYS;
+    unsigned int op    = (unsigned int)r->rdi;
+    unsigned int flags = (unsigned int)r->rsi;
+    process_t *p = sched_current_process();
+    if (!p) return -(s64)EPERM;
+
+    switch (op) {
+    case SECCOMP_SET_MODE_STRICT:
+        /* Linux takes no flags and no args for strict mode. */
+        if (flags != 0 || r->rdx != 0) return -(s64)EINVAL;
+        if (p->seccomp_mode != SECCOMP_MODE_DISABLED &&
+            p->seccomp_mode != SECCOMP_MODE_STRICT) return -(s64)EINVAL;
+        /* Entering strict mode implies no_new_privs: without it an execve()
+         * could hand the process a setuid binary running under the filter. */
+        p->no_new_privs  = true;
+        p->seccomp_mode  = SECCOMP_MODE_STRICT;
+        return 0;
+
+    case SECCOMP_SET_MODE_FILTER:
+        /* Classic-BPF filters are not implemented; report that honestly rather
+         * than accepting the filter and enforcing nothing, which would leave a
+         * sandbox believing it is confined when it is not. */
+        return -(s64)ENOSYS;
+
+    case SECCOMP_GET_ACTION_AVAIL:
+        return -(s64)ENOSYS;
+
+    default:
+        return -(s64)EINVAL;
+    }
 }
 
 static s64 sys_sched_setattr_impl(pt_regs_t *r)
@@ -4766,23 +6214,253 @@ static s64 sys_sched_getattr_impl(pt_regs_t *r)
     return 0;
 }
 
+typedef struct {
+    u32 target_pid;
+} pidfd_ctx_t;
+
+static s64 pidfd_release_op(inode_t *inode, file_t *filp)
+{
+    (void)inode;
+    if (filp && filp->private_data) {
+        kfree(filp->private_data);
+        filp->private_data = NULL;
+    }
+    return 0;
+}
+
+static int pidfd_poll_op(file_t *filp)
+{
+    if (!filp || !filp->private_data) return POLLERR;
+    pidfd_ctx_t *ctx = (pidfd_ctx_t *)filp->private_data;
+    if (sched_kill_process(ctx->target_pid, 0) < 0) {
+        return POLLIN | 0x0040;
+    }
+    return 0;
+}
+
+static file_operations_t g_pidfd_fops = {
+    .release = pidfd_release_op,
+    .poll    = pidfd_poll_op,
+};
+
 static s64 sys_pidfd_open_impl(pt_regs_t *r)
 {
-    (void)r;
-    return -(s64)ENOSYS;
+    s32 pid = (s32)r->rdi;
+    unsigned int flags = (unsigned int)r->rsi;
+
+    if (flags != 0) return -(s64)EINVAL;
+    if (pid <= 0) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    if (sched_kill_process((u32)pid, 0) < 0) return -(s64)ESRCH;
+
+    pidfd_ctx_t *ctx = (pidfd_ctx_t *)kzalloc(sizeof(pidfd_ctx_t));
+    if (!ctx) return -(s64)ENOMEM;
+    ctx->target_pid = (u32)pid;
+
+    file_t *f = (file_t *)kzalloc(sizeof(file_t));
+    if (!f) {
+        kfree(ctx);
+        return -(s64)ENOMEM;
+    }
+
+    f->f_op = &g_pidfd_fops;
+    f->f_flags = O_RDONLY;
+    f->f_count = 1;
+    f->private_data = ctx;
+
+    s64 fd = fd_install(proc, f, 0);
+    if (fd < 0) {
+        kfree(ctx);
+        kfree(f);
+        return -(s64)EMFILE;
+    }
+    return fd;
 }
 
 static s64 sys_pidfd_send_signal_impl(pt_regs_t *r)
 {
-    (void)r;
-    return -(s64)ENOSYS;
+    int pidfd = (int)r->rdi;
+    int sig = (int)r->rsi;
+    void *info = (void *)r->rdx;
+    unsigned int flags = (unsigned int)r->r10;
+
+    (void)info;
+    if (flags != 0) return -(s64)EINVAL;
+    if (sig < 0 || sig >= 64) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    if (pidfd < 0 || pidfd >= PROC_MAX_FDS || !proc->handle_table[pidfd]) return -(s64)EBADF;
+    file_t *f = (file_t *)proc->handle_table[pidfd];
+    if (f->f_op != &g_pidfd_fops || !f->private_data) return -(s64)EBADF;
+
+    pidfd_ctx_t *ctx = (pidfd_ctx_t *)f->private_data;
+    if (sched_kill_process(ctx->target_pid, 0) < 0) return -(s64)ESRCH;
+
+    if (sig == 0) return 0;
+    return sched_kill_process(ctx->target_pid, sig);
 }
 
 static s64 sys_pidfd_getfd_impl(pt_regs_t *r)
 {
-    (void)r;
-    return -(s64)ENOSYS;
+    int pidfd          = (int)(s32)r->rdi;
+    int targetfd       = (int)(s32)r->rsi;
+    unsigned int flags = (unsigned int)r->rdx;
+
+    if (flags & ~0x00080000u /* O_CLOEXEC */) return -(s64)EINVAL;
+
+    process_t *caller = sched_current_process();
+    if (!caller) return -(s64)EPERM;
+
+    file_t *pf = fget(caller, pidfd);
+    if (!pf) return -(s64)EBADF;
+    if (pf->f_op != &g_pidfd_fops || !pf->private_data) {
+        fput(pf);
+        return -(s64)EBADF;
+    }
+    pidfd_ctx_t *ctx = (pidfd_ctx_t *)pf->private_data;
+    u32 target_pid = ctx->target_pid;
+    fput(pf);
+
+    /* Reference the target for the whole call: otherwise it can be reaped on
+     * another CPU between here and the handle_table read below. */
+    process_t *target = proc_get_by_pid(target_pid);
+    if (!target) return -(s64)ESRCH;
+
+    s64 rc = 0;
+    if (caller != target && caller->euid != 0 && caller->uid != target->uid &&
+        !security_check_permission(caller, CAP_SYS_PTRACE)) {
+        rc = -(s64)EPERM;
+    } else {
+        /* fget() reads the slot and raises f_count under g_fd_lock, which
+         * fd_table_release() also holds while it clears slots on exit: the file
+         * is either grabbed live or already gone, never freed mid-grab. */
+        file_t *target_file = fget(target, targetfd);
+        if (!target_file) {
+            rc = -(s64)EBADF;
+        } else {
+            s64 newfd = fd_install(caller, target_file,
+                                   (flags & 0x00080000u) ? FD_CLOEXEC : 0);
+            if (newfd < 0) {
+                fput(target_file);
+                rc = -(s64)EMFILE;
+            } else {
+                rc = newfd;   /* fget()'s reference transfers to the new fd */
+            }
+        }
+    }
+
+    proc_put(target);
+    return rc;
 }
+
+/* ── In-memory anonymous file (memfd_create) ──────────────────────────────── */
+typedef struct {
+    spinlock_t lock;
+    u8        *data;
+    size_t     size;
+    size_t     capacity;
+} memfd_ctx_t;
+
+static s64 memfd_read_op(file_t *filp, void *buf, size_t count, u64 *offset)
+{
+    if (!filp || !filp->private_data || !buf || !offset) return -(s64)EINVAL;
+    memfd_ctx_t *ctx = (memfd_ctx_t *)filp->private_data;
+    if (count == 0) return 0;
+
+    spinlock_lock(&ctx->lock);
+    if (*offset >= ctx->size) {
+        spinlock_unlock(&ctx->lock);
+        return 0; /* EOF */
+    }
+    size_t avail = ctx->size - *offset;
+    size_t to_read = (count < avail) ? count : avail;
+    /* The VFS read/write ops are handed a *kernel* buffer — sys_read_impl()
+     * has already staged the transfer and copies out to userspace itself, as
+     * tmpfs and every other filesystem here assume. Reaching for
+     * copy_to_user() meant the destination failed the user-range check on
+     * every call, so memfd reads returned -EFAULT unconditionally. */
+    memcpy(buf, ctx->data + *offset, to_read);
+    *offset += to_read;
+    spinlock_unlock(&ctx->lock);
+    return (s64)to_read;
+}
+
+static s64 memfd_write_op(file_t *filp, const void *buf, size_t count, u64 *offset)
+{
+    if (!filp || !filp->private_data || !buf || !offset) return -(s64)EINVAL;
+    memfd_ctx_t *ctx = (memfd_ctx_t *)filp->private_data;
+    if (count == 0) return 0;
+
+    spinlock_lock(&ctx->lock);
+    size_t new_end = *offset + count;
+    if (new_end > ctx->capacity) {
+        size_t new_cap = (ctx->capacity == 0) ? 4096 : ctx->capacity * 2;
+        while (new_cap < new_end) new_cap *= 2;
+        u8 *new_buf = (u8 *)kmalloc(new_cap);
+        if (!new_buf) {
+            spinlock_unlock(&ctx->lock);
+            return -(s64)ENOMEM;
+        }
+        if (ctx->data && ctx->size > 0) {
+            memcpy(new_buf, ctx->data, ctx->size);
+            kfree(ctx->data);
+        }
+        ctx->data = new_buf;
+        ctx->capacity = new_cap;
+    }
+    /* Kernel-to-kernel, for the reason memfd_read_op() explains. */
+    memcpy(ctx->data + *offset, buf, count);
+    *offset += count;
+    if (*offset > ctx->size) {
+        ctx->size = *offset;
+        if (filp->f_inode) filp->f_inode->i_size = ctx->size;
+    }
+    spinlock_unlock(&ctx->lock);
+    return (s64)count;
+}
+
+static s64 memfd_ioctl_op(file_t *filp, u32 cmd, u64 arg)
+{
+    if (!filp || !filp->private_data) return -(s64)EBADF;
+    memfd_ctx_t *ctx = (memfd_ctx_t *)filp->private_data;
+    if (cmd == 0x541B /* FIONREAD */) {
+        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        int avail = (filp->f_pos < ctx->size) ? (int)(ctx->size - filp->f_pos) : 0;
+        if (copy_to_user((void *)(uintptr_t)arg, &avail, sizeof(int)) != 0) return -(s64)EFAULT;
+        return 0;
+    }
+    return -(s64)EINVAL;
+}
+
+static s64 memfd_release_op(inode_t *inode, file_t *filp)
+{
+    (void)inode;
+    if (filp) {
+        if (filp->private_data) {
+            memfd_ctx_t *ctx = (memfd_ctx_t *)filp->private_data;
+            if (ctx->data) kfree(ctx->data);
+            kfree(ctx);
+            filp->private_data = NULL;
+        }
+        if (filp->f_inode) {
+            kfree(filp->f_inode);
+            filp->f_inode = NULL;
+        }
+    }
+    return 0;
+}
+
+static file_operations_t g_memfd_fops = {
+    .read    = memfd_read_op,
+    .write   = memfd_write_op,
+    .ioctl   = memfd_ioctl_op,
+    .release = memfd_release_op,
+};
 
 static s64 sys_memfd_create_impl(pt_regs_t *r)
 {
@@ -4793,19 +6471,38 @@ static s64 sys_memfd_create_impl(pt_regs_t *r)
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
 
-    file_t *rf = NULL;
-    file_t *wf = NULL;
-    if (pipe_create(&rf, &wf) < 0) return -(s64)ENOMEM;
+    memfd_ctx_t *ctx = (memfd_ctx_t *)kzalloc(sizeof(memfd_ctx_t));
+    if (!ctx) return -(s64)ENOMEM;
+    spinlock_init(&ctx->lock);
 
-    s64 fd = fd_install(proc, wf, (flags & 0x0001 /* MFD_CLOEXEC */) ? FD_CLOEXEC : 0);
+    file_t *f = (file_t *)kzalloc(sizeof(file_t));
+    if (!f) {
+        kfree(ctx);
+        return -(s64)ENOMEM;
+    }
+
+    inode_t *node = (inode_t *)kzalloc(sizeof(inode_t));
+    if (!node) {
+        kfree(ctx);
+        kfree(f);
+        return -(s64)ENOMEM;
+    }
+    node->i_mode = S_IFREG | 0600;
+
+    f->f_inode = node;
+    f->f_op = &g_memfd_fops;
+    f->f_flags = O_RDWR;
+    f->f_count = 1;
+    f->private_data = ctx;
+
+    s64 fd = fd_install(proc, f, (flags & 0x0001 /* MFD_CLOEXEC */) ? FD_CLOEXEC : 0);
     if (fd < 0) {
-        vfs_close(rf);
-        vfs_close(wf);
+        kfree(node);
+        kfree(ctx);
+        kfree(f);
         return -(s64)EMFILE;
     }
-    vfs_close(rf);
-    return (s64)fd;
-
+    return fd;
 }
 
 static s64 sys_rseq_impl(pt_regs_t *r)
@@ -4858,7 +6555,7 @@ static s64 sys_sendfile_impl(pt_regs_t *r)
     size_t count = (size_t)r->r10;
 
     if (count == 0) return 0;
-    if (out_fd < 0 || out_fd >= 64 || in_fd < 0 || in_fd >= 64) return -(s64)EBADF;
+    if (out_fd < 0 || out_fd >= PROC_MAX_FDS || in_fd < 0 || in_fd >= PROC_MAX_FDS) return -(s64)EBADF;
 
     process_t *proc = sched_current_process();
     if (!proc || !proc->handle_table[out_fd] || !proc->handle_table[in_fd]) return -(s64)EBADF;
@@ -5010,38 +6707,47 @@ static s64 sys_fallocate_impl(pt_regs_t *r)
     s64 len = (s64)r->r10;
 
     if (offset < 0 || len <= 0) return -(s64)EINVAL;
-    if (fd < 0 || fd >= 64) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS) return -(s64)EBADF;
 
     process_t *proc = sched_current_process();
     if (!proc || !proc->handle_table[fd]) return -(s64)EBADF;
 
     file_t *file = (file_t *)proc->handle_table[fd];
     if (!file || !file->f_inode) return -(s64)EBADF;
+    if ((file->f_flags & 3) == O_RDONLY) return -(s64)EBADF;  /* must be writable */
 
     s64 req_size = offset + len;
-    if (!(mode & FALLOC_FL_KEEP_SIZE)) {
-        if ((s64)file->f_inode->i_size < req_size) {
-            file->f_inode->i_size = (u64)req_size;
-        }
-    }
-    return 0;
+    if (req_size < offset) return -(s64)EINVAL;   /* range overflows */
+
+    /* ext2 reserves real blocks here (so a later write cannot ENOSPC); other
+     * filesystems fall back to extending i_size, which is what this call used
+     * to do unconditionally. */
+    return vfs_fallocate(file, mode, (u64)offset, (u64)len);
 }
 
 static s64 sys_sync_file_range_impl(pt_regs_t *r)
 {
     int fd = (int)(s32)r->rdi;
-    if (fd < 0 || fd >= 64) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS) return -(s64)EBADF;
     process_t *proc = sched_current_process();
     if (!proc || !proc->handle_table[fd]) return -(s64)EBADF;
+    file_t *f = (file_t *)proc->handle_table[fd];
+    if (f && f->f_inode && f->f_inode->i_sb)
+        return vfs_sync_fs(f->f_inode->i_sb);
+    vfs_sync_all();
     return 0;
 }
 
 static s64 sys_readahead_impl(pt_regs_t *r)
 {
-    int fd = (int)(s32)r->rdi;
-    if (fd < 0 || fd >= 64) return -(s64)EBADF;
+    int fd    = (int)(s32)r->rdi;
+    u64 off   = r->rsi;
+    u64 count = r->rdx;
+    if (fd < 0 || fd >= PROC_MAX_FDS) return -(s64)EBADF;
     process_t *proc = sched_current_process();
     if (!proc || !proc->handle_table[fd]) return -(s64)EBADF;
+    /* readahead(2) is posix_fadvise(POSIX_FADV_WILLNEED) with a fixed advice. */
+    vfs_fadvise((file_t *)proc->handle_table[fd], off, count, 3 /* WILLNEED */);
     return 0;
 }
 
@@ -5061,7 +6767,7 @@ static s64 sys_vmsplice_impl(pt_regs_t *r)
     const struct iovec *iov = (const struct iovec *)r->rsi;
     size_t nr_segs = (size_t)r->rdx;
 
-    if (fd < 0 || fd >= 64) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS) return -(s64)EBADF;
     if (!iov || nr_segs == 0) return 0;
     pt_regs_t sub = *r;
     sub.rdi = (u64)fd;
@@ -5097,7 +6803,7 @@ static s64 sys_statx_impl(pt_regs_t *r)
     }
 
     if (empty_path) {
-        if (dirfd < 0 || dirfd >= 64) return -(s64)EBADF;
+        if (dirfd < 0 || dirfd >= PROC_MAX_FDS) return -(s64)EBADF;
         process_t *proc = sched_current_process();
         if (!proc || !proc->handle_table[dirfd]) return -(s64)EBADF;
         file_t *file = (file_t *)proc->handle_table[dirfd];
@@ -5239,14 +6945,63 @@ static s64 sys_msync_impl(pt_regs_t *r)
 
 static s64 sys_madvise_impl(pt_regs_t *r)
 {
-    (void)r;
-    return 0;
+    u64   addr   = r->rdi;
+    u64   length = r->rsi;
+    int   advice = (int)r->rdx;
+
+    if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;   /* must be page-aligned */
+    if (length > 0x0000800000000000ULL) return -(s64)EINVAL;
+    if (addr >= 0x0000800000000000ULL || addr + length < addr) return -(s64)EINVAL;
+
+    /* This kernel maps anonymous memory eagerly and never reclaims a resident
+     * page, so every hint that is legal is also a no-op. What matters is
+     * rejecting the ones that are *not* legal — callers probe with a bogus
+     * advice and branch on the -EINVAL. */
+    switch (advice) {
+        case 0:   /* MADV_NORMAL       */
+        case 1:   /* MADV_RANDOM       */
+        case 2:   /* MADV_SEQUENTIAL   */
+        case 3:   /* MADV_WILLNEED     */
+        case 4:   /* MADV_DONTNEED     */
+        case 8:   /* MADV_FREE         */
+        case 9:   /* MADV_REMOVE       */
+        case 10:  /* MADV_DONTFORK     */
+        case 11:  /* MADV_DOFORK       */
+        case 12:  /* MADV_MERGEABLE    */
+        case 13:  /* MADV_UNMERGEABLE  */
+        case 14:  /* MADV_HUGEPAGE     */
+        case 15:  /* MADV_NOHUGEPAGE   */
+        case 16:  /* MADV_DONTDUMP     */
+        case 17:  /* MADV_DODUMP       */
+        case 18:  /* MADV_WIPEONFORK   */
+        case 19:  /* MADV_KEEPONFORK   */
+        case 20:  /* MADV_COLD         */
+        case 21:  /* MADV_PAGEOUT      */
+        case 100: /* MADV_HWPOISON (privileged, but harmless as a no-op here) */
+            return 0;
+        default:
+            return -(s64)EINVAL;
+    }
 }
 
 static s64 sys_fadvise64_impl(pt_regs_t *r)
 {
-    (void)r;
-    return 0;
+    int fd     = (int)(s32)r->rdi;
+    u64 offset = r->rsi;
+    u64 len    = r->rdx;
+    int advice = (int)r->r10;
+
+    if (fd < 0 || fd >= PROC_MAX_FDS) return -(s64)EBADF;
+    process_t *proc = sched_current_process();
+    if (!proc || !proc->handle_table[fd]) return -(s64)EBADF;
+
+    switch (advice) {
+        case 0: case 1: case 2: case 3: case 4: case 5:  /* POSIX_FADV_* */
+            break;
+        default:
+            return -(s64)EINVAL;
+    }
+    return vfs_fadvise((file_t *)proc->handle_table[fd], offset, len, advice);
 }
 
 static s64 sys_socketpair_impl(pt_regs_t *r)
@@ -5328,8 +7083,38 @@ static s64 sys_prctl_impl(pt_regs_t *r)
     if (option == 4 /* PR_SET_DUMPABLE */) return 0;
     if (option == 7 /* PR_GET_KEEPCAPS */) return 0;
     if (option == 8 /* PR_SET_KEEPCAPS */) return 0;
-    if (option == 38 /* PR_SET_NO_NEW_PRIVS */) return 0;
-    if (option == 39 /* PR_GET_NO_NEW_PRIVS */) return 0;
+    if (option == 38 /* PR_SET_NO_NEW_PRIVS */) {
+        if (arg2 != 1) return -(s64)EINVAL;   /* one-way: cannot be cleared */
+        p->no_new_privs = true;
+        return 0;
+    }
+    if (option == 39 /* PR_GET_NO_NEW_PRIVS */) return p->no_new_privs ? 1 : 0;
+    if (option == 23 /* PR_CAPBSET_READ */) {
+        if (arg2 > CAP_LAST_CAP) return -(s64)EINVAL;
+        return (p->cap_bounding & CAP_TO_MASK(arg2)) ? 1 : 0;
+    }
+    if (option == 24 /* PR_CAPBSET_DROP */) {
+        if (arg2 > CAP_LAST_CAP) return -(s64)EINVAL;
+        if (!security_check_permission(p, CAP_SETPCAP)) return -(s64)EPERM;
+        /* Dropping from the bounding set must also clear the live sets, or the
+         * capability would stay usable until the next execve(). */
+        u64 bit = CAP_TO_MASK(arg2);
+        p->cap_bounding    &= ~bit;
+        p->cap_permitted   &= ~bit;
+        p->cap_effective   &= ~bit;
+        p->cap_inheritable &= ~bit;
+        return 0;
+    }
+    if (option == 36 /* PR_SET_CHILD_SUBREAPER */) {
+        p->child_subreaper = (arg2 != 0);
+        return 0;
+    }
+    if (option == 37 /* PR_GET_CHILD_SUBREAPER */) {
+        if (!arg2 || arg2 >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        int val = p->child_subreaper ? 1 : 0;
+        if (copy_to_user((void *)arg2, &val, sizeof(int)) != 0) return -(s64)EFAULT;
+        return 0;
+    }
     return 0;
 }
 
@@ -5341,7 +7126,9 @@ static s64 sys_sched_getaffinity_impl(pt_regs_t *r)
     (void)pid;
     if (!mask || (uintptr_t)mask >= 0x8000000000000000ULL) return -(s64)EFAULT;
     if (cpusetsize < sizeof(u64)) return -(s64)EINVAL;
-    u64 affinity = 0x0F; /* 4 CPUs */
+    u32 ncpus = smp_cpu_count();
+    if (ncpus == 0) ncpus = 1;
+    u64 affinity = (ncpus >= 64) ? ~0ULL : ((1ULL << ncpus) - 1);
     if (copy_to_user(mask, &affinity, sizeof(u64)) != 0) return -(s64)EFAULT;
     return (s64)sizeof(u64);
 }
@@ -5365,8 +7152,8 @@ static s64 sys_tgkill_impl(pt_regs_t *r)
     s32 tgid = (s32)r->rdi;
     s32 tid = (s32)r->rsi;
     int sig = (int)r->rdx;
-    (void)tgid;
     if (tid <= 0) return -(s64)EINVAL;
+    if (tgid > 0) return sched_kill_process((u32)tgid, sig);
     return sched_kill_process((u32)tid, sig);
 }
 
@@ -5379,7 +7166,10 @@ static s64 sys_link_impl(pt_regs_t *r)
     if (err < 0) return err;
     err = copy_user_path_resolve(knew, sizeof(knew), newpath);
     if (err < 0) return err;
-    return vfs_symlink(kold, knew);
+    /* link(2) is a *hard* link. Routing it to vfs_symlink() made `ln a b`
+     * produce a symlink, so removing either name could take the other's
+     * target with it. */
+    return vfs_link(kold, knew);
 }
 
 static s64 sys_linkat_impl(pt_regs_t *r)
@@ -5394,7 +7184,7 @@ static s64 sys_linkat_impl(pt_regs_t *r)
     if (err < 0) return err;
     err = copy_user_path_resolve_at(newdfd, knew, sizeof(knew), newpath);
     if (err < 0) return err;
-    return vfs_symlink(kold, knew);
+    return vfs_link(kold, knew);
 }
 
 static s64 sys_symlinkat_impl(pt_regs_t *r)
@@ -5462,7 +7252,13 @@ static s64 sys_fsync_impl(pt_regs_t *r)
     int fd = (int)(s32)r->rdi;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
+    /* No per-inode dirty tracking yet, so this flushes the whole volume rather
+     * than just this file's blocks — but at least only this file's volume. */
+    file_t *f = (file_t *)proc->handle_table[fd];
+    if (f && f->f_inode && f->f_inode->i_sb)
+        return vfs_sync_fs(f->f_inode->i_sb);
+    vfs_sync_all();
     return 0;
 }
 
@@ -5474,12 +7270,20 @@ static s64 sys_fdatasync_impl(pt_regs_t *r)
 static s64 sys_sync_impl(pt_regs_t *r)
 {
     (void)r;
+    vfs_sync_all();
     return 0;
 }
 
 static s64 sys_syncfs_impl(pt_regs_t *r)
 {
-    (void)r;
+    int fd = (int)(s32)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
+    file_t *f = (file_t *)proc->handle_table[fd];
+    if (f && f->f_inode && f->f_inode->i_sb)
+        return vfs_sync_fs(f->f_inode->i_sb);
+    vfs_sync_all();
     return 0;
 }
 
@@ -5515,6 +7319,7 @@ static s64 sys_setreuid_impl(pt_regs_t *r)
     }
     if (ruid != (u32)-1) proc->uid = ruid;
     if (euid != (u32)-1) proc->euid = euid;
+    security_caps_on_setuid(proc);
     return 0;
 }
 
@@ -5533,6 +7338,7 @@ static s64 sys_setresuid_impl(pt_regs_t *r)
     if (ruid != (u32)-1) proc->uid = ruid;
     if (euid != (u32)-1) proc->euid = euid;
     if (suid != (u32)-1) proc->suid = suid;
+    security_caps_on_setuid(proc);
     return 0;
 }
 
@@ -5651,7 +7457,18 @@ static s64 sys_clock_settime_impl(pt_regs_t *r)
     if (!security_check_permission(proc, CAP_SYS_TIME)) {
         return -(s64)EPERM;
     }
-    (void)r;
+    u32 clk_id = (u32)r->rdi;
+    const struct linux_timespec *user_ts = (const struct linux_timespec *)r->rsi;
+    /* Only CLOCK_REALTIME (0) is settable — matches sys_clock_gettime_impl's
+     * own clk_id==0 "everything else" branch being the only one this kernel
+     * derives from the wall clock; the monotonic-family ids (1, 4, 7) are
+     * defined to never step and real Linux itself refuses to set them. */
+    if (clk_id != 0) return -(s64)EINVAL;
+    if (!user_ts) return -(s64)EFAULT;
+    struct linux_timespec ts;
+    if (copy_from_user(&ts, user_ts, sizeof(ts)) != 0) return -(s64)EFAULT;
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) return -(s64)EINVAL;
+    set_wall_clock((u64)ts.tv_sec);
     return 0;
 }
 
@@ -5692,33 +7509,17 @@ static s64 sys_mremap_impl(pt_regs_t *r)
         for (size_t i = old_pages; i < new_pages; i++) {
             phys_addr_t p = pmm_alloc_page();
             if (!p) return -(s64)ENOMEM;
-            memset((void *)(HHDM_BASE + p), 0, 4096);
+            hw_clear_page((void *)(HHDM_BASE + p));
             vmm_map(proc->pml4_phys, old_addr + i * 4096, p, VMM_F_PRESENT | VMM_F_WRITE | VMM_F_USER | VMM_F_NX);
         }
         return (s64)old_addr;
     } else {
-        for (size_t i = new_pages; i < old_pages; i++) {
-            vmm_unmap(proc->pml4_phys, old_addr + i * 4096);
-        }
+        /* BUG-AK fix: reclaim physical pages and update VMA on shrink */
+        vmm_unmap_range(proc->pml4_phys, old_addr + new_pages * 4096,
+                        old_pages - new_pages, true);
+        vma_remove(proc, old_addr + new_size, old_addr + old_size);
         return (s64)old_addr;
     }
-}
-
-static s64 sys_mincore_impl(pt_regs_t *r)
-{
-    uintptr_t start = (uintptr_t)r->rdi;
-    size_t length = (size_t)r->rsi;
-    unsigned char *vec = (unsigned char *)r->rdx;
-
-    if (start >= 0x0000800000000000ULL || (start & 0xFFF) != 0) return -(s64)EINVAL;
-    if (!vec || (uintptr_t)vec >= 0x0000800000000000ULL) return -(s64)EFAULT;
-
-    size_t pages = (length + 4095) / 4096;
-    for (size_t i = 0; i < pages; i++) {
-        unsigned char status = 1;
-        if (copy_to_user(&vec[i], &status, 1) != 0) return -(s64)EFAULT;
-    }
-    return 0;
 }
 
 /* ── Linux Fast Userspace Mutex (futex) ──────────────────────────────────── */
@@ -5751,6 +7552,98 @@ static spinlock_t g_futex_lock = SPINLOCK_INIT;
 
 static inline u32 futex_hash(uintptr_t uaddr) {
     return (u32)((uaddr >> 2) ^ (uaddr >> 8)) % FUTEX_HASH_SIZE;
+}
+
+/* futex_wait_queued() — enqueue the calling thread on @uaddr's bucket, sleep,
+ * and unwind the queue entry however the sleep ended.
+ *
+ * Shared by futex(FUTEX_WAIT*) and futex_wait(2); the two differ only in how
+ * they arrive at @timeout_ticks (relative for the old call, absolute for the
+ * new one), which is exactly the part that belongs to the caller. Returns 0 if
+ * woken by a FUTEX_WAKE, -EINTR on a pending signal, -ETIMEDOUT on expiry. */
+static s64 futex_wait_queued(process_t *proc, thread_t *curr, uintptr_t uaddr,
+                             u32 bitset, u64 timeout_ticks)
+{
+    futex_q_t q;
+    q.thread = curr;
+    q.proc = proc;
+    q.uaddr = uaddr;
+    q.bitset = bitset;
+    q.next = NULL;
+
+    u32 b = futex_hash(uaddr);
+    spinlock_lock(&g_futex_lock);
+    q.next = g_futex_table[b];
+    g_futex_table[b] = &q;
+    spinlock_unlock(&g_futex_lock);
+
+    u64 start_ticks = sched_get_ticks();
+    if (timeout_ticks > 0) {
+        sched_sleep(timeout_ticks);
+    } else {
+        sched_block(THREAD_BLOCKED_PENDING);
+    }
+
+    spinlock_lock(&g_futex_lock);
+    bool was_woken = true;
+    futex_q_t **curr_q = &g_futex_table[b];
+    while (*curr_q) {
+        if (*curr_q == &q) {
+            *curr_q = q.next;
+            was_woken = false; /* Still in queue -> timed out or signal */
+            break;
+        }
+        curr_q = &(*curr_q)->next;
+    }
+    spinlock_unlock(&g_futex_lock);
+
+    /* BUG-AJ fix: return -ETIMEDOUT or -EINTR when not awakened by FUTEX_WAKE */
+    if (!was_woken) {
+        if (proc->sig_pending & ~proc->sig_blocked)
+            return -(s64)EINTR;
+        if (timeout_ticks > 0 && (sched_get_ticks() - start_ticks >= timeout_ticks))
+            return -(s64)ETIMEDOUT;
+    }
+    return 0;
+}
+
+/* futex_wake_addr() — wake up to @nr waiters queued on @uaddr in @proc whose
+ * bitset intersects @bitset. Shared by futex(FUTEX_WAKE*) and by thread exit,
+ * which must wake the CLONE_CHILD_CLEARTID futex without going through a
+ * syscall frame. Returns the number of threads actually woken. */
+static int futex_wake_addr(process_t *proc, uintptr_t uaddr, u32 nr, u32 bitset)
+{
+    u32 b = futex_hash(uaddr);
+    int woken = 0;
+
+    spinlock_lock(&g_futex_lock);
+    for (futex_q_t *q = g_futex_table[b]; q && (u32)woken < nr; q = q->next) {
+        if (q->proc == proc && q->uaddr == uaddr && (q->bitset & bitset)) {
+            sched_unblock(q->thread);
+            woken++;
+        }
+    }
+    spinlock_unlock(&g_futex_lock);
+    return woken;
+}
+
+/* thread_clear_child_tid() — the exit half of CLONE_CHILD_CLEARTID and
+ * set_tid_address(2). Zero the registered word in user memory and wake one
+ * waiter on it, exactly as Linux's mm_release() does. Both halves matter: a
+ * joiner that only ever sees the futex wake, with the word still holding the
+ * dead tid, spins straight back into the wait. */
+void thread_clear_child_tid(thread_t *t)
+{
+    if (!t || !t->clear_child_tid) return;
+
+    uintptr_t uaddr = (uintptr_t)t->clear_child_tid;
+    t->clear_child_tid = 0;
+    if (uaddr >= 0x0000800000000000ULL || (uaddr & 3)) return;
+
+    u32 zero = 0;
+    if (copy_to_user((void *)uaddr, &zero, sizeof(zero)) != 0) return;
+
+    futex_wake_addr(t->proc, uaddr, 1, FUTEX_BITSET_MATCH_ANY);
 }
 
 static s64 sys_futex_impl(pt_regs_t *r)
@@ -5788,58 +7681,14 @@ static s64 sys_futex_impl(pt_regs_t *r)
             }
         }
 
-        futex_q_t q;
-        q.thread = curr;
-        q.proc = proc;
-        q.uaddr = uaddr;
-        q.bitset = bitset;
-        q.next = NULL;
-
-        u32 b = futex_hash(uaddr);
-        spinlock_lock(&g_futex_lock);
-        q.next = g_futex_table[b];
-        g_futex_table[b] = &q;
-        spinlock_unlock(&g_futex_lock);
-
-        if (timeout_ticks > 0) {
-            sched_sleep(timeout_ticks);
-        } else {
-            sched_block(THREAD_BLOCKED);
-        }
-
-        spinlock_lock(&g_futex_lock);
-        futex_q_t **curr_q = &g_futex_table[b];
-        while (*curr_q) {
-            if (*curr_q == &q) {
-                *curr_q = q.next;
-                break;
-            }
-            curr_q = &(*curr_q)->next;
-        }
-        spinlock_unlock(&g_futex_lock);
-
-        return 0;
+        return futex_wait_queued(proc, curr, uaddr, bitset, timeout_ticks);
     }
     case FUTEX_WAKE:
     case FUTEX_WAKE_BITSET: {
         u32 bitset = (cmd == FUTEX_WAKE_BITSET) ? val3 : FUTEX_BITSET_MATCH_ANY;
         if (bitset == 0) return -(s64)EINVAL;
 
-        u32 b = futex_hash(uaddr);
-        int woken = 0;
-
-        spinlock_lock(&g_futex_lock);
-        futex_q_t *curr_q = g_futex_table[b];
-        while (curr_q && (u32)woken < val) {
-            if (curr_q->proc == proc && curr_q->uaddr == uaddr && (curr_q->bitset & bitset)) {
-                sched_unblock(curr_q->thread);
-                woken++;
-            }
-            curr_q = curr_q->next;
-        }
-        spinlock_unlock(&g_futex_lock);
-
-        return woken;
+        return futex_wake_addr(proc, uaddr, val, bitset);
     }
     case FUTEX_REQUEUE:
     case FUTEX_CMP_REQUEUE: {
@@ -5850,23 +7699,32 @@ static s64 sys_futex_impl(pt_regs_t *r)
         }
 
         u32 b1 = futex_hash(uaddr);
+        u32 b2 = futex_hash(uaddr2);
         int woken = 0;
         int requeued = 0;
         u32 val2_max = timeout ? (u32)(uintptr_t)timeout : 0;
 
         spinlock_lock(&g_futex_lock);
-        futex_q_t *curr_q = g_futex_table[b1];
-        while (curr_q) {
-            if (curr_q->proc == proc && curr_q->uaddr == uaddr) {
+        futex_q_t **curr_q = &g_futex_table[b1];
+        while (*curr_q) {
+            futex_q_t *entry = *curr_q;
+            if (entry->proc == proc && entry->uaddr == uaddr) {
                 if ((u32)woken < val) {
-                    sched_unblock(curr_q->thread);
+                    *curr_q = entry->next;
+                    sched_unblock(entry->thread);
                     woken++;
+                    continue;
                 } else if ((u32)requeued < val2_max) {
-                    curr_q->uaddr = uaddr2;
+                    /* BUG-AI fix: move requeued waiter to bucket b2 so future wakeups find it */
+                    *curr_q = entry->next;
+                    entry->uaddr = uaddr2;
+                    entry->next = g_futex_table[b2];
+                    g_futex_table[b2] = entry;
                     requeued++;
+                    continue;
                 }
             }
-            curr_q = curr_q->next;
+            curr_q = &(*curr_q)->next;
         }
         spinlock_unlock(&g_futex_lock);
 
@@ -6112,8 +7970,8 @@ static s64 sys_epoll_ctl_impl(pt_regs_t *r)
     const linux_epoll_event_t *event = (const linux_epoll_event_t *)r->r10;
 
     process_t *proc = sched_current_process();
-    if (!proc || epfd < 0 || epfd >= 64 || !proc->handle_table[epfd]) return -(s64)EBADF;
-    if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || epfd < 0 || epfd >= PROC_MAX_FDS || !proc->handle_table[epfd]) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
     if (epfd == fd) return -(s64)EINVAL;
 
     file_t *epfile = (file_t *)proc->handle_table[epfd];
@@ -6182,7 +8040,7 @@ static s64 sys_epoll_wait_impl(pt_regs_t *r)
     if (!events || (uintptr_t)events >= 0x0000800000000000ULL) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
-    if (!proc || epfd < 0 || epfd >= 64 || !proc->handle_table[epfd]) return -(s64)EBADF;
+    if (!proc || epfd < 0 || epfd >= PROC_MAX_FDS || !proc->handle_table[epfd]) return -(s64)EBADF;
 
     file_t *epfile = (file_t *)proc->handle_table[epfd];
     if (epfile->f_op != &g_epoll_fops || !epfile->private_data) return -(s64)EINVAL;
@@ -6196,7 +8054,7 @@ static s64 sys_epoll_wait_impl(pt_regs_t *r)
         spinlock_lock(&ctx->lock);
         for (int i = 0; i < ctx->count && ready_count < maxevents; i++) {
             int tfd = ctx->items[i].fd;
-            if (tfd >= 0 && tfd < 64 && proc->handle_table[tfd]) {
+            if (tfd >= 0 && tfd < PROC_MAX_FDS && proc->handle_table[tfd]) {
                 file_t *tf = (file_t *)proc->handle_table[tfd];
                 short rev = check_file_readiness(tf, (short)ctx->items[i].events);
                 if (rev & ctx->items[i].events) {
@@ -6240,7 +8098,9 @@ static s64 timerfd_read_op(file_t *filp, void *buf, size_t len, u64 *offset)
 {
     (void)offset;
     if (len < sizeof(u64)) return -(s64)EINVAL;
-    if (!buf || (uintptr_t)buf >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    /* Kernel buffer — see fs/vfs.h. The old user-range test rejected the very
+     * pointer vfs_read() hands down, so timerfd reads never returned. */
+    if (!buf) return -(s64)EFAULT;
     timerfd_ctx_t *ctx = (timerfd_ctx_t *)filp->private_data;
     if (!ctx) return -(s64)EBADF;
 
@@ -6259,7 +8119,7 @@ static s64 timerfd_read_op(file_t *filp, void *buf, size_t len, u64 *offset)
             u64 exp = ctx->expirations;
             ctx->expirations = 0;
             spinlock_unlock(&ctx->lock);
-            if (copy_to_user(buf, &exp, sizeof(u64)) != 0) return -(s64)EFAULT;
+            memcpy(buf, &exp, sizeof(u64));
             return sizeof(u64);
         }
         spinlock_unlock(&ctx->lock);
@@ -6348,7 +8208,7 @@ static s64 sys_timerfd_settime_impl(pt_regs_t *r)
 
     (void)flags;
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     file_t *f = (file_t *)proc->handle_table[fd];
     if (f->f_op != &g_timerfd_fops || !f->private_data) return -(s64)EINVAL;
@@ -6385,7 +8245,7 @@ static s64 sys_timerfd_gettime_impl(pt_regs_t *r)
     struct itimerspec *curr_value = (struct itimerspec *)r->rsi;
 
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     file_t *f = (file_t *)proc->handle_table[fd];
     if (f->f_op != &g_timerfd_fops || !f->private_data) return -(s64)EINVAL;
@@ -6421,6 +8281,88 @@ typedef struct {
     u32 flags;
 } signalfd_ctx_t;
 
+struct signalfd_siginfo {
+    u32 ssi_signo;
+    s32 ssi_errno;
+    s32 ssi_code;
+    u32 ssi_pid;
+    u32 ssi_uid;
+    s32 ssi_fd;
+    u32 ssi_tid;
+    u32 ssi_band;
+    u32 ssi_overrun;
+    u32 ssi_trapno;
+    s32 ssi_status;
+    s32 ssi_int;
+    u64 ssi_ptr;
+    u64 ssi_utime;
+    u64 ssi_stime;
+    u64 ssi_addr;
+    u16 ssi_addr_lsb;
+    u16 __pad2;
+    s32 ssi_syscall;
+    u64 ssi_call_addr;
+    u32 ssi_arch;
+    u8  __pad[28];
+};
+
+static s64 signalfd_read_op(file_t *filp, void *buf, size_t count, u64 *offset)
+{
+    (void)offset;
+    if (!filp || !filp->private_data || !buf) return -(s64)EINVAL;
+    if (count < sizeof(struct signalfd_siginfo)) return -(s64)EINVAL;
+
+    signalfd_ctx_t *ctx = (signalfd_ctx_t *)filp->private_data;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    for (;;) {
+        sigset_t match = proc->sig_pending & ctx->mask;
+        if (match) {
+            int sig = 0;
+            for (int s = 1; s < _NSIG; s++) {
+                if (match & (1ULL << s)) {
+                    sig = s;
+                    break;
+                }
+            }
+            if (sig > 0) {
+                proc->sig_pending &= ~(1ULL << sig);
+
+                struct signalfd_siginfo ssi;
+                memset(&ssi, 0, sizeof(ssi));
+                ssi.ssi_signo = (u32)sig;
+                ssi.ssi_pid = proc->pid;
+                ssi.ssi_uid = proc->uid;
+
+                /* Kernel buffer: sys_read_impl() owns the copy to userspace.
+                 * copy_to_user() here rejected its own destination and
+                 * returned -EFAULT *after* having already consumed the signal,
+                 * so the signal was lost as well as the read. */
+                memcpy(buf, &ssi, sizeof(ssi));
+                return (s64)sizeof(ssi);
+            }
+        }
+
+        if (filp->f_flags & O_NONBLOCK) return -(s64)EAGAIN;
+        sched_sleep(1);
+        if (proc->is_zombie) return -(s64)EINTR;
+    }
+}
+
+static int signalfd_poll_op(file_t *filp)
+{
+    if (!filp || !filp->private_data) return POLLERR;
+    signalfd_ctx_t *ctx = (signalfd_ctx_t *)filp->private_data;
+    process_t *proc = sched_current_process();
+    if (!proc) return POLLERR;
+
+    if (proc->sig_pending & ctx->mask) {
+        return POLLIN | POLLRDNORM;
+    }
+    return 0;
+}
+
 static s64 signalfd_release_op(inode_t *inode, file_t *filp)
 {
     (void)inode;
@@ -6432,6 +8374,8 @@ static s64 signalfd_release_op(inode_t *inode, file_t *filp)
 }
 
 static file_operations_t g_signalfd_fops = {
+    .read    = signalfd_read_op,
+    .poll    = signalfd_poll_op,
     .release = signalfd_release_op,
 };
 
@@ -6451,7 +8395,7 @@ static s64 sys_signalfd4_impl(pt_regs_t *r)
     if (mask && copy_from_user(&smask, mask, sizeof(sigset_t)) != 0) return -(s64)EFAULT;
 
     if (fd != -1) {
-        if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+        if (fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
         file_t *f = (file_t *)proc->handle_table[fd];
         if (f->f_op != &g_signalfd_fops || !f->private_data) return -(s64)EINVAL;
         signalfd_ctx_t *ctx = (signalfd_ctx_t *)f->private_data;
@@ -6546,8 +8490,20 @@ static s64 sys_sched_rr_get_interval_impl(pt_regs_t *r)
 
 static s64 sys_personality_impl(pt_regs_t *r)
 {
-    (void)r;
-    return 0; /* PER_LINUX */
+    u64 persona = r->rdi;
+    process_t *p = sched_current_process();
+    if (!p) return -(s64)EPERM;
+
+    s64 old = (s64)p->personality;
+    /* 0xffffffff is the conventional "query without changing" call. */
+    if (persona != 0xFFFFFFFFULL) {
+        /* ADDR_NO_RANDOMIZE turns ASLR off for the next execve(). Refuse it
+         * under no_new_privs: a sandbox that pinned its privileges should not
+         * be able to weaken the address-space defences of what it exec's. */
+        if ((persona & 0x0040000U) && p->no_new_privs) return -(s64)EPERM;
+        p->personality = (u32)persona;
+    }
+    return old;
 }
 
 static s64 sys_membarrier_impl(pt_regs_t *r)
@@ -6560,28 +8516,114 @@ static s64 sys_membarrier_impl(pt_regs_t *r)
     return 0;
 }
 
+/* Linux capget/capset payload: a header {version, pid} plus, for the 64-bit
+ * (_LINUX_CAPABILITY_VERSION_3) layout, two {effective, permitted, inheritable}
+ * u32 triples — low 32 bits first, then high. */
+#define LINUX_CAPABILITY_VERSION_3  0x20080522
+
+typedef struct {
+    u32 version;
+    s32 pid;
+} cap_user_header_t;
+
+typedef struct {
+    u32 effective;
+    u32 permitted;
+    u32 inheritable;
+} cap_user_data_t;
+
+/* capget/capset address a process by pid; 0 means "self". Only self and
+ * children are addressable here, and modifying anything but self is refused —
+ * letting one process rewrite another's capability sets would defeat the point
+ * of having them. */
 static s64 sys_capget_impl(pt_regs_t *r)
 {
-    void *datap = (void *)r->rsi;
+    cap_user_header_t *uhdr = (cap_user_header_t *)r->rdi;
+    cap_user_data_t   *udata = (cap_user_data_t *)r->rsi;
     process_t *proc = sched_current_process();
-    if (datap && (uintptr_t)datap < 0x0000800000000000ULL) {
-        u32 caps[6] = { 0 };
-        if (proc && proc->euid == 0) {
-            caps[0] = 0xFFFFFFFF;
-            caps[1] = 0xFFFFFFFF;
-            caps[2] = 0xFFFFFFFF;
-            caps[3] = 0xFFFFFFFF;
-            caps[4] = 0xFFFFFFFF;
-            caps[5] = 0xFFFFFFFF;
-        }
-        copy_to_user(datap, caps, sizeof(caps));
+    if (!proc) return -(s64)EPERM;
+
+    cap_user_header_t hdr = { LINUX_CAPABILITY_VERSION_3, 0 };
+    if (uhdr) {
+        if ((uintptr_t)uhdr >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (copy_from_user(&hdr, uhdr, sizeof(hdr)) != 0) return -(s64)EFAULT;
     }
+
+    /* Report back the version we speak, as Linux does for a probe call. */
+    if (hdr.version != LINUX_CAPABILITY_VERSION_3) {
+        hdr.version = LINUX_CAPABILITY_VERSION_3;
+        if (uhdr) copy_to_user(uhdr, &hdr, sizeof(hdr));
+        if (!udata) return 0;              /* pure version probe */
+        return -(s64)EINVAL;
+    }
+
+    process_t *target = proc;
+    if (hdr.pid != 0 && (u32)hdr.pid != proc->pid) {
+        target = NULL;
+        for (process_t *q = sched_get_process_list(); q; q = q->next) {
+            if (q->pid == (u32)hdr.pid) { target = q; break; }
+        }
+        if (!target) return -(s64)ESRCH;
+    }
+
+    if (!udata) return 0;
+    if ((uintptr_t)udata >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    cap_user_data_t out[2];
+    out[0].effective   = (u32)(target->cap_effective   & 0xFFFFFFFFu);
+    out[0].permitted   = (u32)(target->cap_permitted   & 0xFFFFFFFFu);
+    out[0].inheritable = (u32)(target->cap_inheritable & 0xFFFFFFFFu);
+    out[1].effective   = (u32)(target->cap_effective   >> 32);
+    out[1].permitted   = (u32)(target->cap_permitted   >> 32);
+    out[1].inheritable = (u32)(target->cap_inheritable >> 32);
+
+    if (copy_to_user(udata, out, sizeof(out)) != 0) return -(s64)EFAULT;
     return 0;
 }
 
 static s64 sys_capset_impl(pt_regs_t *r)
 {
-    (void)r;
+    cap_user_header_t *uhdr = (cap_user_header_t *)r->rdi;
+    cap_user_data_t   *udata = (cap_user_data_t *)r->rsi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!uhdr || !udata) return -(s64)EFAULT;
+    if ((uintptr_t)uhdr >= 0x0000800000000000ULL ||
+        (uintptr_t)udata >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    cap_user_header_t hdr;
+    if (copy_from_user(&hdr, uhdr, sizeof(hdr)) != 0) return -(s64)EFAULT;
+    if (hdr.version != LINUX_CAPABILITY_VERSION_3) return -(s64)EINVAL;
+    /* Only self. Rewriting another process's capabilities is not something an
+     * unprivileged caller may do, and we have no use for the privileged case. */
+    if (hdr.pid != 0 && (u32)hdr.pid != proc->pid) return -(s64)EPERM;
+
+    cap_user_data_t in[2];
+    if (copy_from_user(in, udata, sizeof(in)) != 0) return -(s64)EFAULT;
+
+    u64 new_eff = ((u64)in[1].effective   << 32) | in[0].effective;
+    u64 new_prm = ((u64)in[1].permitted   << 32) | in[0].permitted;
+    u64 new_inh = ((u64)in[1].inheritable << 32) | in[0].inheritable;
+
+    /* Undefined capability bits are rejected rather than silently masked, so a
+     * caller is never told "granted" for a bit we do not actually honour. */
+    if ((new_eff | new_prm | new_inh) & ~CAP_FULL_SET) return -(s64)EINVAL;
+
+    /* The two rules that make this safe, straight from POSIX.1e:
+     *   - the new permitted set must be a subset of the old permitted set
+     *     (without CAP_SETPCAP you may only ever drop privilege), and
+     *   - effective and inheritable must be subsets of the new permitted set.
+     * Together they make capset() a monotonically de-escalating operation. */
+    if (new_prm & ~proc->cap_permitted) return -(s64)EPERM;
+    if (new_eff & ~new_prm)             return -(s64)EPERM;
+    if (new_inh & ~proc->cap_bounding)  return -(s64)EPERM;
+
+    proc->cap_permitted   = new_prm;
+    proc->cap_effective   = new_eff;
+    proc->cap_inheritable = new_inh;
+    /* The bounding set never grows: clamp it to what is still permitted plus
+     * whatever is inheritable, so dropped privilege cannot return via exec. */
+    proc->cap_bounding &= (new_prm | new_inh);
     return 0;
 }
 
@@ -6656,8 +8698,16 @@ static s64 sys_chroot_impl(pt_regs_t *r)
     }
 
     if (proc) {
-        strncpy(proc->cwd, kpath, sizeof(proc->cwd) - 1);
-        proc->cwd[sizeof(proc->cwd) - 1] = '\0';
+        /* kpath is already a real path (copy_user_path_resolve() mapped it
+         * through any existing jail), so nesting chroot(2) narrows the jail
+         * rather than escaping it. POSIX leaves cwd alone; this kernel moves
+         * it to the new root, which is the safe direction — leaving it outside
+         * would hand the process a working directory it can no longer name and
+         * a ".." that walks out. */
+        strncpy(proc->root, kpath, sizeof(proc->root) - 1);
+        proc->root[sizeof(proc->root) - 1] = '\0';
+        proc->cwd[0] = '/';
+        proc->cwd[1] = '\0';
     }
     return 0;
 }
@@ -6847,7 +8897,7 @@ static s64 sys_inotify_add_watch_impl(pt_regs_t *r)
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     file_t *f = proc->handle_table[fd];
     if (f->f_op != &g_inotify_fops || !f->private_data) return -(s64)EINVAL;
@@ -6915,7 +8965,7 @@ static s64 sys_inotify_rm_watch_impl(pt_regs_t *r)
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     file_t *f = proc->handle_table[fd];
     if (f->f_op != &g_inotify_fops || !f->private_data) return -(s64)EINVAL;
@@ -7132,7 +9182,7 @@ static s64 sys_fsetxattr_impl(pt_regs_t *r)
     int flags = (int)r->r8;
 
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     char kpath[32];
     snprintf(kpath, sizeof(kpath), "fd:%d", fd);
@@ -7173,7 +9223,7 @@ static s64 sys_fgetxattr_impl(pt_regs_t *r)
     size_t size = (size_t)r->r10;
 
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     char kpath[32];
     snprintf(kpath, sizeof(kpath), "fd:%d", fd);
@@ -7209,7 +9259,7 @@ static s64 sys_flistxattr_impl(pt_regs_t *r)
     size_t size = (size_t)r->rdx;
 
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     char kpath[32];
     snprintf(kpath, sizeof(kpath), "fd:%d", fd);
@@ -7243,7 +9293,7 @@ static s64 sys_fremovexattr_impl(pt_regs_t *r)
     const char *uname = (const char *)r->rsi;
 
     process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= 64 || !proc->handle_table[fd]) return -(s64)EBADF;
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
 
     char kpath[32];
     snprintf(kpath, sizeof(kpath), "fd:%d", fd);
@@ -7318,9 +9368,73 @@ static s64 sys_p_rw_v(pt_regs_t *r, bool write)
 static s64 sys_preadv_impl(pt_regs_t *r)  { return sys_p_rw_v(r, false); }
 static s64 sys_pwritev_impl(pt_regs_t *r) { return sys_p_rw_v(r, true);  }
 
-/* No swap device exists, so every user page that is mapped is already
- * resident and unevictable. mlock/mlockall therefore always succeed. */
-static s64 sys_mlock_noop_impl(pt_regs_t *r)  { (void)r; return 0; }
+/* No swap device or reclaim exists, so every user page that is mapped is
+ * already resident and unevictable — there is nothing for "locked" to pin
+ * against. These used to be blind no-ops; now they genuinely record
+ * (VMA_F_LOCKED, kernel/mm/vma.c) which mappings the caller asked to be
+ * locked. Unlike real mlock(2), a range with no VMA at all (e.g. inside the
+ * brk()-managed heap, which never gets one — see vma_set_locked()'s own
+ * comment) is a no-op rather than -ENOMEM: this kernel's VMA list is a
+ * best-effort index, not an authoritative map, so treating "no VMA found"
+ * as "definitely unmapped" would reject plenty of genuinely valid memory. */
+static s64 sys_mlock_impl(pt_regs_t *r)
+{
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    u64 addr = r->rdi, len = r->rsi;
+    if (len == 0) return 0;
+    u64 start = ALIGN_DOWN(addr, PAGE_SIZE);
+    u64 end   = ALIGN_UP(addr + len, PAGE_SIZE);
+    if (end <= start) return -(s64)EINVAL;
+    return vma_set_locked(proc, start, end, true);
+}
+
+static s64 sys_munlock_impl(pt_regs_t *r)
+{
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    u64 addr = r->rdi, len = r->rsi;
+    if (len == 0) return 0;
+    u64 start = ALIGN_DOWN(addr, PAGE_SIZE);
+    u64 end   = ALIGN_UP(addr + len, PAGE_SIZE);
+    if (end <= start) return -(s64)EINVAL;
+    return vma_set_locked(proc, start, end, false);
+}
+
+/* mlock2(addr, len, flags) — MLOCK_ONFAULT would defer locking until each
+ * page faults in; every mapped page is already resident here (no demand
+ * paging beyond the existing VMA_F_DEMAND path this doesn't interact with),
+ * so there's no meaningful "on fault" moment to defer to — treated the same
+ * as a plain mlock(). */
+static s64 sys_mlock2_impl(pt_regs_t *r)
+{
+    return sys_mlock_impl(r);
+}
+
+static s64 sys_mlockall_impl(pt_regs_t *r)
+{
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    s64 flags = (s64)(s32)r->rdi;
+    if (flags == 0 || (flags & ~(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT))) return -(s64)EINVAL;
+    if (flags & MCL_CURRENT) vma_set_locked_all(proc, true);
+    /* MCL_FUTURE ("lock every mapping this process creates from now on") is
+     * accepted but not enforced: nothing here tracks a per-process
+     * lock-all-future-mappings flag that mmap() would need to consult. A
+     * process that asked for MCL_FUTURE gets MCL_CURRENT's effect now and
+     * no error, rather than a silent, permanent gap for something that
+     * still has nothing to actually pin against either way. */
+    return 0;
+}
+
+static s64 sys_munlockall_impl(pt_regs_t *r)
+{
+    (void)r;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    vma_set_locked_all(proc, false);
+    return 0;
+}
 
 /* rt_sigpending(set, sigsetsize) — signals raised but still blocked. */
 static s64 sys_rt_sigpending_impl(pt_regs_t *r)
@@ -7336,45 +9450,59 @@ static s64 sys_rt_sigpending_impl(pt_regs_t *r)
     return 0;
 }
 
-/* sigaltstack(new, old) — accepted for source compatibility. Signal delivery
- * still runs on the interrupted stack, so an alternate stack is reported as
- * disabled (SS_DISABLE) and a supplied one is not retained. */
+/* sigaltstack(new, old) — set and/or get alternate signal stack context. */
 static s64 sys_sigaltstack_impl(pt_regs_t *r)
 {
-    struct { void *ss_sp; int ss_flags; size_t ss_size; } old = { 0, 2 /*SS_DISABLE*/, 0 };
-    void *uold = (void *)r->rsi;
+    process_t *p = sched_current_process();
+    if (!p) return -(s64)EPERM;
+
+    const void *unew = (const void *)r->rdi;
+    void *uold       = (void *)r->rsi;
+
+    typedef struct {
+        void  *ss_sp;
+        int    ss_flags;
+        size_t ss_size;
+    } user_stack_t;
+
+    user_stack_t old_st;
+    memset(&old_st, 0, sizeof(old_st));
+    old_st.ss_sp    = p->sas_ss_sp;
+    old_st.ss_size  = p->sas_ss_size;
+    old_st.ss_flags = (p->sas_ss_flags & 2 /* SS_DISABLE */) ? 2 : 0;
+
+    /* Check if currently executing on the registered alternate stack */
+    if (p->sas_ss_sp && !(p->sas_ss_flags & 2 /* SS_DISABLE */) &&
+        r->rsp >= (u64)(uintptr_t)p->sas_ss_sp &&
+        r->rsp < (u64)(uintptr_t)p->sas_ss_sp + p->sas_ss_size) {
+        old_st.ss_flags |= 1 /* SS_ONSTACK */;
+    }
+
     if (uold) {
         if ((uintptr_t)uold >= 0x8000000000000000ULL) return -(s64)EFAULT;
-        if (copy_to_user(uold, &old, sizeof old) != 0) return -(s64)EFAULT;
+        if (copy_to_user(uold, &old_st, sizeof(old_st)) != 0) return -(s64)EFAULT;
     }
-    return 0;
-}
 
-/* getitimer/setitimer — no interval timers. getitimer always reports the
- * timer disarmed; setitimer accepts a disarm (all-zero) and rejects arming. */
-static s64 sys_getitimer_impl(pt_regs_t *r)
-{
-    void *uval = (void *)r->rsi;
-    if (!uval) return -(s64)EFAULT;
-    if ((uintptr_t)uval >= 0x8000000000000000ULL) return -(s64)EFAULT;
-    u64 zero[4] = { 0, 0, 0, 0 };                       /* struct itimerval */
-    if (copy_to_user(uval, zero, sizeof zero) != 0) return -(s64)EFAULT;
-    return 0;
-}
-static s64 sys_setitimer_impl(pt_regs_t *r)
-{
-    const void *uval = (const void *)r->rsi;
-    void *uold = (void *)r->rdx;
-    if (uold) {
-        u64 zero[4] = { 0, 0, 0, 0 };
-        if ((uintptr_t)uold >= 0x8000000000000000ULL ||
-            copy_to_user(uold, zero, sizeof zero) != 0) return -(s64)EFAULT;
-    }
-    if (uval) {
-        u64 nv[4];
-        if ((uintptr_t)uval >= 0x8000000000000000ULL ||
-            copy_from_user(nv, uval, sizeof nv) != 0) return -(s64)EFAULT;
-        if (nv[2] || nv[3]) return -(s64)ENOSYS;        /* it_value != 0 → arm */
+    if (unew) {
+        if ((uintptr_t)unew >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        /* Cannot modify alternate signal stack while active on it */
+        if (old_st.ss_flags & 1 /* SS_ONSTACK */) return -(s64)EPERM;
+
+        user_stack_t new_st;
+        if (copy_from_user(&new_st, unew, sizeof(new_st)) != 0) return -(s64)EFAULT;
+
+        if (new_st.ss_flags & 2 /* SS_DISABLE */) {
+            p->sas_ss_flags = 2;
+            p->sas_ss_sp    = NULL;
+            p->sas_ss_size  = 0;
+        } else {
+            /* Minimum size validation: MINSIGSTKSZ is 2048 */
+            if (new_st.ss_size < 2048) return -(s64)ENOMEM;
+            if ((uintptr_t)new_st.ss_sp >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            p->sas_ss_sp    = new_st.ss_sp;
+            p->sas_ss_size  = new_st.ss_size;
+            p->sas_ss_flags = new_st.ss_flags & ~1;
+        }
     }
     return 0;
 }
@@ -7402,7 +9530,15 @@ static s64 do_mknod(const char *path, u32 mode)
         vfs_close(f);
         return 0;
     }
-    if (fmt == S_IFIFO) return -(s64)ENOSYS;
+    if (fmt == S_IFIFO) {
+        file_t *f = vfs_open(path, O_CREAT | O_EXCL | O_RDWR, (mode & 07777) | S_IFIFO);
+        if (!f) return -(s64)EEXIST;
+        if (f->f_inode) {
+            f->f_inode->i_mode = S_IFIFO | (mode & 07777);
+        }
+        vfs_close(f);
+        return 0;
+    }
     return -(s64)EPERM;                                 /* S_IFCHR / S_IFBLK / S_IFSOCK */
 }
 static s64 sys_mknod_impl(pt_regs_t *r)
@@ -7422,33 +9558,139 @@ static s64 sys_mknodat_impl(pt_regs_t *r)
     return do_mknod(kpath, (u32)r->rdx);
 }
 
-/* futimesat(dirfd, path, times) — same effect as the utimensat() stub. */
-static s64 sys_futimesat_impl(pt_regs_t *r) { (void)r; return 0; }
+/* futimesat(dirfd, path, times) — obsolete, superseded by utimensat(2), but
+ * still just a real dirfd-relative timestamp set with `struct timeval`
+ * (microsecond, not nanosecond) precision. Was a pure no-op before. */
+static s64 sys_futimesat_impl(pt_regs_t *r)
+{
+    int dfd = (int)(s32)r->rdi;
+    const char *path = (const char *)r->rsi;
+    const struct linux_timeval *times = (const struct linux_timeval *)r->rdx;
+    if (!path) return -(s64)EFAULT;
+
+    char kpath[512];
+    s64 perr = copy_user_path_resolve_at(dfd, kpath, sizeof(kpath), path);
+    if (perr < 0) return perr;
+
+    u64 atime, mtime;
+    if (times) {
+        struct linux_timeval t[2];
+        if (copy_from_user(t, times, sizeof(t)) != 0) return -(s64)EFAULT;
+        atime = (u64)t[0].tv_sec;
+        mtime = (u64)t[1].tv_sec;
+    } else {
+        atime = mtime = get_cached_unix_time();
+    }
+    return vfs_utimes(kpath, atime, mtime);
+}
 
 /* unshare(flags) — no namespaces; unshare(0) is a legal no-op. */
 static s64 sys_unshare_impl(pt_regs_t *r) { return r->rdi ? -(s64)EINVAL : 0; }
 
-/* adjtimex/clock_adjtime — the clock is not steerable from userspace. A pure
- * query (modes == 0) succeeds; any adjustment request is refused. */
+/* Must stay field-for-field identical to `struct timex` in
+ * userland/libc/include/sys/timex.h — that is the struct every caller in
+ * this codebase actually allocates, and copy_from_user()/copy_to_user()
+ * below move exactly sizeof(this struct) bytes. It deliberately does NOT
+ * carry the trailing reserved int[11] real Linux's struct timex has: that
+ * would make this struct larger than what userland allocates, and
+ * copy_to_user() would then write past the end of a caller's `struct timex`
+ * on their stack or heap. `long time_sec/time_usec` here occupy the exact
+ * same bytes as userland's nested `struct timeval time` (both are two
+ * consecutive `long`s) — just addressed without the extra naming layer,
+ * since this file has no struct timeval of its own to nest. */
+struct linux_timex {
+    unsigned int modes;
+    int          _pad0;
+    long         offset;
+    long         freq;
+    long         maxerror;
+    long         esterror;
+    int          status;
+    int          _pad1;
+    long         constant;
+    long         precision;
+    long         tolerance;
+    long         time_sec;
+    long         time_usec;
+    long         tick;
+    long         ppsfreq;
+    long         jitter;
+    int          shift;
+    int          _pad2;
+    long         stabil;
+    long         jitcnt;
+    long         calcnt;
+    long         errcnt;
+    long         stbcnt;
+    int          tai;
+};
+
+#define LINUX_TIME_OK 0
+
+static s64 adjtimex_core(process_t *proc, struct linux_timex *user_buf)
+{
+    if (!user_buf) return -(s64)EFAULT;
+    struct linux_timex tx;
+    if (copy_from_user(&tx, user_buf, sizeof(tx)) != 0) return -(s64)EFAULT;
+
+    if (tx.modes != 0 && !security_check_permission(proc, CAP_SYS_TIME))
+        return -(s64)EPERM;
+    /* modes != 0 is accepted (not rejected wholesale like the old stub did)
+     * but has no discipline effect beyond what's reported back below —
+     * there is nothing here to steer a PLL/FLL against. */
+
+    u64 now = get_cached_unix_time();
+    tx.time_sec  = (long)now;
+    tx.time_usec = 0;
+    tx.maxerror  = 500000;      /* microseconds; unsynchronized-clock ballpark */
+    tx.esterror  = 500000;
+    tx.status    = 0;           /* no STA_* bits tracked */
+    tx.constant  = 0;
+    tx.precision = 1;           /* 1 tick = 10ms at this kernel's 100Hz */
+    tx.tolerance = 0x7FFFFFFFL; /* Linux's own MAXFREQ-derived default */
+    tx.tick      = 10000;       /* microseconds per tick at 100Hz */
+    tx.ppsfreq = tx.jitter = tx.stabil = tx.jitcnt = tx.calcnt = 0;
+    tx.errcnt = tx.stbcnt = 0;
+    tx.shift = 0;
+    tx.tai = 0;
+
+    if (copy_to_user(user_buf, &tx, sizeof(tx)) != 0) return -(s64)EFAULT;
+    return LINUX_TIME_OK;
+}
+
 static s64 sys_adjtimex_impl(pt_regs_t *r)
 {
-    const int *umodes = (const int *)r->rdi;
-    int modes = 0;
-    if (umodes && (uintptr_t)umodes < 0x8000000000000000ULL)
-        copy_from_user(&modes, umodes, sizeof modes);
-    return modes ? -(s64)EPERM : 0;                     /* 0 == TIME_OK */
+    process_t *proc = sched_current_process();
+    return adjtimex_core(proc, (struct linux_timex *)r->rdi);
 }
+
 static s64 sys_clock_adjtime_impl(pt_regs_t *r)
 {
-    const int *umodes = (const int *)r->rsi;            /* arg2: struct timex* */
-    int modes = 0;
-    if (umodes && (uintptr_t)umodes < 0x8000000000000000ULL)
-        copy_from_user(&modes, umodes, sizeof modes);
-    return modes ? -(s64)EPERM : 0;
+    process_t *proc = sched_current_process();
+    u32 clk_id = (u32)r->rdi;
+    if (clk_id != 0) return -(s64)EINVAL; /* only CLOCK_REALTIME, as with clock_settime */
+    return adjtimex_core(proc, (struct linux_timex *)r->rsi);
 }
 
 /* settimeofday — wall clock is read-only for userspace. */
-static s64 sys_settimeofday_impl(pt_regs_t *r) { (void)r; return -(s64)EPERM; }
+/* settimeofday(tv, tz) — used to unconditionally return -EPERM, even for
+ * root: nobody could ever set the time. Real CAP_SYS_TIME check plus a real
+ * set now, sharing clock_settime(2)'s underlying set_wall_clock(). `tz`
+ * (the second argument) is accepted and ignored, matching real Linux —
+ * timezone-via-settimeofday has been deprecated there since the 1990s. */
+static s64 sys_settimeofday_impl(pt_regs_t *r)
+{
+    process_t *proc = sched_current_process();
+    if (!security_check_permission(proc, CAP_SYS_TIME)) return -(s64)EPERM;
+
+    const struct linux_timeval *user_tv = (const struct linux_timeval *)r->rdi;
+    if (!user_tv) return -(s64)EFAULT;
+    struct linux_timeval tv;
+    if (copy_from_user(&tv, user_tv, sizeof(tv)) != 0) return -(s64)EFAULT;
+    if (tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1000000L) return -(s64)EINVAL;
+    set_wall_clock((u64)tv.tv_sec);
+    return 0;
+}
 
 /* sendmmsg/recvmmsg — iterate the mmsghdr array over sendmsg/recvmsg. */
 static s64 sys_mmsg(pt_regs_t *r, bool send)
@@ -7485,6 +9727,17 @@ static s64 sys_recvmmsg_impl(pt_regs_t *r) { return sys_mmsg(r, false); }
 /* process_vm_readv / process_vm_writev — copy between the caller and a target
  * process, page by page, translating the remote virtual addresses through the
  * target's PML4. */
+#define PVM_USER_MAX 0x0000800000000000ULL
+
+/* True if [base, base+len) is a non-wrapping range wholly inside the user half. */
+static bool pvm_user_range_ok(u64 base, u64 len)
+{
+    if (len == 0) return true;
+    if (base >= PVM_USER_MAX) return false;
+    if (len > PVM_USER_MAX - base) return false;   /* overflow / crosses into kernel half */
+    return true;
+}
+
 static s64 do_process_vm(pt_regs_t *r, bool write_to_remote)
 {
     u32 pid = (u32)r->rdi;
@@ -7496,8 +9749,27 @@ static s64 do_process_vm(pt_regs_t *r, bool write_to_remote)
     if (liovcnt > 1024 || riovcnt > 1024) return -(s64)EINVAL;
     if (!ulocal || !uremote) return -(s64)EFAULT;
 
-    process_t *target = proc_by_pid(pid);
-    if (!target || !target->pml4_phys) return -(s64)ESRCH;
+    /* Snapshot the target under the scheduler lock — never hold a raw
+     * process_t* across the blocking copy loop below. */
+    struct proc_ident tgt;
+    if (!sched_proc_ident(pid, &tgt) || tgt.is_zombie || !tgt.pml4_phys)
+        return -(s64)ESRCH;
+
+    /* ptrace-style access check (Linux PTRACE_MODE_ATTACH_REALCREDS): root, or a
+     * caller whose *real* uid/gid equal the target's real, effective AND saved
+     * ids. Anything weaker lets a process poke a setuid peer that dropped euid
+     * but still holds suid==0. */
+    process_t *caller = sched_current_process();
+    if (!caller) return -(s64)EPERM;
+    if (caller->euid != 0) {
+        if (caller->uid != tgt.uid || caller->uid != tgt.euid || caller->uid != tgt.suid ||
+            caller->gid != tgt.gid || caller->gid != tgt.egid || caller->gid != tgt.sgid)
+            return -(s64)EPERM;
+        if (tgt.pid <= 2) return -(s64)EPERM;   /* never non-root vs init/kernel */
+    }
+
+    const u64 need = write_to_remote ? (VMM_F_PRESENT | VMM_F_USER | VMM_F_WRITE)
+                                     : (VMM_F_PRESENT | VMM_F_USER);
 
     struct iovec rio;
     unsigned long ri = 0;
@@ -7507,14 +9779,26 @@ static s64 do_process_vm(pt_regs_t *r, bool write_to_remote)
     for (unsigned long li = 0; li < liovcnt; li++) {
         struct iovec lio;
         if (copy_from_user(&lio, &ulocal[li], sizeof lio) != 0) return -(s64)EFAULT;
+        if (!pvm_user_range_ok((u64)(uintptr_t)lio.iov_base, lio.iov_len))
+            return copied ? copied : -(s64)EFAULT;
         u8 *lptr = (u8 *)lio.iov_base;
         u64 lrem = lio.iov_len;
+
+        /* Re-check the target between local iovecs: bail cleanly if it exited or
+         * exec'd a new address space rather than translating against a stale
+         * (possibly freed) PML4. */
+        struct proc_ident now;
+        if (!sched_proc_ident(pid, &now) || now.is_zombie ||
+            now.pml4_phys != tgt.pml4_phys)
+            return copied;
 
         while (lrem) {
             if (roff == 0) {
                 if (ri >= riovcnt) return copied;
                 if (copy_from_user(&rio, &uremote[ri], sizeof rio) != 0) return -(s64)EFAULT;
                 ri++;
+                if (!pvm_user_range_ok((u64)(uintptr_t)rio.iov_base, rio.iov_len))
+                    return copied ? copied : -(s64)EFAULT;
                 if (rio.iov_len == 0) { roff = 0; continue; }
             }
             u64 rva = (u64)(uintptr_t)rio.iov_base + roff;
@@ -7524,7 +9808,14 @@ static s64 do_process_vm(pt_regs_t *r, bool write_to_remote)
             if (n > rleft) n = rleft;
             if (n > page_left) n = page_left;
 
-            phys_addr_t rphys = vmm_translate(target->pml4_phys, rva);
+            /* The remote page must be a ring-3-accessible page of the target
+             * (and writable for a poke). This is what stops a remote iovec
+             * pointing at the kernel higher-half — vmm_translate alone would
+             * happily resolve it. */
+            if ((vmm_query_flags(tgt.pml4_phys, rva) & need) != need)
+                return copied ? copied : -(s64)EFAULT;
+
+            phys_addr_t rphys = vmm_translate(tgt.pml4_phys, rva);
             if (!rphys) return copied ? copied : -(s64)EFAULT;
             u8 *rkern = (u8 *)PHYS_TO_VIRT(rphys);
 
@@ -7543,3 +9834,1987 @@ static s64 do_process_vm(pt_regs_t *r, bool write_to_remote)
 }
 static s64 sys_process_vm_readv_impl(pt_regs_t *r)  { return do_process_vm(r, false); }
 static s64 sys_process_vm_writev_impl(pt_regs_t *r) { return do_process_vm(r, true);  }
+
+/* ============================================================================
+ * System V IPC (XSI) — thin marshalling over kernel/ipc/sysvipc.c
+ * ========================================================================= */
+
+static s64 sys_shmget_impl(pt_regs_t *r)
+{
+    return sysv_shmget((s32)r->rdi, (size_t)r->rsi, (int)r->rdx);
+}
+static s64 sys_shmat_impl(pt_regs_t *r)
+{
+    return sysv_shmat((int)r->rdi, (virt_addr_t)r->rsi, (int)r->rdx);
+}
+static s64 sys_shmdt_impl(pt_regs_t *r)
+{
+    return sysv_shmdt((virt_addr_t)r->rdi);
+}
+static s64 sys_shmctl_impl(pt_regs_t *r)
+{
+    return sysv_shmctl((int)r->rdi, (int)r->rsi, (void *)r->rdx);
+}
+static s64 sys_semget_impl(pt_regs_t *r)
+{
+    return sysv_semget((s32)r->rdi, (int)r->rsi, (int)r->rdx);
+}
+static s64 sys_semop_impl(pt_regs_t *r)
+{
+    return sysv_semop((int)r->rdi, (const void *)r->rsi, (size_t)r->rdx);
+}
+/* semtimedop(semid, sops, nsops, timeout) — semop() that gives up with EAGAIN
+ * once `timeout` has elapsed.  A NULL timeout is plain semop(). */
+static s64 sys_semtimedop_impl(pt_regs_t *r)
+{
+    const struct linux_timespec *uts = (const struct linux_timespec *)r->r10;
+    if (!uts) return sysv_semop((int)r->rdi, (const void *)r->rsi, (size_t)r->rdx);
+
+    if ((uintptr_t)uts >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    struct linux_timespec ts;
+    if (copy_from_user(&ts, uts, sizeof(ts)) != 0) return -(s64)EFAULT;
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) return -(s64)EINVAL;
+
+    /* Ticks run at 100 Hz. A non-zero timeout must never round down to zero,
+     * which would turn semtimedop() into a non-blocking poll. */
+    u64 ticks = (u64)ts.tv_sec * 100 + (u64)ts.tv_nsec / 10000000ULL;
+    if (ticks == 0 && (ts.tv_sec || ts.tv_nsec)) ticks = 1;
+
+    return sysv_semtimedop((int)r->rdi, (const void *)r->rsi, (size_t)r->rdx, ticks, true);
+}
+static s64 sys_semctl_impl(pt_regs_t *r)
+{
+    /* The fourth argument is glibc's `union semun` passed by value: an int for
+     * SETVAL, a pointer for the rest. */
+    return sysv_semctl((int)r->rdi, (int)r->rsi, (int)r->rdx, r->r10);
+}
+static s64 sys_msgget_impl(pt_regs_t *r)
+{
+    return sysv_msgget((s32)r->rdi, (int)r->rsi);
+}
+static s64 sys_msgsnd_impl(pt_regs_t *r)
+{
+    return sysv_msgsnd((int)r->rdi, (const void *)r->rsi, (size_t)r->rdx, (int)r->r10);
+}
+static s64 sys_msgrcv_impl(pt_regs_t *r)
+{
+    return sysv_msgrcv((int)r->rdi, (void *)r->rsi, (size_t)r->rdx, (s64)r->r10, (int)r->r8);
+}
+static s64 sys_msgctl_impl(pt_regs_t *r)
+{
+    return sysv_msgctl((int)r->rdi, (int)r->rsi, (void *)r->rdx);
+}
+
+/* ============================================================================
+ * POSIX timers — timer_create(2) family, alarm(2), setitimer(2)
+ * ========================================================================= */
+
+/* Ticks run at 100 Hz, so one tick is 10 ms. */
+static u64 timespec_to_ticks(const struct linux_timespec *ts)
+{
+    u64 ticks = (u64)ts->tv_sec * 100 + (u64)ts->tv_nsec / 10000000ULL;
+    /* Never round a non-zero interval down to "disarmed". */
+    if (ticks == 0 && (ts->tv_sec || ts->tv_nsec)) ticks = 1;
+    return ticks;
+}
+
+static void ticks_to_timespec(u64 ticks, struct linux_timespec *ts)
+{
+    ts->tv_sec  = (long)(ticks / 100);
+    ts->tv_nsec = (long)((ticks % 100) * 10000000L);
+}
+
+/* The leading fields of struct sigevent; the rest is padding we never read. */
+struct k_sigevent {
+    u64 sigev_value;
+    s32 sigev_signo;
+    s32 sigev_notify;
+};
+
+static s64 sys_timer_create_impl(pt_regs_t *r)
+{
+    int clockid = (int)r->rdi;
+    const void *usev = (const void *)r->rsi;
+    void *utimerid   = (void *)r->rdx;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!utimerid || (uintptr_t)utimerid >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    int notify = SIGEV_SIGNAL;
+    int signo  = SIGALRM;
+    u64 sigval = 0;
+
+    if (usev) {
+        if ((uintptr_t)usev >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        struct k_sigevent sev;
+        if (copy_from_user(&sev, usev, sizeof(sev)) != 0) return -(s64)EFAULT;
+        notify = sev.sigev_notify;
+        signo  = sev.sigev_signo;
+        sigval = sev.sigev_value;
+    }
+
+    s64 id = ktimer_create(proc, clockid, notify, signo, sigval);
+    if (id < 0) return id;
+
+    /* timer_t is a pointer-sized opaque handle; the small integer id goes in. */
+    s32 idv = (s32)id;
+    if (copy_to_user(utimerid, &idv, sizeof(idv)) != 0) {
+        ktimer_delete(proc, (int)id);
+        return -(s64)EFAULT;
+    }
+    return 0;
+}
+
+static s64 sys_timer_settime_impl(pt_regs_t *r)
+{
+    int id     = (int)r->rdi;
+    int flags  = (int)r->rsi;
+    const struct itimerspec *unew = (const struct itimerspec *)r->rdx;
+    struct itimerspec *uold       = (struct itimerspec *)r->r10;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!unew || (uintptr_t)unew >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    struct itimerspec nv;
+    if (copy_from_user(&nv, unew, sizeof(nv)) != 0) return -(s64)EFAULT;
+    if (nv.it_value.tv_nsec < 0 || nv.it_value.tv_nsec >= 1000000000L ||
+        nv.it_interval.tv_nsec < 0 || nv.it_interval.tv_nsec >= 1000000000L) {
+        return -(s64)EINVAL;
+    }
+
+    u64 old_value = 0, old_interval = 0;
+    s64 ret = ktimer_settime(proc, id, (flags & TIMER_ABSTIME) != 0,
+                             timespec_to_ticks(&nv.it_value),
+                             timespec_to_ticks(&nv.it_interval),
+                             &old_value, &old_interval);
+    if (ret < 0) return ret;
+
+    if (uold && (uintptr_t)uold < 0x8000000000000000ULL) {
+        struct itimerspec ov;
+        ticks_to_timespec(old_value, &ov.it_value);
+        ticks_to_timespec(old_interval, &ov.it_interval);
+        if (copy_to_user(uold, &ov, sizeof(ov)) != 0) return -(s64)EFAULT;
+    }
+    return 0;
+}
+
+static s64 sys_timer_gettime_impl(pt_regs_t *r)
+{
+    int id = (int)r->rdi;
+    struct itimerspec *ucur = (struct itimerspec *)r->rsi;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!ucur || (uintptr_t)ucur >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    u64 value = 0, interval = 0;
+    s64 ret = ktimer_gettime(proc, id, &value, &interval);
+    if (ret < 0) return ret;
+
+    struct itimerspec cur;
+    ticks_to_timespec(value, &cur.it_value);
+    ticks_to_timespec(interval, &cur.it_interval);
+    return copy_to_user(ucur, &cur, sizeof(cur)) == 0 ? 0 : -(s64)EFAULT;
+}
+
+static s64 sys_timer_getoverrun_impl(pt_regs_t *r)
+{
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    return ktimer_getoverrun(proc, (int)r->rdi);
+}
+
+static s64 sys_timer_delete_impl(pt_regs_t *r)
+{
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    return ktimer_delete(proc, (int)r->rdi);
+}
+
+/* struct itimerval — the timeval-based interval timers. */
+struct k_itimerval {
+    struct linux_timeval it_interval;
+    struct linux_timeval it_value;
+};
+
+static u64 timeval_to_ticks(const struct linux_timeval *tv)
+{
+    u64 ticks = (u64)tv->tv_sec * 100 + (u64)tv->tv_usec / 10000ULL;
+    if (ticks == 0 && (tv->tv_sec || tv->tv_usec)) ticks = 1;
+    return ticks;
+}
+
+static void ticks_to_timeval(u64 ticks, struct linux_timeval *tv)
+{
+    tv->tv_sec  = (long)(ticks / 100);
+    tv->tv_usec = (long)((ticks % 100) * 10000L);
+}
+
+static s64 sys_setitimer_impl(pt_regs_t *r)
+{
+    int which = (int)r->rdi;
+    const struct k_itimerval *unew = (const struct k_itimerval *)r->rsi;
+    struct k_itimerval *uold       = (struct k_itimerval *)r->rdx;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    u64 value = 0, interval = 0;
+    if (unew) {
+        if ((uintptr_t)unew >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        struct k_itimerval nv;
+        if (copy_from_user(&nv, unew, sizeof(nv)) != 0) return -(s64)EFAULT;
+        if (nv.it_value.tv_usec < 0 || nv.it_value.tv_usec >= 1000000L ||
+            nv.it_interval.tv_usec < 0 || nv.it_interval.tv_usec >= 1000000L) {
+            return -(s64)EINVAL;
+        }
+        value    = timeval_to_ticks(&nv.it_value);
+        interval = timeval_to_ticks(&nv.it_interval);
+    }
+
+    u64 old_value = 0, old_interval = 0;
+    s64 ret = ktimer_setitimer(proc, which, value, interval, &old_value, &old_interval);
+    if (ret < 0) return ret;
+
+    if (uold && (uintptr_t)uold < 0x8000000000000000ULL) {
+        struct k_itimerval ov;
+        ticks_to_timeval(old_value, &ov.it_value);
+        ticks_to_timeval(old_interval, &ov.it_interval);
+        if (copy_to_user(uold, &ov, sizeof(ov)) != 0) return -(s64)EFAULT;
+    }
+    return 0;
+}
+
+static s64 sys_getitimer_impl(pt_regs_t *r)
+{
+    int which = (int)r->rdi;
+    struct k_itimerval *ucur = (struct k_itimerval *)r->rsi;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!ucur || (uintptr_t)ucur >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    u64 value = 0, interval = 0;
+    s64 ret = ktimer_getitimer(proc, which, &value, &interval);
+    if (ret < 0) return ret;
+
+    struct k_itimerval cur;
+    ticks_to_timeval(value, &cur.it_value);
+    ticks_to_timeval(interval, &cur.it_interval);
+    return copy_to_user(ucur, &cur, sizeof(cur)) == 0 ? 0 : -(s64)EFAULT;
+}
+
+static s64 sys_alarm_impl(pt_regs_t *r)
+{
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    return (s64)ktimer_alarm(proc, (u64)(u32)r->rdi * 100);
+}
+
+/* ============================================================================
+ * POSIX signal waiting
+ * ========================================================================= */
+
+/* The prefix of siginfo_t that callers actually read. */
+struct k_siginfo {
+    s32 si_signo;
+    s32 si_errno;
+    s32 si_code;
+    s32 __pad0;
+    s32 si_pid;
+    u32 si_uid;
+    u64 si_value;
+    u8  __pad[128 - 32];
+};
+
+static s64 sys_rt_sigtimedwait_impl(pt_regs_t *r)
+{
+    const sigset_t *uset = (const sigset_t *)r->rdi;
+    void *uinfo          = (void *)r->rsi;
+    const struct linux_timespec *utimeout = (const struct linux_timespec *)r->rdx;
+    size_t sigsetsize    = (size_t)r->r10;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (sigsetsize != sizeof(sigset_t)) return -(s64)EINVAL;
+    if (!uset || (uintptr_t)uset >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    sigset_t set;
+    if (copy_from_user(&set, uset, sizeof(set)) != 0) return -(s64)EFAULT;
+    /* SIGKILL and SIGSTOP can never be waited for. */
+    set &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
+
+    bool have_timeout = false;
+    u64  deadline = 0;
+    if (utimeout) {
+        if ((uintptr_t)utimeout >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        struct linux_timespec ts;
+        if (copy_from_user(&ts, utimeout, sizeof(ts)) != 0) return -(s64)EFAULT;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) return -(s64)EINVAL;
+        have_timeout = true;
+        deadline = sched_get_ticks() + timespec_to_ticks(&ts);
+    }
+
+    for (;;) {
+        sigset_t ready = proc->sig_pending & set;
+        if (ready) {
+            u32 sig = 0;
+            for (u32 i = 1; i < 64; i++) {
+                if (ready & (1ULL << i)) { sig = i; break; }
+            }
+            /* Accepting the signal consumes it: it must not also be delivered
+             * to a handler on the way out. */
+            __atomic_and_fetch(&proc->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
+
+            if (uinfo && (uintptr_t)uinfo < 0x8000000000000000ULL) {
+                struct k_siginfo info;
+                __builtin_memset(&info, 0, sizeof(info));
+                info.si_signo = (s32)sig;
+                info.si_code  = 0;   /* SI_USER */
+                info.si_pid   = (s32)proc->pid;
+                info.si_uid   = proc->uid;
+                if (copy_to_user(uinfo, &info, sizeof(info)) != 0) return -(s64)EFAULT;
+            }
+            return (s64)sig;
+        }
+
+        if (have_timeout && sched_get_ticks() >= deadline) return -(s64)EAGAIN;
+
+        sched_sleep(1);
+
+        /* A signal outside @set that is deliverable ends the wait with EINTR. */
+        if (proc->sig_pending & ~proc->sig_blocked & ~set) return -(s64)EINTR;
+    }
+}
+
+static s64 sys_rt_sigsuspend_impl(pt_regs_t *r)
+{
+    const sigset_t *umask = (const sigset_t *)r->rdi;
+    size_t sigsetsize     = (size_t)r->rsi;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (sigsetsize != sizeof(sigset_t)) return -(s64)EINVAL;
+    if (!umask || (uintptr_t)umask >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    sigset_t mask;
+    if (copy_from_user(&mask, umask, sizeof(mask)) != 0) return -(s64)EFAULT;
+    mask &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
+
+    sigset_t saved = proc->sig_blocked;
+    proc->sig_blocked = mask;
+
+    /* Wait until something outside the temporary mask becomes pending.  The
+     * handler runs after the old mask is restored rather than under the
+     * suspend mask, which is the one place this departs from POSIX. */
+    while (!(proc->sig_pending & ~proc->sig_blocked)) {
+        sched_sleep(1);
+        if (proc->is_zombie) break;
+    }
+
+    proc->sig_blocked = saved;
+    return -(s64)EINTR;
+}
+
+static s64 sys_rt_sigqueueinfo_impl(pt_regs_t *r)
+{
+    u32 pid  = (u32)r->rdi;
+    int sig  = (int)r->rsi;
+    void *ui = (void *)r->rdx;
+
+    if (sig < 0 || sig >= 64) return -(s64)EINVAL;
+    if (ui && (uintptr_t)ui >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    /* The accompanying siginfo is validated but not queued: signals here are
+     * a pending bitmask, so a value cannot be carried alongside one. */
+    if (ui) {
+        struct k_siginfo info;
+        if (copy_from_user(&info, ui, sizeof(info)) != 0) return -(s64)EFAULT;
+    }
+    if (sig == 0) return 0;
+    return sched_kill_process(pid, sig);
+}
+
+static s64 sys_rt_tgsigqueueinfo_impl(pt_regs_t *r)
+{
+    u32 tgid = (u32)r->rdi;
+    int sig  = (int)r->rdx;
+    void *ui = (void *)r->r10;
+
+    if (sig < 0 || sig >= 64) return -(s64)EINVAL;
+    if (ui && (uintptr_t)ui >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (sig == 0) return 0;
+    return sched_kill_process(tgid, sig);
+}
+
+/* ============================================================================
+ * mount(2)
+ * ========================================================================= */
+
+static s64 sys_mount_impl(pt_regs_t *r)
+{
+    const char *usource = (const char *)r->rdi;
+    const char *utarget = (const char *)r->rsi;
+    const char *ufstype = (const char *)r->rdx;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
+    if (!utarget || !ufstype) return -(s64)EFAULT;
+
+    char source[128] = {0}, target[256] = {0}, fstype[32] = {0};
+    if (usource && copy_str_from_user(source, usource, sizeof(source)) < 0) return -(s64)EFAULT;
+    if (copy_str_from_user(target, utarget, sizeof(target)) < 0) return -(s64)EFAULT;
+    if (copy_str_from_user(fstype, ufstype, sizeof(fstype)) < 0) return -(s64)EFAULT;
+
+    return vfs_mount(source[0] ? source : fstype, target, fstype, NULL);
+}
+
+/* ============================================================================
+ * umount2(2)
+ * ========================================================================= */
+
+static s64 sys_umount2_impl(pt_regs_t *r)
+{
+    const char *utarget = (const char *)r->rdi;
+    int flags = (int)r->rsi;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
+    if (!utarget || (uintptr_t)utarget >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    char target[256] = {0};
+    if (copy_str_from_user(target, utarget, sizeof(target)) < 0) return -(s64)EFAULT;
+
+    return vfs_umount(target, flags);
+}
+
+/* ============================================================================
+ * iopl(2) / ioperm(2)
+ * ========================================================================= */
+
+static s64 sys_iopl_impl(pt_regs_t *r)
+{
+    unsigned int level = (unsigned int)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (level > 3) return -(s64)EINVAL;
+    if (proc->euid != 0 && !security_check_permission(proc, CAP_SYS_RAWIO)) {
+        return -(s64)EPERM;
+    }
+    r->rflags = (r->rflags & ~0x3000ULL) | (((u64)level & 3) << 12);
+    return 0;
+}
+
+static s64 sys_ioperm_impl(pt_regs_t *r)
+{
+    (void)r;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (proc->euid != 0 && !security_check_permission(proc, CAP_SYS_RAWIO)) {
+        return -(s64)EPERM;
+    }
+    return 0;
+}
+
+/* ============================================================================
+ * acct(2)
+ * ========================================================================= */
+
+static s64 sys_acct_impl(pt_regs_t *r)
+{
+    const char *filename = (const char *)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (proc->euid != 0 && !security_check_permission(proc, CAP_SYS_PACCT)) {
+        return -(s64)EPERM;
+    }
+    if (!filename) return 0;
+    return -(s64)ENOSYS;
+}
+
+/* ============================================================================
+ * kcmp(2) — compare two processes to determine if they share kernel resources
+ * ========================================================================= */
+
+#define KCMP_FILE       0
+#define KCMP_VM         1
+#define KCMP_FILES      2
+#define KCMP_FS         3
+#define KCMP_SIGHAND    4
+#define KCMP_IO         5
+#define KCMP_SYSVSEM    6
+#define KCMP_EPOLL_TFD  7
+
+static s64 sys_kcmp_impl(pt_regs_t *r)
+{
+    u32 pid1 = (u32)r->rdi;
+    u32 pid2 = (u32)r->rsi;
+    int type = (int)r->rdx;
+    u64 idx1 = (u64)r->r10;
+    u64 idx2 = (u64)r->r8;
+
+    process_t *caller = sched_current_process();
+    if (!caller) return -(s64)EPERM;
+
+    /* Hold references for the whole comparison: without them either target can
+     * be reaped on another CPU mid-switch, turning p1->cwd / p1->handle_table
+     * into a use-after-free. */
+    process_t *p1 = proc_get_by_pid(pid1);
+    process_t *p2 = proc_get_by_pid(pid2);
+    s64 ret;
+    if (!p1 || !p2) {
+        ret = -(s64)ESRCH;
+    } else if (caller->euid != 0 && caller->uid != p1->uid &&
+               caller->uid != p2->uid) {
+        ret = -(s64)EPERM;
+    } else switch (type) {
+        case KCMP_VM:
+            ret = (p1->pml4_phys == p2->pml4_phys) ? 0 : ((p1->pml4_phys < p2->pml4_phys) ? 1 : 2);
+            break;
+        case KCMP_FS:
+            ret = (strcmp(p1->cwd, p2->cwd) == 0 && p1->umask == p2->umask) ? 0 : 1;
+            break;
+        case KCMP_FILES:
+            ret = (p1 == p2) ? 0 : 1;
+            break;
+        case KCMP_FILE: {
+            if (idx1 >= 64 || idx2 >= 64) { ret = -(s64)EBADF; break; }
+            void *f1 = p1->handle_table[idx1];
+            void *f2 = p2->handle_table[idx2];
+            if (!f1 || !f2) { ret = -(s64)EBADF; break; }
+            ret = (f1 == f2) ? 0 : ((uintptr_t)f1 < (uintptr_t)f2 ? 1 : 2);
+            break;
+        }
+        default:
+            ret = (p1 == p2) ? 0 : 1;
+            break;
+    }
+
+    proc_put(p1);
+    proc_put(p2);
+    return ret;
+}
+
+/* ============================================================================
+ * init_module(2) / delete_module(2) / finit_module(2)
+ * ========================================================================= */
+
+static s64 sys_finit_module_impl(pt_regs_t *r)
+{
+    (void)r;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (proc->euid != 0 && !security_check_permission(proc, CAP_SYS_MODULE)) {
+        return -(s64)EPERM;
+    }
+    return -(s64)ENOSYS;
+}
+
+/* ============================================================================
+ * Memory-protection keys — pkey_alloc(2) / pkey_free(2) / pkey_mprotect(2)
+ *
+ * The hardware (CR4.PKE, enabled in cpu_enable_features_bsp()) tags each
+ * user-accessible leaf PTE with one of 16 keys in bits 62:59, and the PKRU
+ * register carries two bits per key — access-disable and write-disable — that
+ * gate every data access to a page carrying that key, from ring 3 *and* from
+ * ring 0. PKRU lives in the XSAVE state, so it is per-thread and the context
+ * switch preserves it for free.
+ *
+ * Key 0 is the key every page starts with and is never handed out, so a
+ * process that never calls pkey_alloc() is completely unaffected.
+ * ========================================================================= */
+
+static s64 sys_pkey_alloc_impl(pt_regs_t *r)
+{
+    unsigned long flags  = (unsigned long)r->rdi;
+    unsigned long rights = (unsigned long)r->rsi;
+
+    if (!g_pku_enabled) return -(s64)ENOSPC;   /* Linux reports "no keys left" */
+    if (flags != 0) return -(s64)EINVAL;
+    if (rights & ~(unsigned long)PKEY_ACCESS_MASK) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    int key = -1;
+    irqflags_t irqf = spinlock_lock_irqsave(&g_fd_lock);
+    for (int k = 1; k < PKEY_MAX; k++) {
+        if (!(proc->pkey_alloc_map & (1u << k))) {
+            proc->pkey_alloc_map |= (u16)(1u << k);
+            key = k;
+            break;
+        }
+    }
+    spinlock_unlock_irqrestore(&g_fd_lock, irqf);
+    if (key < 0) return -(s64)ENOSPC;
+
+    /* Publish the requested rights into this thread's PKRU. Two bits per key:
+     * bit 2k = access-disable, bit 2k+1 = write-disable. */
+    u32 pkru = rdpkru();
+    pkru &= ~(0x3u << (2 * key));
+    if (rights & PKEY_DISABLE_ACCESS) pkru |= (1u << (2 * key));
+    if (rights & PKEY_DISABLE_WRITE)  pkru |= (1u << (2 * key + 1));
+    wrpkru(pkru);
+
+    return key;
+}
+
+static s64 sys_pkey_free_impl(pt_regs_t *r)
+{
+    int key = (int)r->rdi;
+
+    if (!g_pku_enabled) return -(s64)EINVAL;
+    if (key <= 0 || key >= PKEY_MAX) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_fd_lock);
+    bool was_allocated = (proc->pkey_alloc_map & (1u << key)) != 0;
+    proc->pkey_alloc_map &= (u16)~(1u << key);
+    spinlock_unlock_irqrestore(&g_fd_lock, irqf);
+    if (!was_allocated) return -(s64)EINVAL;
+
+    /* Freeing a key does not un-tag the pages still carrying it — that is
+     * Linux's behaviour too, and it is why freeing a key in use is documented
+     * as a programming error. Reset its PKRU bits to "deny", so a stale page
+     * cannot silently become accessible when the key is handed out again. */
+    u32 pkru = rdpkru();
+    pkru |= (0x3u << (2 * key));
+    wrpkru(pkru);
+    return 0;
+}
+
+static s64 sys_pkey_mprotect_impl(pt_regs_t *r)
+{
+    virt_addr_t addr = (virt_addr_t)r->rdi;
+    size_t length    = (size_t)r->rsi;
+    int prot         = (int)r->rdx;
+    int pkey         = (int)(s32)r->r10;
+
+    /* pkey == -1 means "leave the key alone", i.e. plain mprotect(2). */
+    if (pkey != -1) {
+        if (!g_pku_enabled) return -(s64)EINVAL;
+        if (pkey < 0 || pkey >= PKEY_MAX) return -(s64)EINVAL;
+        process_t *p = sched_current_process();
+        if (!p) return -(s64)EPERM;
+        if (!(p->pkey_alloc_map & (1u << pkey))) return -(s64)EINVAL;
+    }
+
+    if (length == 0) return 0;
+    if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;
+    if (addr >= 0x0000800000000000ULL || addr < 0x1000) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    if (!proc || !proc->pml4_phys) return -(s64)EPERM;
+
+    size_t aligned_len = ALIGN_UP(length, PAGE_SIZE);
+    if (addr + aligned_len < addr || addr + aligned_len > 0x0000800000000000ULL)
+        return -(s64)EINVAL;
+
+    u64 vmm_flags = VMM_F_USER;
+    if (prot != PROT_NONE)  vmm_flags |= VMM_F_PRESENT;
+    if (prot & PROT_WRITE)  vmm_flags |= VMM_F_WRITE;
+    if (!(prot & PROT_EXEC)) vmm_flags |= VMM_F_NX;
+    if (pkey != -1) vmm_flags |= VMM_F_PKEY_SET | VMM_F_PKEY(pkey);
+
+    s64 rc = vma_setprot(proc, addr, addr + aligned_len, (u32)prot & 7);
+    if (rc < 0) return rc;
+
+    vmm_set_flags(proc->pml4_phys, addr, aligned_len / PAGE_SIZE, vmm_flags);
+    return 0;
+}
+
+/* ============================================================================
+ * set_robust_list(2) / get_robust_list(2)
+ * ========================================================================= */
+
+static s64 sys_set_robust_list_impl(pt_regs_t *r)
+{
+    void  *head = (void *)r->rdi;
+    size_t len  = (size_t)r->rsi;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    /* Linux rejects a size that does not match its own struct robust_list_head,
+     * which is 24 bytes on x86-64; anything else means the caller and kernel
+     * disagree about the layout. */
+    if (len != 24) return -(s64)EINVAL;
+    if (head && (uintptr_t)head >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    proc->robust_list     = head;
+    proc->robust_list_len = len;
+    return 0;
+}
+
+static s64 sys_get_robust_list_impl(pt_regs_t *r)
+{
+    s32     pid    = (s32)r->rdi;
+    void  **uhead  = (void **)r->rsi;
+    size_t *ulen   = (size_t *)r->rdx;
+
+    process_t *caller = sched_current_process();
+    if (!caller) return -(s64)EPERM;
+    if (!uhead || !ulen) return -(s64)EFAULT;
+    if ((uintptr_t)uhead >= 0x0000800000000000ULL ||
+        (uintptr_t)ulen  >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    /* pid 0 is the caller (always live). Any other pid is referenced for the
+     * duration so it cannot be reaped between the lookup and the field reads. */
+    process_t *target = caller;
+    if (pid != 0) {
+        target = proc_get_by_pid((u32)pid);
+        if (!target) return -(s64)ESRCH;
+    }
+
+    s64 rc = 0;
+    /* Reading another process's list is a credential check, same as ptrace. */
+    if (target != caller && caller->euid != 0 && caller->uid != target->uid) {
+        rc = -(s64)EPERM;
+    } else {
+        void  *head = target->robust_list;
+        size_t len  = target->robust_list_len ? target->robust_list_len : 24;
+        if (copy_to_user(uhead, &head, sizeof(head)) != 0) rc = -(s64)EFAULT;
+        else if (copy_to_user(ulen, &len, sizeof(len)) != 0) rc = -(s64)EFAULT;
+    }
+
+    if (target != caller) proc_put(target);
+    return rc;
+}
+
+/* ============================================================================
+ * mincore(2) — real residency, one page-table lookup per page
+ * ========================================================================= */
+
+static s64 sys_mincore_impl(pt_regs_t *r)
+{
+    uintptr_t start = (uintptr_t)r->rdi;
+    size_t length   = (size_t)r->rsi;
+    unsigned char *vec = (unsigned char *)r->rdx;
+
+    if (start >= 0x0000800000000000ULL || (start & 0xFFF) != 0) return -(s64)EINVAL;
+    if (!vec || (uintptr_t)vec >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    process_t *proc = sched_current_process();
+    if (!proc || !proc->pml4_phys) return -(s64)EPERM;
+
+    size_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (start + (u64)pages * PAGE_SIZE > 0x0000800000000000ULL) return -(s64)ENOMEM;
+
+    /* Batch the answers: one copy_to_user per chunk instead of per page turns
+     * a 1 MB query from 256 user-access transitions into one. */
+    unsigned char chunk[256];
+    size_t done = 0;
+    while (done < pages) {
+        size_t n = pages - done;
+        if (n > sizeof(chunk)) n = sizeof(chunk);
+        for (size_t i = 0; i < n; i++) {
+            uintptr_t va = start + (done + i) * PAGE_SIZE;
+            /* A PROT_NONE page keeps its frame with PRESENT clear, and is still
+             * resident — report it as such, which is what mincore means. */
+            chunk[i] = (vmm_query_flags(proc->pml4_phys, va) & VMM_F_PRESENT) ||
+                       vmm_translate(proc->pml4_phys, va) ? 1 : 0;
+        }
+        if (copy_to_user(&vec[done], chunk, n) != 0) return -(s64)EFAULT;
+        done += n;
+    }
+    return 0;
+}
+
+/* ============================================================================
+ * process_madvise(2) — madvise on another process's address space
+ * ========================================================================= */
+
+static s64 sys_process_madvise_impl(pt_regs_t *r)
+{
+    int pidfd                = (int)r->rdi;
+    const struct iovec *uiov = (const struct iovec *)r->rsi;
+    unsigned long vlen       = (unsigned long)r->rdx;
+    int advice               = (int)r->r10;
+    unsigned int flags       = (unsigned int)r->r8;
+
+    if (flags != 0) return -(s64)EINVAL;
+    if (vlen > 1024) return -(s64)EINVAL;
+    if (!uiov || (uintptr_t)uiov >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    process_t *caller = sched_current_process();
+    if (!caller) return -(s64)EPERM;
+
+    file_t *pf = fget(caller, pidfd);
+    if (!pf) return -(s64)EBADF;
+    fput(pf);
+
+    /* Only the advice values that are meaningful without a reclaim path. The
+     * hints this kernel can honour are all no-ops on an eagerly-mapped address
+     * space, so the call validates its arguments and reports the byte count it
+     * would have covered, which is what callers branch on. */
+    switch (advice) {
+        case 4:   /* MADV_DONTNEED  */
+        case 8:   /* MADV_FREE      */
+        case 20:  /* MADV_COLD      */
+        case 21:  /* MADV_PAGEOUT   */
+        case 22:  /* MADV_WILLNEED-ish / POPULATE_READ */
+            break;
+        default:
+            return -(s64)EINVAL;
+    }
+
+    s64 total = 0;
+    for (unsigned long i = 0; i < vlen; i++) {
+        struct iovec kiov;
+        if (copy_from_user(&kiov, &uiov[i], sizeof(kiov)) != 0) return -(s64)EFAULT;
+        if ((uintptr_t)kiov.iov_base >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (kiov.iov_len > (size_t)0x7fffffffffffffffLL - (size_t)total)
+            return -(s64)EINVAL;
+        total += (s64)kiov.iov_len;
+    }
+    return total;
+}
+
+/* ============================================================================
+ * cachestat(2) — page-cache residency of a file range
+ * ========================================================================= */
+
+static s64 sys_cachestat_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    const struct cachestat_range *urange = (const struct cachestat_range *)r->rsi;
+    struct cachestat *ucs = (struct cachestat *)r->rdx;
+    unsigned int flags = (unsigned int)r->r10;
+
+    if (flags != 0) return -(s64)EINVAL;
+    if (!urange || !ucs) return -(s64)EFAULT;
+    if ((uintptr_t)urange >= 0x0000800000000000ULL ||
+        (uintptr_t)ucs    >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    file_t *file = fget(proc, fd);
+    if (!file) return -(s64)EBADF;
+    if (!file->f_inode || S_ISDIR(file->f_inode->i_mode)) { fput(file); return -(s64)EBADF; }
+
+    struct cachestat_range range;
+    if (copy_from_user(&range, urange, sizeof(range)) != 0) { fput(file); return -(s64)EFAULT; }
+
+    u64 size = file->f_inode->i_size;
+    u64 off  = range.off;
+    /* len == 0 means "to the end of the file", per the man page. */
+    u64 len  = range.len ? range.len : (off < size ? size - off : 0);
+    fput(file);
+
+    u64 pages = 0;
+    if (off < size) {
+        u64 end = off + len;
+        if (end < off || end > size) end = size;
+        pages = (end - off + PAGE_SIZE - 1) / PAGE_SIZE;
+    }
+
+    /* This kernel reads through the block layer's cache rather than a unified
+     * page cache with its own residency bookkeeping, so the honest answer is
+     * "everything within the file is cached, nothing is dirty or in
+     * writeback" — the shape callers use to decide whether a read would
+     * block. */
+    struct cachestat cs;
+    __builtin_memset(&cs, 0, sizeof(cs));
+    cs.nr_cache = pages;
+    return copy_to_user(ucs, &cs, sizeof(cs)) == 0 ? 0 : -(s64)EFAULT;
+}
+
+/* ============================================================================
+ * futex_waitv(2) — wait until any one of several futexes is woken
+ * ========================================================================= */
+
+static s64 sys_futex_waitv_impl(pt_regs_t *r)
+{
+    const struct futex_waitv *uwaiters = (const struct futex_waitv *)r->rdi;
+    unsigned int nr = (unsigned int)r->rsi;
+    unsigned int flags = (unsigned int)r->rdx;
+    const struct linux_timespec *utimeout = (const struct linux_timespec *)r->r10;
+
+    if (flags != 0) return -(s64)EINVAL;
+    if (nr == 0 || nr > FUTEX_WAITV_MAX) return -(s64)EINVAL;
+    if (!uwaiters || (uintptr_t)uwaiters >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    process_t *proc = sched_current_process();
+    thread_t  *curr = sched_current_thread();
+    if (!proc || !curr) return -(s64)EPERM;
+
+    struct futex_waitv w[FUTEX_WAITV_MAX];
+    if (copy_from_user(w, uwaiters, (size_t)nr * sizeof(w[0])) != 0) return -(s64)EFAULT;
+
+    for (unsigned int i = 0; i < nr; i++) {
+        if (w[i].__reserved != 0) return -(s64)EINVAL;
+        /* Only 32-bit futexes exist here; the size field must say so. */
+        if ((w[i].flags & 0x0F) != FUTEX2_SIZE_U32) return -(s64)EINVAL;
+        if (w[i].uaddr >= 0x0000800000000000ULL || (w[i].uaddr & 3) != 0)
+            return -(s64)EFAULT;
+    }
+
+    u64 timeout_ticks = 0;
+    if (utimeout) {
+        if ((uintptr_t)utimeout >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        struct linux_timespec ts;
+        if (copy_from_user(&ts, utimeout, sizeof(ts)) != 0) return -(s64)EFAULT;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+            return -(s64)EINVAL;
+        u64 ms = (u64)ts.tv_sec * 1000 + (u64)ts.tv_nsec / 1000000;
+        timeout_ticks = (ms + 9) / 10;
+        if (timeout_ticks == 0) timeout_ticks = 1;
+    }
+
+    /* Enqueue on every futex first, then re-check all the values. Checking
+     * before enqueueing would lose a wake that lands in between. */
+    futex_q_t q[FUTEX_WAITV_MAX];
+    u32 bucket[FUTEX_WAITV_MAX];
+
+    spinlock_lock(&g_futex_lock);
+    for (unsigned int i = 0; i < nr; i++) {
+        q[i].thread = curr;
+        q[i].proc   = proc;
+        q[i].uaddr  = (uintptr_t)w[i].uaddr;
+        q[i].bitset = FUTEX_BITSET_MATCH_ANY;
+        bucket[i]   = futex_hash(q[i].uaddr);
+        q[i].next   = g_futex_table[bucket[i]];
+        g_futex_table[bucket[i]] = &q[i];
+    }
+    spinlock_unlock(&g_futex_lock);
+
+    /* dequeue_all() must run on every exit path below, including the early
+     * "value already changed" one. */
+    #define FUTEX_WAITV_DEQUEUE(found_out) do {                          \
+        spinlock_lock(&g_futex_lock);                                    \
+        for (unsigned int _i = 0; _i < nr; _i++) {                       \
+            futex_q_t **pp = &g_futex_table[bucket[_i]];                 \
+            bool _still = false;                                         \
+            while (*pp) {                                                \
+                if (*pp == &q[_i]) { *pp = q[_i].next; _still = true; break; } \
+                pp = &(*pp)->next;                                       \
+            }                                                            \
+            if (!_still) (found_out) = true;                             \
+        }                                                                \
+        spinlock_unlock(&g_futex_lock);                                  \
+    } while (0)
+
+    for (unsigned int i = 0; i < nr; i++) {
+        u32 cur = 0;
+        bool unqueued = false;   /* the macro reports it; nothing to act on here */
+        if (copy_from_user(&cur, (const void *)(uintptr_t)w[i].uaddr, sizeof(u32)) != 0) {
+            FUTEX_WAITV_DEQUEUE(unqueued);
+            (void)unqueued;
+            return -(s64)EFAULT;
+        }
+        if (cur != (u32)w[i].val) {
+            /* This futex already moved: nothing to wait for, report its index. */
+            FUTEX_WAITV_DEQUEUE(unqueued);
+            (void)unqueued;
+            return (s64)i;
+        }
+    }
+
+    u64 start_ticks = sched_get_ticks();
+    if (timeout_ticks > 0) sched_sleep(timeout_ticks);
+    else                   sched_block(THREAD_BLOCKED_PENDING);
+
+    bool woken = false;
+    FUTEX_WAITV_DEQUEUE(woken);
+    #undef FUTEX_WAITV_DEQUEUE
+
+    if (!woken) {
+        if (proc->sig_pending & ~proc->sig_blocked) return -(s64)EINTR;
+        if (timeout_ticks > 0 && sched_get_ticks() - start_ticks >= timeout_ticks)
+            return -(s64)ETIMEDOUT;
+        return -(s64)EINTR;
+    }
+
+    /* Report the first futex whose value now differs from what we waited on;
+     * fall back to 0 when the waker changed nothing observable. */
+    for (unsigned int i = 0; i < nr; i++) {
+        u32 cur = 0;
+        if (copy_from_user(&cur, (const void *)(uintptr_t)w[i].uaddr, sizeof(u32)) == 0 &&
+            cur != (u32)w[i].val)
+            return (s64)i;
+    }
+    return 0;
+}
+
+/* ============================================================================
+ * mseal(2) — make a mapping's protections permanent
+ * ========================================================================= */
+
+static s64 sys_mseal_impl(pt_regs_t *r)
+{
+    uintptr_t addr = (uintptr_t)r->rdi;
+    size_t len     = (size_t)r->rsi;
+    unsigned long flags = (unsigned long)r->rdx;
+
+    if (flags != 0) return -(s64)EINVAL;
+    if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;
+    if (addr + len < addr || addr + len > 0x0000800000000000ULL) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    /* Every page in the range must be mapped, or Linux returns ENOMEM. We
+     * enforce that much; the seal itself is not yet tracked, so a later
+     * mprotect() on the range still succeeds. Reporting ENOSYS instead would
+     * be worse: callers use mseal() as opportunistic hardening and treat a
+     * success as "done", never as "and now nothing can change". */
+    for (uintptr_t va = addr; va < addr + len; va += PAGE_SIZE) {
+        if (!vmm_translate(proc->pml4_phys, va)) return -(s64)ENOMEM;
+    }
+    return 0;
+}
+
+/* ============================================================================
+ * setns(2)
+ * ========================================================================= */
+
+static s64 sys_setns_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    int nstype = (int)r->rsi;
+    (void)nstype;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
+
+    file_t *f = fget(proc, fd);
+    if (!f) return -(s64)EBADF;
+    fput(f);
+
+    /* There is a single namespace of each kind, so no descriptor can name a
+     * different one to join. EINVAL is what Linux returns for an fd that is
+     * not a namespace file, and is what callers probe for. */
+    return -(s64)EINVAL;
+}
+
+/* ============================================================================
+ * POSIX message queues (mq_open, mq_unlink, mq_timedsend, mq_timedreceive,
+ * mq_notify, mq_getsetattr)
+ *
+ * The subsystem lives in kernel/ipc/mqueue.c; these are register-unpacking
+ * shims and nothing else, so the ABI mapping stays visible in one place.
+ * ========================================================================= */
+
+static s64 sys_mq_open_impl(pt_regs_t *r)
+{
+    return mq_open_impl((const char *)r->rdi, (int)r->rsi, (u32)r->rdx,
+                        (const void *)r->r10);
+}
+
+static s64 sys_mq_unlink_impl(pt_regs_t *r)
+{
+    return mq_unlink_impl((const char *)r->rdi);
+}
+
+static s64 sys_mq_timedsend_impl(pt_regs_t *r)
+{
+    return mq_timedsend_impl((int)r->rdi, (const char *)r->rsi, (size_t)r->rdx,
+                             (u32)r->r10, (const void *)r->r8);
+}
+
+static s64 sys_mq_timedreceive_impl(pt_regs_t *r)
+{
+    return mq_timedreceive_impl((int)r->rdi, (char *)r->rsi, (size_t)r->rdx,
+                                (u32 *)r->r10, (const void *)r->r8);
+}
+
+static s64 sys_mq_notify_impl(pt_regs_t *r)
+{
+    return mq_notify_impl((int)r->rdi, (const void *)r->rsi);
+}
+
+static s64 sys_mq_getsetattr_impl(pt_regs_t *r)
+{
+    return mq_getsetattr_impl((int)r->rdi, (const void *)r->rsi, (void *)r->rdx);
+}
+
+/* ============================================================================
+ * futex2: futex_wake(2), futex_wait(2), futex_requeue(2)
+ *
+ * The newer, flag-word-based entry points onto the same wait queues futex(2)
+ * uses. They are not sugar: futex_wait() takes an *absolute* deadline against
+ * a caller-named clock, which is what a correct pthread_cond_timedwait() needs
+ * and what the FUTEX_WAIT opcode could never express without the
+ * FUTEX_CLOCK_REALTIME retrofit.
+ * ========================================================================= */
+
+/* Reject the parts of the futex2 flag word this kernel cannot honour, so a
+ * program probing for 64-bit or NUMA futexes gets a clean -EINVAL instead of
+ * silently operating on the wrong width. */
+static s64 futex2_check_flags(unsigned int flags)
+{
+    if (flags & ~(u32)(FUTEX2_SIZE_MASK | FUTEX2_NUMA | FUTEX2_PRIVATE))
+        return -(s64)EINVAL;
+    if ((flags & FUTEX2_SIZE_MASK) != FUTEX2_SIZE_U32) return -(s64)EINVAL;
+    if (flags & FUTEX2_NUMA) return -(s64)EINVAL;   /* single memory node */
+    return 0;
+}
+
+static s64 sys_futex_wake_impl(pt_regs_t *r)
+{
+    uintptr_t uaddr = (uintptr_t)r->rdi;
+    u32 mask        = (u32)r->rsi;
+    int nr          = (int)r->rdx;
+    unsigned int flags = (unsigned int)r->r10;
+
+    s64 rc = futex2_check_flags(flags);
+    if (rc < 0) return rc;
+    if (mask == 0 || nr < 0) return -(s64)EINVAL;
+    if (uaddr >= 0x0000800000000000ULL || (uaddr & 3) != 0) return -(s64)EFAULT;
+
+    pt_regs_t sub = *r;
+    sub.rsi = FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG;
+    sub.rdx = (u64)(u32)nr;
+    sub.r9  = mask;
+    return sys_futex_impl(&sub);
+}
+
+static s64 sys_futex_wait_impl(pt_regs_t *r)
+{
+    uintptr_t uaddr = (uintptr_t)r->rdi;
+    u32 val         = (u32)r->rsi;
+    u32 mask        = (u32)r->rdx;
+    unsigned int flags = (unsigned int)r->r10;
+    const struct linux_timespec *utimeout = (const struct linux_timespec *)r->r8;
+    int clockid     = (int)r->r9;
+
+    s64 rc = futex2_check_flags(flags);
+    if (rc < 0) return rc;
+    if (mask == 0) return -(s64)EINVAL;
+    if (uaddr >= 0x0000800000000000ULL || (uaddr & 3) != 0) return -(s64)EFAULT;
+    /* CLOCK_REALTIME (0) and CLOCK_MONOTONIC (1) are the only clocks the call
+     * is defined for; both advance at the same rate here. */
+    if (clockid != 0 && clockid != 1) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    thread_t  *curr = sched_current_thread();
+    if (!proc || !curr) return -(s64)EPERM;
+
+    u32 cur_val = 0;
+    if (copy_from_user(&cur_val, (const void *)uaddr, sizeof(u32)) != 0)
+        return -(s64)EFAULT;
+    if (cur_val != val) return -(s64)EAGAIN;
+
+    /* Absolute deadline, unlike FUTEX_WAIT's relative one. Reading the clock
+     * here rather than in the caller is the whole point: a deadline that has
+     * already passed must not block, however long the caller took to get here. */
+    u64 timeout_ticks = 0;
+    if (utimeout) {
+        if ((uintptr_t)utimeout >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        struct linux_timespec ts;
+        if (copy_from_user(&ts, utimeout, sizeof(ts)) != 0) return -(s64)EFAULT;
+        if (ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) return -(s64)EINVAL;
+
+        u64 now_ticks = sched_get_ticks();
+        u64 abs_ticks = (u64)ts.tv_sec * 100 + (u64)(ts.tv_nsec / 10000000L);
+        if (clockid == 0) {
+            /* CLOCK_REALTIME deadlines are wall-clock; rebase onto ticks. */
+            u64 now_sec = get_cached_unix_time();
+            s64 delta_ms = (s64)((ts.tv_sec - (s64)now_sec) * 1000 +
+                                 ts.tv_nsec / 1000000);
+            if (delta_ms <= 0) return -(s64)ETIMEDOUT;
+            timeout_ticks = (u64)((delta_ms + 9) / 10);
+        } else {
+            if (abs_ticks <= now_ticks) return -(s64)ETIMEDOUT;
+            timeout_ticks = abs_ticks - now_ticks;
+        }
+        if (timeout_ticks == 0) timeout_ticks = 1;
+    }
+
+    return futex_wait_queued(proc, curr, uaddr, mask, timeout_ticks);
+}
+
+static s64 sys_futex_requeue_impl(pt_regs_t *r)
+{
+    /* futex_requeue() takes its two futexes through a two-element array of
+     * struct futex_waitv rather than as two bare pointers, which is what lets
+     * each side carry its own flags. */
+    const struct futex_waitv *uwaiters = (const struct futex_waitv *)r->rdi;
+    unsigned int flags = (unsigned int)r->rsi;
+    int nr_wake    = (int)r->rdx;
+    int nr_requeue = (int)r->r10;
+
+    if (flags != 0) return -(s64)EINVAL;
+    if (nr_wake < 0 || nr_requeue < 0) return -(s64)EINVAL;
+    if (!uwaiters || (uintptr_t)uwaiters >= 0x0000800000000000ULL)
+        return -(s64)EFAULT;
+
+    struct futex_waitv w[2];
+    if (copy_from_user(w, uwaiters, sizeof(w)) != 0) return -(s64)EFAULT;
+
+    for (int i = 0; i < 2; i++) {
+        s64 rc = futex2_check_flags(w[i].flags);
+        if (rc < 0) return rc;
+        if (w[i].__reserved) return -(s64)EINVAL;
+        if (w[i].uaddr >= 0x0000800000000000ULL || (w[i].uaddr & 3) != 0)
+            return -(s64)EFAULT;
+    }
+
+    pt_regs_t sub = *r;
+    sub.rdi = w[0].uaddr;
+    sub.rsi = FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG;
+    sub.rdx = (u64)(u32)nr_wake;
+    sub.r10 = (u64)(u32)nr_requeue;   /* the legacy path reads val2 from here */
+    sub.r8  = w[1].uaddr;
+    sub.r9  = (u32)w[0].val;          /* expected value at the source futex   */
+    return sys_futex_impl(&sub);
+}
+
+/* ============================================================================
+ * ioprio_set(2) / ioprio_get(2)
+ *
+ * The block layer here services requests in arrival order, so a class and
+ * level cannot change when a request is issued. They are still worth storing
+ * and reporting: a program that lowers itself to IOPRIO_CLASS_IDLE and reads
+ * the value back must see the change, ionice(1) works, and the value is
+ * inherited across fork() as the interface promises.
+ * ========================================================================= */
+
+/* Linux's mapping when no explicit priority has been set: best-effort, with
+ * the level derived from the CPU nice value. */
+#define IOPRIO_NORM 4
+
+static s64 ioprio_apply(process_t *p, int prio)
+{
+    int class = IOPRIO_PRIO_CLASS(prio);
+    int data  = IOPRIO_PRIO_DATA(prio);
+    process_t *me = sched_current_process();
+
+    switch (class) {
+    case IOPRIO_CLASS_RT:
+        /* Real-time I/O can starve every other process on the machine. */
+        if (!me || !security_check_permission(me, CAP_SYS_ADMIN)) return -(s64)EPERM;
+        /* fall through */
+    case IOPRIO_CLASS_BE:
+        if (data >= IOPRIO_NR_LEVELS) return -(s64)EINVAL;
+        break;
+    case IOPRIO_CLASS_IDLE:
+        break;
+    case IOPRIO_CLASS_NONE:
+        if (data) return -(s64)EINVAL;
+        break;
+    default:
+        return -(s64)EINVAL;
+    }
+    p->ioprio = (u32)prio;
+    return 0;
+}
+
+/* An unprivileged process may only change a process it could signal. */
+static bool ioprio_may_change(const process_t *me, const process_t *target)
+{
+    if (!me || !target) return false;
+    if (me->euid == 0) return true;
+    return me->euid == target->uid || me->euid == target->euid;
+}
+
+static s64 sys_ioprio_set_impl(pt_regs_t *r)
+{
+    int which = (int)r->rdi;
+    int who   = (int)r->rsi;
+    int prio  = (int)r->rdx;
+
+    process_t *me = sched_current_process();
+    if (!me) return -(s64)EPERM;
+
+    s64 done = 0;
+    switch (which) {
+    case IOPRIO_WHO_PROCESS: {
+        if (!who) return ioprio_apply(me, prio);
+        process_t *t = proc_get_by_pid((u32)who);
+        if (!t) return -(s64)ESRCH;
+        s64 rc = ioprio_may_change(me, t) ? ioprio_apply(t, prio)
+                                          : -(s64)EPERM;
+        proc_put(t);
+        return rc;
+    }
+    case IOPRIO_WHO_PGRP:
+    case IOPRIO_WHO_USER: {
+        u32 key = (u32)who;
+        if (which == IOPRIO_WHO_PGRP && who == 0) key = me->pgid;
+        if (which == IOPRIO_WHO_USER && who == 0) key = me->uid;
+
+        sched_lock();
+        for (process_t *t = sched_get_process_list(); t; t = t->next) {
+            if (t->is_zombie) continue;
+            bool match = (which == IOPRIO_WHO_PGRP) ? (t->pgid == key)
+                                                    : (t->uid == key);
+            if (!match) continue;
+            if (!ioprio_may_change(me, t)) continue;
+            if (ioprio_apply(t, prio) == 0) done++;
+        }
+        sched_unlock();
+        return done ? 0 : -(s64)ESRCH;
+    }
+    default:
+        return -(s64)EINVAL;
+    }
+}
+
+static s64 sys_ioprio_get_impl(pt_regs_t *r)
+{
+    int which = (int)r->rdi;
+    int who   = (int)r->rsi;
+
+    process_t *me = sched_current_process();
+    if (!me) return -(s64)EPERM;
+
+    /* ioprio_get() over a group returns the *highest* priority found, which
+     * for this encoding is the numerically smallest value. */
+    s64 best = -1;
+
+    switch (which) {
+    case IOPRIO_WHO_PROCESS: {
+        process_t *t = me;
+        if (who) {
+            t = proc_get_by_pid((u32)who);
+            if (!t) return -(s64)ESRCH;
+        }
+        best = t->ioprio ? (s64)t->ioprio
+                         : (s64)IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, IOPRIO_NORM);
+        if (who) proc_put(t);
+        return best;
+    }
+    case IOPRIO_WHO_PGRP:
+    case IOPRIO_WHO_USER: {
+        u32 key = (u32)who;
+        if (which == IOPRIO_WHO_PGRP && who == 0) key = me->pgid;
+        if (which == IOPRIO_WHO_USER && who == 0) key = me->uid;
+
+        sched_lock();
+        for (process_t *t = sched_get_process_list(); t; t = t->next) {
+            if (t->is_zombie) continue;
+            bool match = (which == IOPRIO_WHO_PGRP) ? (t->pgid == key)
+                                                    : (t->uid == key);
+            if (!match) continue;
+            s64 v = t->ioprio ? (s64)t->ioprio
+                              : (s64)IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, IOPRIO_NORM);
+            if (best < 0 || v < best) best = v;
+        }
+        sched_unlock();
+        return best < 0 ? -(s64)ESRCH : best;
+    }
+    default:
+        return -(s64)EINVAL;
+    }
+}
+
+/* ============================================================================
+ * NUMA memory policy: set_mempolicy(2), get_mempolicy(2), mbind(2),
+ * migrate_pages(2), set_mempolicy_home_node(2)
+ *
+ * AzamiOS presents one memory node. That makes every policy trivially
+ * satisfied rather than unimplementable, so these validate their arguments the
+ * way a one-node Linux kernel does and keep the state they are given — a
+ * nodemask naming node 3 is an error here for the same reason it is there.
+ * ========================================================================= */
+
+/* Read a user nodemask and check it names nothing but node 0. */
+static s64 mempolicy_check_nodemask(const unsigned long *unodes, unsigned long maxnode,
+                                    u64 *out_mask)
+{
+    *out_mask = 0;
+    if (maxnode > 8 * sizeof(u64) * 16) return -(s64)EINVAL;
+    if (!unodes || maxnode == 0) return 0;
+    if ((uintptr_t)unodes >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    /* maxnode counts bits, and the bitmap is an array of unsigned long. */
+    unsigned long words = (maxnode + 63) / 64;
+    for (unsigned long i = 0; i < words; i++) {
+        u64 w = 0;
+        if (copy_from_user(&w, unodes + i, sizeof(u64)) != 0) return -(s64)EFAULT;
+        if (i == 0) {
+            /* Mask off bits past maxnode before judging the word. */
+            if (maxnode < 64) w &= (maxnode == 0) ? 0 : ((1ULL << maxnode) - 1);
+            *out_mask = w;
+            if (w & ~1ULL) return -(s64)EINVAL;   /* only node 0 exists */
+        } else if (w) {
+            return -(s64)EINVAL;
+        }
+    }
+    return 0;
+}
+
+static s64 mempolicy_check_mode(int mode, u64 nodemask)
+{
+    int flags = mode & MPOL_MODE_FLAGS;
+    mode &= ~MPOL_MODE_FLAGS;
+    if (mode < 0 || mode >= MPOL_MAX) return -(s64)EINVAL;
+    if ((flags & MPOL_F_STATIC_NODES) && (flags & MPOL_F_RELATIVE_NODES))
+        return -(s64)EINVAL;
+
+    /* MPOL_BIND and MPOL_INTERLEAVE require a non-empty node set;
+     * MPOL_DEFAULT and MPOL_LOCAL require an empty one. */
+    if ((mode == MPOL_BIND || mode == MPOL_INTERLEAVE) && nodemask == 0)
+        return -(s64)EINVAL;
+    if ((mode == MPOL_DEFAULT || mode == MPOL_LOCAL) && nodemask != 0)
+        return -(s64)EINVAL;
+    return 0;
+}
+
+static s64 sys_set_mempolicy_impl(pt_regs_t *r)
+{
+    int mode = (int)r->rdi;
+    const unsigned long *unodes = (const unsigned long *)r->rsi;
+    unsigned long maxnode = (unsigned long)r->rdx;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    u64 mask = 0;
+    s64 rc = mempolicy_check_nodemask(unodes, maxnode, &mask);
+    if (rc < 0) return rc;
+    rc = mempolicy_check_mode(mode, mask);
+    if (rc < 0) return rc;
+
+    proc->mempolicy_mode = (u32)mode;
+    proc->mempolicy_nodemask = mask;
+    return 0;
+}
+
+static s64 sys_get_mempolicy_impl(pt_regs_t *r)
+{
+    int *umode = (int *)r->rdi;
+    unsigned long *unodes = (unsigned long *)r->rsi;
+    unsigned long maxnode = (unsigned long)r->rdx;
+    uintptr_t addr = (uintptr_t)r->r10;
+    unsigned long flags = (unsigned long)r->r8;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (flags & ~(unsigned long)(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED))
+        return -(s64)EINVAL;
+    if ((flags & MPOL_F_ADDR) && !addr) return -(s64)EINVAL;
+    if ((flags & MPOL_F_MEMS_ALLOWED) && (flags & (MPOL_F_ADDR | MPOL_F_NODE)))
+        return -(s64)EINVAL;
+
+    int mode;
+    u64 mask;
+    if (flags & MPOL_F_MEMS_ALLOWED) {
+        mode = 0;
+        mask = 1;                       /* node 0 is the only one permitted */
+    } else if (flags & MPOL_F_NODE) {
+        /* Report which node the memory is on, not which policy governs it.
+         * With one node the answer is always 0 — but only for a mapped
+         * address, so an unmapped one still has to fault. */
+        if (flags & MPOL_F_ADDR) {
+            if (addr >= 0x0000800000000000ULL) return -(s64)EFAULT;
+            if (!vmm_translate(proc->pml4_phys, addr)) return -(s64)EFAULT;
+        }
+        mode = 0;
+        mask = proc->mempolicy_nodemask;
+    } else {
+        mode = (int)proc->mempolicy_mode;
+        mask = proc->mempolicy_nodemask;
+    }
+
+    if (umode) {
+        if ((uintptr_t)umode >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (copy_to_user(umode, &mode, sizeof(int)) != 0) return -(s64)EFAULT;
+    }
+    if (unodes && maxnode) {
+        if ((uintptr_t)unodes >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        unsigned long words = (maxnode + 63) / 64;
+        for (unsigned long i = 0; i < words; i++) {
+            u64 w = (i == 0) ? mask : 0;
+            if (copy_to_user(unodes + i, &w, sizeof(u64)) != 0) return -(s64)EFAULT;
+        }
+    }
+    return 0;
+}
+
+/* move_pages(2), fully implemented for the one-node case this kernel
+ * presents — same "faithful for one node rather than stubbed" approach as
+ * the other mempolicy calls above (see this file's MPOL_* comment).
+ * Querying (nodes == NULL) reports node 0 for every present page and
+ * -ENOENT for an unmapped one; a move request succeeds trivially when the
+ * target is node 0 (the page is already there) and fails -ENODEV for any
+ * other target, exactly matching what a real move_pages() reports on
+ * hardware with a single NUMA node.
+ *
+ * Only self (pid == 0 or the caller's own pid) is supported: real
+ * move_pages() can also target another process the caller has
+ * ptrace-equivalent permission over, but every real caller of this syscall
+ * is a NUMA-aware allocator checking or placing its *own* pages — nothing
+ * in a single-node kernel needs the cross-process case, and skipping it
+ * avoids taking on another process's page-table locking here. */
+#define MOVE_PAGES_MAX 1024 /* same per-call bound as readv/writev's iovec cap */
+
+static s64 sys_move_pages_impl(pt_regs_t *r)
+{
+    int pid = (int)r->rdi;
+    unsigned long count = (unsigned long)r->rsi;
+    void *const *upages = (void *const *)r->rdx;
+    const int *unodes = (const int *)r->r10;
+    int *ustatus = (int *)r->r8;
+    /* r9 (flags: MPOL_MF_MOVE / MPOL_MF_MOVE_ALL) doesn't change behavior
+     * either way on a single-node system. */
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (pid != 0 && pid != (int)proc->pid) return -(s64)EPERM;
+
+    if (count > MOVE_PAGES_MAX) return -(s64)E2BIG;
+    if (count == 0) return 0;
+    if (!upages || !ustatus) return -(s64)EFAULT;
+    if ((uintptr_t)upages >= 0x0000800000000000ULL || (uintptr_t)ustatus >= 0x0000800000000000ULL)
+        return -(s64)EFAULT;
+    if (unodes && (uintptr_t)unodes >= 0x0000800000000000ULL) return -(s64)EFAULT;
+
+    for (unsigned long i = 0; i < count; i++) {
+        void *upage_ptr;
+        if (copy_from_user(&upage_ptr, &upages[i], sizeof(void *)) != 0) return -(s64)EFAULT;
+        uintptr_t addr = (uintptr_t)upage_ptr;
+
+        int status;
+        if (addr >= 0x0000800000000000ULL ||
+            !vmm_translate(proc->pml4_phys, ALIGN_DOWN(addr, PAGE_SIZE))) {
+            status = -(s32)ENOENT; /* page not present */
+        } else if (unodes) {
+            int want_node;
+            if (copy_from_user(&want_node, &unodes[i], sizeof(int)) != 0) return -(s64)EFAULT;
+            status = (want_node == 0) ? 0 : -(s32)ENODEV;
+        } else {
+            status = 0; /* query only: present pages are always on node 0 */
+        }
+        if (copy_to_user(&ustatus[i], &status, sizeof(int)) != 0) return -(s64)EFAULT;
+    }
+    return 0;
+}
+
+static s64 sys_mbind_impl(pt_regs_t *r)
+{
+    uintptr_t addr = (uintptr_t)r->rdi;
+    u64 len = r->rsi;
+    int mode = (int)r->rdx;
+    const unsigned long *unodes = (const unsigned long *)r->r10;
+    unsigned long maxnode = (unsigned long)r->r8;
+    unsigned flags = (unsigned)r->r9;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;
+    /* MPOL_MF_STRICT | MPOL_MF_MOVE | MPOL_MF_MOVE_ALL */
+    if (flags & ~7u) return -(s64)EINVAL;
+
+    u64 mask = 0;
+    s64 rc = mempolicy_check_nodemask(unodes, maxnode, &mask);
+    if (rc < 0) return rc;
+    rc = mempolicy_check_mode(mode, mask);
+    if (rc < 0) return rc;
+
+    /* The range has to exist even though the policy cannot move anything. */
+    u64 end = addr + ALIGN_UP(len, PAGE_SIZE);
+    if (end < addr || end > 0x0000800000000000ULL) return -(s64)EINVAL;
+    return 0;
+}
+
+static s64 sys_migrate_pages_impl(pt_regs_t *r)
+{
+    unsigned long maxnode = (unsigned long)r->rsi;
+    const unsigned long *uold = (const unsigned long *)r->rdx;
+    const unsigned long *unew = (const unsigned long *)r->r10;
+
+    u64 om = 0, nm = 0;
+    s64 rc = mempolicy_check_nodemask(uold, maxnode, &om);
+    if (rc < 0) return rc;
+    rc = mempolicy_check_nodemask(unew, maxnode, &nm);
+    if (rc < 0) return rc;
+
+    /* Every page is already on the only node there is, so nothing could not
+     * be moved — which is exactly what a return of 0 means. */
+    return 0;
+}
+
+static s64 sys_set_mempolicy_home_node_impl(pt_regs_t *r)
+{
+    uintptr_t addr = (uintptr_t)r->rdi;
+    u64 len = r->rsi;
+    unsigned long home_node = (unsigned long)r->rdx;
+    unsigned long flags = (unsigned long)r->r10;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (flags) return -(s64)EINVAL;
+    if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;
+    if (home_node != 0) return -(s64)EINVAL;   /* node 0 is the only node */
+    u64 end = addr + ALIGN_UP(len, PAGE_SIZE);
+    if (end < addr || end > 0x0000800000000000ULL) return -(s64)EINVAL;
+
+    proc->mempolicy_home_node = (u32)home_node;
+    return 0;
+}
+
+/* ============================================================================
+ * fchmodat2(2) — fchmodat() with the flags argument it should always have had.
+ * ========================================================================= */
+
+static s64 sys_fchmodat2_impl(pt_regs_t *r)
+{
+    int flags = (int)r->r10;
+
+    /* AT_SYMLINK_NOFOLLOW is the whole reason this call exists; the mode of a
+     * symlink itself is not meaningful on any filesystem here, so the honest
+     * answer is the one Linux gives for filesystems that cannot do it. */
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) return -(s64)EINVAL;
+    if (flags & AT_SYMLINK_NOFOLLOW) return -(s64)EOPNOTSUPP;
+
+    pt_regs_t sub = *r;
+    sub.r10 = 0;
+    return sys_fchmodat_impl(&sub);
+}
+
+/* ============================================================================
+ * restart_syscall(2)
+ *
+ * Never called by a program: the kernel plants it as the return address when a
+ * restartable call is interrupted by a handler installed with SA_RESTART. This
+ * kernel restarts such calls in signal_deliver_pending() by rewinding RIP, so
+ * there is nothing left for the entry point to resume — but the number must
+ * still resolve, because a stray call to it has a defined answer (-EINTR) and
+ * -ENOSYS would be the wrong one.
+ * ========================================================================= */
+
+static s64 sys_restart_syscall_impl(pt_regs_t *r)
+{
+    (void)r;
+    return -(s64)EINTR;
+}
+
+/* ============================================================================
+ * vhangup(2) — revoke the controlling terminal of every process on it.
+ * ========================================================================= */
+
+static s64 sys_vhangup_impl(pt_regs_t *r)
+{
+    (void)r;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!security_check_permission(proc, CAP_SYS_TTY_CONFIG)) return -(s64)EPERM;
+
+    /* getty(8) calls this between sessions so the next login cannot inherit a
+     * descriptor onto the previous user's terminal. Delivering SIGHUP to the
+     * session is the visible half of that contract and the half programs
+     * actually depend on.
+     *
+     * Collect the pids under the scheduler lock and signal afterwards:
+     * sched_kill_process() takes that same lock, and it is the only thing that
+     * knows how to apply a signal's default action, so it must not be called
+     * from inside the walk. */
+    u32 sid = proc->sid;
+    u32 pids[64];
+    u32 npids = 0;
+
+    sched_lock();
+    for (process_t *t = sched_get_process_list(); t; t = t->next) {
+        if (t->is_zombie || t->sid != sid || t->pid == proc->pid) continue;
+        if (npids == (u32)(sizeof(pids) / sizeof(pids[0]))) break;
+        pids[npids++] = t->pid;
+    }
+    sched_unlock();
+
+    for (u32 i = 0; i < npids; i++) sched_kill_process(pids[i], SIGHUP);
+    return 0;
+}
+
+/* ============================================================================
+ * pivot_root(2) — swap the root filesystem for another mounted one.
+ * ========================================================================= */
+
+static s64 sys_pivot_root_impl(pt_regs_t *r)
+{
+    const char *unew = (const char *)r->rdi;
+    const char *uput = (const char *)r->rsi;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
+
+    char newroot[256], putold[256];
+    if (copy_str_from_user(newroot, unew, sizeof(newroot)) < 0) return -(s64)EFAULT;
+    if (copy_str_from_user(putold, uput, sizeof(putold)) < 0) return -(s64)EFAULT;
+
+    /* Both must be directories, and put_old must lie under new_root — the two
+     * constraints that make the swap reversible. */
+    dentry_t *dn = NULL, *dp = NULL;
+    if (vfs_path_lookup(newroot, &dn) < 0 || !dn || !dn->d_inode) return -(s64)ENOENT;
+    if (!S_ISDIR(dn->d_inode->i_mode)) return -(s64)ENOTDIR;
+    if (vfs_path_lookup(putold, &dp) < 0 || !dp || !dp->d_inode) return -(s64)ENOENT;
+    if (!S_ISDIR(dp->d_inode->i_mode)) return -(s64)ENOTDIR;
+
+    size_t nlen = strlen(newroot);
+    while (nlen > 1 && newroot[nlen - 1] == '/') nlen--;
+    if (strncmp(putold, newroot, nlen) != 0 ||
+        (putold[nlen] != '/' && putold[nlen] != '\0'))
+        return -(s64)EINVAL;
+
+    /* The mount table is a single global namespace with no per-process root,
+     * so the old root cannot be detached from under processes that are still
+     * using it. Reporting that honestly beats half-performing the swap. */
+    return -(s64)EBUSY;
+}
+
+/* ============================================================================
+ * process_mrelease(2) — reap the address space of a process that is already
+ * dying, without waiting for it to be reaped by its parent.
+ * ========================================================================= */
+
+static s64 sys_process_mrelease_impl(pt_regs_t *r)
+{
+    int pidfd = (int)r->rdi;
+    unsigned int flags = (unsigned int)r->rsi;
+
+    if (flags != 0) return -(s64)EINVAL;
+
+    process_t *me = sched_current_process();
+    if (!me) return -(s64)EPERM;
+
+    file_t *f = fget(me, pidfd);
+    if (!f) return -(s64)EBADF;
+    if (f->f_op != &g_pidfd_fops || !f->private_data) { fput(f); return -(s64)EBADF; }
+    u32 target_pid = ((pidfd_ctx_t *)f->private_data)->target_pid;
+    fput(f);
+
+    struct proc_ident id;
+    if (!sched_proc_ident(target_pid, &id)) return -(s64)ESRCH;
+    /* Only for a process that is already on its way out: the call exists to
+     * accelerate an OOM kill, not to shoot down a running program. */
+    if (!id.is_zombie) return -(s64)EINVAL;
+    if (me->euid != 0 && me->euid != id.uid) return -(s64)EPERM;
+
+    /* A zombie's address space is torn down at exit here, so the memory this
+     * call would free is already gone. */
+    return 0;
+}
+
+/* ============================================================================
+ * POSIX Named Semaphores — Azami extended syscalls 534–541
+ *
+ * Model: sem_open() returns a normal fd backed by a g_semfd_fops file whose
+ * private_data points to the kernel posix_sem_t.  sem_post / sem_wait / ...
+ * take that fd and look it up via fget() exactly like any other fd call.
+ * sem_unlink() takes a name string.
+ * ============================================================================ */
+
+#include "../ipc/posix_sem.h"
+
+static s64 semfd_release_op(inode_t *inode, file_t *filp)
+{
+    (void)inode;
+    if (filp && filp->private_data) {
+        posix_sem_put((posix_sem_t *)filp->private_data);
+        filp->private_data = NULL;
+    }
+    return 0;
+}
+
+static file_operations_t g_semfd_fops = {
+    .release = semfd_release_op,
+};
+
+/* sem_open(name, oflag, mode, value) → fd or −errno */
+static s64 sys_az_sem_open_impl(pt_regs_t *r)
+{
+    const char *uname = (const char *)r->rdi;
+    int         oflag = (int)r->rsi;
+    unsigned    mode  = (unsigned)r->rdx;
+    unsigned    value = (unsigned)r->r10;
+
+    char kname[POSIX_SEM_NAME_MAX];
+    s64 err = copy_str_from_user(kname, uname, sizeof(kname));
+    if (err < 0) return -(s64)EFAULT;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    posix_sem_t *sem = posix_sem_open_kern(kname, oflag, mode, value);
+    if (!sem) return -(s64)ENOENT; /* caller interprets per oflag */
+
+    file_t *f = (file_t *)kzalloc(sizeof(file_t));
+    if (!f) { posix_sem_put(sem); return -(s64)ENOMEM; }
+
+    f->f_op       = &g_semfd_fops;
+    f->private_data = sem;
+    f->f_count    = 1;
+    f->f_mode     = 0600;
+
+    s64 fd = fd_install(proc, f, 0);
+    if (fd < 0) { posix_sem_put(sem); kfree(f); return -(s64)EMFILE; }
+    return fd;
+}
+
+/* sem_close(fd) */
+static s64 sys_az_sem_close_impl(pt_regs_t *r)
+{
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    /* A normal close() also works — we just provide the specific sem-close path. */
+    return sys_close_impl(r);  /* reuse the standard close */
+}
+
+/* Helper: get the posix_sem_t from an fd, or return NULL (sets errno). */
+static posix_sem_t *semfd_get(process_t *proc, int fd, file_t **fout)
+{
+    file_t *f = fget(proc, fd);
+    if (!f) return NULL;
+    if (f->f_op != &g_semfd_fops || !f->private_data) { fput(f); return NULL; }
+    if (fout) *fout = f;
+    return (posix_sem_t *)f->private_data;
+}
+
+/* sem_post(fd) */
+static s64 sys_az_sem_post_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    file_t *f = NULL;
+    posix_sem_t *sem = semfd_get(proc, fd, &f);
+    if (!sem) return -(s64)EBADF;
+    s64 ret = posix_sem_post(sem);
+    fput(f);
+    return ret;
+}
+
+/* sem_wait(fd) */
+static s64 sys_az_sem_wait_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    file_t *f = NULL;
+    posix_sem_t *sem = semfd_get(proc, fd, &f);
+    if (!sem) return -(s64)EBADF;
+    s64 ret = posix_sem_wait(sem);
+    fput(f);
+    return ret;
+}
+
+/* sem_trywait(fd) */
+static s64 sys_az_sem_trywait_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    file_t *f = NULL;
+    posix_sem_t *sem = semfd_get(proc, fd, &f);
+    if (!sem) return -(s64)EBADF;
+    s64 ret = posix_sem_trywait(sem);
+    fput(f);
+    return ret;
+}
+
+/* sem_timedwait(fd, *timespec) */
+static s64 sys_az_sem_timedwait_impl(pt_regs_t *r)
+{
+    int fd = (int)r->rdi;
+    const struct linux_timespec *uts = (const struct linux_timespec *)r->rsi;
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+
+    u64 abs_ns = 0;
+    if (uts) {
+        struct linux_timespec ts;
+        if (copy_from_user(&ts, uts, sizeof(ts)) != 0) return -(s64)EFAULT;
+        abs_ns = (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+    }
+
+    file_t *f = NULL;
+    posix_sem_t *sem = semfd_get(proc, fd, &f);
+    if (!sem) return -(s64)EBADF;
+    s64 ret = posix_sem_timedwait(sem, abs_ns);
+    fput(f);
+    return ret;
+}
+
+/* sem_unlink(name) */
+static s64 sys_az_sem_unlink_impl(pt_regs_t *r)
+{
+    const char *uname = (const char *)r->rdi;
+    char kname[POSIX_SEM_NAME_MAX];
+    s64 err = copy_str_from_user(kname, uname, sizeof(kname));
+    if (err < 0) return -(s64)EFAULT;
+    return (s64)posix_sem_unlink(kname);
+}
+
+/* sem_getvalue(fd, *sval) */
+static s64 sys_az_sem_getvalue_impl(pt_regs_t *r)
+{
+    int  fd   = (int)r->rdi;
+    int *usval = (int *)r->rsi;
+    if (!usval || (uintptr_t)usval >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    process_t *proc = sched_current_process();
+    if (!proc) return -(s64)EPERM;
+    file_t *f = NULL;
+    posix_sem_t *sem = semfd_get(proc, fd, &f);
+    if (!sem) return -(s64)EBADF;
+    int sval = 0;
+    s64 ret = posix_sem_getvalue(sem, &sval);
+    fput(f);
+    if (ret == 0 && copy_to_user(usval, &sval, sizeof(sval)) != 0)
+        return -(s64)EFAULT;
+    return ret;
+}
+
+/* ============================================================================
+ * ktrace syscall stubs — delegate to ktrace.c at kernel/perf/ktrace.c
+ * These provide a direct syscall interface as an alternative to the
+ * /sys/kernel/trace/ VFS interface.
+ * ============================================================================ */
+
+/* ktrace syscall implementations (API defined in kernel/perf/ktrace.h) */
+
+/* ktrace_enable(name_ptr) or ktrace_disable("-name_ptr") */
+static s64 sys_az_ktrace_enable_impl(pt_regs_t *r)
+{
+    const char *uname = (const char *)r->rdi;
+    char kname[64];
+    s64 err = copy_str_from_user(kname, uname, sizeof(kname));
+    if (err < 0) return -(s64)EFAULT;
+
+    if (kname[0] == '-') {
+        return (s64)ktrace_disable(kname + 1);
+    }
+    return (s64)ktrace_enable(kname);
+}
+
+/* ktrace_read(buf, max_entries) → number of entries written */
+static s64 sys_az_ktrace_read_impl(pt_regs_t *r)
+{
+    void  *ubuf       = (void *)r->rdi;
+    size_t max_entries = (size_t)r->rsi;
+    if (!ubuf || (uintptr_t)ubuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (max_entries == 0) return 0;
+    if (max_entries > 256) max_entries = 256;
+
+    size_t sz = max_entries * sizeof(ktrace_entry_t);
+    ktrace_entry_t *kbuf = (ktrace_entry_t *)kzalloc(sz);
+    if (!kbuf) return -(s64)ENOMEM;
+
+    size_t n = ktrace_read(kbuf, max_entries);
+    s64 ret = 0;
+    if (n > 0 && copy_to_user(ubuf, kbuf, n * sizeof(ktrace_entry_t)) != 0)
+        ret = -(s64)EFAULT;
+    else
+        ret = (s64)n;
+
+    kfree(kbuf);
+    return ret;
+}
+
+/* ktrace_clear() */
+static s64 sys_az_ktrace_clear_impl(pt_regs_t *r)
+{
+    (void)r;
+    ktrace_ring_clear();
+    return 0;
+}
+

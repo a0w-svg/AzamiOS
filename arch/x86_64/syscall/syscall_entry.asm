@@ -33,6 +33,9 @@ section .text
 
 extern syscall_dispatch         ; defined in kernel/syscall/syscall.c
 extern g_cpu_kernel_stack       ; phys/virt table: per-CPU kernel RSP0 values
+extern isr_restore_stub         ; isr.asm — full IRETQ return path (rt_sigreturn)
+extern g_verw_user_clear        ; mitigations.c — MDS/TAA buffer clear armed
+extern g_verw_sel               ; mitigations.c — selector VERW operates on
 
 global az_syscall_entry
 global syscall_abi_init
@@ -46,7 +49,7 @@ global syscall_abi_init
 ;   bits [47:32] = SYSCALL CS/SS base selector (kernel code = base+0,  data = base+8)
 ;
 ; We set:
-;   SYSRET  base = 0x10  → user DS = 0x18, user CS = 0x20  (matches our GDT layout)
+;   SYSRET  base = 0x13  → user SS = 0x1B, user CS = 0x23  (matches our GDT layout)
 ;   SYSCALL base = 0x08  → kernel CS = 0x08, kernel DS = 0x10
 ;
 ; SFMASK (MSR 0xC0000084):
@@ -75,12 +78,20 @@ syscall_abi_init:
     ;              CPU sets SS = STAR[63:48]+8  on SYSRETQ (user data).
     ;
     ; With SYSCALL base = 0x08: kernel CS = 0x08, kernel SS = 0x10 ✓
-    ; With SYSRET  base = 0x10: user   SS = 0x18 | RPL3 = 0x1B,
-    ;                            user   CS = 0x20 | RPL3 = 0x23 ✓
+    ; With SYSRET  base = 0x13: user   SS = 0x13 + 8  = 0x1B (RPL 3 already set),
+    ;                            user   CS = 0x13 + 16 = 0x23 (RPL 3 already set) ✓
+    ;
+    ; The RPL 3 in the base itself is load-bearing, NOT decoration: SYSRET forces
+    ; CS.RPL to 3, but it copies STAR[63:48]+8 into SS.sel verbatim on AMD (and on
+    ; QEMU's TCG SYSRET) — only Intel ORs 3 in. With base 0x10 the process runs
+    ; with SS = 0x18 (RPL 0), which is harmless in ring 3 until the next interrupt
+    ; from user mode pushes that SS into the trap frame: the IRETQ back to CPL 3
+    ; then sees SS.RPL != CS.RPL and raises #GP(0x18) inside the kernel. Linux puts
+    ; RPL 3 in its STAR base (__USER32_CS) for exactly this reason.
     mov  ecx, 0xC0000081        ; MSR_STAR
     xor  edx, edx               ; EDX = bits [63:32] of STAR
     mov  eax, 0                 ; EAX = bits [31:0]  of STAR (reserved = 0)
-    mov  edx, (0x0010 << 16) | 0x0008  ; [63:48]=0x10, [47:32]=0x08
+    mov  edx, (0x0013 << 16) | 0x0008  ; [63:48]=0x13, [47:32]=0x08
     wrmsr
 
     ; ── Write LSTAR (64-bit syscall handler address) ──────────────────────────
@@ -168,10 +179,19 @@ az_syscall_entry:
     mov  rbx, rsp                ; Save original RSP
     and  rsp, -16                ; Align stack to 16 bytes for System V ABI
     call syscall_dispatch
-    mov  rsp, rbx                ; Restore original RSP
+    mov  rsp, rbx                ; Restore original RSP (points at pt_regs base)
 
     ; ── 5. Restore frame ───────────────────────────────────────────────────────
     cli                          ; disable interrupts before we touch RSP
+
+    ; syscall_dispatch returns 1 (EAX) when the return must go via the full
+    ; IRETQ path — rt_sigreturn, whose rebuilt frame carries an
+    ; IRQ-interrupted context's live RCX/R11 and sanitised CS/SS/RFLAGS that
+    ; SYSRETQ cannot honour. RSP already points at the pt_regs `ds` slot, which
+    ; is exactly what isr_restore_stub consumes. GS is still kernel GS; the stub
+    ; does its own swapgs before iretq for the CPL3 return.
+    test eax, eax
+    jnz  isr_restore_stub
 
     pop  rax                     ; restore ds (discard, we handle it below)
     mov  ds, ax
@@ -203,6 +223,16 @@ az_syscall_entry:
 
     ; Restore kernel GS base (swapgs: kernel GS → user GS).
     swapgs
+
+    ; ── MDS / TAA / MMIO-stale-data buffer clear ─────────────────────────────
+    ; Same contract as the IRETQ path in isr.asm: VERW overwrites the
+    ; microarchitectural buffers on affected parts, and must be the last thing
+    ; the kernel does before ring 3 can run. SYSRETQ restores RFLAGS from R11,
+    ; so VERW's write to ZF is discarded.
+    cmp byte [rel g_verw_user_clear], 0
+    je  .no_verw_sysret
+    verw word [rel g_verw_sel]
+.no_verw_sysret:
 
     ; SYSRETQ: returns to RCX (user RIP), restores RFLAGS from R11, DPL → ring 3.
     ; Encoded as 48 0F 07 (REX.W + SYSRET) because older assemblers may not

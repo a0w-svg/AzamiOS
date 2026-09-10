@@ -9,19 +9,55 @@
 #include "../../fs/vfs.h"
 #include "../mm/kmalloc.h"
 #include "../mm/pmm.h"
+#include "../mm/vma.h"
 #include "../../arch/x86_64/mm/vmm.h"
+#include "../../arch/x86_64/cpu/msr.h"   /* cpuid() — BUG-AB fix */
 #include "../../drivers/char/console.h"
 #include "../../include/azami/defs.h"
 #include "../../kernel/lib/string.h"
 #include "../../kernel/lib/random.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 
 #define USER_STACK_TOP      0x00007fffffffe000ULL
 #define USER_STACK_PAGES    64
 #define USER_STACK_BASE     (USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE))
+/* How far below the stack top the stack VMA reaches — the region the fault
+ * handler will grow on demand. Matches the 4 MB window execve() used to
+ * hard-code. */
+#define USER_STACK_MAX_BYTES 0x800000ULL
+extern u8 g_fsgsbase_enabled;
 
 #define DYN_LOAD_BASE       0x0000555555554000ULL
 #define INTERP_LOAD_BASE    0x00007ffff7dd5000ULL
+#define MMAP_ARENA_START    0x0000600000000000ULL
 #define MAX_RECURSION_DEPTH 4
+
+/* ── ASLR ────────────────────────────────────────────────────────────────────
+ * Entropy budgets, in pages, for each randomised region. These are the classic
+ * x86-64 Linux magnitudes: enough that guessing a mapping is impractical, small
+ * enough that no region can collide with its neighbours. Every offset is page
+ * aligned, which the ELF and stack setup paths both require.
+ *
+ *   exec  28 bits of page entropy → 1 TB window for the PIE image
+ *   mmap  28 bits                 → 1 TB window for the mmap arena
+ *   interp/stack are deliberately smaller: both live in the top-of-userspace
+ *   band that the demand-paging heuristic in isr_dispatch() recognises, so
+ *   they must stay inside it.
+ * -------------------------------------------------------------------------- */
+#define ASLR_EXEC_RND_PAGES    (1U << 18)   /* 1 GB of slide for the image  */
+#define ASLR_MMAP_RND_PAGES    (1U << 18)   /* 1 GB of slide for mmap       */
+#define ASLR_INTERP_RND_PAGES  (1U << 14)   /* 64 MB for the dynamic linker */
+#define ASLR_STACK_RND_PAGES   (1U << 11)   /* 8 MB for the initial stack   */
+
+#define ADDR_NO_RANDOMIZE      0x0040000U   /* personality(2) bit            */
+
+/* Page-aligned random offset in [0, max_pages) pages. */
+static u64 aslr_offset(process_t *proc, u32 max_pages)
+{
+    if (proc && (proc->personality & ADDR_NO_RANDOMIZE)) return 0;
+    if (max_pages == 0) return 0;
+    return (u64)(krandom_u64() % max_pages) * PAGE_SIZE;
+}
 
 /* AT_RANDOM entropy comes straight from the kernel CSPRNG. */
 static void get_random_bytes(void *buf, size_t n)
@@ -32,7 +68,7 @@ static void get_random_bytes(void *buf, size_t n)
 static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t top_page_phys,
                             const char *exec_path, const char *const argv[], const char *const envp[],
                             u64 main_entry, u64 phdr_vaddr, u64 phnum, u64 phent, u64 interp_base,
-                            u64 *out_rsp)
+                            u64 stack_top, u64 *out_rsp)
 {
     (void)user_space;
     char *kstack = (char *)PHYS_TO_VIRT(top_page_phys);
@@ -51,7 +87,7 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
                              *(u64 *)(kstack + top_offset) = (u64)(v); } while (0)
 
     /* Number of auxv (key,value) pairs written below — keep in sync. */
-    #define AUX_PAIRS 18
+    #define AUX_PAIRS 19
 
     /* Determine argc / envc up front so the string loops can reserve the exact
      * space the fixed structure (argc + pointer arrays + auxv) will need. */
@@ -73,7 +109,7 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
     STK_NEED(16 + fixed_bytes);
     top_offset -= 16;
     get_random_bytes(kstack + top_offset, 16);
-    u64 u_random_ptr = USER_STACK_TOP - (PAGE_SIZE - top_offset);
+    u64 u_random_ptr = stack_top - (PAGE_SIZE - top_offset);
 
     /* 2. AT_PLATFORM string ("x86_64") */
     const char *platform_str = "x86_64";
@@ -81,7 +117,7 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
     STK_NEED(plat_len + fixed_bytes);
     top_offset -= plat_len;
     memcpy(kstack + top_offset, platform_str, plat_len);
-    u64 u_platform_ptr = USER_STACK_TOP - (PAGE_SIZE - top_offset);
+    u64 u_platform_ptr = stack_top - (PAGE_SIZE - top_offset);
 
     /* 3. AT_EXECFN string (path to executable) */
     const char *execfn_src = exec_path ? exec_path : "/bin/sh.elf";
@@ -89,7 +125,7 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
     STK_NEED(execfn_len + fixed_bytes);
     top_offset -= execfn_len;
     memcpy(kstack + top_offset, execfn_src, execfn_len);
-    u64 u_execfn_ptr = USER_STACK_TOP - (PAGE_SIZE - top_offset);
+    u64 u_execfn_ptr = stack_top - (PAGE_SIZE - top_offset);
 
     /* 4. envp strings */
     for (int i = 0; i < envc; i++) {
@@ -98,7 +134,7 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
         STK_NEED(len + fixed_bytes);
         top_offset -= len;
         memcpy(kstack + top_offset, src, len);
-        u_envp[i] = USER_STACK_TOP - (PAGE_SIZE - top_offset);
+        u_envp[i] = stack_top - (PAGE_SIZE - top_offset);
     }
 
     /* 5. argv strings */
@@ -108,7 +144,7 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
         STK_NEED(len + fixed_bytes);
         top_offset -= len;
         memcpy(kstack + top_offset, src, len);
-        u_argv[i] = USER_STACK_TOP - (PAGE_SIZE - top_offset);
+        u_argv[i] = stack_top - (PAGE_SIZE - top_offset);
     }
 
     /* Align string area down to 8 bytes */
@@ -128,7 +164,13 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
     PUSHQ(u_random_ptr);                    PUSHQ(AT_RANDOM);
     PUSHQ(0);                               PUSHQ(AT_SECURE);
     PUSHQ(100);                             PUSHQ(AT_CLKTCK);
-    PUSHQ(0xbfebfbffULL);                   PUSHQ(AT_HWCAP);
+    /* Populate AT_HWCAP from CPUID(1).EDX and AT_HWCAP2 from CPUID(7).EBX */
+    u32 cpuid_eax, cpuid_ebx, cpuid_ecx, cpuid_edx;
+    cpuid(1, 0, &cpuid_eax, &cpuid_ebx, &cpuid_ecx, &cpuid_edx);
+    PUSHQ((u64)cpuid_edx);              PUSHQ(AT_HWCAP);
+    u64 hwcap2 = 0;
+    if (g_fsgsbase_enabled) hwcap2 |= (1ULL << 1); /* HWCAP2_FSGSBASE */
+    PUSHQ(hwcap2);                      PUSHQ(AT_HWCAP2);
     PUSHQ(proc ? (u64)proc->egid : 0);      PUSHQ(AT_EGID);
     PUSHQ(proc ? (u64)proc->gid  : 0);      PUSHQ(AT_GID);
     PUSHQ(proc ? (u64)proc->euid : 0);      PUSHQ(AT_EUID);
@@ -152,7 +194,7 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
     /* Argc */
     PUSHQ((u64)argc);
 
-    *out_rsp = USER_STACK_TOP - (PAGE_SIZE - top_offset);
+    *out_rsp = stack_top - (PAGE_SIZE - top_offset);
     rc = 0;
 
 out:
@@ -165,11 +207,15 @@ out:
 }
 
 /* Helper to map and load ELF PT_LOAD segments into a virtual address space */
-static int load_elf_segments(vmm_space_t user_space, file_t *file, const elf64_ehdr_t *ehdr,
+static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *file, const elf64_ehdr_t *ehdr,
                              u64 load_bias, u64 *out_phdr_vaddr, u64 *out_max_vaddr)
 {
     u64 phdr_user_vaddr = 0;
     u64 max_vaddr = 0;
+    /* Fallback for images with no PT_PHDR: the program header table is at file
+     * offset e_phoff, so it is visible to the process only if some PT_LOAD
+     * happens to cover that offset. Remember where it lands. */
+    u64 phdr_from_load = 0;
 
     for (u16 i = 0; i < ehdr->e_phnum; i++) {
         elf64_phdr_t phdr;
@@ -183,6 +229,25 @@ static int load_elf_segments(vmm_space_t user_space, file_t *file, const elf64_e
         }
 
         if (phdr.p_type != PT_LOAD || phdr.p_memsz == 0) continue;
+
+        /* Does this segment's file image contain the program header table? If
+         * so its run-time address is the segment's, shifted by the same amount
+         * e_phoff sits past p_offset. Linking without PT_INTERP (a plain static
+         * binary — musl's, for one) leaves out PT_PHDR entirely, and taking
+         * `load_bias + e_phoff` as the answer hands userspace a near-zero
+         * address: musl's __init_tls walks it and faults before main(). */
+        if (phdr_from_load == 0 &&
+            ehdr->e_phoff >= phdr.p_offset &&
+            ehdr->e_phoff + (u64)ehdr->e_phnum * ehdr->e_phentsize
+                <= phdr.p_offset + phdr.p_filesz) {
+            phdr_from_load = load_bias + phdr.p_vaddr + (ehdr->e_phoff - phdr.p_offset);
+        }
+
+        /* A segment whose file image is larger than its memory image is
+         * malformed — the streaming loop below would run off the mapped range. */
+        if (phdr.p_filesz > phdr.p_memsz) {
+            return -ENOEXEC;
+        }
 
         u64 seg_vaddr = load_bias + phdr.p_vaddr;
 
@@ -198,14 +263,24 @@ static int load_elf_segments(vmm_space_t user_space, file_t *file, const elf64_e
         u64 start_vaddr = ALIGN_DOWN(seg_vaddr, PAGE_SIZE);
         u64 end_vaddr = ALIGN_UP(seg_vaddr + phdr.p_memsz, PAGE_SIZE);
 
-        /* Boundary Check: Lower half user space */
-        if (end_vaddr > 0x00007FFFFFFFFFFF) {
+        /* BUG-R fix: exclusive upper bound is 0x0000800000000000 (consistent
+         * with uaccess.asm BUG-O fix); use >= so a segment ending precisely
+         * at the canonical boundary is also rejected. */
+        if (end_vaddr >= 0x0000800000000000ULL) {
             return -EINVAL;
         }
 
         u64 vmm_flags = VMM_F_PRESENT | VMM_F_USER;
         if (phdr.p_flags & PF_W) vmm_flags |= VMM_F_WRITE;
         if (!(phdr.p_flags & PF_X)) vmm_flags |= VMM_F_NX;
+
+        if (proc && end_vaddr > start_vaddr) {
+            u32 vma_prot = 0;
+            if (phdr.p_flags & PF_R) vma_prot |= VMA_PROT_READ;
+            if (phdr.p_flags & PF_W) vma_prot |= VMA_PROT_WRITE;
+            if (phdr.p_flags & PF_X) vma_prot |= VMA_PROT_EXEC;
+            vma_add(proc, start_vaddr, end_vaddr, vma_prot, VMA_F_FILE);
+        }
 
         /* 1. Allocate & map all pages for this segment */
         for (u64 vaddr = start_vaddr; vaddr < end_vaddr; vaddr += PAGE_SIZE) {
@@ -250,11 +325,16 @@ static int load_elf_segments(vmm_space_t user_space, file_t *file, const elf64_e
                 if (nread <= 0) break;
                 bytes_loaded += (u64)nread;
             }
+            if (bytes_loaded < phdr.p_filesz) {
+                pr_debug("[ELF] ERROR: Short read on segment %u! Loaded %llu of %llu bytes\n",
+                         (unsigned int)i, (unsigned long long)bytes_loaded, (unsigned long long)phdr.p_filesz);
+                return -EIO;
+            }
         }
     }
 
-    if (phdr_user_vaddr == 0 && ehdr->e_phoff != 0) {
-        phdr_user_vaddr = load_bias + ehdr->e_phoff;
+    if (phdr_user_vaddr == 0) {
+        phdr_user_vaddr = phdr_from_load;
     }
     if (out_phdr_vaddr) *out_phdr_vaddr = phdr_user_vaddr;
     if (out_max_vaddr) *out_max_vaddr = max_vaddr;
@@ -364,12 +444,17 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     }
 
     /* ── 2. Standard 64-bit ELF Execution ─────────────────────────────────── */
-    elf64_ehdr_t ehdr;
-    memcpy(&ehdr, hdr_buf, sizeof(ehdr));
-    if (nread < (s64)sizeof(ehdr)) {
+    /* BUG-W fix: check for short read BEFORE copying into ehdr so we never
+     * memcpy uninitialized hdr_buf bytes into the header struct.  Use the
+     * type name rather than sizeof(ehdr) so the variable can be declared
+     * after the guard without triggering a "used before declared" diagnostic. */
+    if (nread < (s64)sizeof(elf64_ehdr_t)) {
         vfs_close(file);
         return -ENOEXEC;
     }
+    elf64_ehdr_t ehdr;
+    memcpy(&ehdr, hdr_buf, sizeof(ehdr));
+
 
     if (ehdr.e_ident_magic != ELF_MAGIC || ehdr.e_ident_class != ELFCLASS64 ||
         ehdr.e_ident_data != ELFDATA2LSB || ehdr.e_machine != EM_X86_64) {
@@ -384,9 +469,18 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
         return -ENOEXEC;
     }
 
-    /* Calculate load bias: ET_DYN (PIE) relocates to DYN_LOAD_BASE, ET_EXEC is 0 */
-    u64 load_bias = (ehdr.e_type == ET_DYN) ? DYN_LOAD_BASE : 0;
+    /* Load bias. ET_EXEC is fixed by its own program headers and cannot move;
+     * only ET_DYN (PIE) can be slid, which is exactly why PIE is what makes
+     * ASLR meaningful for the main image. */
+    u64 load_bias = (ehdr.e_type == ET_DYN)
+                        ? DYN_LOAD_BASE + aslr_offset(proc, ASLR_EXEC_RND_PAGES)
+                        : 0;
     u64 main_entry = load_bias + ehdr.e_entry;
+
+    /* Stack placement is randomised per exec. Everything downstream reads this
+     * variable rather than the USER_STACK_TOP constant. */
+    u64 stack_top  = USER_STACK_TOP - aslr_offset(proc, ASLR_STACK_RND_PAGES);
+    u64 stack_base = stack_top - (USER_STACK_PAGES * PAGE_SIZE);
 
     /* Create clean user address space */
     vmm_space_t user_space = vmm_create_space();
@@ -394,11 +488,14 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
         vfs_close(file);
         return -ENOMEM;
     }
+    if (recursion_depth == 0) {
+        vma_reset(proc);
+    }
 
     /* Load main executable segments */
     u64 phdr_user_vaddr = 0;
     u64 max_exec_vaddr = 0;
-    int err = load_elf_segments(user_space, file, &ehdr, load_bias, &phdr_user_vaddr, &max_exec_vaddr);
+    int err = load_elf_segments(proc, user_space, file, &ehdr, load_bias, &phdr_user_vaddr, &max_exec_vaddr);
     if (err < 0) {
         vmm_destroy_space(user_space);
         vfs_close(file);
@@ -432,10 +529,12 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
                     elf64_ehdr_t iehdr;
                     if (vfs_read(ifile, &iehdr, sizeof(iehdr)) == sizeof(iehdr)) {
                         if (iehdr.e_ident_magic == ELF_MAGIC && iehdr.e_machine == EM_X86_64) {
-                            interp_base = (iehdr.e_type == ET_DYN) ? INTERP_LOAD_BASE : 0;
+                            interp_base = (iehdr.e_type == ET_DYN)
+                                              ? INTERP_LOAD_BASE + aslr_offset(proc, ASLR_INTERP_RND_PAGES)
+                                              : 0;
                             u64 iphdr_vaddr = 0;
                             u64 imax_vaddr = 0;
-                            if (load_elf_segments(user_space, ifile, &iehdr, interp_base, &iphdr_vaddr, &imax_vaddr) == 0) {
+                            if (load_elf_segments(proc, user_space, ifile, &iehdr, interp_base, &iphdr_vaddr, &imax_vaddr) == 0) {
                                 final_entry = interp_base + iehdr.e_entry;
                                 pr_debug("[ELF] Loaded dynamic linker %s (Base: 0x%016llx, Entry: 0x%016llx)\n",
                                          interp_path, (unsigned long long)interp_base, (unsigned long long)final_entry);
@@ -453,15 +552,15 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
 
     /* ── 4. Allocate 16 KB Ring-3 User Stack ──────────────────────────────── */
     phys_addr_t top_page_phys = 0;
-    for (u64 vaddr = USER_STACK_BASE; vaddr < USER_STACK_TOP; vaddr += PAGE_SIZE) {
+    for (u64 vaddr = stack_base; vaddr < stack_top; vaddr += PAGE_SIZE) {
         phys_addr_t phys = pmm_alloc_page();
         if (!phys) {
             vmm_destroy_space(user_space);
             return -ENOMEM;
         }
-        __builtin_memset((void *)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+        hw_clear_page((void *)PHYS_TO_VIRT(phys));
         vmm_map(user_space, vaddr, phys, VMM_USER_RW);
-        if (vaddr == USER_STACK_TOP - PAGE_SIZE) {
+        if (vaddr == stack_top - PAGE_SIZE) {
             top_page_phys = phys;
         }
     }
@@ -469,7 +568,7 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     /* ── 5. Initialize Linux System V AMD64 Stack Frame ───────────────────── */
     if (setup_user_stack(proc, user_space, top_page_phys, path, argv, envp,
                          main_entry, phdr_user_vaddr, (u64)ehdr.e_phnum,
-                         (u64)sizeof(elf64_phdr_t), interp_base, out_rsp) < 0) {
+                         (u64)sizeof(elf64_phdr_t), interp_base, stack_top, out_rsp) < 0) {
         vmm_destroy_space(user_space);
         return -ENOMEM;
     }
@@ -477,7 +576,16 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     proc->heap_start   = ALIGN_UP(max_exec_vaddr, PAGE_SIZE);
     if (proc->heap_start == 0) proc->heap_start = 0x10000000;
     proc->heap_end     = proc->heap_start;
-    proc->mmap_current = 0x0000600000000000ULL;
+    proc->mmap_current = MMAP_ARENA_START + aslr_offset(proc, ASLR_MMAP_RND_PAGES);
+
+    /* Publish the stack extent so execve() can register the matching VMA and
+     * the fault handler's stack-growth window lines up with reality. The VMA
+     * is deliberately wider than the pages mapped above, leaving room for the
+     * stack to grow on demand. */
+    proc->stack_high = stack_top;
+    proc->stack_low  = stack_top - USER_STACK_MAX_BYTES;
+    vma_add(proc, proc->stack_low, proc->stack_high,
+            VMA_PROT_READ | VMA_PROT_WRITE, VMA_F_ANON | VMA_F_STACK);
 
     *out_entry = (uintptr_t)final_entry;
     *out_space = user_space;
@@ -510,6 +618,12 @@ process_t *sched_spawn_user_args(const char *path, const char *const argv[], con
     }
     
     proc->pml4_phys = new_space;
+
+    /* Initialize standard I/O file descriptors (0=stdin, 1=stdout, 2=stderr) */
+    for (int fd = 0; fd < 3; fd++) {
+        file_t *con = vfs_open("/dev/console", 0, 0);
+        if (con) proc->handle_table[fd] = con;
+    }
 
     /* Create user thread starting at entry with RSP pointing to System V AMD64 initial stack */
     thread_t *t = thread_create(proc, entry, new_rsp, false);

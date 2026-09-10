@@ -105,7 +105,9 @@ static s64 sock_fop_read(struct file *filp, void *buf, size_t len, u64 *offset)
     socket_t *sock = (socket_t *)filp->private_data;
     bool nonblock = (filp->f_flags & O_NONBLOCK) != 0;
 
-    if (sock->type == SOCK_STREAM && sock->tcp) {
+    if (sock->domain == AF_UNIX && sock->uds) {
+        return unix_socket_recvmsg(sock->uds, buf, len, NULL, NULL, nonblock);
+    } else if (sock->type == SOCK_STREAM && sock->tcp) {
         return tcp_recv(sock->tcp, buf, len, nonblock);
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
         return udp_recvfrom(sock->udp, buf, len, NULL, NULL, nonblock);
@@ -123,10 +125,11 @@ static s64 sock_fop_read(struct file *filp, void *buf, size_t len, u64 *offset)
             spinlock_lock(&sock->raw->lock);
             if (net_buf_queue_len(&sock->raw->rx_queue) == 0) {
                 sock->raw->wait_thread = sched_current_thread();
-                sched_block(THREAD_BLOCKED);
+                spinlock_unlock(&sock->raw->lock);
+                sched_block(THREAD_BLOCKED_PENDING);
+            } else {
+                spinlock_unlock(&sock->raw->lock);
             }
-            spinlock_unlock(&sock->raw->lock);
-            sched_yield();
         }
     }
     return -EINVAL;
@@ -138,7 +141,10 @@ static s64 sock_fop_write(struct file *filp, const void *buf, size_t len, u64 *o
     if (!filp || !filp->private_data || !buf || len == 0) return 0;
     socket_t *sock = (socket_t *)filp->private_data;
 
-    if (sock->type == SOCK_STREAM && sock->tcp) {
+    if (sock->domain == AF_UNIX && sock->uds) {
+        bool nonblock = (filp->f_flags & O_NONBLOCK) != 0;
+        return unix_socket_sendmsg(sock->uds, NULL, buf, len, NULL, 0, nonblock);
+    } else if (sock->type == SOCK_STREAM && sock->tcp) {
         return tcp_send(sock->tcp, buf, len, 0);
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
         return udp_sendto(sock->udp, buf, len, NULL, 0);
@@ -152,7 +158,9 @@ static int sock_fop_poll(struct file *filp)
     socket_t *sock = (socket_t *)filp->private_data;
     int mask = 0;
 
-    if (sock->type == SOCK_STREAM && sock->tcp) {
+    if (sock->domain == AF_UNIX && sock->uds) {
+        mask = unix_socket_poll(sock->uds);
+    } else if (sock->type == SOCK_STREAM && sock->tcp) {
         if (tcp_poll_in(sock->tcp)) mask |= (POLLIN | POLLPRI);
         if (tcp_poll_out(sock->tcp)) mask |= POLLOUT;
         if (sock->tcp->state == TCP_STATE_CLOSED) mask |= POLLHUP;
@@ -195,7 +203,15 @@ static s64 sock_fop_ioctl(struct file *filp, u32 cmd, u64 arg)
     if (cmd == 0x541B /* FIONREAD */) {
         if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
         int bytes = 0;
-        if (sock->type == SOCK_STREAM && sock->tcp) {
+        /* AF_UNIX checked first — sock->tcp/sock->uds alias the same union
+         * storage, so `sock->type == SOCK_STREAM && sock->tcp` below would
+         * otherwise read a unix_sock_t's bytes as if they were a
+         * tcp_sock_t's rx_len field. */
+        if (sock->domain == AF_UNIX && sock->uds) {
+            bytes = 0; /* not tracked precisely; a real byte count would need
+                        * pipe_t's own count field exposed for the STREAM
+                        * case and a per-message length sum for DGRAM. */
+        } else if (sock->type == SOCK_STREAM && sock->tcp) {
             bytes = (int)sock->tcp->rx_len;
         } else if (sock->type == SOCK_DGRAM && sock->udp) {
             bytes = (int)net_buf_queue_len(&sock->udp->rx_queue);
@@ -230,6 +246,25 @@ socket_t *sock_alloc(int domain, int type, int protocol)
     sock->type = type;
     sock->protocol = protocol;
 
+    /* AF_UNIX must be checked before the type-based dispatch below: an
+     * AF_UNIX SOCK_STREAM request used to silently fall into the very same
+     * `type == SOCK_STREAM` branch a real AF_INET socket does, handing back
+     * a TCP socket that happened to work for byte-stream I/O but could
+     * never be bound to a path, never carry SCM_RIGHTS, and reported the
+     * wrong domain to getsockname(). */
+    if (domain == AF_UNIX || domain == AF_LOCAL) {
+        if (type != SOCK_STREAM && type != SOCK_DGRAM) {
+            kfree(sock);
+            return NULL;
+        }
+        sock->uds = unix_socket_create(type);
+        if (!sock->uds) {
+            kfree(sock);
+            return NULL;
+        }
+        return sock;
+    }
+
     if (type == SOCK_STREAM || protocol == IPPROTO_TCP) {
         sock->tcp = tcp_socket_create();
         if (!sock->tcp) {
@@ -257,7 +292,10 @@ void sock_free(socket_t *sock)
 {
     if (!sock) return;
 
-    if (sock->type == SOCK_STREAM && sock->tcp) {
+    if (sock->domain == AF_UNIX && sock->uds) {
+        unix_socket_close(sock->uds);
+        sock->uds = NULL;
+    } else if (sock->type == SOCK_STREAM && sock->tcp) {
         tcp_socket_close(sock->tcp);
         sock->tcp = NULL;
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
@@ -289,7 +327,7 @@ file_t *sock_create_file(socket_t *sock)
 
 int sock_get_from_fd(int fd, socket_t **sock_out)
 {
-    if (fd < 0 || fd >= 64 || !sock_out) return -EBADF;
+    if (fd < 0 || fd >= PROC_MAX_FDS || !sock_out) return -EBADF;
 
     process_t *proc = sched_current_process();
     if (!proc) return -EPERM;
