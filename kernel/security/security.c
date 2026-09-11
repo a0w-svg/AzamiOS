@@ -20,12 +20,29 @@
  * that must never survive boot: a canary an attacker can read out of the
  * kernel image is not a canary at all. security_init() replaces it before any
  * process runs. */
+/* used: every reference to these two symbols is injected by the compiler's
+ * stack-protector pass, into every OTHER translation unit, during each
+ * TU's own final codegen — after LTO's whole-program reachability analysis
+ * has already run. From that analysis's viewpoint nothing calls or reads
+ * these yet, so under -flto they get discarded and every other file's
+ * canary check turns into an undefined reference at final link. */
+__attribute__((used))
 uintptr_t __stack_chk_guard = 0x595E9FBD94FDA766ULL;
 
 /* Whether the guard actually got replaced with unpredictable bits, so the
  * report below can say so rather than implying a protection we do not have. */
 static bool s_canary_random = false;
 
+/* no_stack_protector: this function overwrites __stack_chk_guard itself
+ * partway through. A protected function's epilogue checks its saved canary
+ * against the *current* global, not the one in effect at its own prologue —
+ * so if this function carried a canary, changing the guard mid-body would
+ * make its own return look like a stack smash (the compiled-in placeholder
+ * was pushed at entry; the freshly-randomized value is what the epilogue
+ * compares against). Every function called from here runs entirely after
+ * the reseed and stays fully protected; this is the one frame that has to
+ * opt out, the same way glibc's own stack-chk-guard setup does. */
+void security_init(void) __attribute__((no_stack_protector));
 void security_init(void)
 {
     /* cpu_rand64() prefers RDSEED over RDRAND and retries both, where this
@@ -99,8 +116,11 @@ size_t security_format_status(char *buf, size_t max)
     return off;
 }
 
+__attribute__((used))
 __noreturn void __stack_chk_fail(void)
 {
+    kprintf("[SECURITY] canary check failed, called from %p (frame %p)\n",
+            __builtin_return_address(0), __builtin_frame_address(0));
     PANIC("KERNEL SECURITY VIOLATION: Stack Canary Check Failed! (Buffer Overflow Detected)");
 }
 

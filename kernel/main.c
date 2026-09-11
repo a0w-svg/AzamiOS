@@ -88,6 +88,14 @@ extern volatile struct limine_base_revision g_limine_base_rev;
 /* ============================================================================
  * kernel_main() — called by az_boot_entry() in entry.asm
  * ============================================================================ */
+/* no_stack_protector: this function's own frame spans security_init()'s
+ * reseed of __stack_chk_guard (see the matching comment there) and its
+ * final call, sched_start(), is not declared noreturn, so GCC still emits
+ * a real epilogue + canary check after it — one that fires with a stale
+ * canary if that instruction ever actually executes. Exempting kernel_main
+ * costs nothing: every function it calls keeps its own, independently
+ * correct, canary. */
+void kernel_main(void) __attribute__((no_stack_protector));
 void kernel_main(void)
 {
     /* ── Step 1: Early console (UART COM1) ──────────────────────────────── */

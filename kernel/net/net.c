@@ -66,16 +66,54 @@ static s64 loopback_send(const void *data, size_t len)
 u32 net_checksum_partial(const void *data, size_t len, u32 sum)
 {
     const u8 *p = (const u8 *)data;
+    u64 sum64 = sum;
 
+    /*
+     * Sum 8 (then 4) bytes at a time through a native add rather than one
+     * 16-bit pair per iteration. This is safe for the exact reason the block
+     * comment above warns about *pointer-cast* wide reads: memcpy() is never
+     * an aliasing violation, since it's defined to act on the object's bytes
+     * rather than reinterpreting them through a mismatched type, so the
+     * miscompile that byte-at-a-time reads were written to avoid cannot
+     * recur here.
+     *
+     * The arithmetic is what makes it correct, not just legal: a checksum is
+     * the sum of 16-bit words with the overflow folded back in, and ordinary
+     * integer addition doesn't care whether a carry crosses a 16-bit lane
+     * boundary on its way through a wider accumulator — that carry becomes
+     * part of the running total either way, which "sum, then fold" already
+     * tolerates. Summing four LE 16-bit words via one 64-bit add is thus
+     * exactly the same total as adding them one at a time; the widening in
+     * net_checksum_fold() (32-bit sum → 16 bits) and here (64-bit → 32-bit
+     * return) is the same fold at a different width, not a new idea.
+     */
+    while (len >= 8) {
+        u64 word;
+        memcpy(&word, p, 8);
+        sum64 += word;
+        p   += 8;
+        len -= 8;
+    }
+    if (len >= 4) {
+        u32 word;
+        memcpy(&word, p, 4);
+        sum64 += word;
+        p   += 4;
+        len -= 4;
+    }
     while (len > 1) {
-        sum += (u32)p[0] | ((u32)p[1] << 8);
+        sum64 += (u32)p[0] | ((u32)p[1] << 8);
         p   += 2;
         len -= 2;
     }
     if (len > 0) {
-        sum += (u32)p[0];
+        sum64 += (u32)p[0];
     }
-    return sum;
+
+    while (sum64 >> 32) {
+        sum64 = (sum64 & 0xFFFFFFFFULL) + (sum64 >> 32);
+    }
+    return (u32)sum64;
 }
 
 u16 net_checksum_fold(u32 sum)

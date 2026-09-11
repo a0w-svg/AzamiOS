@@ -123,6 +123,17 @@ typedef struct {
      * AZ_WM_CLIPBOARD_SET and read via AZ_WM_CLIPBOARD_GET.              */
     char          clipboard_buf[4096];
     unsigned int  clipboard_len;   /* bytes in clipboard_buf (excl. NUL)  */
+
+    /* Hardware performance tracking. current_fps is sampled roughly once a
+     * second from wall-clock time in compositor_present_internal(), not
+     * assumed from frame_count alone — a compositor whose damage tracking is
+     * doing its job can go long stretches without a redraw, so "frames since
+     * last sample" is only meaningful paired with how much time that took. */
+    unsigned long long frame_count;
+    unsigned int  current_fps;
+    unsigned long long last_fps_time;        /* CLOCK_MONOTONIC ns of last sample, 0 = not yet sampled */
+    unsigned long long last_fps_frame_count; /* frame_count as of that sample */
+    int           fps_hud_visible;           /* 1 = draw the on-screen FPS counter (F12 toggles it) */
 } az_compositor_t;
 
 /* ── API ──────────────────────────────────────────────────────────────────── */

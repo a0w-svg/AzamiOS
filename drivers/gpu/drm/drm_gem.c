@@ -20,6 +20,7 @@
 #include "../../../kernel/mm/kmalloc.h"
 #include "../../../kernel/mm/pmm.h"
 #include "../../../kernel/lib/string.h"
+#include "../../../arch/x86_64/cpu/hwaccel.h"
 
 /* mmap offsets are fake file offsets, not addresses; space them widely so a
  * client mapping one object can never walk into the next. */
@@ -71,7 +72,10 @@ drm_gem_object_t *drm_gem_object_create(drm_device_t *dev, u32 width, u32 height
                 kfree(obj);
                 return NULL;
             }
-            memset(PHYS_TO_VIRT(page), 0, PAGE_SIZE);
+            /* Freshly allocated backing page: never read before this write,
+             * so hw_clear_page()'s CLZERO/non-temporal path skips the
+             * read-for-ownership a plain memset() would pay for nothing. */
+            hw_clear_page(PHYS_TO_VIRT(page));
             obj->pages[i] = page;
         }
     }
@@ -245,8 +249,8 @@ void drm_gem_blit_rect(drm_gem_object_t *src, void *dst_virt, u32 dst_pitch,
             size_t chunk = PAGE_SIZE - in_pg;
             if (chunk > row_bytes - copied) chunk = row_bytes - copied;
 
-            memcpy(dst + (size_t)y * dst_pitch + x_off + copied,
-                   (u8 *)sp + in_pg, chunk);
+            hw_copy_to_vram(dst + (size_t)y * dst_pitch + x_off + copied,
+                            (u8 *)sp + in_pg, chunk);
             copied += chunk;
         }
     }

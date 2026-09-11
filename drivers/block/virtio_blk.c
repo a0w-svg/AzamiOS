@@ -9,6 +9,7 @@
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../kernel/lib/string.h"
 
 static virtio_blk_dev_t g_vblk_dev;
@@ -49,9 +50,9 @@ static s64 virtio_blk_read_sectors(struct block_dev *dev, u64 lba, u32 count, vo
     virtio_pci_notify(&vdev->vpci, 0, vdev->vq);
 
     void *cookie = NULL;
-    while (!cookie) {
+    for (u32 spins = 0; !cookie; spins++) {
         cookie = virtqueue_get_used(vdev->vq, NULL);
-        __asm__ volatile("pause");
+        if (!cookie) hw_spin_wait(spins);
     }
 
     spinlock_unlock_irqrestore(&g_vblk_lock, flags);
@@ -94,9 +95,9 @@ static s64 virtio_blk_write_sectors(struct block_dev *dev, u64 lba, u32 count, c
     virtio_pci_notify(&vdev->vpci, 0, vdev->vq);
 
     void *cookie = NULL;
-    while (!cookie) {
+    for (u32 spins = 0; !cookie; spins++) {
         cookie = virtqueue_get_used(vdev->vq, NULL);
-        __asm__ volatile("pause");
+        if (!cookie) hw_spin_wait(spins);
     }
 
     spinlock_unlock_irqrestore(&g_vblk_lock, flags);

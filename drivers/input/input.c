@@ -18,6 +18,7 @@
 #include "../../hal/irq.h"
 #include "../../arch/x86_64/cpu/smp.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../include/azami/defs.h"
 #include "../../fs/vfs.h"
 #include "../../kernel/syscall/syscall.h" /* For EFAULT, EINVAL */
@@ -96,17 +97,17 @@ static void input_drain_sources(void)
 /* ── PS/2 controller helpers ─────────────────────────────────────────────── */
 static void ps2_wait_write(void)
 {
-    for (int i = 0; i < 500000; i++) {
+    for (u32 i = 0; i < 500000; i++) {
         if (!(inb(0x64) & 0x02)) return;
-        __asm__ volatile("pause");
+        hw_spin_wait(i);
     }
 }
 
 static void ps2_wait_read(void)
 {
-    for (int i = 0; i < 500000; i++) {
+    for (u32 i = 0; i < 500000; i++) {
         if (inb(0x64) & 0x01) return;
-        __asm__ volatile("pause");
+        hw_spin_wait(i);
     }
 }
 

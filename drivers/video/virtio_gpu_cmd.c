@@ -87,7 +87,7 @@ int virtio_gpu_resource_attach_backing(u32 resource_id, phys_addr_t ptr, u32 len
     return (resp.type == VIRTIO_GPU_RESP_OK_NODATA) ? 0 : -1;
 }
 
-int virtio_gpu_set_scanout(u32 scanout_id, u32 resource_id, u32 width, u32 height)
+int virtio_gpu_set_scanout_offset(u32 scanout_id, u32 resource_id, u32 x, u32 y, u32 width, u32 height)
 {
     struct virtio_gpu_set_scanout cmd;
     struct virtio_gpu_ctrl_hdr resp;
@@ -96,8 +96,8 @@ int virtio_gpu_set_scanout(u32 scanout_id, u32 resource_id, u32 width, u32 heigh
     cmd.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
     cmd.resource_id = resource_id;
     cmd.scanout_id = scanout_id;
-    cmd.r.x = 0;
-    cmd.r.y = 0;
+    cmd.r.x = x;
+    cmd.r.y = y;
     cmd.r.width = width;
     cmd.r.height = height;
 
@@ -108,6 +108,11 @@ int virtio_gpu_set_scanout(u32 scanout_id, u32 resource_id, u32 width, u32 heigh
     }
 
     return (resp.type == VIRTIO_GPU_RESP_OK_NODATA) ? 0 : -1;
+}
+
+int virtio_gpu_set_scanout(u32 scanout_id, u32 resource_id, u32 width, u32 height)
+{
+    return virtio_gpu_set_scanout_offset(scanout_id, resource_id, 0, 0, width, height);
 }
 
 int virtio_gpu_transfer_to_host_2d_rect(u32 resource_id, u32 x, u32 y,
@@ -194,23 +199,30 @@ int virtio_gpu_setup_framebuffer(void)
     g_gpu.screen_height = height;
     g_gpu.resource_id = 1;
     
-    /* Allocate physical memory for the framebuffer (contiguous) */
+    /* Allocate physical memory for double-buffered framebuffer (contiguous) */
     u32 bpp = 4; /* 32-bit ARGB */
-    g_gpu.framebuffer_size = width * height * bpp;
+    g_gpu.framebuffer_size = width * height * bpp * 2; /* 2 full screens */
     u32 pages = (g_gpu.framebuffer_size + 4095) / 4096;
     
     g_gpu.framebuffer_phys = pmm_alloc_pages(pages);
     if (!g_gpu.framebuffer_phys) {
-        pr_debug("[VIRTIO-GPU] Out of memory for framebuffer\n");
-        return -1;
+        /* Fallback to single buffer if memory is tight */
+        g_gpu.framebuffer_size = width * height * bpp;
+        pages = (g_gpu.framebuffer_size + 4095) / 4096;
+        g_gpu.framebuffer_phys = pmm_alloc_pages(pages);
+        if (!g_gpu.framebuffer_phys) {
+            pr_debug("[VIRTIO-GPU] Out of memory for framebuffer\n");
+            return -1;
+        }
     }
     
     /* Map it to virtual memory */
     g_gpu.framebuffer_virt = vmm_map_io(g_gpu.framebuffer_phys, pages * 4096);
     memset(g_gpu.framebuffer_virt, 0, g_gpu.framebuffer_size); /* Clear screen to black */
     
-    /* 2. Create 2D Resource */
-    if (virtio_gpu_resource_create_2d(g_gpu.resource_id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, width, height) < 0) {
+    /* 2. Create 2D Resource (height sized to hold all allocated buffer space) */
+    u32 total_h = (g_gpu.framebuffer_size >= width * height * bpp * 2) ? (height * 2) : height;
+    if (virtio_gpu_resource_create_2d(g_gpu.resource_id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, width, total_h) < 0) {
         pr_debug("[VIRTIO-GPU] Failed to create 2D resource\n");
         return -1;
     }

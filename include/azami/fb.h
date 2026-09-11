@@ -34,6 +34,45 @@
  * A no-op (harmless) on a direct-scanout backend. */
 #define FBIOAZ_DAMAGE         0x4683   /* arg: struct fb_az_rect *          */
 
+/* ── Hardware 2D Acceleration & Capabilities ──────────────────────────────── */
+#define FBIOAZ_ACCEL_FILL     0x4684   /* arg: struct fb_az_fill *          */
+#define FBIOAZ_ACCEL_COPY     0x4685   /* arg: struct fb_az_copy *          */
+#define FBIOAZ_GET_CAPS       0x4686   /* arg: struct fb_az_caps *          */
+
+#define FB_AZ_CAP_DOUBLEBUF   (1U << 0)
+#define FB_AZ_CAP_HW_FLIP     (1U << 1)
+#define FB_AZ_CAP_HW_CURSOR   (1U << 2)
+#define FB_AZ_CAP_ACCEL_2D    (1U << 3)
+#define FB_AZ_CAP_VIRTIO      (1U << 4)
+
+struct fb_az_fill {
+    u32 x;
+    u32 y;
+    u32 w;
+    u32 h;
+    u32 color;      /* 32-bit ARGB8888 pixel value */
+    u32 buffer_idx; /* 0 for primary/front, 1 for backbuffer */
+};
+
+struct fb_az_copy {
+    u32 src_x;
+    u32 src_y;
+    u32 dst_x;
+    u32 dst_y;
+    u32 w;
+    u32 h;
+    u32 src_buf;
+    u32 dst_buf;
+};
+
+struct fb_az_caps {
+    u32 caps;
+    u32 buffers;
+    u32 max_width;
+    u32 max_height;
+    u32 pitch;
+};
+
 struct fb_az_rect {
     u32 x;
     u32 y;

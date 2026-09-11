@@ -10,6 +10,7 @@
 #include "../../kernel/mm/pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include <azami/debug.h>
 
 virtio_gpu_state_t g_gpu;
@@ -75,7 +76,7 @@ static int virtio_gpu_submit(virtio_gpu_state_t *gpu, u16 queue_index,
                      queue_index);
             return -1;
         }
-        __asm__ volatile("pause");
+        hw_spin_wait((u32)spins);
     }
 
     spinlock_unlock_irqrestore(&g_gpu_lock, flags);

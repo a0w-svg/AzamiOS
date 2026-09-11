@@ -10,6 +10,7 @@
 #include "../../kernel/mm/kmalloc.h"
 #include "../../kernel/mm/pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../kernel/lib/string.h"
 #include "../../fs/vfs.h"
 
@@ -62,9 +63,9 @@ s64 virtio_net_send_packet(const void *data, size_t len)
     virtio_pci_notify(&g_vnet.vpci, 1, g_vnet.tx_vq);
 
     void *cookie = NULL;
-    while (!cookie) {
+    for (u32 spins = 0; !cookie; spins++) {
         cookie = virtqueue_get_used(g_vnet.tx_vq, NULL);
-        __asm__ volatile("pause");
+        if (!cookie) hw_spin_wait(spins);
     }
 
     return (s64)len;

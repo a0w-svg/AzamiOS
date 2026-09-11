@@ -33,20 +33,34 @@ static struct dentry *devpts_lookup(struct inode *dir, struct dentry *dentry)
     if (!dir || !dentry) return dentry;
 
     const char *name = dentry->d_name;
+    if (strcmp(name, "ptmx") == 0) {
+        inode_t *inode = (inode_t *)kzalloc(sizeof(inode_t));
+        if (inode) {
+            inode->i_ino = (u64)(PTY_MAX_PAIRS + 2);
+            inode->i_mode = S_IFCHR | 0666;
+            inode->i_sb = dir->i_sb;
+            inode->i_fop = pty_get_ptmx_fops();
+            dentry->d_inode = inode;
+        }
+        return dentry;
+    }
+
     if (name[0] >= '0' && name[0] <= '9') {
         int id = 0;
         const char *p = name;
         while (*p >= '0' && *p <= '9') { id = id * 10 + (*p - '0'); p++; }
-        pty_pair_t *pty = pty_get_pair(id);
-        if (pty) {
-            inode_t *inode = (inode_t *)kzalloc(sizeof(inode_t));
-            if (inode) {
-                inode->i_ino = (u64)(id + 2);
-                inode->i_mode = S_IFCHR | 0620;
-                inode->i_sb = dir->i_sb;
-                inode->i_fop = pty_get_slave_fops();
-                inode->i_private = pty;
-                dentry->d_inode = inode;
+        if (*p == '\0') {
+            pty_pair_t *pty = pty_get_pair(id);
+            if (pty) {
+                inode_t *inode = (inode_t *)kzalloc(sizeof(inode_t));
+                if (inode) {
+                    inode->i_ino = (u64)(id + 2);
+                    inode->i_mode = S_IFCHR | 0620;
+                    inode->i_sb = dir->i_sb;
+                    inode->i_fop = pty_get_slave_fops();
+                    inode->i_private = pty;
+                    dentry->d_inode = inode;
+                }
             }
         }
     }
@@ -62,14 +76,15 @@ static s64 devpts_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
     u8 *out_ptr = (u8 *)dirent_buf;
     u64 idx = *offset;
 
-    /* Build entry list: ., .., then all active PTYs */
-    char names[PTY_MAX_PAIRS + 2][8];
-    u64 inos[PTY_MAX_PAIRS + 2];
-    u8 types[PTY_MAX_PAIRS + 2];
+    /* Build entry list: ., .., ptmx, then all active PTYs */
+    char names[PTY_MAX_PAIRS + 3][8];
+    u64 inos[PTY_MAX_PAIRS + 3];
+    u8 types[PTY_MAX_PAIRS + 3];
     u64 total = 0;
 
     strncpy(names[0], ".", sizeof(names[0]) - 1); inos[0] = 1; types[0] = DT_DIR; total++;
     strncpy(names[1], "..", sizeof(names[1]) - 1); inos[1] = 1; types[1] = DT_DIR; total++;
+    strncpy(names[2], "ptmx", sizeof(names[2]) - 1); inos[2] = (u64)(PTY_MAX_PAIRS + 2); types[2] = DT_CHR; total++;
 
     for (int i = 0; i < PTY_MAX_PAIRS; i++) {
         if (pty_get_pair(i)) {
@@ -103,6 +118,26 @@ static s64 devpts_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
     return (s64)written;
 }
 
+static s64 devpts_statfs(super_block_t *sb, struct statfs *buf)
+{
+    if (!buf) return -(s64)EINVAL;
+    memset(buf, 0, sizeof(struct statfs));
+    buf->f_type = DEVPTS_SUPER_MAGIC;
+    buf->f_bsize = 4096;
+    buf->f_blocks = 0;
+    buf->f_bfree = 0;
+    buf->f_bavail = 0;
+    buf->f_files = PTY_MAX_PAIRS;
+    buf->f_ffree = PTY_MAX_PAIRS;
+    buf->f_namelen = 255;
+    (void)sb;
+    return 0;
+}
+
+static super_operations_t g_devpts_super_ops = {
+    .statfs = devpts_statfs,
+};
+
 static s64 devpts_mount(file_system_type_t *fs_type, const char *dev_name, const char *dir_name, void *data)
 {
     (void)fs_type; (void)dev_name; (void)dir_name; (void)data;
@@ -119,6 +154,7 @@ static s64 devpts_mount(file_system_type_t *fs_type, const char *dev_name, const
 
     sb->s_magic = DEVPTS_SUPER_MAGIC;
     sb->s_blocksize = 4096;
+    sb->s_op = &g_devpts_super_ops;
 
     inode_t *root_inode = (inode_t *)kzalloc(sizeof(inode_t));
     if (!root_inode) {

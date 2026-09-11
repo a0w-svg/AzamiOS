@@ -14,6 +14,7 @@
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../kernel/lib/string.h"
 #include "../../fs/vfs.h"
 
@@ -252,8 +253,9 @@ int pcnet_init(device_t *dev)
 
     /* Wait for initialization complete (IDON bit 8) */
     int timeout = 10000;
+    u32 spins = 0;
     while (!(pcnet_read_csr(0) & 0x0100) && timeout-- > 0) {
-        __asm__ volatile("pause");
+        hw_spin_wait(spins++);
     }
 
     /* Start controller (CSR0 bit 1: STRT, bit 6: INEA enable interrupts) */

@@ -60,7 +60,28 @@ UAPI_ASM := $(shell test -f /usr/include/x86_64-linux-gnu/asm/types.h && \
                     (test -f /usr/include/asm/types.h && echo -idirafter /usr/include))
 HAVE_UAPI := $(if $(and $(UAPI_INC),$(UAPI_ASM)),y,n)
 
-BB_CC := $(MUSL_GCC) $(UAPI_INC) $(UAPI_ASM)
+# ccache wraps whatever compiler ends up in front of it — musl-gcc included,
+# since from ccache's view it's just another compiler-like front end that
+# accepts -c/-o/source the normal way; the flags it internally injects
+# (-nostdinc, -B musl/lib, ...) are part of the invocation ccache hashes,
+# same as any other flag. Real payoff here: `make linux` rebuilds musl and
+# BusyBox from scratch on `make -C tools/linux clean`, and this is the one
+# build in the tree that's third-party C, not touched by DEBUG/LTO above.
+# Auto-detected, same as the other three Makefiles; `make CCACHE=0` opts out.
+CCACHE ?= 1
+CCACHE_PREFIX :=
+ifeq ($(CCACHE),1)
+  CCACHE_BIN := $(shell command -v ccache 2>/dev/null)
+  ifneq ($(CCACHE_BIN),)
+    CCACHE_PREFIX := ccache
+  endif
+endif
+
+# musl's own build (its ./configure + make, below) picks up CC from the
+# environment/command line; HOST_CC is what that gets pointed at.
+HOST_CC := $(CCACHE_PREFIX) gcc
+
+BB_CC := $(CCACHE_PREFIX) $(MUSL_GCC) $(UAPI_INC) $(UAPI_ASM)
 
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 
@@ -103,7 +124,7 @@ toolchain: $(MUSL_GCC)
 $(MUSL_GCC): $(MUSL_SRC)/configure
 	@mkdir -p $(LOG_DIR)
 	@echo "  ⚙  Building musl $(MUSL_VER) (log: $(LOG_DIR)/musl.log)"
-	@cd $(MUSL_SRC) && ./configure --prefix=$(MUSL_DIR) \
+	@cd $(MUSL_SRC) && CC="$(HOST_CC)" ./configure --prefix=$(MUSL_DIR) \
 	    --disable-shared --enable-wrapper=gcc > $(LOG_DIR)/musl.log 2>&1
 	@$(MAKE) -C $(MUSL_SRC) -j$(NPROC) >> $(LOG_DIR)/musl.log 2>&1
 	@$(MAKE) -C $(MUSL_SRC) install >> $(LOG_DIR)/musl.log 2>&1
@@ -140,7 +161,7 @@ probe: $(PROBE)
 
 $(PROBE): tests/abi-probe.c $(MUSL_GCC)
 	@mkdir -p $(OUT_DIR)/bin
-	@$(MUSL_GCC) -static -O2 -o $@ $< -lpthread
+	@$(CCACHE_PREFIX) $(MUSL_GCC) -static -O2 -o $@ $< -lpthread
 	@echo "  ✓  ABI probe: $@"
 
 # ── Install into the initrd staging tree ─────────────────────────────────────

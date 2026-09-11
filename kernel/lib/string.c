@@ -467,3 +467,169 @@ char *strdup(const char *s)
     memcpy(dup, s, len + 1);
     return dup;
 }
+
+char *strndup(const char *s, size_t n)
+{
+    if (!s) return NULL;
+    size_t len = strnlen(s, n);
+    char *dup = (char *)kmalloc(len + 1);
+    if (!dup) return NULL;
+    memcpy(dup, s, len);
+    dup[len] = '\0';
+    return dup;
+}
+
+void *memchr(const void *s, int c, size_t n)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned char uc = (unsigned char)c;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] == uc) return (void *)(p + i);
+    }
+    return NULL;
+}
+
+size_t strnlen(const char *str, size_t maxlen)
+{
+    if (!str) return 0;
+    size_t len = 0;
+    while (len < maxlen && str[len] != '\0') {
+        len++;
+    }
+    return len;
+}
+
+char *strcat(char *dest, const char *src)
+{
+    char *d = dest;
+    while (*d) d++;
+    while ((*d++ = *src++) != '\0');
+    return dest;
+}
+
+char *strncat(char *dest, const char *src, size_t n)
+{
+    char *d = dest;
+    while (*d) d++;
+    while (n > 0 && *src != '\0') {
+        *d++ = *src++;
+        n--;
+    }
+    *d = '\0';
+    return dest;
+}
+
+int strncasecmp(const char *s1, const char *s2, size_t n)
+{
+    while (n > 0 && *s1 && (tolower_c(*s1) == tolower_c(*s2))) {
+        s1++;
+        s2++;
+        n--;
+    }
+    if (n == 0) return 0;
+    return (int)(unsigned char)tolower_c(*s1) - (int)(unsigned char)tolower_c(*s2);
+}
+
+char *strstr(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle) return NULL;
+    if (!*needle) return (char *)haystack;
+    for (; *haystack; haystack++) {
+        if (*haystack == *needle) {
+            const char *h = haystack;
+            const char *n = needle;
+            while (*h && *n && *h == *n) {
+                h++;
+                n++;
+            }
+            if (!*n) return (char *)haystack;
+        }
+    }
+    return NULL;
+}
+
+size_t strspn(const char *s, const char *accept)
+{
+    size_t count = 0;
+    while (*s) {
+        const char *a = accept;
+        while (*a && *a != *s) a++;
+        if (!*a) break;
+        count++;
+        s++;
+    }
+    return count;
+}
+
+size_t strcspn(const char *s, const char *reject)
+{
+    size_t count = 0;
+    while (*s) {
+        const char *r = reject;
+        while (*r) {
+            if (*r == *s) return count;
+            r++;
+        }
+        count++;
+        s++;
+    }
+    return count;
+}
+
+char *strpbrk(const char *s, const char *accept)
+{
+    while (*s) {
+        const char *a = accept;
+        while (*a) {
+            if (*a == *s) return (char *)s;
+            a++;
+        }
+        s++;
+    }
+    return NULL;
+}
+
+char *strsep(char **stringp, const char *delim)
+{
+    if (!stringp || !*stringp) return NULL;
+    char *start = *stringp;
+    char *p = start;
+    while (*p) {
+        const char *d = delim;
+        while (*d) {
+            if (*p == *d) {
+                *p = '\0';
+                *stringp = p + 1;
+                return start;
+            }
+            d++;
+        }
+        p++;
+    }
+    *stringp = NULL;
+    return start;
+}
+
+char *strtok_r(char *str, const char *delim, char **saveptr)
+{
+    char *s = str ? str : *saveptr;
+    if (!s) return NULL;
+
+    /* Skip leading delimiters */
+    s += strspn(s, delim);
+    if (*s == '\0') {
+        *saveptr = NULL;
+        return NULL;
+    }
+
+    /* Find token end */
+    char *token = s;
+    s = strpbrk(token, delim);
+    if (!s) {
+        *saveptr = NULL;
+    } else {
+        *s = '\0';
+        *saveptr = s + 1;
+    }
+    return token;
+}

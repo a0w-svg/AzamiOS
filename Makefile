@@ -22,6 +22,19 @@ AR    := $(CROSS_PREFIX)ar
 GDB   := $(CROSS_PREFIX)gdb
 NASM  := nasm
 
+# ccache wraps the compiler invocation, not the flags — an identical CFLAGS
+# line still hits the cache — so this only ever helps: a few seconds slower
+# than nothing on a stone-cold cache, an order of magnitude faster on every
+# rebuild after (switching branches, `make clean`, CI re-runs of a tree that
+# didn't actually change). Auto-detected; `make CCACHE=0` opts out.
+CCACHE ?= 1
+ifeq ($(CCACHE),1)
+  CCACHE_BIN := $(shell command -v ccache 2>/dev/null)
+  ifneq ($(CCACHE_BIN),)
+    CC := ccache $(CC)
+  endif
+endif
+
 # ── Parallel build ───────────────────────────────────────────────────────────
 # Compile across all host CPUs by default (recursive sub-makes inherit this).
 # `make -j1` on the command line still wins (last -j takes effect), and
@@ -39,11 +52,44 @@ BUILD_DIR := build
 OBJ_DIR   := $(BUILD_DIR)/obj
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 
+# ── Build mode: release (default) vs fast-iteration debug ──────────────────
+# `make DEBUG=1` trades runtime performance for compile speed and gdb
+# fidelity: -O0 compiles noticeably faster and never reorders code around a
+# breakpoint or optimizes a variable out from under `print`. Release keeps
+# the -O3 tuning this kernel already shipped with. Both keep -g, so
+# `make gdb` works either way regardless of which one built kernel.elf.
+DEBUG ?= 0
+ifeq ($(DEBUG),1)
+  OPT_FLAGS := -O0
+else
+  OPT_FLAGS := -O3
+  # Whole-kernel link-time optimization. Off by default: LTO defers codegen
+  # to link time, which is a large blast radius for a freestanding kernel
+  # full of inline asm, naked ISR entry points and sections placed by
+  # scripts/kernel.ld — worth having for a release build, not worth being
+  # the default while it hasn't seen wide testing. `make LTO=1` opts in;
+  # it switches the final link from raw `ld` to the `gcc` driver (see
+  # $(KERNEL_ELF) below) so the LTO plugin actually runs instead of being
+  # silently skipped.
+  LTO ?= 0
+  ifeq ($(LTO),1)
+    # -flto-partition=one: GCC's default multi-partition LTO runs whole-
+    # program analysis before the stack-protector pass has run on any
+    # partition, so it can't see that security.c's __stack_chk_guard /
+    # __stack_chk_fail will turn out to be needed everywhere — every other
+    # TU's canary check ends up an undefined reference at final link. One
+    # partition sidesteps that (at the cost of the final codegen pass
+    # running single-threaded instead of parallel across ltrans workers).
+    OPT_FLAGS += -flto=auto -fno-fat-lto-objects -flto-partition=one
+  endif
+endif
+
 # ── Compiler flags ────────────────────────────────────────────────────────────
 CFLAGS := \
     -std=c11 \
     -ffreestanding \
-    -fno-stack-protector \
+    -fstack-protector-strong \
+    -mstack-protector-guard=global \
     -fno-pie \
     -fno-pic \
     -mno-red-zone \
@@ -55,8 +101,10 @@ CFLAGS := \
     -Wall \
     -Wextra \
     -Wshadow \
+    -Wformat=2 \
+    -Wformat-security \
     -Wno-unused-parameter \
-    -O3 \
+    $(OPT_FLAGS) \
     -g \
     -fno-omit-frame-pointer \
     -fno-strict-aliasing \
@@ -72,6 +120,17 @@ CFLAGS := \
     -Iinclude \
     -Iarch/x86_64 \
     -Ikernel
+
+# stack-protector-strong relies on __stack_chk_guard / __stack_chk_fail,
+# which kernel/security/security.c already defines (a fixed placeholder
+# until security_init() reseeds it from RDSEED/RDRAND, then a hard panic on
+# mismatch — see that file). -mstack-protector-guard=global is mandatory
+# here, not cosmetic: GCC's x86_64 default reads the canary from %fs:0x28,
+# and %fs in this kernel is the *user* thread-pointer register, reloaded
+# per-process by the scheduler — the default would check the canary against
+# whatever a user thread's TLS happens to hold. global instead makes GCC
+# address __stack_chk_guard directly, which is the plain kernel-wide symbol
+# security.c actually defines.
 
 LDFLAGS := \
     -T scripts/kernel.ld \
@@ -141,6 +200,7 @@ KERNEL_C_SRCS := \
     kernel/ipc/posix_sem.c \
     kernel/ktimer.c \
     kernel/security/security.c \
+    kernel/security/seccomp.c \
     kernel/object/object.c \
     fs/vfs.c \
     fs/devfs.c \
@@ -261,7 +321,22 @@ all: $(KERNEL_ELF) hdd.img
 
 $(KERNEL_ELF): $(ALL_OBJS)
 	@mkdir -p $(dir $@)
+ifeq ($(LTO),1)
+	@# LTO IR only means anything to the compiler driver's own link step
+	@# (it loads the LTO plugin and re-optimizes across all objects before
+	@# handing real machine code to `ld`); a raw `ld` invocation, as used
+	@# below, cannot consume it at all. So the LTO build routes through
+	@# $(CC) here instead, translating the linker-specific bits of LDFLAGS
+	@# to -Wl, passthrough.
+	$(CC) $(OPT_FLAGS) -nostdlib -static \
+	    -Wl,-T,scripts/kernel.ld \
+	    -Wl,--no-warn-rwx-segments \
+	    -Wl,-z,max-page-size=0x1000 \
+	    -Wl,--gc-sections \
+	    $^ -o $@
+else
 	$(LD) $(LDFLAGS) $^ -o $@
+endif
 	@echo ""
 	@echo "  ✓  Kernel linked: $@"
 	@echo "     Size: $$(wc -c < $@ | tr -d ' ') bytes"

@@ -10,6 +10,7 @@
 #include "block.h"
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../kernel/lib/string.h"
 #include "../../fs/vfs.h"
 
@@ -52,7 +53,7 @@ static int fdc_wait_ready(bool to_cpu)
             if (to_cpu && (msr & 0x40)) return 0;
             if (!to_cpu && !(msr & 0x40)) return 0;
         }
-        __asm__ volatile("pause");
+        hw_spin_wait((u32)i);
     }
     return -ETIMEDOUT;
 }

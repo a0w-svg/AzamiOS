@@ -64,6 +64,7 @@ typedef struct tmpfs_node {
     /* Directory children (singly-linked list) */
     struct tmpfs_node *children;  /* first child (for dirs)             */
     struct tmpfs_node *next;      /* next sibling in parent's list      */
+    struct tmpfs_node *parent;    /* parent directory node              */
 
     /* Hard link target (NULL if this is the primary node) */
     struct tmpfs_node *target;
@@ -92,6 +93,7 @@ static void     tmpfs_destroy_inode(inode_t *inode);
 static void     tmpfs_write_inode(inode_t *inode);
 static void     tmpfs_put_super(super_block_t *sb);
 static s64      tmpfs_statfs_op(super_block_t *sb, struct statfs *buf);
+static s64      tmpfs_sync_fs(super_block_t *sb);
 
 static struct dentry *tmpfs_lookup(inode_t *dir, dentry_t *dentry);
 static s64      tmpfs_create(inode_t *dir, dentry_t *dentry, u32 mode);
@@ -113,6 +115,8 @@ static s64      tmpfs_file_mmap(file_t *filp, virt_addr_t vaddr, size_t len,
                                 u32 prot, u32 flags, u64 offset);
 static s64      tmpfs_file_ioctl(file_t *filp, u32 cmd, u64 arg);
 static int      tmpfs_file_poll(file_t *filp);
+static s64      tmpfs_file_fallocate(file_t *filp, int mode, u64 offset, u64 len);
+static s64      tmpfs_file_fadvise(file_t *filp, u64 offset, u64 len, int advice);
 static s64      tmpfs_mount(file_system_type_t *fs_type, const char *dev,
                             const char *dir, void *data);
 
@@ -124,6 +128,7 @@ static super_operations_t s_tmpfs_super_ops = {
     .write_inode   = tmpfs_write_inode,
     .put_super     = tmpfs_put_super,
     .statfs        = tmpfs_statfs_op,
+    .sync_fs       = tmpfs_sync_fs,
 };
 
 static inode_operations_t s_tmpfs_dir_iops = {
@@ -163,14 +168,16 @@ static inode_operations_t s_tmpfs_link_iops = {
 };
 
 static file_operations_t s_tmpfs_file_fops = {
-    .read    = tmpfs_file_read,
-    .write   = tmpfs_file_write,
-    .readdir = NULL,
-    .ioctl   = tmpfs_file_ioctl,
-    .mmap    = tmpfs_file_mmap,
-    .open    = tmpfs_file_open,
-    .release = tmpfs_file_release,
-    .poll    = tmpfs_file_poll,
+    .read      = tmpfs_file_read,
+    .write     = tmpfs_file_write,
+    .readdir   = NULL,
+    .ioctl     = tmpfs_file_ioctl,
+    .mmap      = tmpfs_file_mmap,
+    .open      = tmpfs_file_open,
+    .release   = tmpfs_file_release,
+    .poll      = tmpfs_file_poll,
+    .fadvise   = tmpfs_file_fadvise,
+    .fallocate = tmpfs_file_fallocate,
 };
 
 static file_operations_t s_tmpfs_dir_fops = {
@@ -245,6 +252,7 @@ static void tmpfs_node_put(tmpfs_node_t *n)
 /* Link child into parent's children list */
 static void tmpfs_dir_add(tmpfs_node_t *parent, tmpfs_node_t *child)
 {
+    child->parent    = parent;
     child->next      = parent->children;
     parent->children = child;
     parent->size++;
@@ -258,6 +266,7 @@ static int tmpfs_dir_remove(tmpfs_node_t *parent, tmpfs_node_t *child)
         if (*pp == child) {
             *pp = child->next;
             child->next = NULL;
+            child->parent = NULL;
             if (parent->size > 0) parent->size--;
             return 1;
         }
@@ -402,6 +411,12 @@ static void tmpfs_put_super(super_block_t *sb)
         sb->s_fs_info = NULL;
     }
     kfree(sb);
+}
+
+static s64 tmpfs_sync_fs(super_block_t *sb)
+{
+    (void)sb;
+    return 0;
 }
 
 static s64 tmpfs_statfs_op(super_block_t *sb, struct statfs *buf)
@@ -637,8 +652,7 @@ static s64 tmpfs_file_release(inode_t *inode, file_t *filp)
 #define TMPFS_FIONCLEX  0x5450u   /* clear close-on-exec flag (no-op here)     */
 #define TMPFS_FIONBIO   0x5421u   /* set/clear non-blocking (no-op for files)  */
 
-/* ioctl for regular tmpfs files.  Only FIONREAD has a useful answer; all
- * other tty/socket commands are not applicable and return -ENOTTY. */
+/* ioctl for regular tmpfs files. */
 static s64 tmpfs_file_ioctl(file_t *filp, u32 cmd, u64 arg)
 {
     if (!filp || !filp->f_inode) return -9; /* EBADF */
@@ -655,13 +669,75 @@ static s64 tmpfs_file_ioctl(file_t *filp, u32 cmd, u64 arg)
             return -14; /* EFAULT */
         return 0;
     }
-    case TMPFS_FIOCLEX:   /* fall-through: per-fd flag managed by the FD table */
-    case TMPFS_FIONCLEX:
-    case TMPFS_FIONBIO:
-        return 0;         /* accepted, no-op at the filesystem level */
+    case TMPFS_FIOCLEX: {
+        filp->f_fd_flags |= 1; /* FD_CLOEXEC */
+        process_t *proc = sched_current_process();
+        if (proc) {
+            for (int i = 0; i < PROC_MAX_FDS; i++) {
+                if (proc->handle_table[i] == filp) {
+                    proc->fd_flags[i] |= 1;
+                }
+            }
+        }
+        return 0;
+    }
+    case TMPFS_FIONCLEX: {
+        filp->f_fd_flags &= ~1;
+        process_t *proc = sched_current_process();
+        if (proc) {
+            for (int i = 0; i < PROC_MAX_FDS; i++) {
+                if (proc->handle_table[i] == filp) {
+                    proc->fd_flags[i] &= ~1;
+                }
+            }
+        }
+        return 0;
+    }
+    case TMPFS_FIONBIO: {
+        int nonblock = 0;
+        if (copy_from_user(&nonblock, (const void *)(uintptr_t)arg, sizeof(int)) != 0)
+            return -14; /* EFAULT */
+        if (nonblock)
+            filp->f_flags |= 0x00004000; /* O_NONBLOCK */
+        else
+            filp->f_flags &= ~0x00004000;
+        return 0;
+    }
     default:
         return -25;       /* ENOTTY — not a tty/socket-capable device */
     }
+}
+
+static s64 tmpfs_file_fallocate(file_t *filp, int mode, u64 offset, u64 len)
+{
+    if (!filp || !filp->f_inode) return -9; /* EBADF */
+    tmpfs_node_t *node = (tmpfs_node_t *)filp->f_inode->i_private;
+    if (!node || !S_ISREG(node->mode)) return -22; /* EINVAL */
+    if (len == 0) return -22;
+    if (offset > TMPFS_MAX_FILE_SIZE || len > TMPFS_MAX_FILE_SIZE ||
+        offset + len < offset || offset + len > TMPFS_MAX_FILE_SIZE) {
+        return -27; /* EFBIG */
+    }
+
+    if (tmpfs_grow(node, offset + len) != 0) return -28; /* ENOSPC */
+
+    /* FALLOC_FL_KEEP_SIZE is 0x01 */
+    if (!(mode & 0x01)) {
+        if (offset + len > node->size) {
+            node->size = offset + len;
+            filp->f_inode->i_size = (s64)node->size;
+            filp->f_inode->i_blocks = (node->size + 511) / 512;
+        }
+    }
+    return 0;
+}
+
+static s64 tmpfs_file_fadvise(file_t *filp, u64 offset, u64 len, int advice)
+{
+    if (!filp || !filp->f_inode) return -9; /* EBADF */
+    (void)offset; (void)len;
+    if (advice < 0 || advice > 5) return -22; /* EINVAL */
+    return 0;
 }
 
 /* Regular files are always ready for both reading and writing; return the
@@ -845,7 +921,7 @@ static s64 tmpfs_file_readdir(file_t *filp, void *dirent_buf, size_t len, u64 *o
         u16 rec = (u16)((sizeof(linux_dirent64_t) - 1 + strlen(nm) + 1 + 7) & ~7u);
         if (written + rec > len) goto done;
         linux_dirent64_t *d = (linux_dirent64_t *)(dst + written);
-        d->d_ino    = dir->ino; /* simplified: parent ino not tracked */
+        d->d_ino    = dir->parent ? dir->parent->ino : dir->ino;
         d->d_off    = (s64)(entry_idx + 1);
         d->d_reclen = rec;
         d->d_type   = 4;

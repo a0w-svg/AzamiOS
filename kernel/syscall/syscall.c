@@ -124,6 +124,7 @@ static void proc_clone_attrs(process_t *child, const process_t *parent)
     child->umask = parent->umask;
     child->uid  = parent->uid;   child->euid = parent->euid;   child->suid = parent->suid;
     child->gid  = parent->gid;   child->egid = parent->egid;   child->sgid = parent->sgid;
+    child->fsuid = parent->fsuid; child->fsgid = parent->fsgid;
     child->ngroups = parent->ngroups;
     for (u32 i = 0; i < parent->ngroups && i < 32; i++)
         child->groups[i] = parent->groups[i];
@@ -148,6 +149,10 @@ static void proc_clone_attrs(process_t *child, const process_t *parent)
     child->cap_bounding    = parent->cap_bounding;
     child->no_new_privs    = parent->no_new_privs;
     child->seccomp_mode    = parent->seccomp_mode;
+    /* SECCOMP_MODE_FILTER: the child starts out sharing the parent's filter
+     * chain (a confined process cannot fork its way out of confinement) —
+     * see kernel/security/seccomp.c. */
+    seccomp_filters_share(child, parent);
 
     /* fork() duplicates the address space verbatim, so the child keeps the
      * parent's randomised layout; only a subsequent execve() re-rolls it. */
@@ -697,17 +702,66 @@ int syscall_dispatch(pt_regs_t *regs)
     }
 
     /* seccomp gate. Checked before the handler runs so a confined process
-     * cannot reach any syscall side effect. SECCOMP_MODE_STRICT answers a
-     * violation with an immediate SIGKILL, per Linux — the process is not
-     * given an errno it could branch on and retry. */
-    if (unlikely(sp && sp->seccomp_mode != SECCOMP_MODE_DISABLED) &&
-        !security_seccomp_check(sp, nr)) {
-        sched_kill_process(sp->pid, SIGKILL);
-        regs->rax = (u64)(-(s64)EPERM);
-        return 0;
+     * cannot reach any syscall side effect. STRICT answers a violation with
+     * an immediate SIGKILL, per Linux — no errno the process could branch
+     * on and retry. FILTER's actions are richer (seccomp_denied is set for
+     * every one of them except ALLOW/LOG, which fall through to the real
+     * handler below exactly as an unfiltered syscall would); either way,
+     * once regs->rax is decided the normal tail of this function still
+     * runs — ptrace's exit stop, and signal_deliver_pending() so a signal
+     * a denial just raised (SIGSYS from TRAP) actually gets delivered
+     * before returning to ring 3. */
+    bool seccomp_denied = false;
+    if (unlikely(sp && sp->seccomp_mode != SECCOMP_MODE_DISABLED)) {
+        if (sp->seccomp_mode == SECCOMP_MODE_STRICT) {
+            if (!security_seccomp_check(sp, nr)) {
+                sched_kill_process(sp->pid, SIGKILL);
+                regs->rax = (u64)(-(s64)EPERM);
+                return 0;
+            }
+        } else {
+            u32 action = seccomp_filter_run(sp, nr, regs);
+            switch (action & SECCOMP_RET_ACTION_FULL) {
+            case SECCOMP_RET_KILL_PROCESS:
+            case SECCOMP_RET_KILL_THREAD:
+                /* Unmaskable, uncatchable — like STRICT's violation, this
+                 * skips straight past any handler the process installed. */
+                sched_kill_process(sp->pid, SIGSYS);
+                regs->rax = (u64)(-(s64)EPERM);
+                return 0;
+            case SECCOMP_RET_TRAP: {
+                sighandler_t h = sp->sigactions[SIGSYS].sa_handler;
+                if (h != SIG_DFL && h != SIG_IGN)
+                    __atomic_or_fetch(&sp->sig_pending, (1ULL << SIGSYS), __ATOMIC_SEQ_CST);
+                else
+                    sched_kill_process(sp->pid, SIGSYS);
+                regs->rax = (u64)(-(s64)ENOSYS);
+                seccomp_denied = true;
+                break;
+            }
+            case SECCOMP_RET_ERRNO:
+                regs->rax = (u64)(-(s64)(action & SECCOMP_RET_DATA));
+                seccomp_denied = true;
+                break;
+            case SECCOMP_RET_TRACE:
+                /* No ptrace-seccomp (PTRACE_EVENT_SECCOMP) integration yet
+                 * — see the comment on SECCOMP_GET_ACTION_AVAIL above. Fail
+                 * closed rather than silently allow. */
+                regs->rax = (u64)(-(s64)ENOSYS);
+                seccomp_denied = true;
+                break;
+            case SECCOMP_RET_LOG:
+                kprintf("[SECCOMP] pid %u: syscall %llu\n", sp->pid, (unsigned long long)nr);
+                break; /* falls through to ALLOW */
+            case SECCOMP_RET_ALLOW:
+            default:
+                break;
+            }
+        }
     }
 
-    regs->rax = (u64)g_syscall_table[nr](regs);
+    if (!seccomp_denied)
+        regs->rax = (u64)g_syscall_table[nr](regs);
 
     /* Syscall-exit stop. ptrace_syscall_stop() re-tests PT_SYSCALL_TRACE, so a
      * tracer that answered the entry stop with PTRACE_CONT gets no exit stop. */
@@ -1857,10 +1911,55 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
     
     file_t *file = (file_t *)proc->handle_table[fd];
 
-    /* TTY ioctl commands: only valid for character devices / TTYs */
+    /* Generic file descriptor ioctls */
+    if (cmd == 0x5451 /* FIOCLEX */) {
+        proc->fd_flags[fd] |= FD_CLOEXEC;
+        return 0;
+    }
+    if (cmd == 0x5450 /* FIONCLEX */) {
+        proc->fd_flags[fd] &= ~FD_CLOEXEC;
+        return 0;
+    }
+    if (cmd == 0x5421 /* FIONBIO */) {
+        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        int on = 0;
+        if (copy_from_user(&on, (void *)arg, sizeof(int)) != 0) return -(s64)EFAULT;
+        if (on) file->f_flags |= O_NONBLOCK;
+        else    file->f_flags &= ~O_NONBLOCK;
+        return 0;
+    }
+    if (cmd == 0x5452 /* FIOASYNC */) {
+        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        int on = 0;
+        if (copy_from_user(&on, (void *)arg, sizeof(int)) != 0) return -(s64)EFAULT;
+        if (on) file->f_flags |= 0x2000 /* O_ASYNC */;
+        else    file->f_flags &= ~0x2000 /* O_ASYNC */;
+        return 0;
+    }
+
+    /* Network configuration ioctl privilege checks */
+    if (cmd == 0x8916 /* SIOCSIFADDR */ || cmd == 0x891C /* SIOCSIFNETMASK */ ||
+        cmd == 0x892A /* SIOCSIFGW */   || cmd == 0x892B /* SIOCSIFDNS */ ||
+        cmd == 0x8914 /* SIOCSIFFLAGS */ || cmd == 0x8990 /* SIOCSIFDHCP */) {
+        if (!security_check_permission(proc, CAP_NET_ADMIN)) {
+            return -(s64)EPERM;
+        }
+    }
+
+    /* Try file operations driver ioctl first if implemented */
+    if (file->f_op && file->f_op->ioctl) {
+        s64 r_drv = file->f_op->ioctl(file, cmd, arg);
+        if (r_drv != -(s64)ENOTTY && r_drv != -(s64)ENOSYS) {
+            return r_drv;
+        }
+    }
+
+    /* TTY ioctl commands fallback: only valid for character devices / TTYs */
     if (cmd == 0x5401 /* TCGETS */ || cmd == 0x5402 /* TCSETS */ || cmd == 0x5403 /* TCSETSW */ ||
         cmd == 0x5404 /* TCSETSF */ || cmd == 0x5413 /* TIOCGWINSZ */ || cmd == 0x5414 /* TIOCSWINSZ */ ||
-        cmd == 0x540F /* TIOCGPGRP */ || cmd == 0x5410 /* TIOCSPGRP */ || cmd == 0x540B /* TIOCSCTTY */) {
+        cmd == 0x540F /* TIOCGPGRP */ || cmd == 0x5410 /* TIOCSPGRP */ || cmd == 0x540E /* TIOCSCTTY */ ||
+        cmd == 0x5409 /* TCSBRK */ || cmd == 0x540A /* TCXONC */ || cmd == 0x540B /* TCFLSH */ ||
+        cmd == 0x5429 /* TIOCGSID */) {
         if (file->f_inode && !S_ISCHR(file->f_inode->i_mode)) {
             return -(s64)ENOTTY;
         }
@@ -1885,30 +1984,60 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
                 *(u32 *)&termios_buf[4]  = 0x0005; /* OPOST | ONLCR */
                 *(u32 *)&termios_buf[8]  = 0x00BF; /* CS8 | CREAD | B38400 */
                 *(u32 *)&termios_buf[12] = 0x0A3B; /* ISIG | ICANON | ECHO | ECHOE | ECHOK */
-                if (copy_to_user((void *)arg, termios_buf, 44) == 0) return 0;
+                termios_buf[16] = 0;               /* c_line */
+                termios_buf[17 + 0] = 0x03;        /* VINTR = ^C */
+                termios_buf[17 + 1] = 0x1C;        /* VQUIT = ^\ */
+                termios_buf[17 + 2] = 0x7F;        /* VERASE = DEL */
+                termios_buf[17 + 3] = 0x15;        /* VKILL = ^U */
+                termios_buf[17 + 4] = 0x04;        /* VEOF = ^D */
+                termios_buf[17 + 5] = 0;           /* VTIME */
+                termios_buf[17 + 6] = 1;           /* VMIN */
+                termios_buf[17 + 7] = 0;           /* VSWTC */
+                termios_buf[17 + 8] = 0x11;        /* VSTART = ^Q */
+                termios_buf[17 + 9] = 0x13;        /* VSTOP = ^S */
+                termios_buf[17 + 10] = 0x1A;       /* VSUSP = ^Z */
+                if (copy_to_user((void *)arg, termios_buf, 60) == 0) return 0;
                 return -(s64)EFAULT;
             }
             return -(s64)EINVAL;
         }
-        if (cmd == 0x5402 /* TCSETS */ || cmd == 0x5403 /* TCSETSW */ || cmd == 0x5404 /* TCSETSF */) return 0;
+        if (cmd == 0x5402 /* TCSETS */ || cmd == 0x5403 /* TCSETSW */ || cmd == 0x5404 /* TCSETSF */) {
+            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+            char dummy[60];
+            if (copy_from_user(dummy, (const void *)arg, 60) != 0) return -(s64)EFAULT;
+            return 0;
+        }
+        if (cmd == 0x5409 /* TCSBRK */ || cmd == 0x540A /* TCXONC */ || cmd == 0x540B /* TCFLSH */) return 0;
         if (cmd == 0x540F /* TIOCGPGRP */) {
             if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
-                int pgid = (int)proc->pid;
+                int pgid = (int)proc->pgid;
                 if (copy_to_user((void *)arg, &pgid, sizeof(int)) == 0) return 0;
                 return -(s64)EFAULT;
             }
             return -(s64)EINVAL;
         }
-        if (cmd == 0x5410 /* TIOCSPGRP */ || cmd == 0x540B /* TIOCSCTTY */) return 0;
-    }
-
-    /* Network configuration ioctl privilege checks */
-    if (cmd == 0x8916 /* SIOCSIFADDR */ || cmd == 0x891C /* SIOCSIFNETMASK */ ||
-        cmd == 0x892A /* SIOCSIFGW */   || cmd == 0x892B /* SIOCSIFDNS */ ||
-        cmd == 0x8914 /* SIOCSIFFLAGS */ || cmd == 0x8990 /* SIOCSIFDHCP */) {
-        if (!security_check_permission(proc, CAP_NET_ADMIN)) {
-            return -(s64)EPERM;
+        if (cmd == 0x5410 /* TIOCSPGRP */) {
+            if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
+                int pgid = 0;
+                if (copy_from_user(&pgid, (const void *)arg, sizeof(int)) != 0) return -(s64)EFAULT;
+                proc->pgid = (u32)pgid;
+                return 0;
+            }
+            return -(s64)EINVAL;
         }
+        if (cmd == 0x5429 /* TIOCGSID */) {
+            if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
+                int sid = (int)proc->sid;
+                if (copy_to_user((void *)arg, &sid, sizeof(int)) == 0) return 0;
+                return -(s64)EFAULT;
+            }
+            return -(s64)EINVAL;
+        }
+        if (cmd == 0x540E /* TIOCSCTTY */) {
+            proc->sid = proc->pid;
+            return 0;
+        }
+        if (cmd == 0x5422 /* TIOCNOTTY */) return 0;
     }
 
     return vfs_ioctl(file, cmd, arg);
@@ -2499,10 +2628,11 @@ static s64 sys_fork_impl(pt_regs_t *r)
      * stale value and resume with another thread's TLS. */
     {
         thread_t *self = sched_current_thread();
-        u64 tls = self ? (self->fs_base ? self->fs_base : parent->fs_base)
+        u64 tls = self ? (self->has_thread_fs_base ? self->fs_base : parent->fs_base)
                        : parent->fs_base;
-        t->fs_base     = tls;
-        child->fs_base = tls;
+        t->fs_base            = tls;
+        t->has_thread_fs_base = true; /* child resumes with an explicit, resolved base */
+        child->fs_base        = tls;
     }
 
     if (t->user_regs) {
@@ -2553,8 +2683,10 @@ static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int 
         thread_t *t = thread_create_ex(parent, r->rip, (uintptr_t)child_stack, false, false);
         if (!t) return -(s64)ENOMEM;
 
-        if (flags & 0x00080000ULL /* CLONE_SETTLS */)
-            t->fs_base = newtls;                     /* per-thread TLS base */
+        if (flags & 0x00080000ULL /* CLONE_SETTLS */) {
+            t->fs_base            = newtls;          /* per-thread TLS base */
+            t->has_thread_fs_base = true;
+        }
 
         if (t->user_regs) {
             *t->user_regs = *r;
@@ -2627,14 +2759,16 @@ static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int 
     }
 
     if (flags & 0x00080000ULL /* CLONE_SETTLS */) {
-        child->fs_base = newtls;
-        t->fs_base     = newtls;
+        child->fs_base        = newtls;
+        t->fs_base            = newtls;
+        t->has_thread_fs_base = true;
     } else {
         thread_t *self = sched_current_thread();
-        u64 tls = self ? (self->fs_base ? self->fs_base : parent->fs_base)
+        u64 tls = self ? (self->has_thread_fs_base ? self->fs_base : parent->fs_base)
                        : parent->fs_base;
-        t->fs_base     = tls;
-        child->fs_base = tls;
+        t->fs_base            = tls;
+        t->has_thread_fs_base = true; /* explicit, resolved base for the new process's thread */
+        child->fs_base        = tls;
     }
 
     if (t->user_regs) {
@@ -2815,6 +2949,7 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
     thread_t *curr = sched_current_thread();
     if (curr) {
         curr->fs_base = 0;
+        curr->has_thread_fs_base = false; /* fresh image: inherit proc->fs_base again */
         curr->clear_child_tid = 0;
     }
     wrmsr(MSR_FS_BASE, 0);
@@ -4487,24 +4622,54 @@ static s64 sys_fcntl_impl(pt_regs_t *r)
         f->f_flags = (f->f_flags & ~(O_APPEND | O_NONBLOCK)) | ((u32)arg & (O_APPEND | O_NONBLOCK));
         return 0;
     case 5: { /* F_GETLK */
-        if (arg && arg < 0x8000000000000000ULL) {
-            struct {
-                short l_type;
-                short l_whence;
-                s64   l_start;
-                s64   l_len;
-                s32   l_pid;
-            } fl;
-            if (copy_from_user(&fl, (const void *)arg, sizeof(fl)) == 0) {
-                fl.l_type = 2; /* F_UNLCK */
-                copy_to_user((void *)arg, &fl, sizeof(fl));
-            }
+        if (!arg || arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        struct {
+            short l_type;
+            short l_whence;
+            s64   l_start;
+            s64   l_len;
+            s32   l_pid;
+        } fl;
+        if (copy_from_user(&fl, (const void *)arg, sizeof(fl)) != 0) return -(s64)EFAULT;
+        if (f->f_inode && f->f_inode->i_flock_type == LOCK_EX && f->f_inode->i_flock_owner != proc->pid) {
+            fl.l_type = 1; /* F_WRLCK */
+            fl.l_pid  = (s32)f->f_inode->i_flock_owner;
+        } else if (f->f_inode && f->f_inode->i_flock_type == LOCK_SH && fl.l_type == 1 /* F_WRLCK */ && f->f_inode->i_flock_owner != proc->pid) {
+            fl.l_type = 0; /* F_RDLCK */
+            fl.l_pid  = (s32)f->f_inode->i_flock_owner;
+        } else {
+            fl.l_type = 2; /* F_UNLCK */
         }
+        if (copy_to_user((void *)arg, &fl, sizeof(fl)) != 0) return -(s64)EFAULT;
         return 0;
     }
     case 6:   /* F_SETLK */
-    case 7:   /* F_SETLKW */
+    case 7: { /* F_SETLKW */
+        if (!arg || arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        struct {
+            short l_type;
+            short l_whence;
+            s64   l_start;
+            s64   l_len;
+            s32   l_pid;
+        } fl;
+        if (copy_from_user(&fl, (const void *)arg, sizeof(fl)) != 0) return -(s64)EFAULT;
+        int op = (cmd == 6) ? LOCK_NB : 0;
+        if (fl.l_type == 0 /* F_RDLCK */) op |= LOCK_SH;
+        else if (fl.l_type == 1 /* F_WRLCK */) op |= LOCK_EX;
+        else if (fl.l_type == 2 /* F_UNLCK */) op |= LOCK_UN;
+        else return -(s64)EINVAL;
+        return vfs_flock(f, op);
+    }
+    case 8: /* F_SETOWN */
+        proc->pgid = (u32)arg;
         return 0;
+    case 9: /* F_GETOWN */
+        return (s64)proc->pgid;
+    case 1031: /* F_SETPIPE_SZ */
+    case 1032: /* F_GETPIPE_SZ */
+        if (!f->f_inode || !S_ISFIFO(f->f_inode->i_mode)) return -(s64)EINVAL;
+        return 65536;
     default:
         return -(s64)EINVAL;
     }
@@ -4842,15 +5007,22 @@ static s64 sys_clock_gettime_impl(pt_regs_t *r)
 static s64 sys_gettimeofday_impl(pt_regs_t *r)
 {
     struct linux_timeval *user_tv = (struct linux_timeval *)r->rdi;
-    if (!user_tv) return 0;
-    if ((uintptr_t)user_tv >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (user_tv) {
+        if ((uintptr_t)user_tv >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        u64 ticks = sched_get_ticks();
+        u64 unix_sec = get_cached_unix_time();
+        u64 sub_sec_us = (ticks % 100) * 10000ULL;
 
-    u64 ticks = sched_get_ticks();
-    u64 unix_sec = get_cached_unix_time();
-    u64 sub_sec_us = (ticks % 100) * 10000ULL;
+        struct linux_timeval tv = { (long)unix_sec, (long)sub_sec_us };
+        if (copy_to_user(user_tv, &tv, sizeof(tv)) != 0) return -(s64)EFAULT;
+    }
 
-    struct linux_timeval tv = { (long)unix_sec, (long)sub_sec_us };
-    if (copy_to_user(user_tv, &tv, sizeof(tv)) != 0) return -(s64)EFAULT;
+    struct { int tz_minuteswest; int tz_dsttime; } *user_tz = (void *)r->rsi;
+    if (user_tz) {
+        if ((uintptr_t)user_tz >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        struct { int tz_minuteswest; int tz_dsttime; } tz = { 0, 0 };
+        if (copy_to_user(user_tz, &tz, sizeof(tz)) != 0) return -(s64)EFAULT;
+    }
     return 0;
 }
 
@@ -5998,17 +6170,27 @@ static s64 sys_arch_prctl_impl(pt_regs_t *r)
     if (!proc) return -(s64)EPERM;
 
     if (code == ARCH_SET_FS) {
-        /* Per-thread TLS base. Also update proc->fs_base so a later thread that
-         * never sets its own still inherits a sane value. */
+        /* Per-thread TLS base — explicit even when addr is 0, so a later
+         * save/restore (sched_yield, sched_post_switch) knows this thread has
+         * its own override rather than silently promoting it into
+         * proc->fs_base (TODO(T-01)). Also update proc->fs_base so a later
+         * thread that never sets its own still inherits a sane value. */
         thread_t *self = sched_current_thread();
-        if (self) self->fs_base = addr;
+        if (self) {
+            self->fs_base            = addr;
+            self->has_thread_fs_base = true;
+        }
         proc->fs_base = addr;
-        wrmsr(MSR_FS_BASE, addr);
+        /* FSGSBASE turns this into a single GPR write; without it FS_BASE can
+         * only be reached through the WRMSR path, which serializes and costs
+         * far more than the register move it is standing in for. */
+        if (g_fsgsbase_enabled) wrfsbase(addr);
+        else wrmsr(MSR_FS_BASE, addr);
         return 0;
     } else if (code == ARCH_GET_FS) {
         if (!addr || addr >= 0x8000000000000000ULL) return -(s64)EFAULT;
         thread_t *self = sched_current_thread();
-        u64 cur = (self && self->fs_base) ? self->fs_base : proc->fs_base;
+        u64 cur = (self && self->has_thread_fs_base) ? self->fs_base : proc->fs_base;
         return copy_to_user((void *)addr, &cur, sizeof(u64)) == 0 ? 0 : -(s64)EFAULT;
     } else if (code == ARCH_SET_GS) {
         proc->gs_base = addr;
@@ -6247,13 +6429,34 @@ static s64 sys_seccomp_impl(pt_regs_t *r)
         return 0;
 
     case SECCOMP_SET_MODE_FILTER:
-        /* Classic-BPF filters are not implemented; report that honestly rather
-         * than accepting the filter and enforcing nothing, which would leave a
-         * sandbox believing it is confined when it is not. */
-        return -(s64)ENOSYS;
+        if (flags != SECCOMP_FILTER_FLAG_NONE) return -(s64)EINVAL;
+        if (p->seccomp_mode != SECCOMP_MODE_DISABLED &&
+            p->seccomp_mode != SECCOMP_MODE_FILTER) return -(s64)EINVAL;
+        return seccomp_attach_filter(p, (const sock_fprog_t *)r->rdx);
 
-    case SECCOMP_GET_ACTION_AVAIL:
-        return -(s64)ENOSYS;
+    case SECCOMP_GET_ACTION_AVAIL: {
+        if (flags != 0) return -(s64)EINVAL;
+        u32 act = 0;
+        if (copy_from_user(&act, (const void *)r->rdx, sizeof(u32)) != 0)
+            return -(s64)EFAULT;
+        switch (act) {
+        case SECCOMP_RET_KILL_THREAD:
+        case SECCOMP_RET_KILL_PROCESS:
+        case SECCOMP_RET_TRAP:
+        case SECCOMP_RET_ERRNO:
+        case SECCOMP_RET_LOG:
+        case SECCOMP_RET_ALLOW:
+            return 0;
+        /* SECCOMP_RET_TRACE is deliberately not reported available: it
+         * needs a ptrace tracer to be notified and to decide the outcome
+         * (PTRACE_EVENT_SECCOMP), which this kernel does not wire up yet.
+         * seccomp_filter_run() fails a TRACE result closed (-ENOSYS to the
+         * caller) rather than silently allowing it, but that is not the
+         * same guarantee as the real action, so it is not advertised here. */
+        default:
+            return -(s64)95; /* -EOPNOTSUPP */
+        }
+    }
 
     default:
         return -(s64)EINVAL;
@@ -7111,7 +7314,26 @@ static s64 sys_sched_yield_impl(pt_regs_t *r)
 
 static s64 sys_msync_impl(pt_regs_t *r)
 {
-    (void)r;
+    virt_addr_t addr = (virt_addr_t)r->rdi;
+    size_t length = (size_t)r->rsi;
+    int flags = (int)r->rdx;
+
+    if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;
+    if (flags & ~(1 /* MS_ASYNC */ | 2 /* MS_INVALIDATE */ | 4 /* MS_SYNC */)) return -(s64)EINVAL;
+    if ((flags & (1 | 4)) == (1 | 4)) return -(s64)EINVAL;
+    if ((flags & (1 | 4)) == 0) return -(s64)EINVAL;
+    if (addr >= 0x0000800000000000ULL || addr + length < addr) return -(s64)ENOMEM;
+    if (length == 0) return 0;
+
+    process_t *proc = sched_current_process();
+    if (!proc || !proc->pml4_phys) return -(s64)EPERM;
+
+    size_t aligned_len = ALIGN_UP(length, PAGE_SIZE);
+    for (uintptr_t va = addr; va < addr + aligned_len; va += PAGE_SIZE) {
+        if (!vmm_translate(proc->pml4_phys, va)) return -(s64)ENOMEM;
+    }
+
+    vfs_sync_all();
     return 0;
 }
 
@@ -7277,6 +7499,23 @@ static s64 sys_prctl_impl(pt_regs_t *r)
         p->cap_inheritable &= ~bit;
         return 0;
     }
+    if (option == 22 /* PR_SET_SECCOMP */) {
+        if (arg2 == SECCOMP_MODE_STRICT) {
+            if (p->seccomp_mode != SECCOMP_MODE_DISABLED &&
+                p->seccomp_mode != SECCOMP_MODE_STRICT) return -(s64)EINVAL;
+            p->no_new_privs = true;
+            p->seccomp_mode = SECCOMP_MODE_STRICT;
+            return 0;
+        }
+        if (arg2 == SECCOMP_MODE_FILTER) {
+            if (p->seccomp_mode != SECCOMP_MODE_DISABLED &&
+                p->seccomp_mode != SECCOMP_MODE_FILTER) return -(s64)EINVAL;
+            /* prctl's third argument (arg3, %rdx), not arg2 — mode is arg2. */
+            return seccomp_attach_filter(p, (const sock_fprog_t *)r->rdx);
+        }
+        return -(s64)EINVAL;
+    }
+    if (option == 21 /* PR_GET_SECCOMP */) return (s64)p->seccomp_mode;
     if (option == 36 /* PR_SET_CHILD_SUBREAPER */) {
         p->child_subreaper = (arg2 != 0);
         return 0;
@@ -7295,9 +7534,16 @@ static s64 sys_sched_getaffinity_impl(pt_regs_t *r)
     s32 pid = (s32)r->rdi;
     size_t cpusetsize = (size_t)r->rsi;
     void *mask = (void *)r->rdx;
-    (void)pid;
+    if (pid < 0) return -(s64)EINVAL;
     if (!mask || (uintptr_t)mask >= 0x8000000000000000ULL) return -(s64)EFAULT;
     if (cpusetsize < sizeof(u64)) return -(s64)EINVAL;
+
+    if (pid > 0) {
+        process_t *target = proc_get_by_pid((u32)pid);
+        if (!target) return -(s64)ESRCH;
+        proc_put(target);
+    }
+
     u32 ncpus = smp_cpu_count();
     if (ncpus == 0) ncpus = 1;
     u64 affinity = (ncpus >= 64) ? ~0ULL : ((1ULL << ncpus) - 1);
@@ -7307,7 +7553,41 @@ static s64 sys_sched_getaffinity_impl(pt_regs_t *r)
 
 static s64 sys_sched_setaffinity_impl(pt_regs_t *r)
 {
-    (void)r;
+    s32 pid = (s32)r->rdi;
+    size_t cpusetsize = (size_t)r->rsi;
+    const void *mask = (const void *)r->rdx;
+
+    if (pid < 0) return -(s64)EINVAL;
+    if (!mask || (uintptr_t)mask >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (cpusetsize < sizeof(u64)) return -(s64)EINVAL;
+
+    process_t *caller = sched_current_process();
+    if (!caller) return -(s64)EPERM;
+
+    process_t *target = (pid == 0) ? caller : proc_get_by_pid((u32)pid);
+    if (!target) return -(s64)ESRCH;
+
+    if (caller->euid != 0 && caller->uid != target->uid && caller->euid != target->uid) {
+        if (pid != 0) proc_put(target);
+        return -(s64)EPERM;
+    }
+
+    u64 user_mask = 0;
+    if (copy_from_user(&user_mask, mask, sizeof(u64)) != 0) {
+        if (pid != 0) proc_put(target);
+        return -(s64)EFAULT;
+    }
+
+    u32 ncpus = smp_cpu_count();
+    if (ncpus == 0) ncpus = 1;
+    u64 avail_mask = (ncpus >= 64) ? ~0ULL : ((1ULL << ncpus) - 1);
+
+    if ((user_mask & avail_mask) == 0) {
+        if (pid != 0) proc_put(target);
+        return -(s64)EINVAL;
+    }
+
+    if (pid != 0) proc_put(target);
     return 0;
 }
 
@@ -7391,10 +7671,14 @@ static s64 sys_fchownat_impl(pt_regs_t *r)
     const char *path = (const char *)r->rsi;
     u32 uid = (u32)r->rdx;
     u32 gid = (u32)r->r10;
+    int flags = (int)r->r8;
 
     char kpath[512];
     s64 err = copy_user_path_resolve_at(dfd, kpath, sizeof(kpath), path);
     if (err < 0) return err;
+    if (flags & 0x100 /* AT_SYMLINK_NOFOLLOW */) {
+        return vfs_lchown(kpath, uid, gid);
+    }
     return vfs_chown(kpath, uid, gid);
 }
 
@@ -7415,8 +7699,12 @@ static s64 sys_renameat_impl(pt_regs_t *r)
 
 static s64 sys_flock_impl(pt_regs_t *r)
 {
-    (void)r;
-    return 0;
+    int fd = (int)(s32)r->rdi;
+    int operation = (int)r->rsi;
+    process_t *proc = sched_current_process();
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
+    file_t *file = (file_t *)proc->handle_table[fd];
+    return vfs_flock(file, operation);
 }
 
 static s64 sys_fsync_impl(pt_regs_t *r)
@@ -8787,15 +9075,17 @@ static s64 sys_sched_getparam_impl(pt_regs_t *r)
 static s64 sys_sched_get_priority_max_impl(pt_regs_t *r)
 {
     int policy = (int)r->rdi;
-    if (policy == 1 || policy == 2) return 99;
-    return 0;
+    if (policy == 1 /* SCHED_FIFO */ || policy == 2 /* SCHED_RR */) return 99;
+    if (policy == 0 /* SCHED_OTHER */ || policy == 3 /* SCHED_BATCH */ || policy == 5 /* SCHED_IDLE */ || policy == 6 /* SCHED_DEADLINE */) return 0;
+    return -(s64)EINVAL;
 }
 
 static s64 sys_sched_get_priority_min_impl(pt_regs_t *r)
 {
     int policy = (int)r->rdi;
-    if (policy == 1 || policy == 2) return 1;
-    return 0;
+    if (policy == 1 /* SCHED_FIFO */ || policy == 2 /* SCHED_RR */) return 1;
+    if (policy == 0 /* SCHED_OTHER */ || policy == 3 /* SCHED_BATCH */ || policy == 5 /* SCHED_IDLE */ || policy == 6 /* SCHED_DEADLINE */) return 0;
+    return -(s64)EINVAL;
 }
 
 static s64 sys_sched_rr_get_interval_impl(pt_regs_t *r)
@@ -9901,15 +10191,28 @@ static s64 sys_sigaltstack_impl(pt_regs_t *r)
     return 0;
 }
 
-/* setfsuid/setfsgid — the filesystem uid/gid tracks the effective id here;
- * return it and make no change (matches the common no-op implementation). */
+/* setfsuid/setfsgid — set filesystem user/group identity according to Linux spec */
 static s64 sys_setfsuid_impl(pt_regs_t *r)
 {
-    (void)r; process_t *p = sched_current_process(); return p ? (s64)p->euid : 0;
+    u32 fsuid = (u32)r->rdi;
+    process_t *p = sched_current_process();
+    if (!p) return 0;
+    u32 old = p->fsuid;
+    if (p->euid == 0 || fsuid == p->uid || fsuid == p->euid || fsuid == p->suid || fsuid == p->fsuid) {
+        p->fsuid = fsuid;
+    }
+    return (s64)old;
 }
 static s64 sys_setfsgid_impl(pt_regs_t *r)
 {
-    (void)r; process_t *p = sched_current_process(); return p ? (s64)p->egid : 0;
+    u32 fsgid = (u32)r->rdi;
+    process_t *p = sched_current_process();
+    if (!p) return 0;
+    u32 old = p->fsgid;
+    if (p->euid == 0 || fsgid == p->gid || fsgid == p->egid || fsgid == p->sgid || fsgid == p->fsgid) {
+        p->fsgid = fsgid;
+    }
+    return (s64)old;
 }
 
 /* mknod/mknodat — only regular files are creatable this way. Named FIFOs are
@@ -9978,8 +10281,13 @@ static s64 sys_futimesat_impl(pt_regs_t *r)
     return vfs_utimes(kpath, atime, mtime);
 }
 
-/* unshare(flags) — no namespaces; unshare(0) is a legal no-op. */
-static s64 sys_unshare_impl(pt_regs_t *r) { return r->rdi ? -(s64)EINVAL : 0; }
+/* unshare(flags) — CLONE_FS (0x200) and CLONE_FILES (0x400) are legal. */
+static s64 sys_unshare_impl(pt_regs_t *r)
+{
+    u64 flags = r->rdi;
+    if (flags & ~(0x00000200ULL | 0x00000400ULL)) return -(s64)EINVAL;
+    return 0;
+}
 
 /* Must stay field-for-field identical to `struct timex` in
  * userland/libc/include/sys/timex.h — that is the struct every caller in

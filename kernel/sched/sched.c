@@ -89,7 +89,7 @@ void sched_post_switch(void)
         /* Per-thread TLS base when the thread set one (CLONE_SETTLS); otherwise
          * the process-wide base (single-threaded / main thread). */
         thread_t *ct = cpu->current_thread;
-        u64 base = ct->fs_base ? ct->fs_base : ct->proc->fs_base;
+        u64 base = ct->has_thread_fs_base ? ct->fs_base : ct->proc->fs_base;
         if (g_fsgsbase_enabled) wrfsbase(base);
         else wrmsr(MSR_FS_BASE, base);
         wrmsr(MSR_KERNEL_GS_BASE, ct->proc->gs_base);
@@ -326,7 +326,13 @@ static void enqueue_ready(thread_t *t)
     /* Clear our own bit so we don't IPI ourselves unnecessarily */
     if (my_cpu < 64) idle_mask &= ~(1ULL << my_cpu);
     if (idle_mask) {
-        u32 idle_cpu = (u32)__builtin_ctzll(idle_mask);
+        /* Not __builtin_ctzll(): the kernel targets a baseline without BMI1,
+         * so GCC can't fold that builtin into TZCNT and falls back to a
+         * `bsf` sequence anyway — hw_ctz64() gets the same instruction (or
+         * genuine TZCNT where the CPU has it) without going through the
+         * builtin's UB-on-zero contract, which the surrounding `if` already
+         * makes moot here but hw_ctz64() documents properly regardless. */
+        u32 idle_cpu = hw_ctz64(idle_mask);
         smp_send_reschedule(idle_cpu);
     }
 }
@@ -378,6 +384,8 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     proc->last_cpu  = (u32)-1;   /* has not run anywhere yet */
     proc->wait_thread = NULL;
     proc->umask = 022; /* POSIX-02: default file creation mask */
+    proc->fsuid = proc->euid;
+    proc->fsgid = proc->egid;
     proc->pkey_alloc_map = 0x1; /* key 0 is the default key, always taken */
 
     /* POSIX resource limits: infinite unless a resource has a real ceiling.
@@ -504,6 +512,11 @@ void proc_destroy(process_t *proc)
 
     extern void vma_reset(process_t *p);
     vma_reset(proc);
+
+    /* SECCOMP_MODE_FILTER: drop this process's reference to its (possibly
+     * shared, fork()-inherited) filter chain. */
+    extern void seccomp_filters_put(process_t *proc);
+    seccomp_filters_put(proc);
 
     if (proc->pml4_phys && proc->pml4_phys != vmm_kernel_space()) {
         vmm_destroy_space(proc->pml4_phys);
@@ -1024,14 +1037,15 @@ void sched_yield(void)
     cpu->kernel_rsp0 = next->kernel_stack_top;
 
     /* Save the live FS_BASE for the outgoing thread.
-     * Convention: t->fs_base != 0 means the thread set its own TLS base
-     * (via CLONE_SETTLS or arch_prctl); 0 means it inherits proc->fs_base.
-     * NOTE: this means a thread that explicitly set FS_BASE=0 via arch_prctl
-     * will have its per-thread override silently promoted to proc->fs_base.
-     * A has_thread_fs_base flag would fix this cleanly — tracked as TODO(T-01). */
+     * Convention: has_thread_fs_base means the thread explicitly set its own
+     * TLS base (via CLONE_SETTLS or arch_prctl), including to 0 — that case
+     * used to be indistinguishable from "never set" when the check was
+     * `fs_base != 0`, silently promoting an explicit FS_BASE=0 into
+     * proc->fs_base. Fixed as TODO(T-01) by tracking the override with its
+     * own flag instead of overloading the value. */
     if (prev && prev->proc) {
         u64 cur_fs = g_fsgsbase_enabled ? rdfsbase() : rdmsr(MSR_FS_BASE);
-        if (prev->fs_base) prev->fs_base = cur_fs;
+        if (prev->has_thread_fs_base) prev->fs_base = cur_fs;
         else prev->proc->fs_base = cur_fs;
     }
 

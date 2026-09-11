@@ -62,7 +62,15 @@
 #define SVGA_FIFO_STOP           3
 #define SVGA_FIFO_NUM_REGS       4
 
+#define SVGA_REG_CURSOR_ON       27
+#define SVGA_REG_CURSOR_X        28
+#define SVGA_REG_CURSOR_Y        29
+#define SVGA_REG_CURSOR_ID       30
+
 #define SVGA_CMD_UPDATE          1
+#define SVGA_CMD_RECT_FILL       2
+#define SVGA_CMD_RECT_COPY       3
+#define SVGA_CMD_DEFINE_ALPHA_CURSOR 22
 
 typedef struct vmwgfx_device {
     u16    io_base;
@@ -210,8 +218,8 @@ static int vmwgfx_load(drm_device_t *dev)
     dev->min_height    = 480;
     dev->max_width     = sv->max_width;
     dev->max_height    = sv->max_height;
-    dev->cursor_width  = 0;
-    dev->cursor_height = 0;
+    dev->cursor_width  = 64;
+    dev->cursor_height = 64;
     dev->prefer_shadow = true;
 
     drm_crtc_t *crtc = drm_crtc_create(dev);
@@ -251,17 +259,64 @@ static void vmwgfx_unload(drm_device_t *dev)
     }
 }
 
+static int vmwgfx_cursor_set(drm_crtc_t *crtc, drm_gem_object_t *bo, u32 w, u32 h)
+{
+    vmwgfx_device_t *sv = (vmwgfx_device_t *)crtc->dev->dev_private;
+    if (!sv) return -EINVAL;
+
+    if (!bo) {
+        svga_write(sv, SVGA_REG_CURSOR_ON, 0);
+        return 0;
+    }
+
+    if (w > 64 || h > 64) return -EINVAL;
+
+    static u32 img[64 * 64];
+    u32 cur_w = w ? w : 64;
+    u32 cur_h = h ? h : 64;
+    drm_rect_t all = { 0, 0, cur_w, cur_h };
+    memset(img, 0, sizeof(img));
+    drm_gem_blit_rect(bo, img, cur_w * 4, &all, 32);
+
+    svga_fifo_write(sv, SVGA_CMD_DEFINE_ALPHA_CURSOR);
+    svga_fifo_write(sv, 1); /* Cursor ID */
+    svga_fifo_write(sv, (u32)crtc->cursor_hot_x);
+    svga_fifo_write(sv, (u32)crtc->cursor_hot_y);
+    svga_fifo_write(sv, cur_w);
+    svga_fifo_write(sv, cur_h);
+    for (u32 i = 0; i < cur_w * cur_h; i++) {
+        svga_fifo_write(sv, img[i]);
+    }
+    svga_sync(sv);
+
+    svga_write(sv, SVGA_REG_CURSOR_ID, 1);
+    svga_write(sv, SVGA_REG_CURSOR_ON, 1);
+    return 0;
+}
+
+static int vmwgfx_cursor_move(drm_crtc_t *crtc, s32 x, s32 y)
+{
+    vmwgfx_device_t *sv = (vmwgfx_device_t *)crtc->dev->dev_private;
+    if (!sv) return -EINVAL;
+
+    svga_write(sv, SVGA_REG_CURSOR_X, (u32)x);
+    svga_write(sv, SVGA_REG_CURSOR_Y, (u32)y);
+    return 0;
+}
+
 static const drm_driver_t vmwgfx_drm_driver = {
-    .name      = "vmwgfx",
-    .desc      = "VMware SVGA II display adapter",
-    .date      = "20260831",
-    .major     = 2, .minor = 0, .patchlevel = 0,
-    .features  = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER,
-    .load      = vmwgfx_load,
-    .unload    = vmwgfx_unload,
-    .mode_set  = vmwgfx_mode_set,
-    .page_flip = vmwgfx_flush,
-    .dirty_fb  = vmwgfx_flush,
+    .name        = "vmwgfx",
+    .desc        = "VMware SVGA II display adapter",
+    .date        = "20260831",
+    .major       = 2, .minor = 0, .patchlevel = 0,
+    .features    = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER,
+    .load        = vmwgfx_load,
+    .unload      = vmwgfx_unload,
+    .mode_set    = vmwgfx_mode_set,
+    .page_flip   = vmwgfx_flush,
+    .dirty_fb    = vmwgfx_flush,
+    .cursor_set  = vmwgfx_cursor_set,
+    .cursor_move = vmwgfx_cursor_move,
 };
 
 /* ── PCI binding ─────────────────────────────────────────────────────────── */

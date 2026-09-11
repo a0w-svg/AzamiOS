@@ -33,6 +33,14 @@ u32 smp_cpu_count(void)
 
 volatile bool g_smp_sched_active = false;
 
+/* used: the only call site is the literal "call ap_c_entry" text inside
+ * ap_entry()'s inline asm below. That's invisible to LTO's whole-program
+ * reachability analysis (it only sees C-level call graphs, not assembler
+ * text), so under -flto this function looks unreferenced and gets dropped
+ * — silently, at link time, as an undefined-reference error pointing at
+ * the asm(), not at anything wrong here. `used` tells the compiler to keep
+ * it regardless of what its own analysis can see. */
+__attribute__((used))
 void ap_c_entry(struct limine_smp_info *info)
 {
     if (!info) return;

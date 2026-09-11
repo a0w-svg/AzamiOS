@@ -40,6 +40,7 @@
 #define DEBUG 1
 #include <azami/debug.h>
 #include "pmm.h"
+#include "../lib/string.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
 #include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../drivers/char/console.h"
@@ -107,10 +108,14 @@ static __always_inline bool bitmap_test(u64 frame) {
  * makes that check cost nothing on top of the store that was happening anyway.
  */
 
-/* Mask of @n bits starting at bit @bit within one word. */
+/* Mask of @n bits starting at bit @bit within one word. Every caller here
+ * keeps bit + n <= 64 (n is clamped to what's left in the word before this
+ * runs), so BZHI's own "n >= 64 leaves the source unchanged" rule already
+ * covers the n == 64 case without a separate branch: hw_bzhi64(~0ULL, 64)
+ * degenerates to ~0ULL, which is exactly the old special case. */
 static __always_inline u64 word_mask(u64 bit, u64 n)
 {
-    return (n >= 64) ? ~0ULL : (((1ULL << n) - 1) << bit);
+    return hw_bzhi64(~0ULL, (u32)n) << bit;
 }
 
 /* Clamp a range to the bitmap, mirroring the per-bit helpers' habit of
@@ -307,8 +312,15 @@ void pmm_init(void *memmap_raw)
         return;
     }
 
-    /* Mark the entire bitmap as allocated initially. */
-    for (u64 i = 0; i < BITMAP_WORDS; i++) g_bitmap[i] = ~0ULL;
+    /* Mark the entire bitmap as allocated initially. g_bitmap is sized for
+     * the maximum supported 64 GB regardless of how much RAM this machine
+     * actually has (2 MB, always — see BITMAP_WORDS), so this runs on
+     * every boot regardless of installed RAM. A hand-written word-at-a-time
+     * loop compiles to one `mov [mem+idx*8], imm64` per two words — 131072
+     * discrete instructions for 2 MB; the kernel's own memset() (kernel/lib/
+     * string.c) picks `rep stosb` when the CPU advertises ERMS, which does
+     * the same fill as one microcoded operation. */
+    memset(g_bitmap, 0xFF, sizeof(g_bitmap));
 
     /* Clear all free lists. */
     for (u32 o = 0; o < PMM_ORDER_COUNT; o++) g_free_list[o] = NULL;
@@ -422,11 +434,16 @@ static u32 pages_to_order(size_t count)
     if (count > (1UL << PMM_MAX_ORDER)) {
         return (u32)-1;
     }
-    u32 order = 0;
-    while ((1UL << order) < count && order < PMM_MAX_ORDER) {
-        order++;
-    }
-    return order;
+    /* Smallest order such that 2^order >= count, i.e. ceil(log2(count)):
+     * count <= 1 needs no bits at all (order 0), and otherwise
+     * 64 - clz64(count - 1) lands exactly on it (count a power of two
+     * includes its own bit in count-1's top position; anything above the
+     * next-lower power of two carries into the same top bit as the power of
+     * two above it). Replaces a loop that ran up to PMM_MAX_ORDER times with
+     * one LZCNT — this runs on every multi-page alloc/free. */
+    if (count <= 1) return 0;
+    u32 order = 64 - hw_clz64((u64)count - 1);
+    return (order > PMM_MAX_ORDER) ? PMM_MAX_ORDER : order;
 }
 
 /* BUG-U note: pmm_alloc_pages(N) allocates the smallest 2^order block that

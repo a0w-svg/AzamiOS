@@ -3,8 +3,36 @@ CC = $(CROSS_PREFIX)gcc
 LD = $(CROSS_PREFIX)ld
 AR = $(CROSS_PREFIX)ar
 
-CFLAGS = -std=c11 -ffreestanding -fno-stack-protector -fno-pie -fno-pic -m64 \
-         -Wall -Wextra -Wno-unused-parameter -O3 -fno-semantic-interposition -pipe \
+# ccache wraps the compiler, not the flags, so it's a pure win on any rebuild
+# (a `make clean` re-run, switching branches). Auto-detected; `make CCACHE=0`
+# opts out. See the top-level Makefile for the same wiring on the kernel side.
+CCACHE ?= 1
+ifeq ($(CCACHE),1)
+  CCACHE_BIN := $(shell command -v ccache 2>/dev/null)
+  ifneq ($(CCACHE_BIN),)
+    CC := ccache $(CC)
+  endif
+endif
+
+# `make DEBUG=1` swaps -O3 for -O0 across every app for fast iteration /
+# accurate gdb single-stepping; default is the release tuning this build
+# already used.
+DEBUG ?= 0
+ifeq ($(DEBUG),1)
+  OPT_FLAGS := -O0
+else
+  OPT_FLAGS := -O3
+endif
+
+# -fstack-protector-strong is paired with -mstack-protector-guard=global
+# because libc/stdlib.c defines __stack_chk_guard as a plain global (seeded
+# per-process from getentropy() in __libc_init — see there), not a value
+# tucked inside the %fs-based TLS block GCC's default x86_64 guard expects;
+# `global` makes GCC address that symbol directly instead.
+CFLAGS = -std=c11 -ffreestanding -fstack-protector-strong -mstack-protector-guard=global \
+         -fno-pie -fno-pic -m64 \
+         -Wall -Wextra -Wformat=2 -Wformat-security -Wno-unused-parameter \
+         $(OPT_FLAGS) -fno-semantic-interposition -pipe \
          -ffunction-sections -fdata-sections \
          -I. -Ilibc/include -Iapps/shared -Iapps/azwm
 
@@ -424,658 +452,38 @@ icons: skeleton
 		fi \
 	done
 
-# ── System binaries (/sbin) ──────────────────────────────────────────────────
+# ── System binaries (/sbin) + user utilities & applications (/bin) ──────────
+#
+# Every target in SBIN_APPS and BIN_APPS used to carry its own explicit
+# two-line rule — compile apps/NAME/main.c, link it against libc.a — copied
+# ~150 times with nothing but the name changing (this file was ~700 lines of
+# that alone). A static pattern rule per list does the same compiles and
+# links, driven by the two lists already above instead of by a rule per app,
+# so adding an app means adding one line to SBIN_APPS/BIN_APPS, not a new
+# three-line rule to keep in sync with them. Object files still land at
+# $(OBJ_DIR)/NAME.o exactly as before, so nothing downstream (this file's own
+# `apps:` target, anything scripted against build/obj/) changes shape.
+#
+# azwm.elf is the one exception — four source files, not one — and keeps its
+# own explicit rule below rather than forcing the pattern to cover that case.
 
-$(SBIN_DIR)/init.elf: apps/init/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/init.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/init.o libc/libc.a -o $@
+SBIN_APPS_SIMPLE := $(filter-out $(SBIN_DIR)/azwm.elf,$(SBIN_APPS))
 
-# ptrace(2) / perf_event_open(2) regression probe. Runs standalone (exits with
-# the verdict) or as PID 1 in a headless test boot.
-$(BIN_DIR)/strace.elf: apps/strace/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/strace.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/strace.o libc/libc.a -o $@
+$(SBIN_APPS_SIMPLE): $(SBIN_DIR)/%.elf: apps/%/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/$*.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/$*.o libc/libc.a -o $@
 
-$(BIN_DIR)/ktrace.elf: apps/ktrace/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ktrace.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ktrace.o libc/libc.a -o $@
+$(BIN_APPS): $(BIN_DIR)/%.elf: apps/%/main.c libc/libc.a libc/crt0.o | skeleton
+	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/$*.o
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/$*.o libc/libc.a -o $@
 
-$(BIN_DIR)/sem_test.elf: apps/sem_test/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sem_test.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sem_test.o libc/libc.a -o $@
-
-$(BIN_DIR)/lock.elf: apps/lock/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/lock.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/lock.o libc/libc.a -o $@
-
-$(BIN_DIR)/ptraceperf.elf: apps/ptraceperf/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ptraceperf.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ptraceperf.o libc/libc.a -o $@
-
-$(SBIN_DIR)/sessiond.elf: apps/sessiond/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sessiond.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sessiond.o libc/libc.a -o $@
-
+# ── azwm.elf (window manager + compositor + DE extension + desktop) ─────────
 $(SBIN_DIR)/azwm.elf: apps/azwm/main.c apps/azwm/compositor.c apps/azwm/de_compositor.c apps/azwm/desktop.c libc/libc.a libc/crt0.o | skeleton
 	$(CC) $(CFLAGS) -c apps/azwm/main.c -o $(OBJ_DIR)/azwm_main.o
 	$(CC) $(CFLAGS) -c apps/azwm/compositor.c -o $(OBJ_DIR)/azwm_comp.o
 	$(CC) $(CFLAGS) -c apps/azwm/de_compositor.c -o $(OBJ_DIR)/azwm_de.o
 	$(CC) $(CFLAGS) -c apps/azwm/desktop.c -o $(OBJ_DIR)/azwm_desk.o
 	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/azwm_main.o $(OBJ_DIR)/azwm_comp.o $(OBJ_DIR)/azwm_de.o $(OBJ_DIR)/azwm_desk.o libc/libc.a -o $@
-
-$(SBIN_DIR)/wallpaper.elf: apps/wallpaper/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/wallpaper.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/wallpaper.o libc/libc.a -o $@
-
-$(SBIN_DIR)/notifyd.elf: apps/notifyd/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/notifyd.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/notifyd.o libc/libc.a -o $@
-
-$(SBIN_DIR)/lockscreen.elf: apps/lockscreen/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/lockscreen.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/lockscreen.o libc/libc.a -o $@
-
-$(SBIN_DIR)/taskbar.elf: apps/taskbar/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/taskbar.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/taskbar.o libc/libc.a -o $@
-
-$(SBIN_DIR)/poweroff.elf: apps/poweroff/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/poweroff.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/poweroff.o libc/libc.a -o $@
-
-$(SBIN_DIR)/reboot.elf: apps/reboot/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/reboot.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/reboot.o libc/libc.a -o $@
-
-$(SBIN_DIR)/lspci.elf: apps/lspci/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/lspci.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/lspci.o libc/libc.a -o $@
-
-$(SBIN_DIR)/ifconfig.elf: apps/ifconfig/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ifconfig.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ifconfig.o libc/libc.a -o $@
-
-$(SBIN_DIR)/ping.elf: apps/ping/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ping.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ping.o libc/libc.a -o $@
-
-$(SBIN_DIR)/dmesg.elf: apps/dmesg/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/dmesg.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/dmesg.o libc/libc.a -o $@
-
-$(SBIN_DIR)/netstat.elf: apps/netstat/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/netstat.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/netstat.o libc/libc.a -o $@
-
-# ── User utilities & applications (/bin) ─────────────────────────────────────
-
-$(BIN_DIR)/sh.elf: apps/sh/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sh.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sh.o libc/libc.a -o $@
-
-$(BIN_DIR)/ls.elf: apps/ls/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ls.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ls.o libc/libc.a -o $@
-
-$(BIN_DIR)/cat.elf: apps/cat/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/cat.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/cat.o libc/libc.a -o $@
-
-$(BIN_DIR)/echo.elf: apps/echo/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/echo.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/echo.o libc/libc.a -o $@
-
-$(BIN_DIR)/play.elf: apps/play/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/play.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/play.o libc/libc.a -o $@
-
-$(BIN_DIR)/gui_test.elf: apps/gui_test/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/gui_test.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/gui_test.o libc/libc.a -o $@
-
-$(BIN_DIR)/launcher.elf: apps/launcher/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/launcher.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/launcher.o libc/libc.a -o $@
-
-$(BIN_DIR)/about.elf: apps/about/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/about.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/about.o libc/libc.a -o $@
-
-$(BIN_DIR)/calculator.elf: apps/calculator/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/calculator.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/calculator.o libc/libc.a -o $@
-
-$(BIN_DIR)/clock.elf: apps/clock/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/clock.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/clock.o libc/libc.a -o $@
-
-$(BIN_DIR)/sysmon.elf: apps/sysmon/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sysmon.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sysmon.o libc/libc.a -o $@
-
-$(BIN_DIR)/texteditor.elf: apps/texteditor/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/texteditor.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/texteditor.o libc/libc.a -o $@
-
-$(BIN_DIR)/filemanager.elf: apps/filemanager/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/filemanager.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/filemanager.o libc/libc.a -o $@
-
-$(BIN_DIR)/terminal.elf: apps/terminal/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/terminal.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/terminal.o libc/libc.a -o $@
-
-$(BIN_DIR)/settings.elf: apps/settings/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/settings.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/settings.o libc/libc.a -o $@
-
-$(BIN_DIR)/fetch.elf: apps/fetch/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/fetch.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/fetch.o libc/libc.a -o $@
-
-$(BIN_DIR)/pwd.elf: apps/pwd/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/pwd.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/pwd.o libc/libc.a -o $@
-
-$(BIN_DIR)/uname.elf: apps/uname/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/uname.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/uname.o libc/libc.a -o $@
-
-$(BIN_DIR)/head.elf: apps/head/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/head.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/head.o libc/libc.a -o $@
-
-$(BIN_DIR)/wc.elf: apps/wc/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/wc.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/wc.o libc/libc.a -o $@
-
-$(BIN_DIR)/grep.elf: apps/grep/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/grep.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/grep.o libc/libc.a -o $@
-
-$(BIN_DIR)/mkdir.elf: apps/mkdir/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/mkdir.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/mkdir.o libc/libc.a -o $@
-
-$(BIN_DIR)/rm.elf: apps/rm/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/rm.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/rm.o libc/libc.a -o $@
-
-$(BIN_DIR)/touch.elf: apps/touch/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/touch.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/touch.o libc/libc.a -o $@
-
-$(BIN_DIR)/cp.elf: apps/cp/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/cp.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/cp.o libc/libc.a -o $@
-
-$(BIN_DIR)/mv.elf: apps/mv/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/mv.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/mv.o libc/libc.a -o $@
-
-$(BIN_DIR)/tail.elf: apps/tail/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/tail.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/tail.o libc/libc.a -o $@
-
-$(BIN_DIR)/date.elf: apps/date/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/date.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/date.o libc/libc.a -o $@
-
-$(BIN_DIR)/uptime.elf: apps/uptime/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/uptime.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/uptime.o libc/libc.a -o $@
-
-$(BIN_DIR)/df.elf: apps/df/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/df.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/df.o libc/libc.a -o $@
-
-$(BIN_DIR)/free.elf: apps/free/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/free.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/free.o libc/libc.a -o $@
-
-$(BIN_DIR)/env.elf: apps/env/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/env.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/env.o libc/libc.a -o $@
-
-$(BIN_DIR)/which.elf: apps/which/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/which.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/which.o libc/libc.a -o $@
-
-$(BIN_DIR)/sleep.elf: apps/sleep/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sleep.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sleep.o libc/libc.a -o $@
-
-$(BIN_DIR)/kill.elf: apps/kill/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/kill.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/kill.o libc/libc.a -o $@
-
-$(BIN_DIR)/chmod.elf: apps/chmod/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/chmod.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/chmod.o libc/libc.a -o $@
-
-$(BIN_DIR)/clear.elf: apps/clear/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/clear.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/clear.o libc/libc.a -o $@
-
-$(BIN_DIR)/hexdump.elf: apps/hexdump/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/hexdump.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/hexdump.o libc/libc.a -o $@
-
-$(BIN_DIR)/base64.elf: apps/base64/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/base64.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/base64.o libc/libc.a -o $@
-
-$(BIN_DIR)/md5sum.elf: apps/md5sum/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/md5sum.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/md5sum.o libc/libc.a -o $@
-
-$(BIN_DIR)/cut.elf: apps/cut/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/cut.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/cut.o libc/libc.a -o $@
-
-$(BIN_DIR)/sort.elf: apps/sort/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sort.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sort.o libc/libc.a -o $@
-
-$(BIN_DIR)/uniq.elf: apps/uniq/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/uniq.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/uniq.o libc/libc.a -o $@
-
-$(BIN_DIR)/ps.elf: apps/ps/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ps.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ps.o libc/libc.a -o $@
-
-$(BIN_DIR)/top.elf: apps/top/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/top.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/top.o libc/libc.a -o $@
-
-$(BIN_DIR)/tree.elf: apps/tree/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/tree.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/tree.o libc/libc.a -o $@
-
-$(BIN_DIR)/cal.elf: apps/cal/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/cal.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/cal.o libc/libc.a -o $@
-
-$(BIN_DIR)/watch.elf: apps/watch/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/watch.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/watch.o libc/libc.a -o $@
-
-$(BIN_DIR)/screenshot.elf: apps/screenshot/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/screenshot.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/screenshot.o libc/libc.a -o $@
-
-$(BIN_DIR)/paint.elf: apps/paint/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/paint.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/paint.o libc/libc.a -o $@
-
-$(BIN_DIR)/find.elf: apps/find/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/find.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/find.o libc/libc.a -o $@
-
-$(BIN_DIR)/whoami.elf: apps/whoami/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/whoami.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/whoami.o libc/libc.a -o $@
-
-$(BIN_DIR)/du.elf: apps/du/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/du.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/du.o libc/libc.a -o $@
-
-$(BIN_DIR)/time.elf: apps/time/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/time.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/time.o libc/libc.a -o $@
-
-$(BIN_DIR)/tar.elf: apps/tar/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/tar.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/tar.o libc/libc.a -o $@
-
-$(BIN_DIR)/strings.elf: apps/strings/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/strings.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/strings.o libc/libc.a -o $@
-
-$(BIN_DIR)/xargs.elf: apps/xargs/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/xargs.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/xargs.o libc/libc.a -o $@
-
-$(BIN_DIR)/seq.elf: apps/seq/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/seq.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/seq.o libc/libc.a -o $@
-
-$(BIN_DIR)/stat.elf: apps/stat/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/stat.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/stat.o libc/libc.a -o $@
-
-$(BIN_DIR)/basename.elf: apps/basename/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/basename.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/basename.o libc/libc.a -o $@
-
-$(BIN_DIR)/dirname.elf: apps/dirname/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/dirname.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/dirname.o libc/libc.a -o $@
-
-$(BIN_DIR)/yes.elf: apps/yes/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/yes.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/yes.o libc/libc.a -o $@
-
-$(BIN_DIR)/true.elf: apps/true/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/true.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/true.o libc/libc.a -o $@
-
-$(BIN_DIR)/false.elf: apps/false/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/false.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/false.o libc/libc.a -o $@
-
-$(BIN_DIR)/audioplayer.elf: apps/audioplayer/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/audioplayer.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/audioplayer.o libc/libc.a -o $@
-
-$(BIN_DIR)/minesweeper.elf: apps/minesweeper/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/minesweeper.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/minesweeper.o libc/libc.a -o $@
-
-$(BIN_DIR)/2048.elf: apps/2048/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/2048.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/2048.o libc/libc.a -o $@
-
-$(BIN_DIR)/snake.elf: apps/snake/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/snake.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/snake.o libc/libc.a -o $@
-
-$(BIN_DIR)/getfacl.elf: apps/getfacl/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/getfacl.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/getfacl.o libc/libc.a -o $@
-
-$(BIN_DIR)/setfacl.elf: apps/setfacl/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/setfacl.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/setfacl.o libc/libc.a -o $@
-
-$(BIN_DIR)/xorg.elf: apps/xorg/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/xorg.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/xorg.o libc/libc.a -o $@
-
-$(BIN_DIR)/xwm.elf: apps/xwm/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/xwm.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/xwm.o libc/libc.a -o $@
-
-$(BIN_DIR)/xclock.elf: apps/xclock/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/xclock.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/xclock.o libc/libc.a -o $@
-
-$(BIN_DIR)/xcalc.elf: apps/xcalc/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/xcalc.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/xcalc.o libc/libc.a -o $@
-
-$(BIN_DIR)/xeyes.elf: apps/xeyes/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/xeyes.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/xeyes.o libc/libc.a -o $@
-
-$(BIN_DIR)/xgui_demo.elf: apps/xgui_demo/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/xgui_demo.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/xgui_demo.o libc/libc.a -o $@
-
-$(BIN_DIR)/nc.elf: apps/nc/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/nc.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/nc.o libc/libc.a -o $@
-
-$(BIN_DIR)/curl.elf: apps/curl/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/curl.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/curl.o libc/libc.a -o $@
-
-$(BIN_DIR)/httpd.elf: apps/httpd/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/httpd.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/httpd.o libc/libc.a -o $@
-
-$(BIN_DIR)/config.elf: apps/config/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/config.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/config.o libc/libc.a -o $@
-
-$(SBIN_DIR)/dhcpcd.elf: apps/dhcpcd/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/dhcpcd.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/dhcpcd.o libc/libc.a -o $@
-
-$(BIN_DIR)/test.elf: apps/test/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/test.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/test.o libc/libc.a -o $@
-
-$(BIN_DIR)/id.elf: apps/id/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/id.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/id.o libc/libc.a -o $@
-
-$(BIN_DIR)/tr.elf: apps/tr/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/tr.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/tr.o libc/libc.a -o $@
-
-$(BIN_DIR)/sed.elf: apps/sed/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sed.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sed.o libc/libc.a -o $@
-
-$(BIN_DIR)/ln.elf: apps/ln/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ln.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ln.o libc/libc.a -o $@
-
-$(BIN_DIR)/tee.elf: apps/tee/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/tee.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/tee.o libc/libc.a -o $@
-
-$(BIN_DIR)/paste.elf: apps/paste/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/paste.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/paste.o libc/libc.a -o $@
-
-$(BIN_DIR)/comm.elf: apps/comm/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/comm.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/comm.o libc/libc.a -o $@
-
-$(BIN_DIR)/cmp.elf: apps/cmp/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/cmp.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/cmp.o libc/libc.a -o $@
-
-$(BIN_DIR)/fold.elf: apps/fold/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/fold.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/fold.o libc/libc.a -o $@
-
-$(BIN_DIR)/expand.elf: apps/expand/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/expand.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/expand.o libc/libc.a -o $@
-
-$(BIN_DIR)/unexpand.elf: apps/unexpand/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/unexpand.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/unexpand.o libc/libc.a -o $@
-
-$(BIN_DIR)/expr.elf: apps/expr/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/expr.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/expr.o libc/libc.a -o $@
-
-$(BIN_DIR)/printenv.elf: apps/printenv/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/printenv.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/printenv.o libc/libc.a -o $@
-
-$(BIN_DIR)/split.elf: apps/split/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/split.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/split.o libc/libc.a -o $@
-
-$(BIN_DIR)/tty.elf: apps/tty/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/tty.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/tty.o libc/libc.a -o $@
-
-$(BIN_DIR)/logname.elf: apps/logname/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/logname.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/logname.o libc/libc.a -o $@
-
-$(BIN_DIR)/nl.elf: apps/nl/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/nl.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/nl.o libc/libc.a -o $@
-
-$(BIN_DIR)/cksum.elf: apps/cksum/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/cksum.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/cksum.o libc/libc.a -o $@
-
-$(BIN_DIR)/pathchk.elf: apps/pathchk/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/pathchk.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/pathchk.o libc/libc.a -o $@
-
-$(BIN_DIR)/nohup.elf: apps/nohup/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/nohup.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/nohup.o libc/libc.a -o $@
-
-$(BIN_DIR)/groups.elf: apps/groups/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/groups.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/groups.o libc/libc.a -o $@
-
-$(BIN_DIR)/users.elf: apps/users/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/users.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/users.o libc/libc.a -o $@
-
-$(BIN_DIR)/nslookup.elf: apps/nslookup/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/nslookup.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/nslookup.o libc/libc.a -o $@
-
-$(BIN_DIR)/who.elf: apps/who/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/who.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/who.o libc/libc.a -o $@
-
-$(BIN_DIR)/hostname.elf: apps/hostname/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/hostname.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/hostname.o libc/libc.a -o $@
-
-$(BIN_DIR)/sync.elf: apps/sync/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sync.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sync.o libc/libc.a -o $@
-
-$(BIN_DIR)/readlink.elf: apps/readlink/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/readlink.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/readlink.o libc/libc.a -o $@
-
-$(BIN_DIR)/realpath.elf: apps/realpath/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/realpath.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/realpath.o libc/libc.a -o $@
-
-$(BIN_DIR)/tsort.elf: apps/tsort/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/tsort.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/tsort.o libc/libc.a -o $@
-
-$(BIN_DIR)/pr.elf: apps/pr/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/pr.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/pr.o libc/libc.a -o $@
-
-$(BIN_DIR)/od.elf: apps/od/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/od.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/od.o libc/libc.a -o $@
-
-$(BIN_DIR)/timeout.elf: apps/timeout/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/timeout.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/timeout.o libc/libc.a -o $@
-
-$(BIN_DIR)/truncate.elf: apps/truncate/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/truncate.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/truncate.o libc/libc.a -o $@
-
-$(BIN_DIR)/mktemp.elf: apps/mktemp/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/mktemp.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/mktemp.o libc/libc.a -o $@
-
-$(BIN_DIR)/chroot.elf: apps/chroot/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/chroot.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/chroot.o libc/libc.a -o $@
-
-$(BIN_DIR)/nice.elf: apps/nice/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/nice.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/nice.o libc/libc.a -o $@
-
-$(BIN_DIR)/renice.elf: apps/renice/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/renice.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/renice.o libc/libc.a -o $@
-
-$(BIN_DIR)/ionice.elf: apps/ionice/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ionice.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ionice.o libc/libc.a -o $@
-
-$(BIN_DIR)/killall.elf: apps/killall/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/killall.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/killall.o libc/libc.a -o $@
-
-$(BIN_DIR)/pgrep.elf: apps/pgrep/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/pgrep.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/pgrep.o libc/libc.a -o $@
-
-$(BIN_DIR)/losetup.elf: apps/losetup/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/losetup.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/losetup.o libc/libc.a -o $@
-
-$(BIN_DIR)/diff.elf: apps/diff/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/diff.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/diff.o libc/libc.a -o $@
-
-$(BIN_DIR)/patch.elf: apps/patch/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/patch.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/patch.o libc/libc.a -o $@
-
-$(BIN_DIR)/sha256sum.elf: apps/sha256sum/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sha256sum.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sha256sum.o libc/libc.a -o $@
-
-$(BIN_DIR)/sha1sum.elf: apps/sha1sum/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sha1sum.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sha1sum.o libc/libc.a -o $@
-
-$(BIN_DIR)/gzip.elf: apps/gzip/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/gzip.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/gzip.o libc/libc.a -o $@
-
-$(BIN_DIR)/file.elf: apps/file/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/file.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/file.o libc/libc.a -o $@
-
-$(BIN_DIR)/pstree.elf: apps/pstree/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/pstree.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/pstree.o libc/libc.a -o $@
-
-$(BIN_DIR)/ipcs.elf: apps/ipcs/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ipcs.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ipcs.o libc/libc.a -o $@
-
-$(BIN_DIR)/ipcrm.elf: apps/ipcrm/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ipcrm.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ipcrm.o libc/libc.a -o $@
-
-$(BIN_DIR)/lsof.elf: apps/lsof/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/lsof.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/lsof.o libc/libc.a -o $@
-
-$(BIN_DIR)/taskset.elf: apps/taskset/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/taskset.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/taskset.o libc/libc.a -o $@
-
-$(BIN_DIR)/iostat.elf: apps/iostat/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/iostat.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/iostat.o libc/libc.a -o $@
-
-$(BIN_DIR)/lsblk.elf: apps/lsblk/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/lsblk.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/lsblk.o libc/libc.a -o $@
-
-$(BIN_DIR)/ip.elf: apps/ip/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/ip.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/ip.o libc/libc.a -o $@
-
-$(BIN_DIR)/sysctl.elf: apps/sysctl/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/sysctl.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sysctl.o libc/libc.a -o $@
-
-$(BIN_DIR)/inotifywait.elf: apps/inotifywait/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/inotifywait.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/inotifywait.o libc/libc.a -o $@
-
-$(BIN_DIR)/vmstat.elf: apps/vmstat/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/vmstat.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/vmstat.o libc/libc.a -o $@
-
-$(BIN_DIR)/getfattr.elf: apps/getfattr/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/getfattr.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/getfattr.o libc/libc.a -o $@
-
-$(BIN_DIR)/setfattr.elf: apps/setfattr/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/setfattr.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/setfattr.o libc/libc.a -o $@
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 

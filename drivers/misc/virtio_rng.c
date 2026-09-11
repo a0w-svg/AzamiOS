@@ -13,6 +13,7 @@
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../fs/vfs.h"
 
 static virtio_rng_dev_t g_vrng_dev;
@@ -45,9 +46,10 @@ int virtio_rng_get_bytes(void *buf, size_t len)
     u32 len_received = 0;
     void *cookie = NULL;
     int timeout = 100000;
+    u32 spins = 0;
     while (!cookie && timeout-- > 0) {
         cookie = virtqueue_get_used(g_vrng_dev.vq, &len_received);
-        __asm__ volatile("pause");
+        hw_spin_wait(spins++);
     }
 
     spinlock_unlock_irqrestore(&g_vrng_lock, flags);

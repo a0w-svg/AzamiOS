@@ -113,6 +113,12 @@ char *mktemp(char *tmpl);
 char *realpath(const char *path, char *resolved_path);
 int   getsubopt(char **optionp, char * const *tokens, char **valuep);
 
+/* Pseudo-terminal functions (POSIX) */
+int   grantpt(int fd);
+int   unlockpt(int fd);
+char *ptsname(int fd);
+int   ptsname_r(int fd, char *buf, size_t buflen);
+
 /* Environment and process control */
 extern char **environ;
 char *getenv(const char *name);

@@ -9,6 +9,7 @@
 #include "pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../arch/x86_64/cpu/smp.h"
 #include "../../drivers/char/console.h"
 #include "../../include/azami/defs.h"
@@ -62,10 +63,15 @@ static int size_to_bucket(size_t size)
     size_t total = size + sizeof(block_hdr_t);
     if (total < size) return -1; /* Integer overflow */
 
-    for (int i = 0; i < BUCKET_COUNT; i++) {
-        if (total <= g_buckets[i].block_size) return i;
-    }
-    return -1;
+    /* Smallest bucket i (block_size == 1 << (i + MIN_BUCKET_SHIFT)) with
+     * block_size >= total — same ceil(log2) construction as pmm.c's
+     * pages_to_order(), replacing a linear scan through up to BUCKET_COUNT
+     * buckets with one LZCNT. This runs on the front of every kmalloc(),
+     * ahead of even the per-CPU magazine fast path above. */
+    u32 shift = (total <= 1) ? 0 : (u32)(64 - hw_clz64((u64)total - 1));
+    if (shift <= MIN_BUCKET_SHIFT) return 0;
+    u32 idx = shift - MIN_BUCKET_SHIFT;
+    return (idx < BUCKET_COUNT) ? (int)idx : -1;
 }
 
 /* ============================================================================

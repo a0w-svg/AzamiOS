@@ -80,9 +80,89 @@ size_t security_format_status(char *buf, size_t max);
 /* seccomp(2) operations / modes we implement. */
 #define SECCOMP_MODE_DISABLED       0
 #define SECCOMP_MODE_STRICT         1
+#define SECCOMP_MODE_FILTER         2
 #define SECCOMP_SET_MODE_STRICT     0
 #define SECCOMP_SET_MODE_FILTER     1
 #define SECCOMP_GET_ACTION_AVAIL    2
+
+/* SECCOMP_MODE_FILTER: classic-BPF program attachment. Only the flag AzamiOS
+ * actually honours — none, i.e. flags must be 0 — is listed; SECCOMP_FILTER_
+ * FLAG_TSYNC and friends exist in Linux for multi-threaded thread-group
+ * semantics this kernel's process model doesn't have. */
+#define SECCOMP_FILTER_FLAG_NONE    0
+
+/* Classic-BPF program a filter is built from, and what seccomp(2) /
+ * prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...) take a pointer to — same
+ * layout as Linux's struct sock_filter / struct sock_fprog so a filter built
+ * with the standard BPF_STMT/BPF_JUMP macros (userland: <linux/filter.h>)
+ * needs no AzamiOS-specific changes. */
+typedef struct {
+    u16 code;
+    u8  jt;
+    u8  jf;
+    u32 k;
+} sock_filter_t;
+
+typedef struct {
+    u16 len;                 /* number of instructions in `filter` */
+    sock_filter_t *filter;   /* user pointer */
+} sock_fprog_t;
+
+/* What the BPF program is run against — same field layout/offsets as
+ * Linux's struct seccomp_data, since BPF_LD+BPF_ABS instructions address it
+ * by byte offset and a real seccomp-BPF program's offsets are baked in at
+ * compile time. */
+typedef struct {
+    s32 nr;
+    u32 arch;
+    u64 instruction_pointer;
+    u64 args[6];
+} seccomp_data_t;
+
+#define AUDIT_ARCH_X86_64  0xC000003EU
+
+/* SECCOMP_RET_*: what a filter's return value means, and the two masks that
+ * split it into an action (top 16 bits, SECCOMP_RET_KILL_PROCESS excepted —
+ * see seccomp.c) and per-action data (bottom 16 bits, the errno for
+ * SECCOMP_RET_ERRNO). Values match Linux's <linux/seccomp.h> so a filter
+ * program built against the real headers returns the same things here. */
+#define SECCOMP_RET_KILL_PROCESS   0x80000000U
+#define SECCOMP_RET_KILL_THREAD    0x00000000U
+#define SECCOMP_RET_KILL           SECCOMP_RET_KILL_THREAD
+#define SECCOMP_RET_TRAP           0x00030000U
+#define SECCOMP_RET_ERRNO          0x00050000U
+#define SECCOMP_RET_TRACE          0x7ff00000U
+#define SECCOMP_RET_LOG            0x7ffc0000U
+#define SECCOMP_RET_ALLOW          0x7fff0000U
+#define SECCOMP_RET_ACTION_FULL    0xffff0000U
+#define SECCOMP_RET_DATA           0x0000ffffU
+
+/** seccomp_attach_filter(proc, ufprog) — seccomp(SECCOMP_SET_MODE_FILTER, ...)
+ *  and prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...) both land here: copy
+ *  the program in from `ufprog` (a user struct sock_fprog *), validate it,
+ *  and prepend it to @proc's filter chain. Returns 0, or a negative errno
+ *  (-EINVAL: bad program; -EFAULT: program unreadable; -ENOMEM). Sets
+ *  @proc->seccomp_mode and @proc->no_new_privs on success, the latter for
+ *  the same reason SECCOMP_SET_MODE_STRICT does (security.c). */
+s64 seccomp_attach_filter(process_t *proc, const sock_fprog_t *ufprog);
+
+/** seccomp_filter_run(proc, syscall_nr, regs) — Run every filter attached to
+ *  @proc against this syscall (newest-attached first) and return the most
+ *  restrictive SECCOMP_RET_* action across all of them, exactly as Linux's
+ *  seccomp_run_filters() does for a stacked set of filters. Only meaningful
+ *  when proc->seccomp_mode == SECCOMP_MODE_FILTER. */
+u32 seccomp_filter_run(process_t *proc, u64 syscall_nr, const pt_regs_t *regs);
+
+/** seccomp_filters_share(child, parent) — fork(): the child starts out
+ *  sharing the parent's filter chain (one more reference on the shared
+ *  head), exactly like Linux. A later seccomp() call in either process
+ *  prepends a new filter without disturbing what the other one sees. */
+void seccomp_filters_share(process_t *child, const process_t *parent);
+
+/** seccomp_filters_put(proc) — Drop this process's reference to its filter
+ *  chain. Called once from proc_destroy(); safe to call with no filters
+ *  attached (proc->seccomp_filters == NULL). */
+void seccomp_filters_put(process_t *proc);
 
 /** security_check_permission(proc, capability) — Check capability bits on a process. */
 bool security_check_permission(process_t *proc, u32 capability);

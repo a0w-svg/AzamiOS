@@ -39,6 +39,8 @@ static u8  s_clear_variant = HW_CLEAR_REP_STOSB;
 static u8  s_have_crc32    = 0;
 static u8  s_have_tpause   = 0;
 u8         g_popcnt_enabled = 0;
+u8         g_lzcnt_enabled  = 0;
+u8         g_bmi2_enabled   = 0;
 static u32 s_line_size     = 64;
 
 /* Scratch for the boot probes. A whole line so CLZERO, whose operand is
@@ -193,6 +195,108 @@ void hw_copy_page(void *dst, const void *src)
     __asm__ volatile("sfence" ::: "memory");
 }
 
+void hw_copy_to_vram(void *dst, const void *src, size_t len)
+{
+    if (!dst || !src || len == 0) return;
+
+    if (g_erms_enabled) {
+        u8 *d = (u8 *)dst;
+        const u8 *s = (const u8 *)src;
+        __asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(len) : : "memory");
+        return;
+    }
+
+    u8 *d8 = (u8 *)dst;
+    const u8 *src8 = (const u8 *)src;
+    while (len && ((uintptr_t)d8 & 7)) {
+        *d8++ = *src8++;
+        len--;
+    }
+
+    u64 *d64 = (u64 *)d8;
+    const u64 *src64 = (const u64 *)src8;
+    size_t qwords = len / 8;
+    size_t blocks = qwords / 8;
+
+    for (size_t b = 0; b < blocks; b++) {
+        u64 v0 = src64[0], v1 = src64[1], v2 = src64[2], v3 = src64[3];
+        u64 v4 = src64[4], v5 = src64[5], v6 = src64[6], v7 = src64[7];
+        __asm__ volatile(
+            "movnti %1, 0(%0)  \n"
+            "movnti %2, 8(%0)  \n"
+            "movnti %3, 16(%0) \n"
+            "movnti %4, 24(%0) \n"
+            "movnti %5, 32(%0) \n"
+            "movnti %6, 40(%0) \n"
+            "movnti %7, 48(%0) \n"
+            "movnti %8, 56(%0) \n"
+            : : "r"(d64), "r"(v0), "r"(v1), "r"(v2), "r"(v3),
+                "r"(v4), "r"(v5), "r"(v6), "r"(v7) : "memory");
+        d64 += 8;
+        src64 += 8;
+    }
+
+    size_t rem_q = qwords % 8;
+    for (size_t i = 0; i < rem_q; i++) {
+        u64 v = *src64++;
+        __asm__ volatile("movnti %1, (%0)" : : "r"(d64++), "r"(v) : "memory");
+    }
+
+    __asm__ volatile("sfence" ::: "memory");
+
+    d8 = (u8 *)d64;
+    src8 = (const u8 *)src64;
+    size_t rem_bytes = len & 7;
+    while (rem_bytes--) {
+        *d8++ = *src8++;
+    }
+}
+
+void hw_fill_vram(void *dst, u32 val, size_t count)
+{
+    if (!dst || count == 0) return;
+
+    u64 val64 = ((u64)val << 32) | (u64)val;
+    u32 *d32 = (u32 *)dst;
+
+    if (((uintptr_t)d32 & 4) && count > 0) {
+        *d32++ = val;
+        count--;
+    }
+
+    size_t qwords = count / 2;
+    u64 *d64 = (u64 *)d32;
+
+    if (g_erms_enabled) {
+        __asm__ volatile("rep stosq" : "+D"(d64), "+c"(qwords) : "a"(val64) : "memory");
+    } else {
+        size_t blocks = qwords / 8;
+        for (size_t b = 0; b < blocks; b++) {
+            __asm__ volatile(
+                "movnti %1, 0(%0)  \n"
+                "movnti %1, 8(%0)  \n"
+                "movnti %1, 16(%0) \n"
+                "movnti %1, 24(%0) \n"
+                "movnti %1, 32(%0) \n"
+                "movnti %1, 40(%0) \n"
+                "movnti %1, 48(%0) \n"
+                "movnti %1, 56(%0) \n"
+                : : "r"(d64), "r"(val64) : "memory");
+            d64 += 8;
+        }
+        size_t rem_q = qwords % 8;
+        for (size_t i = 0; i < rem_q; i++) {
+            __asm__ volatile("movnti %1, (%0)" : : "r"(d64++), "r"(val64) : "memory");
+        }
+        __asm__ volatile("sfence" ::: "memory");
+    }
+
+    if (count & 1) {
+        d32 = (u32 *)((u8 *)d64 + qwords * 8);
+        *d32 = val;
+    }
+}
+
 /* ── Contention backoff ──────────────────────────────────────────────────── */
 
 /* Iterations of plain PAUSE before it is worth entering a power state, and the
@@ -243,6 +347,8 @@ void hwaccel_init(void)
 
     s_have_crc32     = g_cpu_info.has_sse4_2 ? 1 : 0;
     g_popcnt_enabled = g_cpu_info.has_popcnt ? 1 : 0;
+    g_lzcnt_enabled  = g_cpu_info.has_lzcnt  ? 1 : 0;
+    g_bmi2_enabled   = g_cpu_info.has_bmi2   ? 1 : 0;
 
     /* Page clear. CLZERO first (no read-for-ownership at all), then MOVNTI,
      * then ERMS. A CPU with ERMS but no CLZERO keeps `rep stosb`: on those
@@ -264,9 +370,12 @@ void hwaccel_init(void)
         s_have_tpause = 1;
     }
 
-    kprintf("[CPU] hwaccel: crc32c=%s popcnt=%s clear=%s spin=%s (line %u B)\n",
+    kprintf("[CPU] hwaccel: crc32c=%s popcnt=%s bmi=%s%s%s clear=%s spin=%s (line %u B)\n",
             s_have_crc32 ? "sse4.2" : "table",
             g_popcnt_enabled ? "hw" : "swar",
+            g_cpu_info.has_bmi1 ? "tzcnt" : "bsf",
+            g_lzcnt_enabled ? "+lzcnt" : "",
+            g_bmi2_enabled ? "+bzhi" : "",
             s_clear_variant == HW_CLEAR_CLZERO ? "clzero" :
             s_clear_variant == HW_CLEAR_MOVNTI ? "movnti" : "rep-stosb",
             s_have_tpause ? "tpause" : "pause",
@@ -275,9 +384,12 @@ void hwaccel_init(void)
 
 size_t hwaccel_format(char *buf, size_t max)
 {
-    return (size_t)scnprintf(buf, max, "crc32c=%s popcnt=%s clear=%s spin=%s",
+    return (size_t)scnprintf(buf, max, "crc32c=%s popcnt=%s bmi=%s%s%s clear=%s spin=%s",
             s_have_crc32 ? "sse4.2" : "table",
             g_popcnt_enabled ? "hw" : "swar",
+            g_cpu_info.has_bmi1 ? "tzcnt" : "bsf",
+            g_lzcnt_enabled ? "+lzcnt" : "",
+            g_bmi2_enabled ? "+bzhi" : "",
             s_clear_variant == HW_CLEAR_CLZERO ? "clzero" :
             s_clear_variant == HW_CLEAR_MOVNTI ? "movnti" : "rep-stosb",
             s_have_tpause ? "tpause" : "pause");

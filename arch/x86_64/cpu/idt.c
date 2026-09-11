@@ -228,7 +228,24 @@ static bool handle_user_page_fault(pt_regs_t *r, uintptr_t fault_addr)
             valid_fault = true;
             region_prot = probed;
         }
-        else if (fault_addr >= 0x00007fe000000000ULL && fault_addr < 0x00007fffffffe000ULL) {
+        /* Stack-region fallback for a fault vma_probe() didn't resolve. This
+         * used to accept any address in a hardcoded ~128 GB window
+         * (0x00007fe0'00000000..0x00007fffffffe000) — far past the 8 MB
+         * stack the ELF loader actually reserves (elf.c: proc->stack_low =
+         * stack_top - USER_STACK_MAX_BYTES, registered as a VMA there). A
+         * stack pointer that walked off the bottom of a real 8 MB stack —
+         * runaway/unbounded recursion, an attacker-controlled recursion
+         * depth — kept getting fresh zeroed pages instead of a fault, all
+         * the way down through 128 GB of address space, capped only by
+         * systemwide free memory (the pmm_get_free_pages() check above).
+         * That both defeated the stack-size limit as a guard against
+         * unbounded growth and stayed silent about it. Bounding this to the
+         * process's own registered stack VMA turns that into an immediate,
+         * correctly-attributed SIGSEGV at the 8 MB mark — the same
+         * immediate-#PF guarantee the kernel's own per-thread stacks get
+         * from their dedicated guard page (see kstack_alloc() in sched.c). */
+        else if (proc->stack_low > 0 && fault_addr >= proc->stack_low &&
+                 fault_addr < proc->stack_high) {
             valid_fault = true;
             region_prot = VMA_PROT_READ | VMA_PROT_WRITE;
         }

@@ -94,21 +94,36 @@ u8 virtio_pci_get_status(virtio_pci_device_t *virtio_dev)
 
 bool virtio_pci_negotiate_features(virtio_pci_device_t *virtio_dev, u64 requested_features)
 {
+    /* Read device features (bits 0-31 and bits 32-63) */
+    virtio_dev->common_cfg->device_feature_select = 0;
+    u32 dev_f0 = virtio_dev->common_cfg->device_feature;
+    virtio_dev->common_cfg->device_feature_select = 1;
+    u32 dev_f1 = virtio_dev->common_cfg->device_feature;
+    u64 device_features = ((u64)dev_f1 << 32) | dev_f0;
+
     /* Always request VERSION_1 */
-    requested_features |= VIRTIO_F_VERSION_1;
-    
+    u64 version_1_mask = (1ULL << VIRTIO_F_VERSION_1);
+    requested_features |= version_1_mask;
+
+    /* Negotiate: subset of what device supports */
+    u64 negotiated = requested_features & device_features;
+    if (!(device_features & version_1_mask)) {
+        pr_debug("[VIRTIO] Device does not offer VERSION_1 feature bit.\n");
+    }
+    negotiated |= (requested_features & version_1_mask);
+
     /* Write feature bits 0-31 */
     virtio_dev->common_cfg->driver_feature_select = 0;
-    virtio_dev->common_cfg->driver_feature = (u32)requested_features;
-    
+    virtio_dev->common_cfg->driver_feature = (u32)negotiated;
+
     /* Write feature bits 32-63 */
     virtio_dev->common_cfg->driver_feature_select = 1;
-    virtio_dev->common_cfg->driver_feature = (u32)(requested_features >> 32);
-    
+    virtio_dev->common_cfg->driver_feature = (u32)(negotiated >> 32);
+
     /* Set FEATURES_OK */
     u8 status = virtio_pci_get_status(virtio_dev);
     virtio_pci_set_status(virtio_dev, status | VIRTIO_CONFIG_S_FEATURES_OK);
-    
+
     /* Read back to ensure device accepted them */
     status = virtio_pci_get_status(virtio_dev);
     return (status & VIRTIO_CONFIG_S_FEATURES_OK) != 0;

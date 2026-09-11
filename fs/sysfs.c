@@ -29,6 +29,7 @@ typedef enum {
     SYSFS_TYPE_POWER_DIR,
     SYSFS_TYPE_BUS_DIR,
     SYSFS_TYPE_FS_DIR,
+    SYSFS_TYPE_FS_SUBDIR,
 
     /* Class subdirectories */
     SYSFS_TYPE_CLASS_NET_DIR,
@@ -666,6 +667,11 @@ static struct dentry *sysfs_lookup(struct inode *dir, struct dentry *dentry)
         } else if (strcmp(name, "clear") == 0) {
             dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 712, S_IFREG | 0666, SYSFS_TYPE_KERNEL_TRACE_CLEAR, NULL, 0);
         }
+    } else if (priv->type == SYSFS_TYPE_FS_DIR) {
+        file_system_type_t *fs = vfs_find_fs(name);
+        if (fs) {
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 900, S_IFDIR | 0555, SYSFS_TYPE_FS_SUBDIR, fs->name, 0);
+        }
     }
 
     return dentry;
@@ -689,8 +695,8 @@ static s64 sysfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u6
         return sysfs_dm_readdir(priv, dirent_buf, len, offset);
     }
 
-    const char *entries[16];
-    u8 types[16];
+    const char *entries[32];
+    u8 types[32];
     u64 total_entries = 2;
     entries[0] = "."; types[0] = DT_DIR;
     entries[1] = ".."; types[1] = DT_DIR;
@@ -757,6 +763,16 @@ static s64 sysfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u6
         entries[total_entries] = "enable"; types[total_entries++] = DT_REG;
         entries[total_entries] = "pipe"; types[total_entries++] = DT_REG;
         entries[total_entries] = "clear"; types[total_entries++] = DT_REG;
+    } else if (priv->type == SYSFS_TYPE_FS_DIR) {
+        const char *known_fs[] = { "ext2", "tmpfs", "devpts", "devfs", "procfs", "squashfs", "fat32" };
+        for (size_t i = 0; i < sizeof(known_fs) / sizeof(known_fs[0]) && total_entries < ARRAY_SIZE(entries); i++) {
+            if (vfs_find_fs(known_fs[i])) {
+                entries[total_entries] = known_fs[i];
+                types[total_entries++] = DT_DIR;
+            }
+        }
+    } else if (priv->type == SYSFS_TYPE_FS_SUBDIR) {
+        /* No extra entries needed, just . and .. */
     }
 
     while (idx < total_entries) {
@@ -789,6 +805,26 @@ static s64 sysfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u6
  * Mount & Registration
  * -------------------------------------------------------------------------- */
 
+static s64 sysfs_statfs(super_block_t *sb, struct statfs *buf)
+{
+    if (!buf) return -(s64)EFAULT;
+    memset(buf, 0, sizeof(struct statfs));
+    buf->f_type = SYSFS_SUPER_MAGIC;
+    buf->f_bsize = 4096;
+    buf->f_blocks = 0;
+    buf->f_bfree = 0;
+    buf->f_bavail = 0;
+    buf->f_files = 0;
+    buf->f_ffree = 0;
+    buf->f_namelen = 255;
+    (void)sb;
+    return 0;
+}
+
+static super_operations_t g_sysfs_super_ops = {
+    .statfs = sysfs_statfs,
+};
+
 static s64 sysfs_mount(file_system_type_t *fs_type, const char *dev_name, const char *dir_name, void *data)
 {
     (void)fs_type; (void)dev_name; (void)dir_name; (void)data;
@@ -805,6 +841,7 @@ static s64 sysfs_mount(file_system_type_t *fs_type, const char *dev_name, const 
 
     sb->s_magic = SYSFS_SUPER_MAGIC;
     sb->s_blocksize = 4096;
+    sb->s_op = &g_sysfs_super_ops;
 
     inode_t *root_inode = sysfs_alloc_inode(sb, 1, S_IFDIR | 0555, SYSFS_TYPE_ROOT_DIR, NULL, 0);
     if (!root_inode) {

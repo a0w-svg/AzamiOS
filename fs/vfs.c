@@ -12,6 +12,7 @@
 #include "../drivers/char/console.h"
 #include "../include/azami/defs.h"
 #include "../kernel/syscall/syscall.h"
+#include "../kernel/sched/sched.h"
 #include "../arch/x86_64/cpu/hwaccel.h"
 
 
@@ -670,6 +671,12 @@ static inline bool is_valid_vfs_fop(const file_operations_t *fop)
 s64 vfs_close(file_t *file)
 {
     if (!is_valid_vfs_file(file)) return -(s64)EBADF;
+
+    process_t *proc = sched_current_process();
+    u32 pid = proc ? proc->pid : 1;
+    if (file->f_inode && file->f_inode->i_flock_owner == pid) {
+        vfs_flock(file, LOCK_UN);
+    }
     
     if (__atomic_sub_fetch(&file->f_count, 1, __ATOMIC_SEQ_CST) != 0) {
         return 0; /* Still referenced by another handle, or already zero */
@@ -1018,7 +1025,21 @@ s64 vfs_readlink(const char *path, char *buf, size_t bufsiz)
     if (dentry->d_inode->i_op && dentry->d_inode->i_op->readlink) {
         return dentry->d_inode->i_op->readlink(dentry, buf, bufsiz);
     }
-    return -(s64)ENOSYS;
+    if (dentry->d_inode->i_private) {
+        const char *tgt = (const char *)dentry->d_inode->i_private;
+        size_t tlen = strlen(tgt);
+        if (tlen > bufsiz) tlen = bufsiz;
+        memcpy(buf, tgt, tlen);
+        return (s64)tlen;
+    }
+    return -(s64)EINVAL;
+}
+
+static inline void vfs_sync_inode_metadata(inode_t *inode)
+{
+    if (inode && inode->i_sb && inode->i_sb->s_op && inode->i_sb->s_op->write_inode) {
+        inode->i_sb->s_op->write_inode(inode);
+    }
 }
 
 s64 vfs_chmod(const char *path, u32 mode)
@@ -1030,6 +1051,7 @@ s64 vfs_chmod(const char *path, u32 mode)
         return -(s64)ENOENT;
     }
     dentry->d_inode->i_mode = (dentry->d_inode->i_mode & S_IFMT) | (mode & ~S_IFMT);
+    vfs_sync_inode_metadata(dentry->d_inode);
     return 0;
 }
 
@@ -1037,6 +1059,7 @@ s64 vfs_fchmod(file_t *file, u32 mode)
 {
     if (!file || !file->f_inode) return -(s64)EBADF;
     file->f_inode->i_mode = (file->f_inode->i_mode & S_IFMT) | (mode & ~S_IFMT);
+    vfs_sync_inode_metadata(file->f_inode);
     return 0;
 }
 
@@ -1050,6 +1073,7 @@ s64 vfs_chown(const char *path, u32 uid, u32 gid)
     }
     if (uid != (u32)-1) dentry->d_inode->i_uid = uid;
     if (gid != (u32)-1) dentry->d_inode->i_gid = gid;
+    vfs_sync_inode_metadata(dentry->d_inode);
     return 0;
 }
 
@@ -1063,6 +1087,7 @@ s64 vfs_lchown(const char *path, u32 uid, u32 gid)
     }
     if (uid != (u32)-1) dentry->d_inode->i_uid = uid;
     if (gid != (u32)-1) dentry->d_inode->i_gid = gid;
+    vfs_sync_inode_metadata(dentry->d_inode);
     return 0;
 }
 
@@ -1071,6 +1096,7 @@ s64 vfs_fchown(file_t *file, u32 uid, u32 gid)
     if (!file || !file->f_inode) return -(s64)EBADF;
     if (uid != (u32)-1) file->f_inode->i_uid = uid;
     if (gid != (u32)-1) file->f_inode->i_gid = gid;
+    vfs_sync_inode_metadata(file->f_inode);
     return 0;
 }
 
@@ -1093,6 +1119,7 @@ s64 vfs_utimes(const char *path, u64 atime, u64 mtime)
     }
     if (atime != (u64)-1) dentry->d_inode->i_atime = atime;
     if (mtime != (u64)-1) dentry->d_inode->i_mtime = mtime;
+    vfs_sync_inode_metadata(dentry->d_inode);
     return 0;
 }
 
@@ -1101,6 +1128,7 @@ s64 vfs_futimes(file_t *file, u64 atime, u64 mtime)
     if (!file || !file->f_inode) return -(s64)EBADF;
     if (atime != (u64)-1) file->f_inode->i_atime = atime;
     if (mtime != (u64)-1) file->f_inode->i_mtime = mtime;
+    vfs_sync_inode_metadata(file->f_inode);
     return 0;
 }
 
@@ -1151,4 +1179,79 @@ s64 vfs_fstatfs(file_t *file, struct statfs *buf)
     buf->f_frsize = buf->f_bsize;
     return 0;
 }
+
+s64 vfs_flock(file_t *file, int operation)
+{
+    if (!is_valid_vfs_file(file) || !file->f_inode) return -(s64)EBADF;
+
+    if (operation & ~(LOCK_SH | LOCK_EX | LOCK_NB | LOCK_UN)) return -(s64)EINVAL;
+
+    int type = operation & (LOCK_SH | LOCK_EX | LOCK_UN);
+    if (type != LOCK_SH && type != LOCK_EX && type != LOCK_UN) return -(s64)EINVAL;
+
+    process_t *proc = sched_current_process();
+    u32 pid = proc ? proc->pid : 1;
+    inode_t *ino = file->f_inode;
+
+    spinlock_lock(&g_vfs_lock);
+
+    if (type == LOCK_UN) {
+        if (ino->i_flock_type == LOCK_EX) {
+            if (ino->i_flock_owner == pid || ino->i_flock_owner == 0) {
+                ino->i_flock_type = 0;
+                ino->i_flock_owner = 0;
+                ino->i_flock_count = 0;
+            }
+        } else if (ino->i_flock_type == LOCK_SH) {
+            if (ino->i_flock_count > 0) {
+                ino->i_flock_count--;
+                if (ino->i_flock_count == 0) {
+                    ino->i_flock_type = 0;
+                    ino->i_flock_owner = 0;
+                }
+            }
+        }
+        spinlock_unlock(&g_vfs_lock);
+        return 0;
+    }
+
+    if (type == LOCK_SH) {
+        while (ino->i_flock_type == LOCK_EX && ino->i_flock_owner != pid) {
+            if (operation & LOCK_NB) {
+                spinlock_unlock(&g_vfs_lock);
+                return -(s64)11; /* -EWOULDBLOCK / -EAGAIN */
+            }
+            spinlock_unlock(&g_vfs_lock);
+            sched_yield();
+            spinlock_lock(&g_vfs_lock);
+        }
+        ino->i_flock_type = LOCK_SH;
+        ino->i_flock_count++;
+        if (ino->i_flock_owner == 0) ino->i_flock_owner = pid;
+        spinlock_unlock(&g_vfs_lock);
+        return 0;
+    }
+
+    if (type == LOCK_EX) {
+        while ((ino->i_flock_type == LOCK_EX && ino->i_flock_owner != pid) ||
+               (ino->i_flock_type == LOCK_SH && (ino->i_flock_count > 1 || (ino->i_flock_count == 1 && ino->i_flock_owner != pid)))) {
+            if (operation & LOCK_NB) {
+                spinlock_unlock(&g_vfs_lock);
+                return -(s64)11; /* -EWOULDBLOCK / -EAGAIN */
+            }
+            spinlock_unlock(&g_vfs_lock);
+            sched_yield();
+            spinlock_lock(&g_vfs_lock);
+        }
+        ino->i_flock_type = LOCK_EX;
+        ino->i_flock_owner = pid;
+        ino->i_flock_count = 1;
+        spinlock_unlock(&g_vfs_lock);
+        return 0;
+    }
+
+    spinlock_unlock(&g_vfs_lock);
+    return 0;
+}
+
 

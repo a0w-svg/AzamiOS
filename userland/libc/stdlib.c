@@ -981,9 +981,29 @@ int system(const char *command)
     return status;
 }
 
+/* no_stack_protector: this function reseeds __stack_chk_guard itself, and a
+ * protected function's epilogue checks its saved canary against whatever
+ * the global holds *now* — not the placeholder it held at this function's
+ * own entry. Without this attribute, __libc_init() would fail its own
+ * canary check on return, every time, for every process. See the matching
+ * comment on kernel/security/security.c's security_init(), which reseeds
+ * the kernel-side guard the same way and needs the same exemption. */
+void __libc_init(int argc, char **argv, char **envp) __attribute__((no_stack_protector));
 void __libc_init(int argc, char **argv, char **envp)
 {
     (void)argc; (void)argv;
+
+    /* Reseed the stack canary before anything else runs. __stack_chk_guard
+     * starts life as the fixed constant above — enough to satisfy the
+     * linker, not enough to stop an attacker who has read this binary from
+     * predicting it. getentropy() already falls back to rand() if
+     * SYS_getrandom ever fails, so this always leaves the guard non-zero;
+     * zero the low byte the same way the kernel does (security_init(), in
+     * kernel/security/security.c) so a NUL-terminated string overflow can't
+     * copy the canary forward intact. */
+    uintptr_t canary = 0;
+    if (getentropy(&canary, sizeof canary) == 0 && canary != 0)
+        __stack_chk_guard = canary & ~(uintptr_t)0xFF;
 
     /* Pick the widest string/memory scanners this CPU supports before the
      * first strdup() below reaches for strlen()/memcpy(). Skipping this only

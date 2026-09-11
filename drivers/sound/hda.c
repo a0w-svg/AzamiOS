@@ -13,6 +13,7 @@
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../kernel/lib/string.h"
 #include "../../fs/vfs.h"
 
@@ -131,8 +132,9 @@ int hda_init(device_t *dev)
     if (!(gctl & 1)) {
         hda_write32(HDA_REG_GCTL, gctl | 1);
         int timeout = 10000;
+        u32 spins = 0;
         while (!(hda_read32(HDA_REG_GCTL) & 1) && timeout-- > 0) {
-            __asm__ volatile("pause");
+            hw_spin_wait(spins++);
         }
     }
 

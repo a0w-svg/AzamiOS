@@ -38,6 +38,7 @@
 #include "../../arch/x86_64/boot/limine_req.h"
 #include "../misc/bga.h"
 #include "virtio_gpu.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 #include <azami/debug.h>
 #include <azami/vsync.h>
 
@@ -118,6 +119,20 @@ static s64 fbdev_flip_to(u32 buf_idx, bool wait_vsync)
     if (!g_fb_state.has_hw_flip || buf_idx >= g_fb_state.buffers) return -(s64)EINVAL;
 
     if (wait_vsync) vsync_wait(0);
+
+    if (g_fb_state.is_virtio) {
+        u32 y_off = buf_idx * g_fb_state.height;
+        u64 byte_off = (u64)y_off * g_fb_state.pitch;
+        virtio_gpu_transfer_to_host_2d_rect(g_gpu.resource_id, 0, y_off,
+                                            g_fb_state.width, g_fb_state.height, byte_off);
+        virtio_gpu_set_scanout_offset(0, g_gpu.resource_id, 0, y_off,
+                                      g_fb_state.width, g_fb_state.height);
+        virtio_gpu_resource_flush_rect(g_gpu.resource_id, 0, y_off,
+                                       g_fb_state.width, g_fb_state.height);
+        g_fb_state.y_offset = y_off;
+        return 0;
+    }
+
     if (bga_flip_buffer(buf_idx) != 0) return -(s64)EIO;
 
     g_fb_state.y_offset = buf_idx * g_fb_state.height;
@@ -171,14 +186,16 @@ static void fbdev_probe_hardware(void)
         g_fb_state.height          = g_gpu.screen_height ? g_gpu.screen_height : 800;
         g_fb_state.pitch           = g_fb_state.width * 4;
         g_fb_state.bpp             = 32;
-        g_fb_state.single_fb_size  = g_gpu.framebuffer_size;
+        g_fb_state.single_fb_size  = (size_t)g_fb_state.pitch * g_fb_state.height;
         g_fb_state.total_vram_size = g_gpu.framebuffer_size;
-        g_fb_state.buffers         = 1;
-        g_fb_state.has_hw_flip     = false;
+        g_fb_state.buffers         = (g_fb_state.single_fb_size && g_gpu.framebuffer_size >= g_fb_state.single_fb_size * 2) ? 2 : 1;
+        g_fb_state.has_hw_flip     = (g_fb_state.buffers > 1);
         g_fb_state.y_offset        = 0;
         g_fb_state.is_virtio       = true;
-        pr_debug("[FBDEV] Active Backend: VirtIO-GPU (%ux%ux32, resource %u, LFB: 0x%016llx)\n",
-                 g_fb_state.width, g_fb_state.height, g_gpu.resource_id,
+        pr_debug("[FBDEV] Active Backend: VirtIO-GPU (%ux%ux32, %u buffer%s, resource %u, LFB: 0x%016llx)\n",
+                 g_fb_state.width, g_fb_state.height,
+                 g_fb_state.buffers, g_fb_state.buffers == 1 ? "" : "s",
+                 g_gpu.resource_id,
                  (unsigned long long)g_gpu.framebuffer_phys);
         return;
     }
@@ -248,8 +265,8 @@ static s64 fbdev_write(struct file *filp, const void *buf, size_t len, u64 *offs
     size_t to_write = (len > avail) ? avail : len;
 
     u8 *dst = (u8 *)PHYS_TO_VIRT(g_fb_state.phys_addr + *offset);
-    /* Kernel buffer — see fs/vfs.h. */
-    memcpy(dst, buf, to_write);
+    /* High-performance non-temporal / ERMS VRAM copy */
+    hw_copy_to_vram(dst, buf, to_write);
 
     *offset += to_write;
     __atomic_add_fetch(&g_fb_state.present_gen, 1, __ATOMIC_RELAXED);
@@ -446,6 +463,79 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
             }
             spinlock_unlock_irqrestore(&g_fb_state.dmg_lock, f);
             __atomic_add_fetch(&g_fb_state.present_gen, 1, __ATOMIC_RELAXED);
+            return 0;
+        }
+
+        case FBIOAZ_ACCEL_FILL: {
+            struct fb_az_fill fill;
+            if (copy_from_user(&fill, (void *)(uintptr_t)arg, sizeof(fill)) != 0) return -(s64)EFAULT;
+            if (fill.w == 0 || fill.h == 0) return 0;
+            if (fill.x >= g_fb_state.width || fill.y >= g_fb_state.height) return -(s64)EINVAL;
+            if (fill.buffer_idx >= g_fb_state.buffers) return -(s64)EINVAL;
+
+            u32 w = fill.w, h = fill.h;
+            if (fill.x + w > g_fb_state.width)  w = g_fb_state.width  - fill.x;
+            if (fill.y + h > g_fb_state.height) h = g_fb_state.height - fill.y;
+
+            u32 y_base = fill.buffer_idx * g_fb_state.height + fill.y;
+            u8 *vram_base = (u8 *)PHYS_TO_VIRT(g_fb_state.phys_addr);
+
+            for (u32 row = 0; row < h; row++) {
+                u32 *row_dst = (u32 *)(vram_base + (size_t)(y_base + row) * g_fb_state.pitch + (size_t)fill.x * 4);
+                hw_fill_vram(row_dst, fill.color, w);
+            }
+
+            if (g_fb_state.is_virtio && fill.buffer_idx == (g_fb_state.y_offset / (g_fb_state.height ? g_fb_state.height : 1))) {
+                fbdev_virtio_present_rect(fill.x, fill.y, w, h);
+            }
+            __atomic_add_fetch(&g_fb_state.present_gen, 1, __ATOMIC_RELAXED);
+            return 0;
+        }
+
+        case FBIOAZ_ACCEL_COPY: {
+            struct fb_az_copy cp;
+            if (copy_from_user(&cp, (void *)(uintptr_t)arg, sizeof(cp)) != 0) return -(s64)EFAULT;
+            if (cp.w == 0 || cp.h == 0) return 0;
+            if (cp.src_buf >= g_fb_state.buffers || cp.dst_buf >= g_fb_state.buffers) return -(s64)EINVAL;
+            if (cp.src_x >= g_fb_state.width || cp.src_y >= g_fb_state.height) return -(s64)EINVAL;
+            if (cp.dst_x >= g_fb_state.width || cp.dst_y >= g_fb_state.height) return -(s64)EINVAL;
+
+            u32 w = cp.w, h = cp.h;
+            if (cp.src_x + w > g_fb_state.width)  w = g_fb_state.width  - cp.src_x;
+            if (cp.src_y + h > g_fb_state.height) h = g_fb_state.height - cp.src_y;
+            if (cp.dst_x + w > g_fb_state.width)  w = g_fb_state.width  - cp.dst_x;
+            if (cp.dst_y + h > g_fb_state.height) h = g_fb_state.height - cp.dst_y;
+
+            u32 src_y_base = cp.src_buf * g_fb_state.height + cp.src_y;
+            u32 dst_y_base = cp.dst_buf * g_fb_state.height + cp.dst_y;
+            u8 *vram_base = (u8 *)PHYS_TO_VIRT(g_fb_state.phys_addr);
+
+            for (u32 row = 0; row < h; row++) {
+                const u8 *src_row = vram_base + (size_t)(src_y_base + row) * g_fb_state.pitch + (size_t)cp.src_x * 4;
+                u8 *dst_row = vram_base + (size_t)(dst_y_base + row) * g_fb_state.pitch + (size_t)cp.dst_x * 4;
+                hw_copy_to_vram(dst_row, src_row, (size_t)w * 4);
+            }
+
+            if (g_fb_state.is_virtio && cp.dst_buf == (g_fb_state.y_offset / (g_fb_state.height ? g_fb_state.height : 1))) {
+                fbdev_virtio_present_rect(cp.dst_x, cp.dst_y, w, h);
+            }
+            __atomic_add_fetch(&g_fb_state.present_gen, 1, __ATOMIC_RELAXED);
+            return 0;
+        }
+
+        case FBIOAZ_GET_CAPS: {
+            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            struct fb_az_caps caps;
+            memset(&caps, 0, sizeof(caps));
+            caps.buffers = g_fb_state.buffers;
+            caps.max_width = g_fb_state.width;
+            caps.max_height = g_fb_state.height;
+            caps.pitch = g_fb_state.pitch;
+            caps.caps = (g_fb_state.buffers > 1 ? FB_AZ_CAP_DOUBLEBUF : 0) |
+                        (g_fb_state.has_hw_flip ? FB_AZ_CAP_HW_FLIP : 0) |
+                        (g_fb_state.is_virtio ? (FB_AZ_CAP_VIRTIO | FB_AZ_CAP_HW_CURSOR) : 0) |
+                        FB_AZ_CAP_ACCEL_2D;
+            if (copy_to_user((void *)(uintptr_t)arg, &caps, sizeof(caps)) != 0) return -(s64)EFAULT;
             return 0;
         }
 

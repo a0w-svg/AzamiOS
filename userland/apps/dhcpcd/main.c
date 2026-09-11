@@ -84,6 +84,15 @@ int main(int argc, char **argv)
         /* Trigger kernel DHCP negotiation */
         ioctl(net_fd, SIOCSIFDHCP, 0);
 
+        /* Poll every 100ms rather than every full second: this kernel-side
+         * path either lands the lease almost immediately or it doesn't
+         * complete at all (see the socket-based fallback below), so the old
+         * sleep(1) x 10 only ever bought a worst case of 10 real seconds of
+         * boot time for nothing observable. 100ms x 10 still gives it a full
+         * second to land — plenty, since a successful negotiation on this
+         * kernel's own loopback-fast virtual network resolves in well under
+         * that — while capping the cost of falling through to line 118 at a
+         * tenth of what it was. */
         dhcp_lease_t lease;
         memset(&lease, 0, sizeof(lease));
         for (int wait = 0; wait < 10; wait++) {
@@ -111,7 +120,7 @@ int main(int argc, char **argv)
                 close(net_fd);
                 return 0;
             }
-            sleep(1);
+            usleep(100000);
         }
     }
 

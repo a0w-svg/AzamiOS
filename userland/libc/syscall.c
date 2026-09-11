@@ -20,6 +20,7 @@
 #include "include/sys/times.h"
 #include "include/sys/statvfs.h"
 #include "include/sys/timeb.h"
+#include "include/pwd.h"
 #include "include/shadow.h"
 #include "include/sys/statx.h"
 #include "include/sys/uio.h"
@@ -768,8 +769,7 @@ int sysinfo(struct sysinfo *info)
 
 int sys_reboot(int magic1, int magic2, int cmd, void *arg)
 {
-    (void)magic1; (void)magic2; (void)arg;
-    return (int)__syscall_ret(syscall4(SYS_reboot, 0xfee1dead, 672274793, cmd, 0));
+    return (int)__syscall_ret(syscall4(SYS_reboot, magic1, magic2, cmd, (long)arg));
 }
 
 /* ── Timing & Sleeping ───────────────────────────────────────────────────── */
@@ -797,8 +797,7 @@ int usleep(unsigned long usec)
 
 int gettimeofday(struct timeval *tv, struct timezone *tz)
 {
-    (void)tz;
-    return (int)__syscall_ret(syscall2(SYS_gettimeofday, (long)tv, 0));
+    return (int)__syscall_ret(syscall2(SYS_gettimeofday, (long)tv, (long)tz));
 }
 
 /* Declared in sys/time.h but never actually implemented — every caller got
@@ -872,52 +871,22 @@ long pathconf(const char *path, int name)
 
 ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
-    off_t old_pos = lseek(fd, 0, 1);
-    if (old_pos < 0) return -1;
-    if (lseek(fd, offset, 0) < 0) return -1;
-    ssize_t ret = read(fd, buf, count);
-    lseek(fd, old_pos, 0);
-    return ret;
+    return (ssize_t)__syscall_ret(syscall4(SYS_pread64, fd, (long)buf, count, offset));
 }
 
 ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 {
-    off_t old_pos = lseek(fd, 0, 1);
-    if (old_pos < 0) return -1;
-    if (lseek(fd, offset, 0) < 0) return -1;
-    ssize_t ret = write(fd, buf, count);
-    lseek(fd, old_pos, 0);
-    return ret;
+    return (ssize_t)__syscall_ret(syscall4(SYS_pwrite64, fd, (long)buf, count, offset));
 }
 
 ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 {
-    if (!iov || iovcnt <= 0) return -1;
-    ssize_t total = 0;
-    for (int i = 0; i < iovcnt; i++) {
-        if (iov[i].iov_len > 0) {
-            ssize_t r = read(fd, iov[i].iov_base, iov[i].iov_len);
-            if (r < 0) return (total > 0) ? total : -1;
-            total += r;
-            if ((size_t)r < iov[i].iov_len) break;
-        }
-    }
-    return total;
+    return (ssize_t)__syscall_ret(syscall3(SYS_readv, fd, (long)iov, iovcnt));
 }
 
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
-    if (!iov || iovcnt <= 0) return -1;
-    ssize_t total = 0;
-    for (int i = 0; i < iovcnt; i++) {
-        if (iov[i].iov_len > 0) {
-            ssize_t w = write(fd, iov[i].iov_base, iov[i].iov_len);
-            if (w < 0) return (total > 0) ? total : -1;
-            total += w;
-            if ((size_t)w < iov[i].iov_len) break;
-        }
-    }
-    return total;
+    return (ssize_t)__syscall_ret(syscall3(SYS_writev, fd, (long)iov, iovcnt));
 }
 
 int chroot(const char *path)
@@ -1031,7 +1000,9 @@ int faccessat(int dirfd, const char *pathname, int mode, int flags)
 
 int sys_fchmodat(int dirfd, const char *path, mode_t mode, int flags)
 {
-    (void)flags;
+    if (flags != 0) {
+        return (int)__syscall_ret(syscall4(SYS_fchmodat2, dirfd, (long)path, mode, flags));
+    }
     return (int)__syscall_ret(syscall3(SYS_fchmodat, dirfd, (long)path, mode));
 }
 
@@ -1290,13 +1261,20 @@ int getpagesize(void)
 
 char *getlogin(void)
 {
-    return "azami";
+    const char *u = getenv("LOGNAME");
+    if (!u) u = getenv("USER");
+    if (u && *u) return (char *)u;
+    struct passwd *pw = getpwuid(geteuid());
+    if (pw && pw->pw_name) return pw->pw_name;
+    return geteuid() == 0 ? "root" : "azami";
 }
 
 int getlogin_r(char *buf, size_t bufsize)
 {
-    if (!buf || bufsize < 6) { errno = ERANGE; return -1; }
-    strcpy(buf, "azami");
+    if (!buf) { errno = EINVAL; return -1; }
+    char *name = getlogin();
+    if (strlen(name) + 1 > bufsize) { errno = ERANGE; return -1; }
+    strcpy(buf, name);
     return 0;
 }
 
@@ -1391,6 +1369,10 @@ int ftime(struct timeb *tp)
     return 0;
 }
 
+static int s_sp_fd = -1;
+static struct spwd s_sp_buf;
+static char s_sp_line[256];
+
 static struct spwd s_root_spwd = {
     .sp_namp = (char *)"root",
     .sp_pwdp = (char *)"*",
@@ -1403,15 +1385,101 @@ static struct spwd s_root_spwd = {
     .sp_flag = 0
 };
 
-struct spwd *getspnam(const char *name)
+void setspent(void)
 {
-    if (name && strcmp(name, "root") == 0) return &s_root_spwd;
-    return 0;
+    if (s_sp_fd >= 0) {
+        lseek(s_sp_fd, 0, SEEK_SET);
+    } else {
+        s_sp_fd = open("/etc/shadow", O_RDONLY);
+    }
 }
 
-struct spwd *getspent(void) { return &s_root_spwd; }
-void setspent(void) {}
-void endspent(void) {}
+void endspent(void)
+{
+    if (s_sp_fd >= 0) {
+        close(s_sp_fd);
+        s_sp_fd = -1;
+    }
+}
+
+static struct spwd *parse_shadow_line(char *line)
+{
+    if (!line) return NULL;
+    /* Format: username:password:lstchg:min:max:warn:inact:expire:flag */
+    char *fields[9];
+    char *cur = line;
+    for (int i = 0; i < 9; i++) {
+        fields[i] = cur;
+        char *colon = strchr(cur, ':');
+        if (colon) {
+            *colon = '\0';
+            cur = colon + 1;
+        } else {
+            char *nl = strchr(cur, '\n');
+            if (nl) *nl = '\0';
+            char *cr = strchr(cur, '\r');
+            if (cr) *cr = '\0';
+            if (i < 8) return NULL;
+        }
+    }
+
+    s_sp_buf.sp_namp   = fields[0];
+    s_sp_buf.sp_pwdp   = fields[1];
+    s_sp_buf.sp_lstchg = fields[2][0] ? atol(fields[2]) : -1;
+    s_sp_buf.sp_min    = fields[3][0] ? atol(fields[3]) : -1;
+    s_sp_buf.sp_max    = fields[4][0] ? atol(fields[4]) : -1;
+    s_sp_buf.sp_warn   = fields[5][0] ? atol(fields[5]) : -1;
+    s_sp_buf.sp_inact  = fields[6][0] ? atol(fields[6]) : -1;
+    s_sp_buf.sp_expire = fields[7][0] ? atol(fields[7]) : -1;
+    s_sp_buf.sp_flag   = fields[8][0] ? (unsigned long)atol(fields[8]) : 0;
+
+    return &s_sp_buf;
+}
+
+struct spwd *getspent(void)
+{
+    if (s_sp_fd < 0) {
+        setspent();
+        if (s_sp_fd < 0) return NULL;
+    }
+
+    for (;;) {
+        size_t i = 0;
+        while (i + 1 < sizeof(s_sp_line)) {
+            char c;
+            ssize_t n = read(s_sp_fd, &c, 1);
+            if (n <= 0) break;
+            if (c == '\r') continue;
+            if (c == '\n') break;
+            s_sp_line[i++] = c;
+        }
+        s_sp_line[i] = '\0';
+        if (i == 0) return NULL;
+        if (s_sp_line[0] == '#') continue;
+        struct spwd *sp = parse_shadow_line(s_sp_line);
+        if (sp) return sp;
+    }
+}
+
+struct spwd *getspnam(const char *name)
+{
+    if (!name) return NULL;
+    setspent();
+    struct spwd *sp;
+    while ((sp = getspent()) != NULL) {
+        if (strcmp(sp->sp_namp, name) == 0) {
+            endspent();
+            return sp;
+        }
+    }
+    endspent();
+
+    /* Fallback default root user if not found or /etc/shadow inaccessible */
+    if (strcmp(name, "root") == 0) {
+        return &s_root_spwd;
+    }
+    return NULL;
+}
 
 int fsync(int fd)
 {
@@ -1440,8 +1508,7 @@ int setregid(gid_t rgid, gid_t egid)
 
 int setresuid(uid_t ruid, uid_t euid, uid_t suid)
 {
-    (void)suid;
-    return (int)__syscall_ret(syscall2(SYS_setresuid, ruid, euid));
+    return (int)__syscall_ret(syscall3(SYS_setresuid, ruid, euid, suid));
 }
 
 int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid)
@@ -1451,8 +1518,7 @@ int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid)
 
 int setresgid(gid_t rgid, gid_t egid, gid_t sgid)
 {
-    (void)sgid;
-    return (int)__syscall_ret(syscall2(SYS_setresgid, rgid, egid));
+    return (int)__syscall_ret(syscall3(SYS_setresgid, rgid, egid, sgid));
 }
 
 int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid)
@@ -1679,11 +1745,7 @@ int sched_getaffinity(pid_t pid, size_t cpusetsize, void *mask)
 
 int sched_rr_get_interval(pid_t pid, struct timespec *tp)
 {
-    (void)pid;
-    if (!tp) { errno = EINVAL; return -1; }
-    tp->tv_sec = 0;
-    tp->tv_nsec = 10000000L; /* 10ms default timeslice */
-    return 0;
+    return (int)__syscall_ret(syscall2(SYS_sched_rr_get_interval, pid, (long)tp));
 }
 
 int klogctl(int type, char *bufp, int len)

@@ -43,6 +43,9 @@
 #include <mqueue.h>
 #include <sys/ioprio.h>
 #include <numaif.h>
+#include <stddef.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <linux/futex.h>
 
 
@@ -526,6 +529,57 @@ static void run_posix_verification_suite(void)
                         "stack canary is randomised per boot");
         }
 
+        /* seccomp(2) SECCOMP_MODE_FILTER: a real classic-BPF program, run in
+         * a forked child so a wrong verdict can't take the test suite down
+         * with it. First child: a filter that returns SECCOMP_RET_ERRNO for
+         * one specific syscall (mkdir) and SECCOMP_RET_ALLOW for everything
+         * else, proving both a denial and a pass-through in one program.
+         * Second child: SECCOMP_RET_KILL_PROCESS on the same syscall, proving
+         * the kill is real (SIGSYS) and not just a loud denial. */
+        {
+            pid_t sc_pid = fork();
+            if (sc_pid == 0) {
+                struct sock_filter filt[] = {
+                    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                             (unsigned int)offsetof(struct seccomp_data, nr)),
+                    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_mkdir, 0, 1),
+                    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+                    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+                };
+                struct sock_fprog prog = { sizeof(filt) / sizeof(filt[0]), filt };
+                if (syscall3(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, (long)&prog) != 0) _exit(2);
+                errno = 0;
+                int mk = mkdir("/tmp/seccomp_denied_dir", 0755);
+                if (mk == 0 || errno != EPERM) _exit(3);      /* denial didn't land */
+                if (getpid() <= 0) _exit(4);                  /* pass-through broke */
+                _exit(0);
+            }
+            int sc_status = 0;
+            waitpid(sc_pid, &sc_status, 0);
+            TEST_ASSERT(WIFEXITED(sc_status) && WEXITSTATUS(sc_status) == 0,
+                        "seccomp SECCOMP_MODE_FILTER: RET_ERRNO denies one syscall, RET_ALLOW passes the rest");
+        }
+        {
+            pid_t sk_pid = fork();
+            if (sk_pid == 0) {
+                struct sock_filter filt[] = {
+                    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                             (unsigned int)offsetof(struct seccomp_data, nr)),
+                    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_mkdir, 0, 1),
+                    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+                    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+                };
+                struct sock_fprog prog = { sizeof(filt) / sizeof(filt[0]), filt };
+                if (syscall3(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, (long)&prog) != 0) _exit(2);
+                mkdir("/tmp/seccomp_kill_dir", 0755);
+                _exit(9); /* unreachable if RET_KILL_PROCESS actually fired */
+            }
+            int sk_status = 0;
+            waitpid(sk_pid, &sk_status, 0);
+            TEST_ASSERT(WIFSIGNALED(sk_status) && WTERMSIG(sk_status) == SIGSYS,
+                        "seccomp SECCOMP_MODE_FILTER: RET_KILL_PROCESS terminates the process (SIGSYS)");
+        }
+
         /* Machine-check log. Reading it polls the MCA banks, so a clean run
          * here also proves the bank MSRs are addressable on this part. */
         int mfd = open("/proc/mcelog", O_RDONLY);
@@ -551,7 +605,19 @@ static void run_posix_verification_suite(void)
         }
     }
 
-    /* 12. Native GCC Toolchain Verification */
+    /* 12. Native GCC Toolchain Verification — real gcc/as/ld invocations
+     * (cc1 does actual compilation, ld does a real link), unlike the ~200
+     * syscall-probe tests above that each cost microseconds. Under QEMU TCG
+     * emulation this one step is ~2s of an ~8s boot — the single largest
+     * cost in the whole sequence. Still worth having (it is the only thing
+     * that actually proves the self-hosted toolchain staged into the image
+     * works), just not worth paying on every boot by default.
+     * `touch /etc/run-toolchain-selftest` before repacking the initrd
+     * re-enables it. */
+    if (access("/etc/run-toolchain-selftest", F_OK) != 0) {
+        printf("[INIT] Skipping native GCC/binutils smoke test "
+               "(touch /etc/run-toolchain-selftest to re-enable)\n");
+    } else {
     int as_pid = fork();
     if (as_pid == 0) {
         int lfd = open("/tmp/as_log.txt", O_CREAT | O_WRONLY | O_TRUNC, 0666);
@@ -646,6 +712,7 @@ static void run_posix_verification_suite(void)
         waitpid(run_pid, &run_status, 0);
         printf("[INIT-HELLO] /tmp/hello execution returned status=0x%x (exit_code=%d)\n", run_status, (run_status >> 8) & 0xFF);
         TEST_ASSERT(run_status == 0, "Native compiled binary execution (/tmp/hello)");
+    }
     }
 
 

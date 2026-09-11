@@ -76,9 +76,64 @@ struct termios {
 #define B57600  0010001
 #define B115200 0010002
 
+/* Control characters */
+#define VINTR    0
+#define VQUIT    1
+#define VERASE   2
+#define VKILL    3
+#define VEOF     4
+#define VTIME    5
+#define VMIN     6
+#define VSWTC    7
+#define VSTART   8
+#define VSTOP    9
+#define VSUSP    10
+#define VEOL     11
+
+/* c_cflag */
+#define CSIZE    0000060
+#define CS5      0000000
+#define CS6      0000020
+#define CS7      0000040
+#define CS8      0000060
+#define CSTOPB   0000100
+#define CREAD    0000200
+#define PARENB   0000400
+#define PARODD   0001000
+#define HUPCL    0002000
+#define CLOCAL   0004000
+
+/* Flush / Flow */
+#define TCIFLUSH  0
+#define TCOFLUSH  1
+#define TCIOFLUSH 2
+
+#define TCOOFF 0
+#define TCOON  1
+#define TCIOFF 2
+#define TCION  3
+
 int tcgetattr(int fd, struct termios *termios_p);
 int tcsetattr(int fd, int optional_actions, const struct termios *termios_p);
 speed_t cfgetispeed(const struct termios *termios_p);
 speed_t cfgetospeed(const struct termios *termios_p);
 int cfsetispeed(struct termios *termios_p, speed_t speed);
 int cfsetospeed(struct termios *termios_p, speed_t speed);
+void cfmakeraw(struct termios *termios_p);
+int tcsendbreak(int fd, int duration);
+int tcflush(int fd, int queue_selector);
+int tcflow(int fd, int action);
+
+#ifndef _STRUCT_WINSIZE_DEFINED
+#define _STRUCT_WINSIZE_DEFINED
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel;
+    unsigned short ws_ypixel;
+};
+#endif
+
+pid_t tcgetpgrp(int fd);
+int tcsetpgrp(int fd, pid_t pgrp);
+pid_t tcgetsid(int fd);

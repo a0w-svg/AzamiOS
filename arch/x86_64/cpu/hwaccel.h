@@ -7,11 +7,12 @@
  * once through a boot-time function pointer or a cached predicate, so a call
  * site pays no CPUID cost and no per-call branch chain.
  *
- * Only GPR-operand extensions appear here — SSE4.2's CRC32, POPCNT, MOVNTI,
- * CLZERO and the WAITPKG timed pauses. The kernel is built -mno-sse and does
- * not save XMM/YMM state across its own entry paths, so a routine that touched
- * a vector register would silently corrupt whichever thread it interrupted;
- * that is why there is no AVX memcpy here, and why there must not be one.
+ * Only GPR-operand extensions appear here — SSE4.2's CRC32, POPCNT, BMI1/BMI2
+ * (TZCNT/LZCNT/BZHI), MOVNTI, CLZERO and the WAITPKG timed pauses. The kernel
+ * is built -mno-sse and does not save XMM/YMM state across its own entry
+ * paths, so a routine that touched a vector register would silently corrupt
+ * whichever thread it interrupted; that is why there is no AVX memcpy here,
+ * and why there must not be one.
  *
  * The wider extensions the CPU may have — CLWB, CLFLUSHOPT, CLDEMOTE,
  * MOVDIR64B, SERIALIZE — are detected in cpu.c and reported through
@@ -82,6 +83,23 @@ void hw_clear_pages(void *va, size_t npages);
  */
 void hw_copy_page(void *dst, const void *src);
 
+/* ── Video Memory / Aperture Acceleration ────────────────────────────────── */
+
+/**
+ * hw_copy_to_vram(dst, src, len) — high-throughput copy to Write-Combining VRAM.
+ *
+ * Uses ERMS `rep movsb` or 64-bit non-temporal GPR stores (`movnti`) with `sfence`.
+ * Avoids cache pollution of CPU caches while bursting data across the PCIe bus.
+ */
+void hw_copy_to_vram(void *dst, const void *src, size_t len);
+
+/**
+ * hw_fill_vram(dst, val, count) — high-throughput 32-bit pixel fill in VRAM.
+ *
+ * Fills @count 32-bit pixels with @val using 64-bit packed stores.
+ */
+void hw_fill_vram(void *dst, u32 val, size_t count);
+
 /* ── Bit scanning ────────────────────────────────────────────────────────── */
 
 /* Set by hwaccel_init() when CPUID reports POPCNT. Read directly by the inline
@@ -110,6 +128,80 @@ static inline unsigned hw_popcnt64(u64 word)
     word = (word & 0x3333333333333333ULL) + ((word >> 2) & 0x3333333333333333ULL);
     word = (word + (word >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
     return (unsigned)((word * 0x0101010101010101ULL) >> 56);
+}
+
+/* Set by hwaccel_init() when CPUID reports true LZCNT (AMD ABM, or Intel via
+ * BMI1 — cpu.c only sets has_lzcnt once has_bmi1 is confirmed, for the reason
+ * hw_clz64() below depends on). Read directly by that inline for the same
+ * one-branch-not-a-call reason as g_popcnt_enabled. */
+extern u8 g_lzcnt_enabled;
+
+/* Set by hwaccel_init() when CPUID reports BMI2. Unlike TZCNT/LZCNT, BZHI has
+ * no legacy opcode to fall back to — it is a VEX-only encoding that faults on
+ * a CPU that doesn't claim it, so hw_bzhi64() must gate on this rather than
+ * just emitting the instruction and hoping. */
+extern u8 g_bmi2_enabled;
+
+/**
+ * hw_ctz64(word) — count trailing zero bits; 64 for word == 0.
+ *
+ * Emits TZCNT unconditionally, with no CPUID check needed at all: on a CPU
+ * without BMI1, TZCNT's F3 0F BC encoding just decodes as plain BSF (ignoring
+ * the REP prefix it's built from), and BSF's result for a *nonzero* input is
+ * numerically identical to TZCNT's — both are "the position of the lowest set
+ * bit". The only place they disagree is a zero input, which this handles in
+ * software before the asm ever runs, so the BSF fallback is always correct,
+ * not just usually. (This is why cpu.c warns that blind TZCNT/LZCNT emission
+ * gives "the wrong answer for a zero input rather than faulting" — the
+ * warning is about that one input, not about needing BMI1 to be safe here.)
+ */
+static inline unsigned hw_ctz64(u64 word)
+{
+    if (word == 0) return 64;
+    u64 r;
+    __asm__("tzcnt %1, %0" : "=r"(r) : "rm"(word) : "cc");
+    return (unsigned)r;
+}
+
+/**
+ * hw_clz64(word) — count leading zero bits; 64 for word == 0.
+ *
+ * Unlike TZCNT/BSF, this genuinely needs the CPUID check: LZCNT's fallback
+ * decode on a CPU without it is BSR, and BSR returns the *bit index* of the
+ * highest set bit — a different number from "count of leading zeros", not
+ * the same value under a different name (they're related by `63 - index`,
+ * but the raw registers disagree for every nonzero input, not just zero).
+ * Emitting LZCNT and trusting the legacy decode here would silently return
+ * bit-index instead of leading-zero-count on any pre-BMI1/ABM part.
+ */
+static inline unsigned hw_clz64(u64 word)
+{
+    if (word == 0) return 64;
+    u64 r;
+    if (g_lzcnt_enabled) {
+        __asm__("lzcnt %1, %0" : "=r"(r) : "rm"(word) : "cc");
+        return (unsigned)r;
+    }
+    __asm__("bsr %1, %0" : "=r"(r) : "rm"(word) : "cc");
+    return (unsigned)(63 - r);
+}
+
+/**
+ * hw_bzhi64(src, n) — the low @n bits of @src, all others cleared
+ * (n >= 64 returns @src unchanged, matching BZHI's own out-of-range rule).
+ *
+ * BZHI (BMI2) is a VEX-only opcode with no pre-BMI2 decode to fall back
+ * through — unlike TZCNT/LZCNT it simply doesn't exist on an older part, so
+ * this checks g_bmi2_enabled rather than emitting it unconditionally.
+ */
+static inline u64 hw_bzhi64(u64 src, u32 n)
+{
+    if (g_bmi2_enabled) {
+        u64 r;
+        __asm__("bzhi %2, %1, %0" : "=r"(r) : "rm"(src), "r"((u64)n) : "cc");
+        return r;
+    }
+    return (n >= 64) ? src : (src & ((1ULL << n) - 1));
 }
 
 /* ── Contention backoff ──────────────────────────────────────────────────── */

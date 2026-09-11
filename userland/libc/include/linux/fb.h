@@ -148,4 +148,43 @@ struct fb_az_hwcursor_pos {
     int32_t y;
 };
 
+/* ── Hardware 2D Acceleration & Capabilities ──────────────────────────────── */
+#define FBIOAZ_ACCEL_FILL     0x4684   /* arg: struct fb_az_fill *          */
+#define FBIOAZ_ACCEL_COPY     0x4685   /* arg: struct fb_az_copy *          */
+#define FBIOAZ_GET_CAPS       0x4686   /* arg: struct fb_az_caps *          */
+
+#define FB_AZ_CAP_DOUBLEBUF   (1U << 0)
+#define FB_AZ_CAP_HW_FLIP     (1U << 1)
+#define FB_AZ_CAP_HW_CURSOR   (1U << 2)
+#define FB_AZ_CAP_ACCEL_2D    (1U << 3)
+#define FB_AZ_CAP_VIRTIO      (1U << 4)
+
+struct fb_az_fill {
+    uint32_t x;
+    uint32_t y;
+    uint32_t w;
+    uint32_t h;
+    uint32_t color;      /* 32-bit ARGB8888 pixel value */
+    uint32_t buffer_idx; /* 0 for primary/front, 1 for backbuffer */
+};
+
+struct fb_az_copy {
+    uint32_t src_x;
+    uint32_t src_y;
+    uint32_t dst_x;
+    uint32_t dst_y;
+    uint32_t w;
+    uint32_t h;
+    uint32_t src_buf;
+    uint32_t dst_buf;
+};
+
+struct fb_az_caps {
+    uint32_t caps;
+    uint32_t buffers;
+    uint32_t max_width;
+    uint32_t max_height;
+    uint32_t pitch;
+};
+
 #endif /* _LINUX_FB_H */

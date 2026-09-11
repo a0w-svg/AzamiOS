@@ -151,8 +151,8 @@ static void regs_export(const process_t *t, const pt_regs_t *r,
     u->rip = r->rip; u->cs = r->cs; u->eflags = r->rflags;
     u->rsp = r->rsp; u->ss = r->ss;
     u->ds = r->ds;   u->es = r->ds;  u->fs = 0; u->gs = 0;
-    u->fs_base = t->threads && t->threads->fs_base ? t->threads->fs_base
-                                                   : t->fs_base;
+    u->fs_base = t->threads && t->threads->has_thread_fs_base ? t->threads->fs_base
+                                                              : t->fs_base;
     u->gs_base = t->gs_base;
 }
 
@@ -178,7 +178,10 @@ static void regs_import(process_t *t, pt_regs_t *r,
     r->cs = 0x23; r->ss = 0x1B; r->ds = 0x1B;
 
     t->ptrace_orig_rax = u->orig_rax;
-    if (t->threads && u->fs_base < USER_ADDR_MAX) t->threads->fs_base = u->fs_base;
+    if (t->threads && u->fs_base < USER_ADDR_MAX) {
+        t->threads->fs_base            = u->fs_base;
+        t->threads->has_thread_fs_base = true;
+    }
     if (u->gs_base < USER_ADDR_MAX) t->gs_base = u->gs_base;
 }
 

@@ -8,6 +8,7 @@
 #include "include/fcntl.h"
 #include "include/stdlib.h"
 #include "include/string.h"
+#include "include/signal.h"
 
 int posix_spawn_file_actions_init(posix_spawn_file_actions_t *file_actions)
 {
@@ -84,6 +85,73 @@ int posix_spawnattr_getflags(const posix_spawnattr_t *attr, short *flags)
     return 0;
 }
 
+int posix_spawnattr_getpgroup(const posix_spawnattr_t *attr, pid_t *pgroup)
+{
+    if (!attr || !pgroup) return 22;
+    *pgroup = (pid_t)attr->pgroup;
+    return 0;
+}
+
+int posix_spawnattr_setpgroup(posix_spawnattr_t *attr, pid_t pgroup)
+{
+    if (!attr) return 22;
+    attr->pgroup = (short)pgroup;
+    return 0;
+}
+
+int posix_spawnattr_getsigmask(const posix_spawnattr_t *attr, sigset_t *sigmask)
+{
+    if (!attr || !sigmask) return 22;
+    *sigmask = attr->sigmask;
+    return 0;
+}
+
+int posix_spawnattr_setsigmask(posix_spawnattr_t *attr, const sigset_t *sigmask)
+{
+    if (!attr || !sigmask) return 22;
+    attr->sigmask = *sigmask;
+    return 0;
+}
+
+int posix_spawnattr_getsigdefault(const posix_spawnattr_t *attr, sigset_t *sigdefault)
+{
+    if (!attr || !sigdefault) return 22;
+    *sigdefault = attr->sigdefault;
+    return 0;
+}
+
+int posix_spawnattr_setsigdefault(posix_spawnattr_t *attr, const sigset_t *sigdefault)
+{
+    if (!attr || !sigdefault) return 22;
+    attr->sigdefault = *sigdefault;
+    return 0;
+}
+
+static void apply_spawn_attr(const posix_spawnattr_t *attrp)
+{
+    if (!attrp) return;
+    if (attrp->flags & POSIX_SPAWN_SETPGROUP) {
+        setpgid(0, attrp->pgroup);
+    }
+    if (attrp->flags & POSIX_SPAWN_RESETIDS) {
+        seteuid(getuid());
+        setegid(getgid());
+    }
+    if (attrp->flags & POSIX_SPAWN_SETSIGMASK) {
+        sigprocmask(SIG_SETMASK, &attrp->sigmask, NULL);
+    }
+    if (attrp->flags & POSIX_SPAWN_SETSIGDEF) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_DFL;
+        for (int sig = 1; sig < 32; sig++) {
+            if (attrp->sigdefault & (1UL << (sig - 1))) {
+                sigaction(sig, &sa, NULL);
+            }
+        }
+    }
+}
+
 static void apply_file_actions(const posix_spawn_file_actions_t *fa)
 {
     if (!fa) return;
@@ -113,9 +181,7 @@ int posix_spawn(pid_t *pid, const char *path,
     if (cpid < 0) return 12; /* ENOMEM / EAGAIN */
 
     if (cpid == 0) {
-        if (attrp && (attrp->flags & POSIX_SPAWN_SETPGROUP)) {
-            setpgid(0, attrp->pgroup);
-        }
+        apply_spawn_attr(attrp);
         apply_file_actions(file_actions);
         execve(path, argv, envp);
         _exit(127);
@@ -136,9 +202,7 @@ int posix_spawnp(pid_t *pid, const char *file,
     if (cpid < 0) return 12;
 
     if (cpid == 0) {
-        if (attrp && (attrp->flags & POSIX_SPAWN_SETPGROUP)) {
-            setpgid(0, attrp->pgroup);
-        }
+        apply_spawn_attr(attrp);
         apply_file_actions(file_actions);
         execvpe(file, argv, envp);
         _exit(127);

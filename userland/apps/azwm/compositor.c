@@ -9,7 +9,35 @@
 #include "../../libc/include/az/ipc.h"
 #include "../../libc/include/string.h"
 #include "../../libc/include/stdio.h"
+#include "../../libc/include/time.h"
 #include <stdbool.h>
+#include <emmintrin.h>
+#include <immintrin.h>
+
+/* Runtime AVX2 gate — see the identical check in shared/gfx_pipeline.h for
+ * why this needs XGETBV and not just the CPUID feature bit: the binary is
+ * built for the SSE2-only baseline (no -march here), so the AVX2 codepaths
+ * below only run from behind __attribute__((target("avx2"))) functions,
+ * never because the whole translation unit was compiled for AVX2. */
+static inline int compositor_cpu_has_avx2(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+
+    unsigned int eax, ebx, ecx, edx;
+    __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                                 : "a"(1), "c"(0));
+    if (!(ecx & (1u << 27)) || !(ecx & (1u << 28))) { cached = 0; return 0; }
+
+    unsigned int xcr0_lo, xcr0_hi;
+    __asm__ __volatile__("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+    if ((xcr0_lo & 0x6u) != 0x6u) { cached = 0; return 0; }
+
+    __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                                 : "a"(7), "c"(0));
+    cached = (ebx & (1u << 5)) ? 1 : 0;
+    return cached;
+}
 
 /* ── Pixel buffer base address for shared memory window buffers ───────────── */
 #include <fcntl.h>
@@ -60,6 +88,11 @@ void compositor_init(az_compositor_t *comp,
     comp->pending[1].valid = 0;
     comp->cursor_rect[0].valid = 0;
     comp->cursor_rect[1].valid = 0;
+    comp->frame_count          = 0;
+    comp->current_fps          = 60;
+    comp->last_fps_time        = 0;
+    comp->last_fps_frame_count = 0;
+    comp->fps_hud_visible      = 0;
 
     comp->list_head = 0; /* NULL */
     comp->list_tail = 0; /* NULL */
@@ -211,8 +244,13 @@ int compositor_create_window(az_compositor_t *comp,
     win->title[ti] = '\0';
 
     unsigned long pixels_total = (unsigned long)w * h;
-    for (unsigned long i = 0; i < pixels_total; i++) {
-        win->pixels[i] = 0xFF1E1E2E; 
+    unsigned long pi = 0;
+    __m128i bg128 = _mm_set1_epi32((int)0xFF1E1E2EU);
+    for (; pi + 4 <= pixels_total; pi += 4) {
+        _mm_storeu_si128((__m128i *)(win->pixels + pi), bg128);
+    }
+    for (; pi < pixels_total; pi++) {
+        win->pixels[pi] = 0xFF1E1E2EU; 
     }
 
     /* Add to Z-order front */
@@ -356,6 +394,238 @@ static inline unsigned int alpha_shade_black(unsigned int dst, unsigned int alph
     return 0xFF000000 | rb | g;
 }
 
+/* One 4-pixel step of alpha_shade_black_span's translucent case. Factored out
+ * so the AVX2 path below can call the exact same math on its own remainder
+ * instead of re-deriving it — the two must never be free to disagree. */
+static inline void alpha_shade_black_block4_sse2(unsigned int *dst, __m128i inv_a_vec, __m128i alpha_mask)
+{
+    __m128i zero = _mm_setzero_si128();
+    __m128i d = _mm_loadu_si128((const __m128i *)dst);
+    __m128i d_lo = _mm_unpacklo_epi8(d, zero);
+    __m128i d_hi = _mm_unpackhi_epi8(d, zero);
+
+    __m128i res_lo = _mm_srli_epi16(_mm_mullo_epi16(d_lo, inv_a_vec), 8);
+    __m128i res_hi = _mm_srli_epi16(_mm_mullo_epi16(d_hi, inv_a_vec), 8);
+
+    __m128i res = _mm_packus_epi16(res_lo, res_hi);
+    res = _mm_or_si128(res, alpha_mask);
+    _mm_storeu_si128((__m128i *)dst, res);
+}
+
+__attribute__((target("avx2")))
+static void alpha_shade_black_span_avx2(unsigned int *dst, unsigned int alpha, int count)
+{
+    unsigned int inv_a = 255 - alpha;
+    __m256i inv_a_vec = _mm256_set1_epi16((short)inv_a);
+    __m256i zero = _mm256_setzero_si256();
+    __m256i alpha_mask = _mm256_set1_epi32((int)0xFF000000U);
+
+    int px = 0;
+    for (; px + 8 <= count; px += 8) {
+        __m256i d = _mm256_loadu_si256((const __m256i *)(dst + px));
+        __m256i d_lo = _mm256_unpacklo_epi8(d, zero);
+        __m256i d_hi = _mm256_unpackhi_epi8(d, zero);
+
+        __m256i res_lo = _mm256_srli_epi16(_mm256_mullo_epi16(d_lo, inv_a_vec), 8);
+        __m256i res_hi = _mm256_srli_epi16(_mm256_mullo_epi16(d_hi, inv_a_vec), 8);
+
+        __m256i res = _mm256_packus_epi16(res_lo, res_hi);
+        res = _mm256_or_si256(res, alpha_mask);
+        _mm256_storeu_si256((__m256i *)(dst + px), res);
+    }
+    if (px + 4 <= count) {
+        __m128i inv_a_vec4 = _mm_set1_epi16((short)inv_a);
+        __m128i alpha_mask4 = _mm_set1_epi32((int)0xFF000000U);
+        alpha_shade_black_block4_sse2(dst + px, inv_a_vec4, alpha_mask4);
+        px += 4;
+    }
+    for (; px < count; px++) dst[px] = alpha_shade_black(dst[px], alpha);
+}
+
+__attribute__((target("avx2")))
+static void alpha_shade_black_span_fill_avx2(unsigned int *dst, int count)
+{
+    __m256i black = _mm256_set1_epi32((int)0xFF000000U);
+    int px = 0;
+    for (; px + 8 <= count; px += 8) {
+        _mm256_storeu_si256((__m256i *)(dst + px), black);
+    }
+    __m128i black4 = _mm_set1_epi32((int)0xFF000000U);
+    for (; px + 4 <= count; px += 4) {
+        _mm_storeu_si128((__m128i *)(dst + px), black4);
+    }
+    for (; px < count; px++) dst[px] = 0xFF000000U;
+}
+
+static inline void alpha_shade_black_span(unsigned int *dst, unsigned int alpha, int count)
+{
+    if (count <= 0 || alpha == 0) return;
+    if (alpha >= 255) {
+        if (compositor_cpu_has_avx2()) {
+            alpha_shade_black_span_fill_avx2(dst, count);
+            return;
+        }
+        int px = 0;
+        __m128i black4 = _mm_set1_epi32((int)0xFF000000U);
+        for (; px + 4 <= count; px += 4) {
+            _mm_storeu_si128((__m128i *)(dst + px), black4);
+        }
+        for (; px < count; px++) dst[px] = 0xFF000000U;
+        return;
+    }
+
+    if (compositor_cpu_has_avx2()) {
+        alpha_shade_black_span_avx2(dst, alpha, count);
+        return;
+    }
+
+    int px = 0;
+    unsigned int inv_a = 255 - alpha;
+    __m128i inv_a_vec = _mm_set1_epi16((short)inv_a);
+    __m128i alpha_mask = _mm_set1_epi32((int)0xFF000000U);
+
+    for (; px + 4 <= count; px += 4) {
+        alpha_shade_black_block4_sse2(dst + px, inv_a_vec, alpha_mask);
+    }
+    for (; px < count; px++) {
+        dst[px] = alpha_shade_black(dst[px], alpha);
+    }
+}
+
+/* One 4-pixel step of composite_blend_span, opaque/transparent shortcuts
+ * included — the opaque shortcut is load-bearing for correctness, not just
+ * speed: the fixed-point blend below does not reproduce an opaque source
+ * exactly (its rounding is one off from identity at full alpha), so skipping
+ * it for a "remainder" block would make that block disagree with a same-sized
+ * span processed entirely by this function. Shared by the SSE2 loop and the
+ * AVX2 remainder so the two can never drift apart on it independently. */
+static inline void composite_blend_block4_sse2(unsigned int *dst, const unsigned int *src)
+{
+    __m128i alpha_mask = _mm_set1_epi32((int)0xFF000000U);
+    __m128i s = _mm_loadu_si128((const __m128i *)src);
+    __m128i s_alpha = _mm_and_si128(s, alpha_mask);
+    __m128i is_opaque = _mm_cmpeq_epi32(s_alpha, alpha_mask);
+    if (_mm_movemask_epi8(is_opaque) == 0xFFFF) {
+        _mm_storeu_si128((__m128i *)dst, s);
+        return;
+    }
+
+    __m128i is_zero = _mm_cmpeq_epi32(s_alpha, _mm_setzero_si128());
+    if (_mm_movemask_epi8(is_zero) == 0xFFFF) {
+        return;
+    }
+
+    __m128i d = _mm_loadu_si128((const __m128i *)dst);
+    __m128i zero = _mm_setzero_si128();
+
+    __m128i s_lo = _mm_unpacklo_epi8(s, zero);
+    __m128i d_lo = _mm_unpacklo_epi8(d, zero);
+    __m128i a0 = _mm_shufflelo_epi16(s_lo, _MM_SHUFFLE(3, 3, 3, 3));
+    a0 = _mm_shufflehi_epi16(a0, _MM_SHUFFLE(3, 3, 3, 3));
+    __m128i inv_a0 = _mm_sub_epi16(_mm_set1_epi16(255), a0);
+    __m128i out_lo = _mm_add_epi16(_mm_mullo_epi16(s_lo, a0), _mm_mullo_epi16(d_lo, inv_a0));
+    out_lo = _mm_srli_epi16(out_lo, 8);
+
+    __m128i s_hi = _mm_unpackhi_epi8(s, zero);
+    __m128i d_hi = _mm_unpackhi_epi8(d, zero);
+    __m128i a1 = _mm_shufflelo_epi16(s_hi, _MM_SHUFFLE(3, 3, 3, 3));
+    a1 = _mm_shufflehi_epi16(a1, _MM_SHUFFLE(3, 3, 3, 3));
+    __m128i inv_a1 = _mm_sub_epi16(_mm_set1_epi16(255), a1);
+    __m128i out_hi = _mm_add_epi16(_mm_mullo_epi16(s_hi, a1), _mm_mullo_epi16(d_hi, inv_a1));
+    out_hi = _mm_srli_epi16(out_hi, 8);
+
+    __m128i out = _mm_packus_epi16(out_lo, out_hi);
+    out = _mm_or_si128(out, alpha_mask);
+    _mm_storeu_si128((__m128i *)dst, out);
+}
+
+__attribute__((target("avx2")))
+static void composite_blend_span_avx2(unsigned int *dst, const unsigned int *src, int count)
+{
+    __m256i alpha_mask = _mm256_set1_epi32((int)0xFF000000U);
+    __m256i zero = _mm256_setzero_si256();
+
+    int px = 0;
+    for (; px + 8 <= count; px += 8) {
+        __m256i s = _mm256_loadu_si256((const __m256i *)(src + px));
+        __m256i s_alpha = _mm256_and_si256(s, alpha_mask);
+        __m256i is_opaque = _mm256_cmpeq_epi32(s_alpha, alpha_mask);
+        if ((unsigned)_mm256_movemask_epi8(is_opaque) == 0xFFFFFFFFu) {
+            _mm256_storeu_si256((__m256i *)(dst + px), s);
+            continue;
+        }
+
+        __m256i is_zero = _mm256_cmpeq_epi32(s_alpha, zero);
+        if ((unsigned)_mm256_movemask_epi8(is_zero) == 0xFFFFFFFFu) {
+            continue;
+        }
+
+        __m256i d = _mm256_loadu_si256((const __m256i *)(dst + px));
+
+        __m256i s_lo = _mm256_unpacklo_epi8(s, zero);
+        __m256i d_lo = _mm256_unpacklo_epi8(d, zero);
+        __m256i a0 = _mm256_shufflelo_epi16(s_lo, _MM_SHUFFLE(3, 3, 3, 3));
+        a0 = _mm256_shufflehi_epi16(a0, _MM_SHUFFLE(3, 3, 3, 3));
+        __m256i inv_a0 = _mm256_sub_epi16(_mm256_set1_epi16(255), a0);
+        __m256i out_lo = _mm256_add_epi16(_mm256_mullo_epi16(s_lo, a0), _mm256_mullo_epi16(d_lo, inv_a0));
+        out_lo = _mm256_srli_epi16(out_lo, 8);
+
+        __m256i s_hi = _mm256_unpackhi_epi8(s, zero);
+        __m256i d_hi = _mm256_unpackhi_epi8(d, zero);
+        __m256i a1 = _mm256_shufflelo_epi16(s_hi, _MM_SHUFFLE(3, 3, 3, 3));
+        a1 = _mm256_shufflehi_epi16(a1, _MM_SHUFFLE(3, 3, 3, 3));
+        __m256i inv_a1 = _mm256_sub_epi16(_mm256_set1_epi16(255), a1);
+        __m256i out_hi = _mm256_add_epi16(_mm256_mullo_epi16(s_hi, a1), _mm256_mullo_epi16(d_hi, inv_a1));
+        out_hi = _mm256_srli_epi16(out_hi, 8);
+
+        __m256i out = _mm256_packus_epi16(out_lo, out_hi);
+        out = _mm256_or_si256(out, alpha_mask);
+        _mm256_storeu_si256((__m256i *)(dst + px), out);
+    }
+    if (px + 4 <= count) {
+        composite_blend_block4_sse2(dst + px, src + px);
+        px += 4;
+    }
+    while (px < count) {
+        unsigned int col = src[px];
+        unsigned int a = (col >> 24) & 0xFF;
+        if (a == 255) {
+            dst[px] = col;
+        } else if (a > 0) {
+            dst[px] = alpha_blend(dst[px], col, a);
+        }
+        px++;
+    }
+}
+
+/* ── SIMD / SSE2 or AVX2-accelerated parallel alpha blend span ───────────── */
+static inline void composite_blend_span(unsigned int *dst, const unsigned int *src, int count)
+{
+    if (compositor_cpu_has_avx2()) {
+        composite_blend_span_avx2(dst, src, count);
+        return;
+    }
+
+    int px = 0;
+
+    /* Process 4 pixels at a time with SSE2 */
+    for (; px + 4 <= count; px += 4) {
+        composite_blend_block4_sse2(dst + px, src + px);
+    }
+
+    /* Scalar remainder */
+    while (px < count) {
+        unsigned int col = src[px];
+        unsigned int a = (col >> 24) & 0xFF;
+        if (a == 255) {
+            dst[px] = col;
+        } else if (a > 0) {
+            dst[px] = alpha_blend(dst[px], col, a);
+        }
+        px++;
+    }
+}
+
 static void bb_fill_rect(az_compositor_t *comp, int rx, int ry, int rw, int rh, unsigned int color)
 {
     if (rw <= 0 || rh <= 0) return;
@@ -486,7 +756,7 @@ static void draw_drop_shadow(az_compositor_t *comp, int rx, int ry, int rw, int 
         if (dist >= s) continue;
         unsigned int alpha = alpha_lut[dist];
         unsigned int *line = &comp->backbuf[y * pitch_px];
-        for (int x = x_start; x < x_end; x++) line[x] = alpha_shade_black(line[x], alpha);
+        alpha_shade_black_span(&line[x_start], alpha, x_end - x_start);
     }
 
     /* 2. Bottom strip */
@@ -496,7 +766,7 @@ static void draw_drop_shadow(az_compositor_t *comp, int rx, int ry, int rw, int 
         if (dist >= s) continue;
         unsigned int alpha = alpha_lut[dist];
         unsigned int *line = &comp->backbuf[y * pitch_px];
-        for (int x = x_start; x < x_end; x++) line[x] = alpha_shade_black(line[x], alpha);
+        alpha_shade_black_span(&line[x_start], alpha, x_end - x_start);
     }
 
     /* 3. Left strip */
@@ -571,7 +841,23 @@ static void draw_drop_shadow(az_compositor_t *comp, int rx, int ry, int rw, int 
     }
 }
 
-static void render_window(az_compositor_t *comp, az_window_t *win)
+/*
+ * @clip_x0/y0/x1/y1 bound the region compositor_present() is actually going
+ * to copy out this frame (compose_screen derives it from the damage box, or
+ * the full screen when nothing narrowed it). Only the client-area blit below
+ * is clipped to it — that SIMD alpha blend is the costliest part of drawing
+ * a window and the part damage most often shrinks to almost nothing (a text
+ * caret in an otherwise static, maximized terminal), so narrowing just that
+ * loop turns the expensive part from O(window area) into O(damage area)
+ * without changing a single pixel that would reach the screen: anything
+ * outside the clip is, under the same has_damage contract compositor_present()
+ * already relies on, unchanged from the backbuf's last correct composite of
+ * it. The frame chrome (border, titlebar, buttons, shadow) stays unclipped
+ * since it is cheap and callers already skip this whole function when a
+ * window's frame+shadow bounds miss the clip entirely.
+ */
+static void render_window(az_compositor_t *comp, az_window_t *win,
+                          int clip_x0, int clip_y0, int clip_x1, int clip_y1)
 {
     if (!win->visible || win->wid == 0) return;
 
@@ -684,7 +970,15 @@ static void render_window(az_compositor_t *comp, az_window_t *win)
         if (win->buffer_h > 0 && max_rows > (int)win->buffer_h)
             max_rows = (int)win->buffer_h;
 
-        for (int row = 0; row < max_rows; row++) {
+        int row_lo = 0, row_hi = max_rows;
+        {
+            int lo = clip_y0 - wy;
+            int hi = clip_y1 - wy;
+            if (lo > row_lo) row_lo = lo;
+            if (hi < row_hi) row_hi = hi;
+        }
+
+        for (int row = row_lo; row < row_hi; row++) {
             int sy = wy + row;
             if (sy < 0 || sy >= (int)comp->fb_height) continue;
 
@@ -703,6 +997,15 @@ static void render_window(az_compositor_t *comp, az_window_t *win)
             if (dst_x + copy_w > (int)comp->fb_width) {
                 copy_w = (int)comp->fb_width - dst_x;
             }
+            if (dst_x < clip_x0) {
+                int adj = clip_x0 - dst_x;
+                src_x  += adj;
+                copy_w -= adj;
+                dst_x   = clip_x0;
+            }
+            if (dst_x + copy_w > clip_x1) {
+                copy_w = clip_x1 - dst_x;
+            }
             if (win->buffer_w > 0 && src_x + copy_w > (int)win->buffer_w) {
                 copy_w = (int)win->buffer_w - src_x;
             }
@@ -714,15 +1017,8 @@ static void render_window(az_compositor_t *comp, az_window_t *win)
                     unsigned int *src_ptr = &win->pixels[offset];
                     unsigned int *dst_ptr = &comp->backbuf[(unsigned int)sy * pitch_px + (unsigned int)dst_x];
 
-                    for (int px = 0; px < copy_w; px++) {
-                        unsigned int col = src_ptr[px];
-                        unsigned int a = (col >> 24) & 0xFF;
-                        if (a == 255) {
-                            dst_ptr[px] = col;
-                        } else if (a > 0) {
-                            dst_ptr[px] = alpha_blend(dst_ptr[px], col, a);
-                        }
-                    }
+                    /* High-speed SIMD-vectorized alpha blending */
+                    composite_blend_span(dst_ptr, src_ptr, copy_w);
                 }
             }
         }
@@ -951,6 +1247,38 @@ static void draw_context_menu(az_compositor_t *comp)
     }
 }
 
+/* On-screen frame-rate counter, F12-toggled — reads current_fps as sampled
+ * by compositor_present_internal(). Small enough to always draw whole rather
+ * than bother clipping it to the damage box. */
+static void draw_fps_hud(az_compositor_t *comp)
+{
+    if (!comp->fps_hud_visible) return;
+
+    char label[16];
+    int len = snprintf(label, sizeof(label), "%u FPS", comp->current_fps);
+    if (len < 0) return;
+    if ((size_t)len >= sizeof(label)) len = (int)sizeof(label) - 1;
+
+    int w = 16 + len * 8;
+    int h = 24;
+    int x = (int)comp->fb_width - w - 10;
+    int y = 10;
+    if (x < 0) x = 0;
+
+    bb_fill_rounded_rect(comp, x, y, w, h, 6, 0xFF181825);
+    unsigned int color = comp->current_fps >= 50 ? 0xFFA6E3A1
+                        : comp->current_fps >= 30 ? 0xFFF9E2AF
+                        : 0xFFF38BA8;
+    desktop_draw_text_at(comp->backbuf, comp->fb_width, comp->fb_height,
+                         comp->fb_pitch / 4, x + 8, y + 8, label, color);
+
+    /* This panel just redrew outside whatever the rest of the frame already
+     * marked dirty (it lives in the corner, not wherever activity is), so
+     * name its own rect or the damage-clipped present step below would never
+     * actually copy it to the screen. */
+    compositor_damage(comp, x, y, w, h);
+}
+
 /* ── Presentation ────────────────────────────────────────────────────────── */
 
 static void rect_union(azwm_rect_t *dst, int x0, int y0, int x1, int y1)
@@ -993,13 +1321,31 @@ static void copy_rect(az_compositor_t *comp, unsigned int *dst,
 {
     if (!r->valid) return;
     unsigned int pitch_px = comp->fb_pitch / 4;
-    size_t row_bytes = (size_t)(r->x1 - r->x0) * sizeof(unsigned int);
+    int w = r->x1 - r->x0;
+    if (w <= 0) return;
 
     for (int y = r->y0; y < r->y1; y++) {
-        memcpy(&dst[(unsigned int)y * pitch_px + (unsigned int)r->x0],
-               &comp->backbuf[(unsigned int)y * pitch_px + (unsigned int)r->x0],
-               row_bytes);
+        unsigned int *dst_row = &dst[(unsigned int)y * pitch_px + (unsigned int)r->x0];
+        const unsigned int *src_row = &comp->backbuf[(unsigned int)y * pitch_px + (unsigned int)r->x0];
+
+        int px = 0;
+        /* Align to 16-byte boundary for streaming stores */
+        while (((uintptr_t)&dst_row[px] & 15) && px < w) {
+            dst_row[px] = src_row[px];
+            px++;
+        }
+        /* 128-bit streaming non-temporal stores direct to write-combining VRAM */
+        while (px + 4 <= w) {
+            __m128i v = _mm_loadu_si128((const __m128i *)&src_row[px]);
+            _mm_stream_si128((__m128i *)&dst_row[px], v);
+            px += 4;
+        }
+        while (px < w) {
+            dst_row[px] = src_row[px];
+            px++;
+        }
     }
+    _mm_sfence();
 }
 
 void compositor_enable_page_flip(az_compositor_t *comp, int fb_fd,
@@ -1184,6 +1530,31 @@ static void compositor_present_internal(az_compositor_t *comp, bool recomposited
 
     comp->old_cursor_x = comp->cursor_x;
     comp->old_cursor_y = comp->cursor_y;
+    comp->frame_count++;
+
+    /* Re-sample current_fps about once a second of wall-clock time. Cheap
+     * enough to do on every present (cursor-only ones included, since those
+     * are real frames too) — one clock_gettime call and, on 999 out of 1000
+     * of them, nothing else. */
+    {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+            unsigned long long now_ns = (unsigned long long)ts.tv_sec * 1000000000ULL
+                                       + (unsigned long long)ts.tv_nsec;
+            if (comp->last_fps_time == 0) {
+                comp->last_fps_time        = now_ns;
+                comp->last_fps_frame_count = comp->frame_count;
+            } else {
+                unsigned long long elapsed = now_ns - comp->last_fps_time;
+                if (elapsed >= 1000000000ULL) {
+                    unsigned long long frames = comp->frame_count - comp->last_fps_frame_count;
+                    comp->current_fps = (unsigned int)((frames * 1000000000ULL) / elapsed);
+                    comp->last_fps_time        = now_ns;
+                    comp->last_fps_frame_count = comp->frame_count;
+                }
+            }
+        }
+    }
 }
 
 void compositor_present(az_compositor_t *comp)
@@ -1193,20 +1564,60 @@ void compositor_present(az_compositor_t *comp)
 
 void compose_screen(az_compositor_t *comp)
 {
-    /* ── 1. Clear backbuf only if tail window does not fully cover screen ─ */
+    /*
+     * The region compositor_present() is actually going to copy out this
+     * frame — the damage box clamped to the screen, or the whole screen when
+     * nothing called compositor_damage() (the same "nothing said what
+     * changed, assume all of it did" rule compositor_present_internal()
+     * applies on the far end). Steps 1 and 2 below use it to skip work whose
+     * result could not reach the screen anyway, on the same has_damage
+     * contract the present step already trusts.
+     */
+    int clip_x0 = 0, clip_y0 = 0;
+    int clip_x1 = (int)comp->fb_width, clip_y1 = (int)comp->fb_height;
+    if (comp->has_damage) {
+        clip_x0 = comp->dirty_min_x < 0 ? 0 : comp->dirty_min_x;
+        clip_y0 = comp->dirty_min_y < 0 ? 0 : comp->dirty_min_y;
+        clip_x1 = comp->dirty_max_x > (int)comp->fb_width  ? (int)comp->fb_width  : comp->dirty_max_x;
+        clip_y1 = comp->dirty_max_y > (int)comp->fb_height ? (int)comp->fb_height : comp->dirty_max_y;
+    }
+
+    /* ── 1. Clear backbuf only if tail window does not fully cover screen,
+     *      and only the part of it the damage box actually names ───────── */
     az_window_t *tail = comp->list_tail;
     bool tail_has_frame = win_has_frame(tail);
     bool full_coverage = (tail && tail->visible && tail->wid != 0 && !tail_has_frame &&
                           tail->x <= 0 && tail->y <= 0 &&
                           tail->width >= comp->fb_width && tail->height >= comp->fb_height);
-    if (!full_coverage) {
-        bb_fill_rect(comp, 0, 0, comp->fb_width, comp->fb_height, 0xFF1E1E2E);
+    if (!full_coverage && clip_x1 > clip_x0 && clip_y1 > clip_y0) {
+        bb_fill_rect(comp, clip_x0, clip_y0, clip_x1 - clip_x0, clip_y1 - clip_y0, 0xFF1E1E2E);
     }
 
-    /* ── 2. Draw all windows (back to front in Z-order) ───────────────── */
+    /* ── 2. Draw windows that can touch the clip (back to front in Z-order) ─
+     * Every window still gets a full, un-clipped repaint when it is drawn —
+     * only *whether* it's worth drawing at all is decided here — except its
+     * client-area blit, which render_window itself narrows to the clip
+     * (see the comment on render_window). */
     az_window_t *curr = comp->list_tail;
     while (curr) {
-        render_window(comp, curr);
+        if (curr->visible && curr->wid != 0) {
+            bool has_frame = win_has_frame(curr);
+            int ox = curr->x, oy = curr->y;
+            int ow = (int)curr->width, oh = (int)curr->height;
+            if (has_frame) {
+                ox -= AZWM_BORDER_W;
+                oy -= (AZWM_TITLEBAR_H + AZWM_BORDER_W);
+                ow += 2 * AZWM_BORDER_W;
+                oh += (AZWM_TITLEBAR_H + 2 * AZWM_BORDER_W);
+            }
+            /* Padded by more than the drop shadow's 12px radius so a
+             * focused window's shadow is never left stale just outside its
+             * own frame. */
+            if (ox - 14 < clip_x1 && ox + ow + 14 > clip_x0 &&
+                oy - 14 < clip_y1 && oy + oh + 14 > clip_y0) {
+                render_window(comp, curr, clip_x0, clip_y0, clip_x1, clip_y1);
+            }
+        }
         curr = curr->prev;
     }
 
@@ -1214,6 +1625,7 @@ void compose_screen(az_compositor_t *comp)
     draw_snap_preview(comp);
     draw_alt_tab_hud(comp);
     draw_context_menu(comp);
+    draw_fps_hud(comp);
 
     /*
      * ── 4. Presentation ───────────────────────────────────────────────

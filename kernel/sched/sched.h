@@ -22,6 +22,7 @@ typedef enum {
 
 struct process;
 struct az_object;
+struct seccomp_filter;
 typedef struct az_object az_object_t;
 
 /* Extended FPU/SIMD save area, sized by FPU_STATE_MAX_SIZE (arch/x86_64/cpu/
@@ -57,7 +58,12 @@ typedef struct thread {
     u32             cpu_id;          /* Currently assigned logical CPU */
     pt_regs_t      *user_regs;       /* Saved user frame during syscalls/interrupts */
     u64             sleep_end_ticks; /* Ticks when sleeping should end */
-    u64             fs_base;         /* Per-thread FS_BASE (TLS); 0 => use proc->fs_base */
+    u64             fs_base;         /* Per-thread FS_BASE (TLS) override */
+    bool            has_thread_fs_base; /* fs_base is an explicit override (arch_prctl/
+                                          * CLONE_SETTLS), even if the value is 0 —
+                                          * distinguishes "TLS base explicitly set to
+                                          * NULL" from "never set, inherit proc->fs_base".
+                                          * Fixes TODO(T-01). */
     u64             clear_child_tid; /* CLONE_CHILD_CLEARTID / set_tid_address(2) futex */
     fpu_state_t     fpu_state;       /* XSAVE/FXSAVE area */
     struct thread  *next;            /* Ready queue / list pointer */
@@ -86,6 +92,7 @@ typedef struct thread {
 #define SIGSTOP    19
 #define SIGTSTP    20
 #define SIGWINCH   28
+#define SIGSYS     31   /* seccomp SECCOMP_RET_TRAP/RET_KILL_* report this signal */
 #define _NSIG      64
 
 typedef u64 sigset_t;
@@ -194,6 +201,8 @@ typedef struct process {
     u32             egid;                  /* Effective Group ID */
     u32             suid;                  /* Saved User ID */
     u32             sgid;                  /* Saved Group ID */
+    u32             fsuid;                 /* Filesystem User ID */
+    u32             fsgid;                 /* Filesystem Group ID */
     u32             groups[32];            /* Supplementary groups */
     u32             ngroups;               /* Number of supplementary groups */
     int             pdeath_sig;            /* Signal to receive on parent death */
@@ -257,9 +266,16 @@ typedef struct process {
      * so a sandboxed child cannot regain privilege through a setuid execve(). */
     bool            no_new_privs;
 
-    /* seccomp(2) mode: 0 = disabled, 1 = SECCOMP_MODE_STRICT. Inherited across
-     * fork/exec and, like no_new_privs, one-way. */
+    /* seccomp(2) mode: 0 = disabled, 1 = SECCOMP_MODE_STRICT, 2 = _FILTER.
+     * Inherited across fork/exec and, like no_new_privs, one-way. */
     u32             seccomp_mode;
+
+    /* SECCOMP_MODE_FILTER: head of this process's attached-filter chain
+     * (newest first, each node's `prev` pointing at the next-oldest and
+     * refcounted since fork() shares the chain rather than copying it —
+     * see kernel/security/seccomp.c). NULL when no filter is attached, and
+     * always NULL when seccomp_mode != SECCOMP_MODE_FILTER. */
+    struct seccomp_filter *seccomp_filters;
 
     /* personality(2) word. Only ADDR_NO_RANDOMIZE (0x0040000) is acted on: it
      * disables ASLR for the next execve(), which is what `setarch -R` and most

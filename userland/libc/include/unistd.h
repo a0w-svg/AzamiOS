@@ -56,6 +56,11 @@ int getgroups(int size, gid_t list[]);
 int setgroups(size_t size, const gid_t *list);
 int initgroups(const char *user, gid_t group);
 
+/* Terminal process group and session control */
+pid_t tcgetpgrp(int fd);
+int tcsetpgrp(int fd, pid_t pgrp);
+pid_t tcgetsid(int fd);
+
 /* File I/O */
 ssize_t read(int fd, void *buf, size_t count);
 ssize_t write(int fd, const void *buf, size_t count);

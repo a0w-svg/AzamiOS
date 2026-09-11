@@ -21,6 +21,9 @@
 #include "../azwm/de_protocol.h"
 #include "../azwm/de_font.h"
 #include "de_log.h"
+#if defined(__x86_64__)
+#include <emmintrin.h>
+#endif
 
 /* ============================================================================
  * Color definitions & Multi-Theme System
@@ -187,6 +190,22 @@ static inline void uk_fill_rect(uk_window_t *w,
     if (x0 >= x1 || y0 >= y1) return;
 
     int fill_w = x1 - x0;
+#if defined(__x86_64__)
+    __m128i col128 = _mm_set1_epi32((int)col);
+    for (int y = y0; y < y1; y++) {
+        unsigned int *dst = &w->pixels[(unsigned int)y * w->width + (unsigned int)x0];
+        int count = fill_w;
+        while (count >= 4) {
+            _mm_storeu_si128((__m128i *)dst, col128);
+            dst += 4;
+            count -= 4;
+        }
+        while (count > 0) {
+            *dst++ = col;
+            count--;
+        }
+    }
+#else
     unsigned long long col64 = ((unsigned long long)col << 32) | (unsigned long long)col;
 
     for (int y = y0; y < y1; y++) {
@@ -212,6 +231,7 @@ static inline void uk_fill_rect(uk_window_t *w,
             *dst = col;
         }
     }
+#endif
 }
 
 /* Vertical gradient fill (top→bottom) */
@@ -233,8 +253,20 @@ static inline void uk_gradient_v(uk_window_t *w,
         unsigned int t = (rh > 1) ? (unsigned int)((y - ry) * 255 / (rh - 1)) : 0;
         unsigned int col = uk_blend(top_col, bot_col, t);
         unsigned int *dst = &w->pixels[(unsigned int)y * w->width + (unsigned int)x0];
-        unsigned long long col64 = ((unsigned long long)col << 32) | (unsigned long long)col;
         int count = fill_w;
+#if defined(__x86_64__)
+        __m128i col128 = _mm_set1_epi32((int)col);
+        while (count >= 4) {
+            _mm_storeu_si128((__m128i *)dst, col128);
+            dst += 4;
+            count -= 4;
+        }
+        while (count > 0) {
+            *dst++ = col;
+            count--;
+        }
+#else
+        unsigned long long col64 = ((unsigned long long)col << 32) | (unsigned long long)col;
         if (((unsigned long)dst & 7) && count > 0) {
             *dst++ = col;
             count--;
@@ -254,6 +286,7 @@ static inline void uk_gradient_v(uk_window_t *w,
         if (count > 0) {
             *dst = col;
         }
+#endif
     }
 }
 
@@ -304,6 +337,18 @@ static inline void uk_fill_circle(uk_window_t *w, int cx, int cy, int r, unsigne
 
         unsigned int *dst = &w->pixels[(unsigned int)py * w->width + (unsigned int)x0];
         int count = x1 - x0;
+#if defined(__x86_64__)
+        __m128i col128 = _mm_set1_epi32((int)col);
+        while (count >= 4) {
+            _mm_storeu_si128((__m128i *)dst, col128);
+            dst += 4;
+            count -= 4;
+        }
+        while (count > 0) {
+            *dst++ = col;
+            count--;
+        }
+#else
         unsigned long long col64 = ((unsigned long long)col << 32) | (unsigned long long)col;
         if (((unsigned long)dst & 7) && count > 0) {
             *dst++ = col;
@@ -322,6 +367,7 @@ static inline void uk_fill_circle(uk_window_t *w, int cx, int cy, int r, unsigne
         }
         dst = (unsigned int *)dst64;
         if (count > 0) *dst = col;
+#endif
     }
 }
 

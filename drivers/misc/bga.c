@@ -15,6 +15,9 @@
 #include "../../include/azami/fb.h"
 #include "../../fs/vfs.h"
 #include "../../kernel/sched/sched.h"
+#include "../../kernel/lib/string.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
+#include <azami/vsync.h>
 
 
 /* BGA driver state */
@@ -98,11 +101,8 @@ void bga_clear_screen(uint32_t color)
     if (!g_bga.fb_virt) return;
 
     if (g_bga.bpp == 32) {
-        volatile uint32_t *fb = (volatile uint32_t *)g_bga.fb_virt;
         uint32_t pixels = g_bga.width * g_bga.height * 2; /* Clear both double-buffer pages */
-        for (uint32_t i = 0; i < pixels; i++) {
-            fb[i] = color;
-        }
+        hw_fill_vram((void *)g_bga.fb_virt, color, pixels);
     } else {
         /* Fallback for other bpp */
         for (uint32_t y = 0; y < g_bga.height * 2; y++) {
@@ -148,8 +148,81 @@ static s64 bga_ioctl(struct file *filp, u32 cmd, u64 arg)
             if (copy_to_user((void *)(uintptr_t)arg, &fix, sizeof(fix)) != 0) return -(s64)EFAULT;
             return 0;
         }
+
+        case FBIOPAN_DISPLAY: {
+            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            struct fb_var_screeninfo var;
+            if (copy_from_user(&var, (void *)(uintptr_t)arg, sizeof(var)) != 0) return -(s64)EFAULT;
+            u32 buf_idx = var.yoffset / (g_bga.height ? g_bga.height : 1);
+            if (bga_flip_buffer(buf_idx) != 0) return -(s64)EINVAL;
+            return 0;
+        }
+
+        case FBIO_WAITFORVSYNC: {
+            vsync_wait(0);
+            return 0;
+        }
+
+        case FBIOAZ_GET_CAPS: {
+            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            struct fb_az_caps caps;
+            memset(&caps, 0, sizeof(caps));
+            caps.buffers = 2;
+            caps.max_width = g_bga.width;
+            caps.max_height = g_bga.height;
+            caps.pitch = g_bga.pitch;
+            caps.caps = FB_AZ_CAP_DOUBLEBUF | FB_AZ_CAP_HW_FLIP | FB_AZ_CAP_ACCEL_2D;
+            if (copy_to_user((void *)(uintptr_t)arg, &caps, sizeof(caps)) != 0) return -(s64)EFAULT;
+            return 0;
+        }
+
+        case FBIOAZ_ACCEL_FILL: {
+            struct fb_az_fill fl;
+            if (copy_from_user(&fl, (void *)(uintptr_t)arg, sizeof(fl)) != 0) return -(s64)EFAULT;
+            if (fl.buffer_idx >= 2 || fl.w == 0 || fl.h == 0) return -(s64)EINVAL;
+            if (fl.x >= g_bga.width || fl.y >= g_bga.height) return -(s64)EINVAL;
+
+            u32 w = fl.w, h = fl.h;
+            if (fl.x + w > g_bga.width)  w = g_bga.width  - fl.x;
+            if (fl.y + h > g_bga.height) h = g_bga.height - fl.y;
+
+            u32 y_base = fl.buffer_idx * g_bga.height + fl.y;
+            u8 *vram_base = (u8 *)g_bga.fb_virt;
+
+            for (u32 row = 0; row < h; row++) {
+                u32 *row_ptr = (u32 *)(vram_base + (size_t)(y_base + row) * g_bga.pitch + (size_t)fl.x * 4);
+                hw_fill_vram(row_ptr, fl.color, w);
+            }
+            return 0;
+        }
+
+        case FBIOAZ_ACCEL_COPY: {
+            struct fb_az_copy cp;
+            if (copy_from_user(&cp, (void *)(uintptr_t)arg, sizeof(cp)) != 0) return -(s64)EFAULT;
+            if (cp.src_buf >= 2 || cp.dst_buf >= 2 || cp.w == 0 || cp.h == 0) return -(s64)EINVAL;
+            if (cp.src_x >= g_bga.width || cp.src_y >= g_bga.height) return -(s64)EINVAL;
+            if (cp.dst_x >= g_bga.width || cp.dst_y >= g_bga.height) return -(s64)EINVAL;
+
+            u32 w = cp.w, h = cp.h;
+            if (cp.src_x + w > g_bga.width)  w = g_bga.width  - cp.src_x;
+            if (cp.src_y + h > g_bga.height) h = g_bga.height - cp.src_y;
+            if (cp.dst_x + w > g_bga.width)  w = g_bga.width  - cp.dst_x;
+            if (cp.dst_y + h > g_bga.height) h = g_bga.height - cp.dst_y;
+
+            u32 src_y_base = cp.src_buf * g_bga.height + cp.src_y;
+            u32 dst_y_base = cp.dst_buf * g_bga.height + cp.dst_y;
+            u8 *vram_base = (u8 *)g_bga.fb_virt;
+
+            for (u32 row = 0; row < h; row++) {
+                const u8 *src_row = vram_base + (size_t)(src_y_base + row) * g_bga.pitch + (size_t)cp.src_x * 4;
+                u8 *dst_row = vram_base + (size_t)(dst_y_base + row) * g_bga.pitch + (size_t)cp.dst_x * 4;
+                hw_copy_to_vram(dst_row, src_row, (size_t)w * 4);
+            }
+            return 0;
+        }
+
         default:
-            return -1;
+            return -(s64)EINVAL;
     }
 }
 

@@ -20,6 +20,9 @@
  * ============================================================================ */
 
 #include <stdbool.h>
+#if defined(__x86_64__)
+#include <emmintrin.h>
+#endif
 #include "../../libc/include/az/ipc.h"
 #include "../../libc/include/stdio.h"
 #include "../../libc/include/stdlib.h"
@@ -180,7 +183,23 @@ static void wp_render_animated_gradient(unsigned int *px, unsigned int w, unsign
         int cur_b = left_b << 16;
 
         unsigned int *line = &px[y * w];
-        for (unsigned int x = 0; x < w; x++) {
+        unsigned int x = 0;
+#if defined(__x86_64__)
+        for (; x + 4 <= w; x += 4) {
+            unsigned int p0 = 0xFF000000 | (((unsigned int)(cur_r >> 16)) << 16) | (((unsigned int)(cur_g >> 16)) << 8) | (unsigned int)(cur_b >> 16);
+            cur_r += step_r; cur_g += step_g; cur_b += step_b;
+            unsigned int p1 = 0xFF000000 | (((unsigned int)(cur_r >> 16)) << 16) | (((unsigned int)(cur_g >> 16)) << 8) | (unsigned int)(cur_b >> 16);
+            cur_r += step_r; cur_g += step_g; cur_b += step_b;
+            unsigned int p2 = 0xFF000000 | (((unsigned int)(cur_r >> 16)) << 16) | (((unsigned int)(cur_g >> 16)) << 8) | (unsigned int)(cur_b >> 16);
+            cur_r += step_r; cur_g += step_g; cur_b += step_b;
+            unsigned int p3 = 0xFF000000 | (((unsigned int)(cur_r >> 16)) << 16) | (((unsigned int)(cur_g >> 16)) << 8) | (unsigned int)(cur_b >> 16);
+            cur_r += step_r; cur_g += step_g; cur_b += step_b;
+
+            __m128i quad = _mm_set_epi32((int)p3, (int)p2, (int)p1, (int)p0);
+            _mm_storeu_si128((__m128i *)&line[x], quad);
+        }
+#endif
+        for (; x < w; x++) {
             unsigned int r = (unsigned int)(cur_r >> 16);
             unsigned int g = (unsigned int)(cur_g >> 16);
             unsigned int b = (unsigned int)(cur_b >> 16);

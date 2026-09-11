@@ -155,6 +155,11 @@ typedef struct inode {
     inode_operations_t *i_op;
     struct file_operations *i_fop;
     
+    /* Advisory file locking (flock / fcntl) */
+    u32 i_flock_type;   /* 0 = unlocked, 1 = LOCK_SH, 2 = LOCK_EX */
+    u32 i_flock_count;  /* Number of shared lock holders, or 1 for exclusive */
+    u32 i_flock_owner;  /* PID of exclusive lock owner (or first locker) */
+
     void *i_private; /* Filesystem specific private data */
 } inode_t;
 
@@ -243,6 +248,9 @@ void vfs_init(void);
 /** vfs_register_fs() — Register a new filesystem type. */
 s64 vfs_register_fs(file_system_type_t *fs);
 
+/** vfs_find_fs() — Find a registered filesystem type by name. */
+file_system_type_t *vfs_find_fs(const char *name);
+
 /** vfs_mount() — Mount a filesystem. */
 s64 vfs_mount(const char *source, const char *target, const char *fstype, void *data);
 
@@ -310,6 +318,14 @@ s64 vfs_utimes(const char *path, u64 atime, u64 mtime);
 s64 vfs_futimes(file_t *file, u64 atime, u64 mtime);
 s64 vfs_statfs(const char *path, struct statfs *buf);
 s64 vfs_fstatfs(file_t *file, struct statfs *buf);
+s64 vfs_flock(file_t *file, int operation);
+
+#ifndef LOCK_SH
+#define LOCK_SH 1
+#define LOCK_EX 2
+#define LOCK_NB 4
+#define LOCK_UN 8
+#endif
 
 /* DevFS API */
 int devfs_register_device(const char *name, file_operations_t *fops, void *private_data);

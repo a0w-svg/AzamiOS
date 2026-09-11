@@ -194,6 +194,7 @@ int virtio_gpu_get_display_info(u32 *width, u32 *height);
 int virtio_gpu_resource_create_2d(u32 resource_id, u32 format, u32 width, u32 height);
 int virtio_gpu_resource_attach_backing(u32 resource_id, phys_addr_t ptr, u32 length);
 int virtio_gpu_set_scanout(u32 scanout_id, u32 resource_id, u32 width, u32 height);
+int virtio_gpu_set_scanout_offset(u32 scanout_id, u32 resource_id, u32 x, u32 y, u32 width, u32 height);
 int virtio_gpu_setup_framebuffer(void);
 
 /**

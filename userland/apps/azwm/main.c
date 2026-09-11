@@ -782,6 +782,13 @@ int main(int argc, char **argv)
                         continue;
                     }
 
+                    /* F12: Toggle on-screen FPS counter */
+                    if (ev.scancode == 0x58 || ev.keycode == 139 /* F12 */) {
+                        comp.fps_hud_visible = !comp.fps_hud_visible;
+                        redraw_needed = true;
+                        continue;
+                    }
+
                     /* Alt+F4: Close focused window */
                     if (is_alt && (ev.scancode == 0x3E || ev.keycode == 131 /* F4 */)) {
                         if (comp.focused_window && comp.focused_window->title[0] != '\0') {
