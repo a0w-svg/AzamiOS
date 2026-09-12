@@ -626,6 +626,42 @@ static inline void composite_blend_span(unsigned int *dst, const unsigned int *s
     }
 }
 
+__attribute__((target("avx2")))
+static void bb_fill_span_avx2(unsigned int *dst, unsigned int color, int count)
+{
+    __m256i c256 = _mm256_set1_epi32((int)color);
+    int i = 0;
+    for (; i + 8 <= count; i += 8) {
+        _mm256_storeu_si256((__m256i *)(dst + i), c256);
+    }
+    if (i + 4 <= count) {
+        _mm_storeu_si128((__m128i *)(dst + i), _mm256_castsi256_si128(c256));
+        i += 4;
+    }
+    while (i < count) {
+        dst[i] = color;
+        i++;
+    }
+}
+
+static inline void bb_fill_span(unsigned int *dst, unsigned int color, int count)
+{
+    if (count <= 0) return;
+    if (compositor_cpu_has_avx2()) {
+        bb_fill_span_avx2(dst, color, count);
+        return;
+    }
+    int i = 0;
+    __m128i col128 = _mm_set1_epi32((int)color);
+    for (; i + 4 <= count; i += 4) {
+        _mm_storeu_si128((__m128i *)(dst + i), col128);
+    }
+    while (i < count) {
+        dst[i] = color;
+        i++;
+    }
+}
+
 static void bb_fill_rect(az_compositor_t *comp, int rx, int ry, int rw, int rh, unsigned int color)
 {
     if (rw <= 0 || rh <= 0) return;
@@ -639,30 +675,10 @@ static void bb_fill_rect(az_compositor_t *comp, int rx, int ry, int rw, int rh, 
 
     unsigned int pitch_px = comp->fb_pitch / 4;
     int fill_w = x1 - x0;
-    unsigned long long col64 = ((unsigned long long)color << 32) | (unsigned long long)color;
 
     for (int y = y0; y < y1; y++) {
         unsigned int *dst = &comp->backbuf[(unsigned int)y * pitch_px + (unsigned int)x0];
-        int w = fill_w;
-        if (((unsigned long)dst & 7) && w > 0) {
-            *dst++ = color;
-            w--;
-        }
-        unsigned long long *dst64 = (unsigned long long *)dst;
-        while (w >= 4) {
-            dst64[0] = col64;
-            dst64[1] = col64;
-            dst64 += 2;
-            w -= 4;
-        }
-        if (w >= 2) {
-            *dst64++ = col64;
-            w -= 2;
-        }
-        dst = (unsigned int *)dst64;
-        if (w > 0) {
-            *dst = color;
-        }
+        bb_fill_span(dst, color, fill_w);
     }
 }
 
@@ -690,25 +706,7 @@ static void bb_fill_circle(az_compositor_t *comp, int cx, int cy, int r, unsigne
         if (x0 >= x1) continue;
 
         unsigned int *dst = &comp->backbuf[(unsigned int)py * pitch_px + (unsigned int)x0];
-        int w = x1 - x0;
-        unsigned long long col64 = ((unsigned long long)color << 32) | (unsigned long long)color;
-        if (((unsigned long)dst & 7) && w > 0) {
-            *dst++ = color;
-            w--;
-        }
-        unsigned long long *dst64 = (unsigned long long *)dst;
-        while (w >= 4) {
-            dst64[0] = col64;
-            dst64[1] = col64;
-            dst64 += 2;
-            w -= 4;
-        }
-        if (w >= 2) {
-            *dst64++ = col64;
-            w -= 2;
-        }
-        dst = (unsigned int *)dst64;
-        if (w > 0) *dst = color;
+        bb_fill_span(dst, color, x1 - x0);
     }
 }
 
@@ -1316,14 +1314,55 @@ static azwm_rect_t cursor_bounds(const az_compositor_t *comp, int cx, int cy)
     return r;
 }
 
+__attribute__((target("avx2")))
+static void copy_rect_avx2(az_compositor_t *comp, unsigned int *dst,
+                           const azwm_rect_t *r)
+{
+    unsigned int pitch_px = comp->fb_pitch / 4;
+    int w = r->x1 - r->x0;
+
+    for (int y = r->y0; y < r->y1; y++) {
+        unsigned int *dst_row = &dst[(unsigned int)y * pitch_px + (unsigned int)r->x0];
+        const unsigned int *src_row = &comp->backbuf[(unsigned int)y * pitch_px + (unsigned int)r->x0];
+
+        int px = 0;
+        /* Align to 32-byte boundary for AVX2 streaming stores */
+        while (((uintptr_t)&dst_row[px] & 31) && px < w) {
+            dst_row[px] = src_row[px];
+            px++;
+        }
+        /* 256-bit streaming non-temporal stores direct to write-combining VRAM */
+        while (px + 8 <= w) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)&src_row[px]);
+            _mm256_stream_si256((__m256i *)&dst_row[px], v);
+            px += 8;
+        }
+        while (px + 4 <= w) {
+            __m128i v = _mm_loadu_si128((const __m128i *)&src_row[px]);
+            _mm_stream_si128((__m128i *)&dst_row[px], v);
+            px += 4;
+        }
+        while (px < w) {
+            dst_row[px] = src_row[px];
+            px++;
+        }
+    }
+    _mm_sfence();
+}
+
 static void copy_rect(az_compositor_t *comp, unsigned int *dst,
                       const azwm_rect_t *r)
 {
     if (!r->valid) return;
-    unsigned int pitch_px = comp->fb_pitch / 4;
     int w = r->x1 - r->x0;
     if (w <= 0) return;
 
+    if (compositor_cpu_has_avx2()) {
+        copy_rect_avx2(comp, dst, r);
+        return;
+    }
+
+    unsigned int pitch_px = comp->fb_pitch / 4;
     for (int y = r->y0; y < r->y1; y++) {
         unsigned int *dst_row = &dst[(unsigned int)y * pitch_px + (unsigned int)r->x0];
         const unsigned int *src_row = &comp->backbuf[(unsigned int)y * pitch_px + (unsigned int)r->x0];

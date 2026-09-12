@@ -65,42 +65,7 @@ char *strncat(char *dest, const char *src, size_t n)
 
 /* ── Comparison ──────────────────────────────────────────────────────────── */
 
-int strcmp(const char *s1, const char *s2)
-{
-    if (!s1 || !s2) { if (s1 == s2) return 0; return s1 ? 1 : -1; }
-    if (s1 == s2) return 0;
-
-    /* If both strings share 8-byte alignment, compare 8 bytes at a time */
-    if ((((uintptr_t)s1 ^ (uintptr_t)s2) & 7) == 0) {
-        while ((uintptr_t)s1 & 7) {
-            if (*s1 != *s2 || *s1 == '\0')
-                return *(const unsigned char *)s1 - *(const unsigned char *)s2;
-            s1++; s2++;
-        }
-        const unsigned long *lp1 = (const unsigned long *)s1;
-        const unsigned long *lp2 = (const unsigned long *)s2;
-        for (;;) {
-            unsigned long w1 = *lp1;
-            unsigned long w2 = *lp2;
-            unsigned long zeros = (w1 - 0x0101010101010101UL) & ~w1 & 0x8080808080808080UL;
-            if (w1 != w2 || zeros) break;
-            lp1++; lp2++;
-        }
-        s1 = (const char *)lp1;
-        s2 = (const char *)lp2;
-    }
-
-    while (*s1 && (*s1 == *s2)) { s1++; s2++; }
-    return *(const unsigned char *)s1 - *(const unsigned char *)s2;
-}
-
-int strncmp(const char *s1, const char *s2, size_t n)
-{
-    if (n == 0) return 0;
-    if (!s1 || !s2) { if (s1 == s2) return 0; return s1 ? 1 : -1; }
-    while (n > 1 && *s1 && (*s1 == *s2)) { s1++; s2++; n--; }
-    return *(const unsigned char *)s1 - *(const unsigned char *)s2;
-}
+/* strcmp() and strncmp() are the SSE2/AVX2 versions in string_simd.c. */
 
 int strcasecmp(const char *s1, const char *s2)
 {
@@ -284,84 +249,7 @@ int strerror_r(int errnum, char *buf, size_t buflen)
 
 /* ── Memory ──────────────────────────────────────────────────────────────── */
 
-void *memset(void *dest, int c, size_t n)
-{
-    unsigned char *d = (unsigned char *)dest;
-    unsigned long c8 = (unsigned char)c;
-    unsigned long c64 = c8 * 0x0101010101010101UL;
-
-    size_t qwords = n >> 3;
-    size_t bytes  = n & 7;
-
-    __asm__ volatile("cld" : : : "cc");
-    if (qwords > 0) {
-        __asm__ volatile(
-            "rep stosq"
-            : "+D"(d), "+c"(qwords)
-            : "a"(c64)
-            : "memory"
-        );
-    }
-    if (bytes > 0) {
-        __asm__ volatile(
-            "rep stosb"
-            : "+D"(d), "+c"(bytes)
-            : "a"((unsigned char)c)
-            : "memory"
-        );
-    }
-    return dest;
-}
-
-void *memcpy(void *dest, const void *src, size_t n)
-{
-    unsigned char *d = (unsigned char *)dest;
-    const unsigned char *s = (const unsigned char *)src;
-
-    size_t qwords = n >> 3;
-    size_t bytes  = n & 7;
-
-    __asm__ volatile("cld" : : : "cc");
-    if (qwords > 0) {
-        __asm__ volatile(
-            "rep movsq"
-            : "+D"(d), "+S"(s), "+c"(qwords)
-            :
-            : "memory"
-        );
-    }
-    if (bytes > 0) {
-        __asm__ volatile(
-            "rep movsb"
-            : "+D"(d), "+S"(s), "+c"(bytes)
-            :
-            : "memory"
-        );
-    }
-    return dest;
-}
-
-void *memmove(void *dest, const void *src, size_t n)
-{
-    unsigned char *d = (unsigned char *)dest;
-    const unsigned char *s = (const unsigned char *)src;
-    if (d == s || n == 0) return dest;
-    if (d < s || d >= s + n) {
-        return memcpy(dest, src, n);
-    } else {
-        d += n - 1;
-        s += n - 1;
-        __asm__ volatile(
-            "std\n\t"
-            "rep movsb\n\t"
-            "cld"
-            : "+D"(d), "+S"(s), "+c"(n)
-            :
-            : "memory", "cc"
-        );
-        return dest;
-    }
-}
+/* memset(), memcpy(), memmove(), memcmp(), and memchr() are the SSE2/AVX2 versions in string_simd.c. */
 
 /* memcmp() and memchr() are the SSE2/AVX2 versions in string_simd.c. */
 

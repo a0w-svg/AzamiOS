@@ -310,7 +310,9 @@ static void isr_dispatch_inner(pt_regs_t *r)
     if (vec == 49) {
         extern void lapic_eoi(void);
         lapic_eoi();
-        if ((r->cs & 3) != 0) {
+        cpu_info_t *cpu = smp_get_cpu();
+        if (cpu) cpu->needs_reschedule = true;
+        if ((r->cs & 3) != 0 || (cpu && cpu->current_thread == cpu->idle_thread)) {
             sched_check_reschedule();
         }
         return;

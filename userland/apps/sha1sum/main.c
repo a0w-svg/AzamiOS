@@ -16,7 +16,183 @@ typedef struct {
 
 #define ROL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
 
-static void sha1_transform(sha1_ctx_t *ctx, const uint8_t data[64])
+#if defined(__x86_64__)
+#include <immintrin.h>
+
+static inline int sha1_cpu_has_shani(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+
+    unsigned int eax, ebx, ecx, edx;
+    __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                                 : "a"(1), "c"(0));
+    /* Need SSSE3 (ECX bit 9) and SSE4.1 (ECX bit 19) */
+    if (!(ecx & (1u << 9)) || !(ecx & (1u << 19))) {
+        cached = 0;
+        return 0;
+    }
+
+    __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                                 : "a"(7), "c"(0));
+    /* CPU_EXT_SHA is EBX bit 29 */
+    cached = (ebx & (1u << 29)) ? 1 : 0;
+    return cached;
+}
+
+__attribute__((target("sha,sse4.1,ssse3")))
+static void sha1_transform_shani(sha1_ctx_t *ctx, const uint8_t data[64])
+{
+    const __m128i SHUF_MASK = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+
+    __m128i msg0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(data + 0)), SHUF_MASK);
+    __m128i msg1 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(data + 16)), SHUF_MASK);
+    __m128i msg2 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(data + 32)), SHUF_MASK);
+    __m128i msg3 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(data + 48)), SHUF_MASK);
+
+    __m128i abcd = _mm_set_epi32((int)ctx->state[0], (int)ctx->state[1], (int)ctx->state[2], (int)ctx->state[3]);
+    __m128i e0   = _mm_set_epi32((int)ctx->state[4], 0, 0, 0);
+
+    __m128i orig_abcd = abcd;
+    __m128i orig_e0   = e0;
+
+    __m128i abcd_old, e1;
+
+    /* Rounds 0-3 */
+    e0 = _mm_add_epi32(e0, msg0);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 0);
+
+    /* Rounds 4-7 */
+    e1 = _mm_sha1nexte_epu32(abcd_old, msg1);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 0);
+
+    /* Rounds 8-11 */
+    e0 = _mm_sha1nexte_epu32(abcd_old, msg2);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 0);
+
+    /* Rounds 12-15 */
+    e1 = _mm_sha1nexte_epu32(abcd_old, msg3);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 0);
+
+    /* Rounds 16-19 */
+    msg0 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg0, msg1), msg2), msg3);
+    e0 = _mm_sha1nexte_epu32(abcd_old, msg0);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 0);
+
+    /* Rounds 20-23 */
+    msg1 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg1, msg2), msg3), msg0);
+    e1 = _mm_sha1nexte_epu32(abcd_old, msg1);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 1);
+
+    /* Rounds 24-27 */
+    msg2 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg2, msg3), msg0), msg1);
+    e0 = _mm_sha1nexte_epu32(abcd_old, msg2);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 1);
+
+    /* Rounds 28-31 */
+    msg3 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg3, msg0), msg1), msg2);
+    e1 = _mm_sha1nexte_epu32(abcd_old, msg3);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 1);
+
+    /* Rounds 32-35 */
+    msg0 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg0, msg1), msg2), msg3);
+    e0 = _mm_sha1nexte_epu32(abcd_old, msg0);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 1);
+
+    /* Rounds 36-39 */
+    msg1 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg1, msg2), msg3), msg0);
+    e1 = _mm_sha1nexte_epu32(abcd_old, msg1);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 1);
+
+    /* Rounds 40-43 */
+    msg2 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg2, msg3), msg0), msg1);
+    e0 = _mm_sha1nexte_epu32(abcd_old, msg2);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 2);
+
+    /* Rounds 44-47 */
+    msg3 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg3, msg0), msg1), msg2);
+    e1 = _mm_sha1nexte_epu32(abcd_old, msg3);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 2);
+
+    /* Rounds 48-51 */
+    msg0 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg0, msg1), msg2), msg3);
+    e0 = _mm_sha1nexte_epu32(abcd_old, msg0);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 2);
+
+    /* Rounds 52-55 */
+    msg1 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg1, msg2), msg3), msg0);
+    e1 = _mm_sha1nexte_epu32(abcd_old, msg1);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 2);
+
+    /* Rounds 56-59 */
+    msg2 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg2, msg3), msg0), msg1);
+    e0 = _mm_sha1nexte_epu32(abcd_old, msg2);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 2);
+
+    /* Rounds 60-63 */
+    msg3 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg3, msg0), msg1), msg2);
+    e1 = _mm_sha1nexte_epu32(abcd_old, msg3);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 3);
+
+    /* Rounds 64-67 */
+    msg0 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg0, msg1), msg2), msg3);
+    e0 = _mm_sha1nexte_epu32(abcd_old, msg0);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 3);
+
+    /* Rounds 68-71 */
+    msg1 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg1, msg2), msg3), msg0);
+    e1 = _mm_sha1nexte_epu32(abcd_old, msg1);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 3);
+
+    /* Rounds 72-75 */
+    msg2 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg2, msg3), msg0), msg1);
+    e0 = _mm_sha1nexte_epu32(abcd_old, msg2);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 3);
+
+    /* Rounds 76-79 */
+    msg3 = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(msg3, msg0), msg1), msg2);
+    e1 = _mm_sha1nexte_epu32(abcd_old, msg3);
+    abcd_old = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 3);
+
+    /* Final E */
+    e0 = _mm_sha1nexte_epu32(abcd_old, _mm_setzero_si128());
+
+    abcd = _mm_add_epi32(abcd, orig_abcd);
+    e0   = _mm_add_epi32(e0, orig_e0);
+
+    uint32_t out[4], out_e[4];
+    _mm_storeu_si128((__m128i*)out, abcd);
+    _mm_storeu_si128((__m128i*)out_e, e0);
+
+    ctx->state[0] = out[3];
+    ctx->state[1] = out[2];
+    ctx->state[2] = out[1];
+    ctx->state[3] = out[0];
+    ctx->state[4] = out_e[3];
+}
+#endif
+
+static void sha1_transform_scalar(sha1_ctx_t *ctx, const uint8_t data[64])
 {
     uint32_t a = ctx->state[0], b = ctx->state[1], c = ctx->state[2], d = ctx->state[3], e = ctx->state[4];
     uint32_t w[80];
@@ -50,6 +226,17 @@ static void sha1_transform(sha1_ctx_t *ctx, const uint8_t data[64])
 
     ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c;
     ctx->state[3] += d; ctx->state[4] += e;
+}
+
+static void sha1_transform(sha1_ctx_t *ctx, const uint8_t data[64])
+{
+#if defined(__x86_64__)
+    if (sha1_cpu_has_shani()) {
+        sha1_transform_shani(ctx, data);
+        return;
+    }
+#endif
+    sha1_transform_scalar(ctx, data);
 }
 
 static void sha1_init(sha1_ctx_t *ctx)

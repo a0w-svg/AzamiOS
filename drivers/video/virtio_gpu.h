@@ -9,6 +9,7 @@
 #include "../../hal/virtio_pci.h"
 
 #define VIRTIO_GPU_F_VIRGL 0 /* We only support 2D for now */
+#define VIRTIO_GPU_F_EDID   1 /* Device can report per-scanout EDID blobs */
 
 /* VIRTIO_GPU Control Commands */
 enum virtio_gpu_ctrl_type {
@@ -83,6 +84,24 @@ struct virtio_gpu_display_one {
 struct virtio_gpu_resp_display_info {
     struct virtio_gpu_ctrl_hdr hdr;
     struct virtio_gpu_display_one pmodes[VIRTIO_GPU_MAX_SCANOUTS];
+} __attribute__((packed));
+
+/* GET_EDID (VIRTIO_GPU_F_EDID). A monitor's EDID is a 128-byte block (plus
+ * optional 128-byte extensions this driver does not need); the device hands
+ * back up to 1024 bytes so a multi-extension EDID is not truncated. */
+#define VIRTIO_GPU_EDID_MAX_SIZE 1024
+
+struct virtio_gpu_get_edid {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 scanout_id;
+    u32 padding;
+} __attribute__((packed));
+
+struct virtio_gpu_resp_edid {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 size;
+    u32 padding;
+    u8  edid[VIRTIO_GPU_EDID_MAX_SIZE];
 } __attribute__((packed));
 
 /* RESOURCE_CREATE_2D */
@@ -196,6 +215,51 @@ int virtio_gpu_resource_attach_backing(u32 resource_id, phys_addr_t ptr, u32 len
 int virtio_gpu_set_scanout(u32 scanout_id, u32 resource_id, u32 width, u32 height);
 int virtio_gpu_set_scanout_offset(u32 scanout_id, u32 resource_id, u32 x, u32 y, u32 width, u32 height);
 int virtio_gpu_setup_framebuffer(void);
+
+/**
+ * virtio_gpu_get_display_info_all(out_modes, max, out_count) — like
+ * virtio_gpu_get_display_info(), but returns every scanout the host reports
+ * as enabled (up to @max, capped at VIRTIO_GPU_MAX_SCANOUTS), not just
+ * scanout 0. @out_count receives how many entries of @out_modes were filled
+ * in; out_modes[i].r gives that scanout's geometry, indexed by real scanout
+ * id (a gap — id 0 and 2 enabled, 1 not — leaves that slot's .enabled at 0
+ * rather than compacting the array, so the array index is always the
+ * scanout id to pass to virtio_gpu_set_scanout() and friends).
+ */
+int virtio_gpu_get_display_info_all(struct virtio_gpu_display_one *out_modes,
+                                    u32 max, u32 *out_count);
+
+/**
+ * virtio_gpu_setup_scanout_resource() — bring up an independent 2D resource
+ * and backing store for one scanout, the multi-monitor counterpart of
+ * virtio_gpu_setup_framebuffer() (which only ever drives scanout 0, for
+ * backward compatibility with the fbdev/compositor code that already
+ * depends on its exact fields). @resource_id must not collide with another
+ * live resource (scanout 0's framebuffer uses 1, the hardware cursor uses
+ * 0xC0). On success @out_phys/@out_virt/@out_pitch describe the backing this
+ * scanout's owner should render into before calling
+ * virtio_gpu_transfer_to_host_2d()/virtio_gpu_resource_flush() on it.
+ */
+int virtio_gpu_setup_scanout_resource(u32 scanout_id, u32 resource_id,
+                                      u32 width, u32 height,
+                                      phys_addr_t *out_phys, void **out_virt,
+                                      u32 *out_pitch);
+
+/**
+ * virtio_gpu_edid_supported() — true once feature negotiation has confirmed
+ * the device offers VIRTIO_GPU_F_EDID (checked once at init, so this is a
+ * plain flag read, not a fresh feature-bit query).
+ */
+bool virtio_gpu_edid_supported(void);
+
+/**
+ * virtio_gpu_get_edid(scanout_id, out, out_len) — fetch a scanout's raw EDID
+ * block (up to VIRTIO_GPU_EDID_MAX_SIZE bytes) into @out. Returns the number
+ * of bytes written, or a negative errno. Only meaningful when
+ * virtio_gpu_edid_supported() is true; the command still round-trips
+ * otherwise but the host has nothing meaningful to report.
+ */
+int virtio_gpu_get_edid(u32 scanout_id, u8 *out, u32 out_len);
 
 /**
  * virtio_gpu_transfer_to_host_2d_rect / virtio_gpu_resource_flush_rect —

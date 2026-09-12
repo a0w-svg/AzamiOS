@@ -44,11 +44,20 @@ static int virtio_gpu_submit(virtio_gpu_state_t *gpu, u16 queue_index,
         return -1;
     }
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_gpu_lock);
+    /* Plain lock, not _irqsave: nothing ever touches g_gpu_lock from
+     * interrupt context (this driver is polled end to end — see
+     * virtio_gpu_init, which never unmasks the device's INTx line), so a
+     * ticket lock alone is enough to serialize concurrent callers. Disabling
+     * interrupts for the whole submit+poll used to mean a page flip — or,
+     * via the cursor queue, every pointer move — stalled this core's timer
+     * tick and IPI delivery for the entire host round trip. Under TCG
+     * (no KVM) that round trip is not free, and it was happening on the
+     * compositor's hot path. */
+    spinlock_lock(&g_gpu_lock);
 
     int cookie = 1;
     if (virtqueue_add_chain(vq, addrs, lens, is_write, ndesc, (void *)(uintptr_t)cookie) < 0) {
-        spinlock_unlock_irqrestore(&g_gpu_lock, flags);
+        spinlock_unlock(&g_gpu_lock);
         pr_debug("[VIRTIO-GPU] Failed to add command to virtqueue %u\n", queue_index);
         return -1;
     }
@@ -57,12 +66,11 @@ static int virtio_gpu_submit(virtio_gpu_state_t *gpu, u16 queue_index,
     virtio_pci_notify(&gpu->vpci, queue_index, vq);
 
     /*
-     * Poll for completion with interrupts off. Bounded on purpose: this runs
-     * on the compositor's path (a page flip, and — via the cursor queue — every
-     * pointer move), so a device that never retires the descriptor must fail
-     * the operation, not wedge the core forever with IRQs masked. The cap is
-     * far longer than any real round trip (microseconds under QEMU); hitting it
-     * means the queue is genuinely stuck.
+     * Poll for completion. Bounded on purpose: this runs on the compositor's
+     * path, so a device that never retires the descriptor must fail the
+     * operation, not wedge the caller forever. The cap is far longer than any
+     * real round trip (microseconds under QEMU); hitting it means the queue
+     * is genuinely stuck.
      */
     void *returned_cookie = NULL;
     u64 spins = 0;
@@ -71,7 +79,7 @@ static int virtio_gpu_submit(virtio_gpu_state_t *gpu, u16 queue_index,
         returned_cookie = virtqueue_get_used(vq, NULL);
         if (returned_cookie) break;
         if (++spins >= SPIN_LIMIT) {
-            spinlock_unlock_irqrestore(&g_gpu_lock, flags);
+            spinlock_unlock(&g_gpu_lock);
             pr_debug("[VIRTIO-GPU] queue %u timed out waiting for completion\n",
                      queue_index);
             return -1;
@@ -79,7 +87,7 @@ static int virtio_gpu_submit(virtio_gpu_state_t *gpu, u16 queue_index,
         hw_spin_wait((u32)spins);
     }
 
-    spinlock_unlock_irqrestore(&g_gpu_lock, flags);
+    spinlock_unlock(&g_gpu_lock);
 
     if (resp) {
         struct virtio_gpu_ctrl_hdr *hdr = (struct virtio_gpu_ctrl_hdr *)resp;
@@ -100,6 +108,11 @@ int virtio_gpu_send_command(virtio_gpu_state_t *gpu, void *cmd, u32 cmd_size, vo
 int virtio_gpu_send_cursor(virtio_gpu_state_t *gpu, void *cmd, u32 cmd_size, void *resp, u32 resp_size)
 {
     return virtio_gpu_submit(gpu, 1, gpu->cursorq, cmd, cmd_size, resp, resp_size);
+}
+
+bool virtio_gpu_edid_supported(void)
+{
+    return (g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_EDID)) != 0;
 }
 
 int virtio_gpu_init(device_t *pci_dev)
@@ -125,11 +138,18 @@ int virtio_gpu_init(device_t *pci_dev)
     /* 2. Set ACKNOWLEDGE and DRIVER */
     virtio_pci_set_status(&g_gpu.vpci, virtio_pci_get_status(&g_gpu.vpci) | VIRTIO_CONFIG_S_ACKNOWLEDGE | VIRTIO_CONFIG_S_DRIVER);
 
-    /* 3. Negotiate features (we don't request any special 3D features) */
-    if (!virtio_pci_negotiate_features(&g_gpu.vpci, 0)) {
+    /* 3. Negotiate features. We don't request 3D (VIRTIO_GPU_F_VIRGL), but
+     * do ask for EDID: negotiation only grants bits the device actually
+     * offers, so requesting it is free on a host that predates the feature
+     * — negotiated_features simply won't have the bit set and
+     * virtio_gpu_edid_supported() reports that below. */
+    if (!virtio_pci_negotiate_features(&g_gpu.vpci, 1ULL << VIRTIO_GPU_F_EDID)) {
         pr_debug("[VIRTIO-GPU] Failed to negotiate features\n");
         virtio_pci_set_status(&g_gpu.vpci, VIRTIO_CONFIG_S_FAILED);
         return -1;
+    }
+    if (g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_EDID)) {
+        pr_debug("[VIRTIO-GPU] Device offers EDID\n");
     }
 
     /* 4. Setup queues */

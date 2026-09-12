@@ -76,7 +76,15 @@ typedef struct virtio_pci_device {
     volatile u8 *device_cfg;
     volatile u8 *notify_base;
     u32 notify_multiplier;
-    
+
+    /* Feature bits actually accepted by the device (the intersection of what
+     * was requested and what device_feature reported), filled in by
+     * virtio_pci_negotiate_features(). A driver that requests an optional
+     * feature bit — one the transport is not required to have — needs this
+     * to find out whether it stuck, since negotiation silently drops bits
+     * the device does not offer rather than failing. */
+    u64 negotiated_features;
+
 } virtio_pci_device_t;
 
 /**

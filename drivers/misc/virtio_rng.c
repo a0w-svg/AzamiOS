@@ -30,13 +30,18 @@ int virtio_rng_get_bytes(void *buf, size_t len)
     phys_addr_t buf_phys = vmm_translate(vmm_kernel_space(), (virt_addr_t)buf);
     if (!buf_phys) return -EFAULT;
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_vrng_lock);
+    /* Plain lock: g_vrng_lock is never touched from interrupt context, so
+     * there is nothing for _irqsave to protect against here — only against
+     * concurrent callers on other cores, which the ticket lock alone already
+     * serializes. Leaving interrupts enabled across the wait keeps a slow
+     * entropy request from stalling this core's timer/IPIs. */
+    spinlock_lock(&g_vrng_lock);
 
     /* Device writes entropy into the buffer */
     u32 len32 = (u32)len;
     bool is_write = true;
     if (virtqueue_add_chain(g_vrng_dev.vq, &buf_phys, &len32, &is_write, 1, (void *)1) < 0) {
-        spinlock_unlock_irqrestore(&g_vrng_lock, flags);
+        spinlock_unlock(&g_vrng_lock);
         return -EIO;
     }
 
@@ -52,7 +57,7 @@ int virtio_rng_get_bytes(void *buf, size_t len)
         hw_spin_wait(spins++);
     }
 
-    spinlock_unlock_irqrestore(&g_vrng_lock, flags);
+    spinlock_unlock(&g_vrng_lock);
 
     if (!cookie) return -ETIMEDOUT;
     return (int)len_received;

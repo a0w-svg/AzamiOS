@@ -39,23 +39,39 @@ static s64 virtio_blk_read_sectors(struct block_dev *dev, u64 lba, u32 count, vo
     u32 lens[3] = { sizeof(hdr), bytes_to_read, 1 };
     bool is_write[3] = { false, true, true }; /* Device reads hdr, writes data & status */
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_vblk_lock);
+    /* Plain lock, not _irqsave: this path only ever runs in thread context
+     * (no ISR touches g_vblk_lock), so there is no reentrancy hazard to guard
+     * against by disabling interrupts. Masking them for the whole round trip
+     * used to stall this core's timer tick and IPIs for as long as the host
+     * took to service the request — under TCG that is not free. See the same
+     * fix in virtio_gpu.c's virtio_gpu_submit(). */
+    spinlock_lock(&g_vblk_lock);
 
     if (virtqueue_add_chain(vdev->vq, addrs, lens, is_write, 3, (void *)1) < 0) {
-        spinlock_unlock_irqrestore(&g_vblk_lock, flags);
+        spinlock_unlock(&g_vblk_lock);
         return -EIO;
     }
 
     virtqueue_kick(vdev->vq);
     virtio_pci_notify(&vdev->vpci, 0, vdev->vq);
 
+    /* Bounded: a wedged host must fail the request, not hang the caller (and
+     * every other thread queued behind this lock) forever. */
     void *cookie = NULL;
-    for (u32 spins = 0; !cookie; spins++) {
+    u64 spins = 0;
+    const u64 SPIN_LIMIT = 200000000ULL;
+    while (!cookie) {
         cookie = virtqueue_get_used(vdev->vq, NULL);
-        if (!cookie) hw_spin_wait(spins);
+        if (cookie) break;
+        if (++spins >= SPIN_LIMIT) {
+            spinlock_unlock(&g_vblk_lock);
+            pr_debug("[VIRTIO-BLK] read request timed out\n");
+            return -EIO;
+        }
+        hw_spin_wait((u32)spins);
     }
 
-    spinlock_unlock_irqrestore(&g_vblk_lock, flags);
+    spinlock_unlock(&g_vblk_lock);
 
     if (status != VIRTIO_BLK_S_OK) return -EIO;
     return (s64)count;
@@ -84,10 +100,10 @@ static s64 virtio_blk_write_sectors(struct block_dev *dev, u64 lba, u32 count, c
     u32 lens[3] = { sizeof(hdr), bytes_to_write, 1 };
     bool is_write[3] = { false, false, true }; /* Device reads hdr & data, writes status */
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_vblk_lock);
+    spinlock_lock(&g_vblk_lock);
 
     if (virtqueue_add_chain(vdev->vq, addrs, lens, is_write, 3, (void *)1) < 0) {
-        spinlock_unlock_irqrestore(&g_vblk_lock, flags);
+        spinlock_unlock(&g_vblk_lock);
         return -EIO;
     }
 
@@ -95,12 +111,20 @@ static s64 virtio_blk_write_sectors(struct block_dev *dev, u64 lba, u32 count, c
     virtio_pci_notify(&vdev->vpci, 0, vdev->vq);
 
     void *cookie = NULL;
-    for (u32 spins = 0; !cookie; spins++) {
+    u64 spins = 0;
+    const u64 SPIN_LIMIT = 200000000ULL;
+    while (!cookie) {
         cookie = virtqueue_get_used(vdev->vq, NULL);
-        if (!cookie) hw_spin_wait(spins);
+        if (cookie) break;
+        if (++spins >= SPIN_LIMIT) {
+            spinlock_unlock(&g_vblk_lock);
+            pr_debug("[VIRTIO-BLK] write request timed out\n");
+            return -EIO;
+        }
+        hw_spin_wait((u32)spins);
     }
 
-    spinlock_unlock_irqrestore(&g_vblk_lock, flags);
+    spinlock_unlock(&g_vblk_lock);
 
     if (status != VIRTIO_BLK_S_OK) return -EIO;
     return (s64)count;

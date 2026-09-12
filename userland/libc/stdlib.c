@@ -51,22 +51,37 @@ static void *g_heap_top = NULL;
  * malloc()/free() while holding the lock). */
 static int g_malloc_lock = 0;
 
+#define MALLOC_FUTEX_WAIT 128
+#define MALLOC_FUTEX_WAKE 129
+
 static void malloc_lock(void)
 {
-    int spin = 0;
-    while (__sync_lock_test_and_set(&g_malloc_lock, 1)) {
-        if (++spin < 100) {
-            __asm__ volatile("pause");
-        } else {
-            syscall0(SYS_AZ_YIELD);
-            spin = 0;
+    int exp = 0;
+    if (__atomic_compare_exchange_n(&g_malloc_lock, &exp, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return;
+
+    for (int i = 0; i < 100; i++) {
+        __asm__ volatile("pause");
+        exp = 0;
+        if (__atomic_compare_exchange_n(&g_malloc_lock, &exp, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return;
+    }
+
+    while (1) {
+        if (exp == 2 || __atomic_exchange_n(&g_malloc_lock, 2, __ATOMIC_ACQ_REL) != 0) {
+            syscall4(SYS_futex, (long)&g_malloc_lock, MALLOC_FUTEX_WAIT, 2, 0);
         }
+        exp = 0;
+        if (__atomic_compare_exchange_n(&g_malloc_lock, &exp, 2, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return;
     }
 }
 
 static void malloc_unlock(void)
 {
-    __sync_lock_release(&g_malloc_lock);
+    if (__atomic_exchange_n(&g_malloc_lock, 0, __ATOMIC_RELEASE) == 2) {
+        syscall4(SYS_futex, (long)&g_malloc_lock, MALLOC_FUTEX_WAKE, 1, 0);
+    }
 }
 
 static void *malloc_unlocked(size_t size)

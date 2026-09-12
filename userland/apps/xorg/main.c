@@ -130,13 +130,24 @@ static void xorg_composite(void)
         }
 
         /* Draw window client pixels */
-        for (unsigned int wy = 0; wy < w->h; wy++) {
-            int py = w->y + (int)wy;
-            if (py < 0 || py >= (int)g_xorg.height) continue;
-            for (unsigned int wx = 0; wx < w->w; wx++) {
-                int px = w->x + (int)wx;
-                if (px < 0 || px >= (int)g_xorg.width) continue;
-                g_xorg.backbuffer[py * stride + px] = w->pixels[wy * w->w + wx];
+        int x0 = w->x;
+        int y0 = w->y;
+        int x1 = w->x + (int)w->w;
+        int y1 = w->y + (int)w->h;
+
+        int clip_x0 = x0 < 0 ? 0 : x0;
+        int clip_y0 = y0 < 0 ? 0 : y0;
+        int clip_x1 = x1 > (int)g_xorg.width ? (int)g_xorg.width : x1;
+        int clip_y1 = y1 > (int)g_xorg.height ? (int)g_xorg.height : y1;
+
+        if (clip_x0 < clip_x1 && clip_y0 < clip_y1) {
+            int span_w = clip_x1 - clip_x0;
+            int src_x_off = clip_x0 - x0;
+            for (int py = clip_y0; py < clip_y1; py++) {
+                int wy = py - y0;
+                uint32_t *dst_row = &g_xorg.backbuffer[py * stride + clip_x0];
+                const uint32_t *src_row = &w->pixels[wy * w->w + src_x_off];
+                memcpy(dst_row, src_row, (size_t)span_w * sizeof(uint32_t));
             }
         }
     }

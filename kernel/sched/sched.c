@@ -27,28 +27,31 @@
 
 
 static spinlock_t g_sched_lock = SPINLOCK_INIT;
-static thread_t  *g_ready_queue = NULL;
 static process_t *g_process_list = NULL;
 static process_t *g_kernel_proc = NULL;
 static u32 g_next_pid = 1;
 static u32 g_next_pcid = 0;   /* rolls 1..4095 for user address spaces */
 static u32 g_next_tid = 1;
 
-/* CFS min_vruntime: monotonically-advancing floor equal to the largest
- * vruntime ever dequeued as the run-queue head. Threads are enqueued with
- * their vruntime clamped up to this floor.
+/* Per-CPU CFS Runqueues (SCHED-SMP-01)
  *
- * Without it, a thread joining the queue with a stale-low vruntime — a brand
- * new thread (thread_create_ex sets vruntime = 0) or one that just woke from a
- * long sleep/block — sorts ahead of every running thread and keeps the CPU
- * until it accumulates their vruntime. On a box that has been up a while the
- * running threads sit at (ticks_run * priority), so "catching up" means many
- * seconds of exclusive CPU: new and just-woken threads starve everything else.
+ * Each CPU manages its own runqueue guarded by its own spinlock. When a CPU's
+ * local queue is depleted, it performs work-stealing from the busiest core's
+ * queue for any threads allowing that CPU in their affinity_mask.
  *
- * Guarded by g_sched_lock (every enqueue_ready/dequeue_ready caller holds it). */
-static u64 g_min_vruntime = 0;
+ * Locking hierarchy: g_sched_lock -> rq->lock. Never acquire g_sched_lock
+ * while holding any rq->lock. */
+typedef struct runqueue {
+    spinlock_t lock;
+    thread_t  *head;
+    u64        min_vruntime;
+    u32        nr_running;
+} runqueue_t;
+
+static runqueue_t g_cpu_rq[SMP_MAX_CPUS];
 
 static void enqueue_ready(thread_t *t);
+static void rq_remove_thread_locked(thread_t *t);
 
 /* Sleep queue is kept sorted by sleep_end_ticks (ascending) for O(1) tick scan */
 static thread_t *g_sleep_queue = NULL;
@@ -297,56 +300,174 @@ process_t *sched_current_process(void)
     return t ? t->proc : NULL;
 }
 
+static void rq_remove_thread_locked(thread_t *t)
+{
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        runqueue_t *rq = &g_cpu_rq[i];
+        spinlock_lock(&rq->lock);
+        thread_t *curr = rq->head, *prev = NULL;
+        while (curr) {
+            if (curr == t) {
+                if (prev) prev->next = curr->next;
+                else rq->head = curr->next;
+                curr->next = NULL;
+                if (rq->nr_running > 0) rq->nr_running--;
+                spinlock_unlock(&rq->lock);
+                return;
+            }
+            prev = curr;
+            curr = curr->next;
+        }
+        spinlock_unlock(&rq->lock);
+    }
+}
+
 static void enqueue_ready(thread_t *t)
 {
     t->state = THREAD_READY;
     t->next = NULL;
 
-    /* Clamp up to the run-queue floor so a stale-low vruntime cannot starve
-     * the queue (see g_min_vruntime). This is a no-op for a thread that was
-     * just preempted — it ran, so its vruntime already sits at or above the
-     * floor — and only bites the new/just-woken case it is meant to fix. */
-    if (t->vruntime < g_min_vruntime) t->vruntime = g_min_vruntime;
+    u32 ncpus = smp_cpu_count();
+    if (ncpus == 0) ncpus = 1;
+    if (ncpus > SMP_MAX_CPUS) ncpus = SMP_MAX_CPUS;
 
-    if (!g_ready_queue || t->vruntime < g_ready_queue->vruntime) {
-        t->next = g_ready_queue;
-        g_ready_queue = t;
+    u64 online_mask = (ncpus >= 64) ? ~0ULL : ((1ULL << ncpus) - 1);
+    u64 valid_cpus = t->affinity_mask & online_mask;
+    if (valid_cpus == 0) valid_cpus = online_mask;
+
+    u64 idle_mask = __atomic_load_n(&g_idle_cpu_mask, __ATOMIC_RELAXED) & online_mask;
+    u32 my_cpu = smp_current_cpu_id();
+    if (my_cpu >= SMP_MAX_CPUS) my_cpu = 0;
+
+    u32 target_cpu = (u32)-1;
+
+    /* 1. Cache warmth preference: if thread's previous cpu is idle and in affinity mask, keep it there */
+    if (t->cpu_id < ncpus && (valid_cpus & (1ULL << t->cpu_id)) && (idle_mask & (1ULL << t->cpu_id))) {
+        target_cpu = t->cpu_id;
+    }
+    /* 2. Any other idle CPU matching affinity in O(1) via hw_ctz64 */
+    if (target_cpu == (u32)-1) {
+        u64 idle_candidates = idle_mask & valid_cpus;
+        if (idle_candidates) {
+            target_cpu = hw_ctz64(idle_candidates);
+        }
+    }
+    /* 3. If no idle CPU, select CPU with lowest load (nr_running) among valid_cpus */
+    if (target_cpu == (u32)-1) {
+        u32 min_load = (u32)-1;
+        if (valid_cpus & (1ULL << my_cpu)) {
+            target_cpu = my_cpu;
+            min_load = __atomic_load_n(&g_cpu_rq[my_cpu].nr_running, __ATOMIC_RELAXED);
+        }
+        for (u32 i = 0; i < ncpus; i++) {
+            if (!(valid_cpus & (1ULL << i))) continue;
+            u32 nr = __atomic_load_n(&g_cpu_rq[i].nr_running, __ATOMIC_RELAXED);
+            if (nr < min_load) {
+                min_load = nr;
+                target_cpu = i;
+            }
+        }
+    }
+    if (target_cpu >= ncpus) target_cpu = 0;
+
+    runqueue_t *rq = &g_cpu_rq[target_cpu];
+    spinlock_lock(&rq->lock);
+
+    /* Clamp up to the run-queue floor so a stale-low vruntime cannot starve the queue */
+    if (t->vruntime < rq->min_vruntime) t->vruntime = rq->min_vruntime;
+
+    if (!rq->head || t->vruntime < rq->head->vruntime) {
+        t->next = rq->head;
+        rq->head = t;
     } else {
-        thread_t *curr = g_ready_queue;
+        thread_t *curr = rq->head;
         while (curr->next && curr->next->vruntime <= t->vruntime) {
             curr = curr->next;
         }
         t->next = curr->next;
         curr->next = t;
     }
+    rq->nr_running++;
+    spinlock_unlock(&rq->lock);
 
-    /* Wake up an idle CPU using O(1) bitmask lookup instead of O(n) scan. */
-    u64 idle_mask = __atomic_load_n(&g_idle_cpu_mask, __ATOMIC_RELAXED);
-    u32 my_cpu    = smp_current_cpu_id();
-    /* Clear our own bit so we don't IPI ourselves unnecessarily */
-    if (my_cpu < 64) idle_mask &= ~(1ULL << my_cpu);
-    if (idle_mask) {
-        /* Not __builtin_ctzll(): the kernel targets a baseline without BMI1,
-         * so GCC can't fold that builtin into TZCNT and falls back to a
-         * `bsf` sequence anyway — hw_ctz64() gets the same instruction (or
-         * genuine TZCNT where the CPU has it) without going through the
-         * builtin's UB-on-zero contract, which the surrounding `if` already
-         * makes moot here but hw_ctz64() documents properly regardless. */
-        u32 idle_cpu = hw_ctz64(idle_mask);
-        smp_send_reschedule(idle_cpu);
+    /* Wake up target CPU if it was idle, or request local reschedule */
+    if (target_cpu != my_cpu) {
+        if (idle_mask & (1ULL << target_cpu)) {
+            smp_send_reschedule(target_cpu);
+        }
+    } else {
+        cpu_info_t *cpu = smp_get_cpu();
+        if (cpu && (cpu->current_thread == g_idle_threads[my_cpu] ||
+                    (rq->head == t && cpu->current_thread && t->vruntime < cpu->current_thread->vruntime))) {
+            cpu->needs_reschedule = true;
+        }
     }
 }
 
 static thread_t *dequeue_ready(void)
 {
-    if (!g_ready_queue) return NULL;
-    thread_t *t = g_ready_queue;
-    g_ready_queue = t->next;
-    t->next = NULL;
-    /* The queue is sorted ascending, so the head is the minimum: advance the
-     * floor to it. Monotone by construction — never walks backwards. */
-    if (t->vruntime > g_min_vruntime) g_min_vruntime = t->vruntime;
-    return t;
+    u32 my_cpu = smp_current_cpu_id();
+    if (my_cpu >= SMP_MAX_CPUS) my_cpu = 0;
+
+    runqueue_t *my_rq = &g_cpu_rq[my_cpu];
+    spinlock_lock(&my_rq->lock);
+    if (my_rq->head) {
+        thread_t *t = my_rq->head;
+        my_rq->head = t->next;
+        t->next = NULL;
+        if (my_rq->nr_running > 0) my_rq->nr_running--;
+        if (t->vruntime > my_rq->min_vruntime) my_rq->min_vruntime = t->vruntime;
+        spinlock_unlock(&my_rq->lock);
+        return t;
+    }
+    spinlock_unlock(&my_rq->lock);
+
+    /* Local queue is empty: perform work-stealing from busiest CPU */
+    u32 ncpus = smp_cpu_count();
+    if (ncpus > SMP_MAX_CPUS) ncpus = SMP_MAX_CPUS;
+    if (ncpus <= 1) return NULL;
+
+    u32 best_victim = (u32)-1;
+    u32 max_run = 0;
+    for (u32 i = 0; i < ncpus; i++) {
+        if (i == my_cpu) continue;
+        u32 nr = __atomic_load_n(&g_cpu_rq[i].nr_running, __ATOMIC_RELAXED);
+        if (nr > max_run) {
+            max_run = nr;
+            best_victim = i;
+        }
+    }
+
+    if (best_victim != (u32)-1 && max_run > 0) {
+        for (u32 attempt = 0; attempt < ncpus; attempt++) {
+            u32 victim = (best_victim + attempt) % ncpus;
+            if (victim == my_cpu) continue;
+            runqueue_t *vrq = &g_cpu_rq[victim];
+            if (__atomic_load_n(&vrq->nr_running, __ATOMIC_RELAXED) == 0) continue;
+
+            spinlock_lock(&vrq->lock);
+            thread_t *prev = NULL;
+            thread_t *curr = vrq->head;
+            while (curr) {
+                if (curr->affinity_mask & (1ULL << my_cpu)) {
+                    /* Steal this thread! */
+                    if (prev) prev->next = curr->next;
+                    else vrq->head = curr->next;
+                    curr->next = NULL;
+                    if (vrq->nr_running > 0) vrq->nr_running--;
+                    if (curr->vruntime < my_rq->min_vruntime)
+                        curr->vruntime = my_rq->min_vruntime;
+                    spinlock_unlock(&vrq->lock);
+                    return curr;
+                }
+                prev = curr;
+                curr = curr->next;
+            }
+            spinlock_unlock(&vrq->lock);
+        }
+    }
+
+    return NULL;
 }
 
 process_t *proc_create(const char *name, phys_addr_t pml4_phys)
@@ -387,6 +508,7 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     proc->fsuid = proc->euid;
     proc->fsgid = proc->egid;
     proc->pkey_alloc_map = 0x1; /* key 0 is the default key, always taken */
+    proc->affinity_mask = (u64)-1; /* All CPUs allowed by default */
 
     /* POSIX resource limits: infinite unless a resource has a real ceiling.
      * fork() overwrites the whole table from the parent in proc_clone_attrs().
@@ -694,6 +816,8 @@ thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool
     t->proc = proc ? proc : g_kernel_proc;
     t->state = THREAD_READY;
     t->vruntime = 0;
+    t->affinity_mask = proc ? proc->affinity_mask : (u64)-1;
+    t->cpu_id = (u32)-1;
     /* Base CFS weight is 10 (vruntime grows by this each tick — lower means a
      * larger CPU share). A process that has changed its nice value or picked
      * an RT policy carries that onto every thread it spawns. */
@@ -777,11 +901,11 @@ static void idle_loop(void *arg)
     cpu_info_t *cpu = smp_get_cpu();
     bool have_id = cpu && cpu->cpu_id < 64;
     u64 mybit = have_id ? (1ULL << cpu->cpu_id) : 0;
+    u32 my_cpu = (cpu && cpu->cpu_id < SMP_MAX_CPUS) ? cpu->cpu_id : 0;
+    runqueue_t *my_rq = &g_cpu_rq[my_cpu];
 
     for (;;) {
-        /* BUG-13: read g_ready_queue atomically — a plain load is a data race
-         * on non-TSO ISAs (x86 TSO makes it safe today, but C UB travels). */
-        if (__atomic_load_n(&g_ready_queue, __ATOMIC_ACQUIRE)) {
+        if (__atomic_load_n(&my_rq->head, __ATOMIC_ACQUIRE)) {
             /* Clear idle bit before yielding so enqueue_ready doesn't IPI us again */
             if (have_id)
                 __atomic_and_fetch((u64 *)&g_idle_cpu_mask, ~mybit, __ATOMIC_RELAXED);
@@ -798,12 +922,12 @@ static void idle_loop(void *arg)
          * before our idle bit became visible could have had its wakeup IPI
          * skipped by enqueue_ready(). Catch it here instead of sleeping on it. */
         cpu_cli();
-        /* Arm the wake-up watch on the run queue head *before* the final test,
+        /* Arm the wake-up watch on the local run queue head *before* the final test,
          * so a thread enqueued in the gap still breaks us out of the wait. On a
          * CPU without MONITOR/MWAIT this is a no-op and the STI;HLT below
          * provides the same guarantee via the wake-up IPI. */
-        cpu_idle_arm(&g_ready_queue);
-        if (__atomic_load_n(&g_ready_queue, __ATOMIC_ACQUIRE)) {
+        cpu_idle_arm(&my_rq->head);
+        if (__atomic_load_n(&my_rq->head, __ATOMIC_ACQUIRE)) {
             if (have_id)
                 __atomic_and_fetch((u64 *)&g_idle_cpu_mask, ~mybit, __ATOMIC_RELAXED);
             cpu_sti();
@@ -931,6 +1055,13 @@ static void sched_reaper_loop(void *arg)
 
 void sched_init(void)
 {
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        spinlock_init(&g_cpu_rq[i].lock);
+        g_cpu_rq[i].head = NULL;
+        g_cpu_rq[i].min_vruntime = 0;
+        g_cpu_rq[i].nr_running = 0;
+    }
+
     g_kernel_proc = proc_create("AzamiOS-Kernel", vmm_kernel_space());
 
     /* One idle thread per CPU. g_idle_threads is sized for SMP_MAX_CPUS; clamp
@@ -1119,7 +1250,9 @@ void sched_tick(pt_regs_t *regs)
      */
     thread_t *sq_head = __atomic_load_n(&g_sleep_queue, __ATOMIC_RELAXED);
     bool wake_due   = sq_head && sq_head->sleep_end_ticks <= current_ticks;
-    bool rq_nonempty = __atomic_load_n(&g_ready_queue, __ATOMIC_RELAXED) != NULL;
+    u32 my_cpu = (cpu->cpu_id < SMP_MAX_CPUS) ? cpu->cpu_id : 0;
+    runqueue_t *my_rq = &g_cpu_rq[my_cpu];
+    bool rq_nonempty = __atomic_load_n(&my_rq->head, __ATOMIC_RELAXED) != NULL;
 
     bool should_preempt = false;
 
@@ -1135,8 +1268,10 @@ void sched_tick(pt_regs_t *regs)
             enqueue_ready(waking);
         }
 
-        should_preempt = (g_ready_queue && (curr == g_idle_threads[cpu->cpu_id] ||
-                                            g_ready_queue->vruntime < curr->vruntime));
+        spinlock_lock(&my_rq->lock);
+        should_preempt = (my_rq->head && (curr == g_idle_threads[cpu->cpu_id] ||
+                                          my_rq->head->vruntime < curr->vruntime));
+        spinlock_unlock(&my_rq->lock);
         spinlock_unlock(&g_sched_lock);
     }
 
@@ -1554,8 +1689,7 @@ void sched_exit_group_mark(void)
          * kernel stack will simply be abandoned — no CPU will switch_to it
          * again — so promote straight to ZOMBIE for the reaper to free. */
         if (t->state == THREAD_READY) {
-            for (thread_t **pp = &g_ready_queue; *pp; pp = &(*pp)->next)
-                if (*pp == t) { *pp = t->next; break; }
+            rq_remove_thread_locked(t);
         } else if (t->state == THREAD_SLEEPING) {
             for (thread_t **pp = &g_sleep_queue; *pp; pp = &(*pp)->next)
                 if (*pp == t) { *pp = t->next; break; }
@@ -2085,13 +2219,8 @@ s64 sched_kill_process(u32 pid, int sig)
             /* Thread is descheduled and off-CPU; promote straight to ZOMBIE */
             t->state = THREAD_ZOMBIE;
         } else if (t->state == THREAD_READY) {
-            /* Remove from ready queue */
-            for (thread_t **pp = &g_ready_queue; *pp; pp = &(*pp)->next) {
-                if (*pp == t) {
-                    *pp = t->next;
-                    break;
-                }
-            }
+            /* Remove from per-CPU ready queue */
+            rq_remove_thread_locked(t);
             t->state = THREAD_ZOMBIE;
         } else if (t->state == THREAD_BLOCKED_PENDING || t->state == THREAD_SLEEPING_PENDING) {
             /* Mid-switch on a CPU: mark DYING so sched_post_switch zombifies it */
@@ -2195,4 +2324,113 @@ u64 sched_get_ticks(void)
 {
     return __atomic_load_n(&g_system_ticks, __ATOMIC_RELAXED);
 }
+
+int sched_set_thread_affinity(thread_t *t, u64 mask)
+{
+    if (!t) return -ESRCH;
+    u32 ncpus = smp_cpu_count();
+    if (ncpus == 0) ncpus = 1;
+    if (ncpus > SMP_MAX_CPUS) ncpus = SMP_MAX_CPUS;
+    u64 online_mask = (ncpus >= 64) ? ~0ULL : ((1ULL << ncpus) - 1);
+    if ((mask & online_mask) == 0) return -EINVAL;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    t->affinity_mask = mask;
+
+    /* If thread is currently running on a CPU not in the mask, request reschedule */
+    if (t->state == THREAD_RUNNING && t->cpu_id < SMP_MAX_CPUS) {
+        if (!(mask & (1ULL << t->cpu_id))) {
+            if (t->cpu_id == smp_current_cpu_id()) {
+                cpu_info_t *cpu = smp_get_cpu();
+                if (cpu) cpu->needs_reschedule = true;
+            } else {
+                smp_send_reschedule(t->cpu_id);
+            }
+        }
+    } else if (t->state == THREAD_READY) {
+        /* If it's queued on an RQ of a CPU not in the mask, migrate it */
+        for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+            if (!(mask & (1ULL << i))) {
+                runqueue_t *rq = &g_cpu_rq[i];
+                spinlock_lock(&rq->lock);
+                thread_t *curr = rq->head, *prev = NULL;
+                bool found = false;
+                while (curr) {
+                    if (curr == t) {
+                        if (prev) prev->next = curr->next;
+                        else rq->head = curr->next;
+                        curr->next = NULL;
+                        if (rq->nr_running > 0) rq->nr_running--;
+                        found = true;
+                        break;
+                    }
+                    prev = curr;
+                    curr = curr->next;
+                }
+                spinlock_unlock(&rq->lock);
+                if (found) {
+                    enqueue_ready(t);
+                    break;
+                }
+            }
+        }
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    return 0;
+}
+
+int sched_set_proc_affinity(process_t *proc, u64 mask)
+{
+    if (!proc) return -ESRCH;
+    u32 ncpus = smp_cpu_count();
+    if (ncpus == 0) ncpus = 1;
+    if (ncpus > SMP_MAX_CPUS) ncpus = SMP_MAX_CPUS;
+    u64 online_mask = (ncpus >= 64) ? ~0ULL : ((1ULL << ncpus) - 1);
+    if ((mask & online_mask) == 0) return -EINVAL;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    proc->affinity_mask = mask;
+    for (thread_t *t = proc->threads; t; t = t->proc_next) {
+        t->affinity_mask = mask;
+        if (t->state == THREAD_RUNNING && t->cpu_id < SMP_MAX_CPUS) {
+            if (!(mask & (1ULL << t->cpu_id))) {
+                if (t->cpu_id == smp_current_cpu_id()) {
+                    cpu_info_t *cpu = smp_get_cpu();
+                    if (cpu) cpu->needs_reschedule = true;
+                } else {
+                    smp_send_reschedule(t->cpu_id);
+                }
+            }
+        } else if (t->state == THREAD_READY) {
+            for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+                if (!(mask & (1ULL << i))) {
+                    runqueue_t *rq = &g_cpu_rq[i];
+                    spinlock_lock(&rq->lock);
+                    thread_t *curr = rq->head, *prev = NULL;
+                    bool found = false;
+                    while (curr) {
+                        if (curr == t) {
+                            if (prev) prev->next = curr->next;
+                            else rq->head = curr->next;
+                            curr->next = NULL;
+                            if (rq->nr_running > 0) rq->nr_running--;
+                            found = true;
+                            break;
+                        }
+                        prev = curr;
+                        curr = curr->next;
+                    }
+                    spinlock_unlock(&rq->lock);
+                    if (found) {
+                        enqueue_ready(t);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    return 0;
+}
+
 

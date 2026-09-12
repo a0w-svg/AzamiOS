@@ -37,6 +37,34 @@ int virtio_gpu_get_display_info(u32 *width, u32 *height)
     return 0;
 }
 
+int virtio_gpu_get_display_info_all(struct virtio_gpu_display_one *out_modes,
+                                    u32 max, u32 *out_count)
+{
+    struct virtio_gpu_ctrl_hdr cmd;
+    struct virtio_gpu_resp_display_info resp;
+
+    if (!out_modes || !out_count) return -1;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = VIRTIO_GPU_CMD_GET_DISPLAY_INFO;
+
+    memset(&resp, 0, sizeof(resp));
+
+    if (virtio_gpu_send_command(&g_gpu, &cmd, sizeof(cmd), &resp, sizeof(resp)) < 0) {
+        return -1;
+    }
+
+    if (resp.hdr.type != VIRTIO_GPU_RESP_OK_DISPLAY_INFO) {
+        return -1;
+    }
+
+    u32 n = max < VIRTIO_GPU_MAX_SCANOUTS ? max : VIRTIO_GPU_MAX_SCANOUTS;
+    memset(out_modes, 0, sizeof(*out_modes) * max);
+    for (u32 i = 0; i < n; i++) out_modes[i] = resp.pmodes[i];
+    *out_count = n;
+    return 0;
+}
+
 int virtio_gpu_resource_create_2d(u32 resource_id, u32 format, u32 width, u32 height)
 {
     struct virtio_gpu_resource_create_2d cmd;
@@ -253,6 +281,91 @@ int virtio_gpu_setup_framebuffer(void)
     
     pr_debug("[VIRTIO-GPU] Framebuffer setup complete.\n");
     return 0;
+}
+
+/* ── Multi-monitor scanouts ───────────────────────────────────────────────── */
+
+int virtio_gpu_setup_scanout_resource(u32 scanout_id, u32 resource_id,
+                                      u32 width, u32 height,
+                                      phys_addr_t *out_phys, void **out_virt,
+                                      u32 *out_pitch)
+{
+    if (!out_phys || !out_virt || width == 0 || height == 0) return -1;
+
+    u32 bpp = 4; /* 32-bit ARGB, same format as the primary scanout */
+    u32 size = width * height * bpp;
+    u32 pages = (size + 4095) / 4096;
+
+    phys_addr_t phys = pmm_alloc_pages(pages);
+    if (!phys) {
+        pr_debug("[VIRTIO-GPU] scanout %u: out of memory for backing (%ux%u)\n",
+                 scanout_id, width, height);
+        return -1;
+    }
+
+    void *virt = vmm_map_io(phys, pages * 4096);
+    if (!virt) {
+        pr_debug("[VIRTIO-GPU] scanout %u: failed to map backing\n", scanout_id);
+        return -1;
+    }
+    memset(virt, 0, size);
+
+    if (virtio_gpu_resource_create_2d(resource_id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
+                                      width, height) < 0) {
+        pr_debug("[VIRTIO-GPU] scanout %u: failed to create resource %u\n",
+                 scanout_id, resource_id);
+        return -1;
+    }
+    if (virtio_gpu_resource_attach_backing(resource_id, phys, size) < 0) {
+        pr_debug("[VIRTIO-GPU] scanout %u: failed to attach backing\n", scanout_id);
+        return -1;
+    }
+    if (virtio_gpu_set_scanout(scanout_id, resource_id, width, height) < 0) {
+        pr_debug("[VIRTIO-GPU] scanout %u: failed to bind resource %u\n",
+                 scanout_id, resource_id);
+        return -1;
+    }
+    if (virtio_gpu_transfer_to_host_2d(resource_id, width, height) < 0 ||
+        virtio_gpu_resource_flush(resource_id, width, height) < 0) {
+        pr_debug("[VIRTIO-GPU] scanout %u: initial flush failed\n", scanout_id);
+        return -1;
+    }
+
+    *out_phys = phys;
+    *out_virt = virt;
+    if (out_pitch) *out_pitch = width * bpp;
+
+    pr_debug("[VIRTIO-GPU] scanout %u ready: %ux%u, resource %u\n",
+             scanout_id, width, height, resource_id);
+    return 0;
+}
+
+/* ── EDID (VIRTIO_GPU_F_EDID) ─────────────────────────────────────────────── */
+
+int virtio_gpu_get_edid(u32 scanout_id, u8 *out, u32 out_len)
+{
+    struct virtio_gpu_get_edid cmd;
+    struct virtio_gpu_resp_edid resp;
+
+    if (!out || out_len == 0) return -1;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.hdr.type = VIRTIO_GPU_CMD_GET_EDID;
+    cmd.scanout_id = scanout_id;
+
+    memset(&resp, 0, sizeof(resp));
+
+    if (virtio_gpu_send_command(&g_gpu, &cmd, sizeof(cmd), &resp, sizeof(resp)) < 0) {
+        return -1;
+    }
+    if (resp.hdr.type != VIRTIO_GPU_RESP_OK_EDID) {
+        return -1;
+    }
+
+    u32 n = resp.size < VIRTIO_GPU_EDID_MAX_SIZE ? resp.size : VIRTIO_GPU_EDID_MAX_SIZE;
+    if (n > out_len) n = out_len;
+    memcpy(out, resp.edid, n);
+    return (int)n;
 }
 
 /* ── Hardware cursor ─────────────────────────────────────────────────────────

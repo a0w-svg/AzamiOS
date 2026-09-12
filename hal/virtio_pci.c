@@ -111,6 +111,7 @@ bool virtio_pci_negotiate_features(virtio_pci_device_t *virtio_dev, u64 requeste
         pr_debug("[VIRTIO] Device does not offer VERSION_1 feature bit.\n");
     }
     negotiated |= (requested_features & version_1_mask);
+    virtio_dev->negotiated_features = negotiated;
 
     /* Write feature bits 0-31 */
     virtio_dev->common_cfg->driver_feature_select = 0;

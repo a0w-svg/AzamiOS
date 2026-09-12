@@ -7538,15 +7538,15 @@ static s64 sys_sched_getaffinity_impl(pt_regs_t *r)
     if (!mask || (uintptr_t)mask >= 0x8000000000000000ULL) return -(s64)EFAULT;
     if (cpusetsize < sizeof(u64)) return -(s64)EINVAL;
 
-    if (pid > 0) {
-        process_t *target = proc_get_by_pid((u32)pid);
-        if (!target) return -(s64)ESRCH;
-        proc_put(target);
-    }
+    process_t *target = (pid == 0) ? sched_current_process() : proc_get_by_pid((u32)pid);
+    if (!target) return -(s64)ESRCH;
+    u64 affinity = target->affinity_mask;
+    if (pid > 0) proc_put(target);
 
     u32 ncpus = smp_cpu_count();
     if (ncpus == 0) ncpus = 1;
-    u64 affinity = (ncpus >= 64) ? ~0ULL : ((1ULL << ncpus) - 1);
+    u64 avail_mask = (ncpus >= 64) ? ~0ULL : ((1ULL << ncpus) - 1);
+    affinity &= avail_mask;
     if (copy_to_user(mask, &affinity, sizeof(u64)) != 0) return -(s64)EFAULT;
     return (s64)sizeof(u64);
 }
@@ -7587,8 +7587,9 @@ static s64 sys_sched_setaffinity_impl(pt_regs_t *r)
         return -(s64)EINVAL;
     }
 
+    int err = sched_set_proc_affinity(target, user_mask & avail_mask);
     if (pid != 0) proc_put(target);
-    return 0;
+    return err < 0 ? (s64)err : 0;
 }
 
 static s64 sys_tkill_impl(pt_regs_t *r)
@@ -8023,7 +8024,43 @@ typedef struct futex_q {
 
 #define FUTEX_HASH_SIZE 64
 static futex_q_t *g_futex_table[FUTEX_HASH_SIZE];
-static spinlock_t g_futex_lock = SPINLOCK_INIT;
+static spinlock_t g_futex_bucket_locks[FUTEX_HASH_SIZE] = { [0 ... FUTEX_HASH_SIZE - 1] = SPINLOCK_INIT };
+
+static void futex_lock_all_buckets(void) {
+    for (u32 i = 0; i < FUTEX_HASH_SIZE; i++) {
+        spinlock_lock(&g_futex_bucket_locks[i]);
+    }
+}
+
+static void futex_unlock_all_buckets(void) {
+    for (s32 i = FUTEX_HASH_SIZE - 1; i >= 0; i--) {
+        spinlock_unlock(&g_futex_bucket_locks[i]);
+    }
+}
+
+static void futex_lock_two_buckets(u32 b1, u32 b2) {
+    if (b1 < b2) {
+        spinlock_lock(&g_futex_bucket_locks[b1]);
+        spinlock_lock(&g_futex_bucket_locks[b2]);
+    } else if (b1 > b2) {
+        spinlock_lock(&g_futex_bucket_locks[b2]);
+        spinlock_lock(&g_futex_bucket_locks[b1]);
+    } else {
+        spinlock_lock(&g_futex_bucket_locks[b1]);
+    }
+}
+
+static void futex_unlock_two_buckets(u32 b1, u32 b2) {
+    if (b1 < b2) {
+        spinlock_unlock(&g_futex_bucket_locks[b2]);
+        spinlock_unlock(&g_futex_bucket_locks[b1]);
+    } else if (b1 > b2) {
+        spinlock_unlock(&g_futex_bucket_locks[b1]);
+        spinlock_unlock(&g_futex_bucket_locks[b2]);
+    } else {
+        spinlock_unlock(&g_futex_bucket_locks[b1]);
+    }
+}
 
 static inline u32 futex_hash(uintptr_t uaddr) {
     return (u32)((uaddr >> 2) ^ (uaddr >> 8)) % FUTEX_HASH_SIZE;
@@ -8047,10 +8084,10 @@ static s64 futex_wait_queued(process_t *proc, thread_t *curr, uintptr_t uaddr,
     q.next = NULL;
 
     u32 b = futex_hash(uaddr);
-    spinlock_lock(&g_futex_lock);
+    spinlock_lock(&g_futex_bucket_locks[b]);
     q.next = g_futex_table[b];
     g_futex_table[b] = &q;
-    spinlock_unlock(&g_futex_lock);
+    spinlock_unlock(&g_futex_bucket_locks[b]);
 
     u64 start_ticks = sched_get_ticks();
     if (timeout_ticks > 0) {
@@ -8059,7 +8096,7 @@ static s64 futex_wait_queued(process_t *proc, thread_t *curr, uintptr_t uaddr,
         sched_block(THREAD_BLOCKED_PENDING);
     }
 
-    spinlock_lock(&g_futex_lock);
+    spinlock_lock(&g_futex_bucket_locks[b]);
     bool was_woken = true;
     futex_q_t **curr_q = &g_futex_table[b];
     while (*curr_q) {
@@ -8070,7 +8107,7 @@ static s64 futex_wait_queued(process_t *proc, thread_t *curr, uintptr_t uaddr,
         }
         curr_q = &(*curr_q)->next;
     }
-    spinlock_unlock(&g_futex_lock);
+    spinlock_unlock(&g_futex_bucket_locks[b]);
 
     /* BUG-AJ fix: return -ETIMEDOUT or -EINTR when not awakened by FUTEX_WAKE */
     if (!was_woken) {
@@ -8091,14 +8128,20 @@ static int futex_wake_addr(process_t *proc, uintptr_t uaddr, u32 nr, u32 bitset)
     u32 b = futex_hash(uaddr);
     int woken = 0;
 
-    spinlock_lock(&g_futex_lock);
-    for (futex_q_t *q = g_futex_table[b]; q && (u32)woken < nr; q = q->next) {
+    spinlock_lock(&g_futex_bucket_locks[b]);
+    futex_q_t **curr_q = &g_futex_table[b];
+    while (*curr_q && (u32)woken < nr) {
+        futex_q_t *q = *curr_q;
         if (q->proc == proc && q->uaddr == uaddr && (q->bitset & bitset)) {
+            *curr_q = q->next;
+            q->next = NULL;
             sched_unblock(q->thread);
             woken++;
+        } else {
+            curr_q = &(*curr_q)->next;
         }
     }
-    spinlock_unlock(&g_futex_lock);
+    spinlock_unlock(&g_futex_bucket_locks[b]);
     return woken;
 }
 
@@ -8239,13 +8282,14 @@ static s64 sys_futex_impl(pt_regs_t *r)
         int requeued = 0;
         u32 val2_max = timeout ? (u32)(uintptr_t)timeout : 0;
 
-        spinlock_lock(&g_futex_lock);
+        futex_lock_two_buckets(b1, b2);
         futex_q_t **curr_q = &g_futex_table[b1];
         while (*curr_q) {
             futex_q_t *entry = *curr_q;
             if (entry->proc == proc && entry->uaddr == uaddr) {
                 if ((u32)woken < val) {
                     *curr_q = entry->next;
+                    entry->next = NULL;
                     sched_unblock(entry->thread);
                     woken++;
                     continue;
@@ -8261,7 +8305,7 @@ static s64 sys_futex_impl(pt_regs_t *r)
             }
             curr_q = &(*curr_q)->next;
         }
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_two_buckets(b1, b2);
 
         return woken + requeued;
     }
@@ -11474,7 +11518,7 @@ static s64 sys_futex_waitv_impl(pt_regs_t *r)
     futex_q_t q[FUTEX_WAITV_MAX];
     u32 bucket[FUTEX_WAITV_MAX];
 
-    spinlock_lock(&g_futex_lock);
+    futex_lock_all_buckets();
     for (unsigned int i = 0; i < nr; i++) {
         q[i].thread = curr;
         q[i].proc   = proc;
@@ -11484,12 +11528,12 @@ static s64 sys_futex_waitv_impl(pt_regs_t *r)
         q[i].next   = g_futex_table[bucket[i]];
         g_futex_table[bucket[i]] = &q[i];
     }
-    spinlock_unlock(&g_futex_lock);
+    futex_unlock_all_buckets();
 
     /* dequeue_all() must run on every exit path below, including the early
      * "value already changed" one. */
     #define FUTEX_WAITV_DEQUEUE(found_out) do {                          \
-        spinlock_lock(&g_futex_lock);                                    \
+        futex_lock_all_buckets();                                        \
         for (unsigned int _i = 0; _i < nr; _i++) {                       \
             futex_q_t **pp = &g_futex_table[bucket[_i]];                 \
             bool _still = false;                                         \
@@ -11499,7 +11543,7 @@ static s64 sys_futex_waitv_impl(pt_regs_t *r)
             }                                                            \
             if (!_still) (found_out) = true;                             \
         }                                                                \
-        spinlock_unlock(&g_futex_lock);                                  \
+        futex_unlock_all_buckets();                                      \
     } while (0)
 
     for (unsigned int i = 0; i < nr; i++) {

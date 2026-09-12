@@ -23,6 +23,191 @@
 #include "de_log.h"
 #if defined(__x86_64__)
 #include <emmintrin.h>
+#include <immintrin.h>
+
+static inline int uk_cpu_has_avx2(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+
+    unsigned int eax, ebx, ecx, edx;
+    __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                                 : "a"(1), "c"(0));
+    if (!(ecx & (1u << 27)) || !(ecx & (1u << 28))) { cached = 0; return 0; }
+
+    unsigned int xcr0_lo, xcr0_hi;
+    __asm__ __volatile__("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+    if ((xcr0_lo & 0x6u) != 0x6u) { cached = 0; return 0; }
+
+    __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                                 : "a"(7), "c"(0));
+    cached = (ebx & (1u << 5)) ? 1 : 0;
+    return cached;
+}
+
+__attribute__((target("avx2")))
+static inline void uk_fill_span_avx2(unsigned int *dst, unsigned int col, int count)
+{
+    __m256i c256 = _mm256_set1_epi32((int)col);
+    int i = 0;
+    for (; i + 8 <= count; i += 8) {
+        _mm256_storeu_si256((__m256i *)(dst + i), c256);
+    }
+    if (i + 4 <= count) {
+        _mm_storeu_si128((__m128i *)(dst + i), _mm256_castsi256_si128(c256));
+        i += 4;
+    }
+    while (i < count) {
+        dst[i] = col;
+        i++;
+    }
+}
+
+static inline void uk_fill_span(unsigned int *dst, unsigned int col, int count)
+{
+    if (count <= 0) return;
+    if (uk_cpu_has_avx2()) {
+        uk_fill_span_avx2(dst, col, count);
+        return;
+    }
+    int i = 0;
+    __m128i col128 = _mm_set1_epi32((int)col);
+    for (; i + 4 <= count; i += 4) {
+        _mm_storeu_si128((__m128i *)(dst + i), col128);
+    }
+    while (i < count) {
+        dst[i] = col;
+        i++;
+    }
+}
+
+__attribute__((target("avx2")))
+static inline void uk_commit_frame_avx2(unsigned int *dst, const unsigned int *src, size_t count)
+{
+    size_t i = 0;
+    while (i < count && ((uintptr_t)(dst + i) & 31)) {
+        dst[i] = src[i];
+        i++;
+    }
+    for (; i + 8 <= count; i += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+        _mm256_stream_si256((__m256i *)(dst + i), v);
+    }
+    _mm_sfence();
+    for (; i < count; i++) {
+        dst[i] = src[i];
+    }
+}
+
+static inline void uk_commit_frame(unsigned int *dst, const unsigned int *src, size_t count)
+{
+    if (uk_cpu_has_avx2()) {
+        uk_commit_frame_avx2(dst, src, count);
+        return;
+    }
+    size_t i = 0;
+    while (i < count && ((uintptr_t)(dst + i) & 15)) {
+        dst[i] = src[i];
+        i++;
+    }
+    for (; i + 4 <= count; i += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(src + i));
+        _mm_stream_si128((__m128i *)(dst + i), v);
+    }
+    _mm_sfence();
+    for (; i < count; i++) {
+        dst[i] = src[i];
+    }
+}
+
+__attribute__((target("avx2")))
+static inline void uk_apply_alpha_avx2(unsigned int *pixels, size_t total, unsigned int alpha)
+{
+    __m256i a_vec = _mm256_set1_epi16((short)alpha);
+    __m256i color_mask = _mm256_set1_epi32((int)0x00FFFFFF);
+    size_t i = 0;
+    for (; i + 8 <= total; i += 8) {
+        __m256i c = _mm256_loadu_si256((const __m256i *)(pixels + i));
+        __m256i ca = _mm256_srli_epi32(c, 24);
+        __m256i mult = _mm256_mullo_epi16(ca, a_vec);
+        __m256i na = _mm256_srli_epi16(_mm256_add_epi16(mult, _mm256_set1_epi16(128)), 8);
+        __m256i na_shifted = _mm256_slli_epi32(na, 24);
+        __m256i res = _mm256_or_si256(_mm256_and_si256(c, color_mask), na_shifted);
+        _mm256_storeu_si256((__m256i *)(pixels + i), res);
+    }
+    for (; i < total; i++) {
+        unsigned int c = pixels[i];
+        unsigned int ca = (c >> 24) & 0xFF;
+        if (ca > 0) {
+            unsigned int na = (ca * alpha + 128) >> 8;
+            pixels[i] = (na << 24) | (c & 0x00FFFFFF);
+        }
+    }
+}
+
+static inline void uk_apply_alpha(unsigned int *pixels, size_t total, unsigned int alpha)
+{
+    if (uk_cpu_has_avx2()) {
+        uk_apply_alpha_avx2(pixels, total, alpha);
+        return;
+    }
+    __m128i a_vec = _mm_set1_epi16((short)alpha);
+    __m128i color_mask = _mm_set1_epi32((int)0x00FFFFFF);
+    size_t i = 0;
+    for (; i + 4 <= total; i += 4) {
+        __m128i c = _mm_loadu_si128((const __m128i *)(pixels + i));
+        __m128i ca = _mm_srli_epi32(c, 24);
+        __m128i mult = _mm_mullo_epi16(ca, a_vec);
+        __m128i na = _mm_srli_epi16(_mm_add_epi16(mult, _mm_set1_epi16(128)), 8);
+        __m128i na_shifted = _mm_slli_epi32(na, 24);
+        __m128i res = _mm_or_si128(_mm_and_si128(c, color_mask), na_shifted);
+        _mm_storeu_si128((__m128i *)(pixels + i), res);
+    }
+    for (; i < total; i++) {
+        unsigned int c = pixels[i];
+        unsigned int ca = (c >> 24) & 0xFF;
+        if (ca > 0) {
+            unsigned int na = (ca * alpha + 128) >> 8;
+            pixels[i] = (na << 24) | (c & 0x00FFFFFF);
+        }
+    }
+}
+#else
+static inline void uk_fill_span(unsigned int *dst, unsigned int col, int count)
+{
+    if (count <= 0) return;
+    int i = 0;
+    unsigned long long col64 = ((unsigned long long)col << 32) | (unsigned long long)col;
+    if (((unsigned long)dst & 7) && count > 0) {
+        dst[i++] = col;
+    }
+    unsigned long long *dst64 = (unsigned long long *)&dst[i];
+    int count64 = (count - i) / 2;
+    for (int j = 0; j < count64; j++) {
+        dst64[j] = col64;
+    }
+    i += count64 * 2;
+    while (i < count) {
+        dst[i++] = col;
+    }
+}
+
+static inline void uk_commit_frame(unsigned int *dst, const unsigned int *src, size_t count)
+{
+    memcpy(dst, src, count * sizeof(unsigned int));
+}
+
+static inline void uk_apply_alpha(unsigned int *pixels, size_t total, unsigned int alpha)
+{
+    for (size_t i = 0; i < total; i++) {
+        unsigned int c = pixels[i];
+        unsigned int ca = (c >> 24) & 0xFF;
+        if (ca > 0) {
+            unsigned int na = (ca * alpha + 128) >> 8;
+            pixels[i] = (na << 24) | (c & 0x00FFFFFF);
+        }
+    }
+}
 #endif
 
 /* ============================================================================
@@ -190,48 +375,10 @@ static inline void uk_fill_rect(uk_window_t *w,
     if (x0 >= x1 || y0 >= y1) return;
 
     int fill_w = x1 - x0;
-#if defined(__x86_64__)
-    __m128i col128 = _mm_set1_epi32((int)col);
     for (int y = y0; y < y1; y++) {
         unsigned int *dst = &w->pixels[(unsigned int)y * w->width + (unsigned int)x0];
-        int count = fill_w;
-        while (count >= 4) {
-            _mm_storeu_si128((__m128i *)dst, col128);
-            dst += 4;
-            count -= 4;
-        }
-        while (count > 0) {
-            *dst++ = col;
-            count--;
-        }
+        uk_fill_span(dst, col, fill_w);
     }
-#else
-    unsigned long long col64 = ((unsigned long long)col << 32) | (unsigned long long)col;
-
-    for (int y = y0; y < y1; y++) {
-        unsigned int *dst = &w->pixels[(unsigned int)y * w->width + (unsigned int)x0];
-        int count = fill_w;
-        if (((unsigned long)dst & 7) && count > 0) {
-            *dst++ = col;
-            count--;
-        }
-        unsigned long long *dst64 = (unsigned long long *)dst;
-        while (count >= 4) {
-            dst64[0] = col64;
-            dst64[1] = col64;
-            dst64 += 2;
-            count -= 4;
-        }
-        if (count >= 2) {
-            *dst64++ = col64;
-            count -= 2;
-        }
-        dst = (unsigned int *)dst64;
-        if (count > 0) {
-            *dst = col;
-        }
-    }
-#endif
 }
 
 /* Vertical gradient fill (top→bottom) */
@@ -253,40 +400,7 @@ static inline void uk_gradient_v(uk_window_t *w,
         unsigned int t = (rh > 1) ? (unsigned int)((y - ry) * 255 / (rh - 1)) : 0;
         unsigned int col = uk_blend(top_col, bot_col, t);
         unsigned int *dst = &w->pixels[(unsigned int)y * w->width + (unsigned int)x0];
-        int count = fill_w;
-#if defined(__x86_64__)
-        __m128i col128 = _mm_set1_epi32((int)col);
-        while (count >= 4) {
-            _mm_storeu_si128((__m128i *)dst, col128);
-            dst += 4;
-            count -= 4;
-        }
-        while (count > 0) {
-            *dst++ = col;
-            count--;
-        }
-#else
-        unsigned long long col64 = ((unsigned long long)col << 32) | (unsigned long long)col;
-        if (((unsigned long)dst & 7) && count > 0) {
-            *dst++ = col;
-            count--;
-        }
-        unsigned long long *dst64 = (unsigned long long *)dst;
-        while (count >= 4) {
-            dst64[0] = col64;
-            dst64[1] = col64;
-            dst64 += 2;
-            count -= 4;
-        }
-        if (count >= 2) {
-            *dst64++ = col64;
-            count -= 2;
-        }
-        dst = (unsigned int *)dst64;
-        if (count > 0) {
-            *dst = col;
-        }
-#endif
+        uk_fill_span(dst, col, fill_w);
     }
 }
 
@@ -304,11 +418,21 @@ static inline void uk_gradient_h(uk_window_t *w,
     if ((unsigned int)y1 > w->height) y1 = (int)w->height;
     if (x0 >= x1 || y0 >= y1) return;
 
-    for (int x = x0; x < x1; x++) {
-        unsigned int t = (rw > 1) ? (unsigned int)((x - rx) * 255 / (rw - 1)) : 0;
-        unsigned int col = uk_blend(left_col, right_col, t);
+    int fill_w = x1 - x0;
+    #define UK_GRAD_STACK_MAX 1024
+    unsigned int stack_row[UK_GRAD_STACK_MAX];
+    int chunk = (fill_w < UK_GRAD_STACK_MAX) ? fill_w : UK_GRAD_STACK_MAX;
+    for (int off = 0; off < fill_w; off += chunk) {
+        int seg = fill_w - off;
+        if (seg > chunk) seg = chunk;
+        for (int i = 0; i < seg; i++) {
+            int x = x0 + off + i;
+            unsigned int t = (rw > 1) ? (unsigned int)((x - rx) * 255 / (rw - 1)) : 0;
+            stack_row[i] = uk_blend(left_col, right_col, t);
+        }
         for (int y = y0; y < y1; y++) {
-            w->pixels[(unsigned int)y * w->width + (unsigned int)x] = col;
+            unsigned int *dst = &w->pixels[(unsigned int)y * w->width + (unsigned int)x0 + off];
+            memcpy(dst, stack_row, (size_t)seg * sizeof(unsigned int));
         }
     }
 }
@@ -336,38 +460,7 @@ static inline void uk_fill_circle(uk_window_t *w, int cx, int cy, int r, unsigne
         if (x0 >= x1) continue;
 
         unsigned int *dst = &w->pixels[(unsigned int)py * w->width + (unsigned int)x0];
-        int count = x1 - x0;
-#if defined(__x86_64__)
-        __m128i col128 = _mm_set1_epi32((int)col);
-        while (count >= 4) {
-            _mm_storeu_si128((__m128i *)dst, col128);
-            dst += 4;
-            count -= 4;
-        }
-        while (count > 0) {
-            *dst++ = col;
-            count--;
-        }
-#else
-        unsigned long long col64 = ((unsigned long long)col << 32) | (unsigned long long)col;
-        if (((unsigned long)dst & 7) && count > 0) {
-            *dst++ = col;
-            count--;
-        }
-        unsigned long long *dst64 = (unsigned long long *)dst;
-        while (count >= 4) {
-            dst64[0] = col64;
-            dst64[1] = col64;
-            dst64 += 2;
-            count -= 4;
-        }
-        if (count >= 2) {
-            *dst64++ = col64;
-            count -= 2;
-        }
-        dst = (unsigned int *)dst64;
-        if (count > 0) *dst = col;
-#endif
+        uk_fill_span(dst, col, x1 - x0);
     }
 }
 
@@ -706,8 +799,8 @@ static inline void uk_icon_about(uk_window_t *w, int ix, int iy)
 static inline void uk_invalidate(uk_window_t *win)
 {
     if (win->shared && win->pixels && win->shared != win->pixels) {
-        memcpy(win->shared, win->pixels,
-               (size_t)win->width * win->height * sizeof(unsigned int));
+        uk_commit_frame(win->shared, win->pixels,
+                        (size_t)win->width * win->height);
     }
 
     az_wm_msg_t inv;
@@ -898,9 +991,7 @@ static inline void uk_clear(uk_window_t *w, unsigned int col)
 {
     if (!w || !w->pixels) return;
     unsigned int total = w->width * w->height;
-    for (unsigned int i = 0; i < total; i++) {
-        w->pixels[i] = col;
-    }
+    uk_fill_span(w->pixels, col, (int)total);
 }
 
 /* ============================================================================
@@ -1350,14 +1441,7 @@ static inline void uk_draw_toast(uk_window_t *w,
     uk_draw_rounded_rect_outline(w, tx, ty, toast_w, toast_h, 10, UK_SURFACE1);
     if (alpha < 255) {
         unsigned int total = w->width * w->height;
-        for (unsigned int i = 0; i < total; i++) {
-            unsigned int c = w->pixels[i];
-            unsigned int ca = (c >> 24) & 0xFF;
-            if (ca > 0) {
-                unsigned int na = (ca * alpha) / 255;
-                w->pixels[i] = (na << 24) | (c & 0x00FFFFFF);
-            }
-        }
+        uk_apply_alpha(w->pixels, (size_t)total, alpha);
     }
 }
 

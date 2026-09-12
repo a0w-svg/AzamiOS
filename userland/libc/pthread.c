@@ -9,25 +9,17 @@
 #include "include/unistd.h"
 #include "include/errno.h"
 
+#define FUTEX_WAIT_PRIVATE 128
+#define FUTEX_WAKE_PRIVATE 129
+
 #define DEFAULT_THREAD_STACK_SIZE (64 * 1024) /* 64 KB */
 #define PTHREAD_KEYS_MAX 64
 
 /* ── Join bookkeeping ────────────────────────────────────────────────────
  *
- * pthread_join() used to be `wait4(tid, ...)` — but wait4(2) waits on child
- * *processes*, and a pthread_create()'d thread is not one (SYS_AZ_THREAD_CREATE
- * spawns a thread inside the *same* process, sharing its pid). That call
- * returned -ECHILD immediately without blocking at all, so pthread_join()
- * never actually joined anything — confirmed by a regression test
- * (userland/examples/thread_tls_test.c) racing main() reading a worker
- * thread's results against pthread_join() returning instantly.
- *
- * Fixed with a small fixed-size table of join slots: pthread_create()
- * reserves one before the new thread starts running and hands the new
- * thread a pointer to it directly (no need to search by tid later), the
- * new thread's own trampoline marks it done with its return value once
- * start_routine returns, and pthread_join() spins/yields (same pattern as
- * every other lock in this file) until it sees `done`. */
+ * pthread_join() uses futex(FUTEX_WAIT_PRIVATE) to wait for thread completion
+ * with zero CPU spin/yield overhead. When the thread finishes, the trampoline
+ * stores done = 1 and calls futex(FUTEX_WAKE_PRIVATE). */
 #define PTHREAD_JOIN_MAX 256
 
 typedef struct {
@@ -42,16 +34,30 @@ static int g_join_lock = 0;
 
 static void join_lock(void)
 {
-    int spin = 0;
-    while (__sync_lock_test_and_set(&g_join_lock, 1)) {
-        if (++spin < 100) { __asm__ volatile("pause"); }
-        else { syscall0(SYS_AZ_YIELD); spin = 0; }
+    int exp = 0;
+    if (__atomic_compare_exchange_n(&g_join_lock, &exp, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return;
+    for (int i = 0; i < 100; i++) {
+        __asm__ volatile("pause");
+        exp = 0;
+        if (__atomic_compare_exchange_n(&g_join_lock, &exp, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return;
+    }
+    while (1) {
+        if (exp == 2 || __atomic_exchange_n(&g_join_lock, 2, __ATOMIC_ACQ_REL) != 0) {
+            syscall4(SYS_futex, (long)&g_join_lock, FUTEX_WAIT_PRIVATE, 2, 0);
+        }
+        exp = 0;
+        if (__atomic_compare_exchange_n(&g_join_lock, &exp, 2, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return;
     }
 }
 
 static void join_unlock(void)
 {
-    __sync_lock_release(&g_join_lock);
+    if (__atomic_exchange_n(&g_join_lock, 0, __ATOMIC_RELEASE) == 2) {
+        syscall4(SYS_futex, (long)&g_join_lock, FUTEX_WAKE_PRIVATE, 1, 0);
+    }
 }
 
 /* Reserved for the child before it starts running, so the child never has
@@ -115,8 +121,8 @@ static void thread_startup_trampoline(void *raw_ctx)
 
     if (slot) {
         slot->retval = ret;
-        __sync_synchronize();
-        slot->done = 1;
+        __atomic_store_n(&slot->done, 1, __ATOMIC_RELEASE);
+        syscall4(SYS_futex, (long)&slot->done, FUTEX_WAKE_PRIVATE, 1, 0);
     }
     pthread_exit(ret);
 }
@@ -165,12 +171,9 @@ int pthread_join(pthread_t thread, void **retval)
         return ESRCH;
     }
 
-    int spin = 0;
-    while (!slot->done) {
-        if (++spin < 100) { __asm__ volatile("pause"); }
-        else { syscall0(SYS_AZ_YIELD); spin = 0; }
+    while (!__atomic_load_n(&slot->done, __ATOMIC_ACQUIRE)) {
+        syscall4(SYS_futex, (long)&slot->done, FUTEX_WAIT_PRIVATE, 0, 0);
     }
-    __sync_synchronize();
     if (retval) *retval = slot->retval;
 
     join_lock();
@@ -324,18 +327,37 @@ int pthread_mutex_lock(pthread_mutex_t *mutex)
         return 0;
     }
 
-    int spin = 0;
-    while (__sync_lock_test_and_set(&mutex->lock, 1)) {
-        if (++spin < 100) {
-            __asm__ volatile("pause");
-        } else {
-            syscall0(SYS_AZ_YIELD);
-            spin = 0;
+    /* Fast path: 0 -> 1 */
+    int exp = 0;
+    if (__atomic_compare_exchange_n(&mutex->lock, &exp, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        mutex->owner = me;
+        mutex->count = 1;
+        return 0;
+    }
+
+    /* Adaptive spin */
+    for (int i = 0; i < 100; i++) {
+        __asm__ volatile("pause");
+        exp = 0;
+        if (__atomic_compare_exchange_n(&mutex->lock, &exp, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            mutex->owner = me;
+            mutex->count = 1;
+            return 0;
         }
     }
-    mutex->owner = me;
-    mutex->count = 1;
-    return 0;
+
+    /* Contended slow path: mark 2 (has waiters) and sleep in futex */
+    while (1) {
+        if (exp == 2 || __atomic_exchange_n(&mutex->lock, 2, __ATOMIC_ACQ_REL) != 0) {
+            syscall4(SYS_futex, (long)&mutex->lock, FUTEX_WAIT_PRIVATE, 2, 0);
+        }
+        exp = 0;
+        if (__atomic_compare_exchange_n(&mutex->lock, &exp, 2, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            mutex->owner = me;
+            mutex->count = 1;
+            return 0;
+        }
+    }
 }
 
 int pthread_mutex_trylock(pthread_mutex_t *mutex)
@@ -347,7 +369,8 @@ int pthread_mutex_trylock(pthread_mutex_t *mutex)
         return 0;
     }
 
-    if (__sync_lock_test_and_set(&mutex->lock, 1) == 0) {
+    int exp = 0;
+    if (__atomic_compare_exchange_n(&mutex->lock, &exp, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
         mutex->owner = me;
         mutex->count = 1;
         return 0;
@@ -363,7 +386,10 @@ int pthread_mutex_unlock(pthread_mutex_t *mutex)
     mutex->count--;
     if (mutex->count == 0) {
         mutex->owner = 0;
-        __sync_lock_release(&mutex->lock);
+        /* If previous value was 2, there were waiters to wake */
+        if (__atomic_exchange_n(&mutex->lock, 0, __ATOMIC_RELEASE) == 2) {
+            syscall4(SYS_futex, (long)&mutex->lock, FUTEX_WAKE_PRIVATE, 1, 0);
+        }
     }
     return 0;
 }
@@ -387,11 +413,11 @@ int pthread_cond_destroy(pthread_cond_t *cond)
 int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
 {
     if (!cond || !mutex) return -1;
-    int seq = cond->seq;
+    int seq = __atomic_load_n(&cond->seq, __ATOMIC_ACQUIRE);
     pthread_mutex_unlock(mutex);
 
-    while (cond->seq == seq) {
-        syscall0(SYS_AZ_YIELD);
+    while (__atomic_load_n(&cond->seq, __ATOMIC_ACQUIRE) == seq) {
+        syscall4(SYS_futex, (long)&cond->seq, FUTEX_WAIT_PRIVATE, seq, 0);
     }
 
     pthread_mutex_lock(mutex);
@@ -401,14 +427,16 @@ int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
 int pthread_cond_signal(pthread_cond_t *cond)
 {
     if (!cond) return -1;
-    __sync_fetch_and_add(&cond->seq, 1);
+    __atomic_add_fetch(&cond->seq, 1, __ATOMIC_RELEASE);
+    syscall4(SYS_futex, (long)&cond->seq, FUTEX_WAKE_PRIVATE, 1, 0);
     return 0;
 }
 
 int pthread_cond_broadcast(pthread_cond_t *cond)
 {
     if (!cond) return -1;
-    __sync_fetch_and_add(&cond->seq, 1);
+    __atomic_add_fetch(&cond->seq, 1, __ATOMIC_RELEASE);
+    syscall4(SYS_futex, (long)&cond->seq, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, 0);
     return 0;
 }
 
@@ -435,9 +463,14 @@ int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock)
     for (;;) {
         int v = rwlock->lock;
         if (v >= 0) {
-            if (__sync_bool_compare_and_swap(&rwlock->lock, v, v + 1)) return 0;
+            if (__atomic_compare_exchange_n(&rwlock->lock, &v, v + 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
         }
-        syscall0(SYS_AZ_YIELD);
+        for (int i = 0; i < 64; i++) {
+            __asm__ volatile("pause");
+            v = rwlock->lock;
+            if (v >= 0 && __atomic_compare_exchange_n(&rwlock->lock, &v, v + 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
+        }
+        syscall4(SYS_futex, (long)&rwlock->lock, FUTEX_WAIT_PRIVATE, v, 0);
     }
 }
 
@@ -446,7 +479,7 @@ int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock)
     if (!rwlock) return EINVAL;
     int v = rwlock->lock;
     if (v >= 0) {
-        if (__sync_bool_compare_and_swap(&rwlock->lock, v, v + 1)) return 0;
+        if (__atomic_compare_exchange_n(&rwlock->lock, &v, v + 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
     }
     return EBUSY;
 }
@@ -455,15 +488,22 @@ int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock)
 {
     if (!rwlock) return EINVAL;
     for (;;) {
-        if (__sync_bool_compare_and_swap(&rwlock->lock, 0, -1)) return 0;
-        syscall0(SYS_AZ_YIELD);
+        int v = 0;
+        if (__atomic_compare_exchange_n(&rwlock->lock, &v, -1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
+        for (int i = 0; i < 64; i++) {
+            __asm__ volatile("pause");
+            v = 0;
+            if (__atomic_compare_exchange_n(&rwlock->lock, &v, -1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
+        }
+        syscall4(SYS_futex, (long)&rwlock->lock, FUTEX_WAIT_PRIVATE, rwlock->lock, 0);
     }
 }
 
 int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock)
 {
     if (!rwlock) return EINVAL;
-    if (__sync_bool_compare_and_swap(&rwlock->lock, 0, -1)) return 0;
+    int v = 0;
+    if (__atomic_compare_exchange_n(&rwlock->lock, &v, -1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
     return EBUSY;
 }
 
@@ -473,9 +513,17 @@ int pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
     for (;;) {
         int v = rwlock->lock;
         if (v == -1) {
-            if (__sync_bool_compare_and_swap(&rwlock->lock, -1, 0)) return 0;
+            if (__atomic_compare_exchange_n(&rwlock->lock, &v, 0, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+                syscall4(SYS_futex, (long)&rwlock->lock, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, 0);
+                return 0;
+            }
         } else if (v > 0) {
-            if (__sync_bool_compare_and_swap(&rwlock->lock, v, v - 1)) return 0;
+            if (__atomic_compare_exchange_n(&rwlock->lock, &v, v - 1, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+                if (v == 1) {
+                    syscall4(SYS_futex, (long)&rwlock->lock, FUTEX_WAKE_PRIVATE, 1, 0);
+                }
+                return 0;
+            }
         } else {
             return EINVAL;
         }
@@ -545,17 +593,18 @@ int pthread_barrier_destroy(pthread_barrier_t *barrier)
 int pthread_barrier_wait(pthread_barrier_t *barrier)
 {
     if (!barrier) return EINVAL;
-    unsigned int cycle = barrier->cycle;
-    unsigned int in = __sync_add_and_fetch(&barrier->in, 1);
+    unsigned int cycle = __atomic_load_n(&barrier->cycle, __ATOMIC_ACQUIRE);
+    unsigned int in = __atomic_add_fetch(&barrier->in, 1, __ATOMIC_SEQ_CST);
 
     if (in == barrier->count) {
         barrier->in = 0;
-        __sync_fetch_and_add(&barrier->cycle, 1);
+        __atomic_add_fetch(&barrier->cycle, 1, __ATOMIC_RELEASE);
+        syscall4(SYS_futex, (long)&barrier->cycle, FUTEX_WAKE_PRIVATE, barrier->count, 0);
         return PTHREAD_BARRIER_SERIAL_THREAD;
     }
 
-    while (barrier->cycle == cycle) {
-        syscall0(SYS_AZ_YIELD);
+    while (__atomic_load_n(&barrier->cycle, __ATOMIC_ACQUIRE) == cycle) {
+        syscall4(SYS_futex, (long)&barrier->cycle, FUTEX_WAIT_PRIVATE, cycle, 0);
     }
     return 0;
 }

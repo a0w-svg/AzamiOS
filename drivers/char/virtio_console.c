@@ -128,12 +128,15 @@ static s64 vcon_read(file_t *filp, void *buf, size_t len, u64 *offset)
     (void)filp; (void)offset;
     if (!g_vcon.ready || !buf) return -(s64)EINVAL;
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_vcon.lock);
+    /* Plain lock: this device is deliberately polled with its INTx line
+     * masked (see vcon_probe), so nothing ever touches g_vcon.lock from
+     * interrupt context and there is no need to disable interrupts here. */
+    spinlock_lock(&g_vcon.lock);
     vcon_drain_rx();
 
     u32 avail = vcon_ring_used();
     if (avail == 0) {
-        spinlock_unlock_irqrestore(&g_vcon.lock, flags);
+        spinlock_unlock(&g_vcon.lock);
         return 0;
     }
     if (avail > len) avail = (u32)len;
@@ -144,7 +147,7 @@ static s64 vcon_read(file_t *filp, void *buf, size_t len, u64 *offset)
         staging[i] = g_vcon.ring[(g_vcon.tail + i) & (VCON_RING_SIZE - 1)];
     }
     g_vcon.tail = (g_vcon.tail + avail) & (VCON_RING_SIZE - 1);
-    spinlock_unlock_irqrestore(&g_vcon.lock, flags);
+    spinlock_unlock(&g_vcon.lock);
 
     /* Kernel buffer: see the note on the VFS read/write contract in fs/vfs.h.
      * copy_to_user() rejected this destination, so vcon reads always failed. */
@@ -158,28 +161,30 @@ static s64 vcon_write(file_t *filp, const void *buf, size_t len, u64 *offset)
     if (!g_vcon.ready || !buf || len == 0) return -(s64)EINVAL;
     if (len > VCON_TX_SIZE) len = VCON_TX_SIZE;
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_vcon.lock);
+    spinlock_lock(&g_vcon.lock);
 
     /* Kernel buffer — see fs/vfs.h. */
     memcpy(g_vcon.tx_buf, buf, len);
 
     phys_addr_t phys = vmm_translate(vmm_kernel_space(), (virt_addr_t)g_vcon.tx_buf);
     if (virtqueue_add_buf(g_vcon.tx_vq, phys, (u32)len, false, (void *)1) != 0) {
-        spinlock_unlock_irqrestore(&g_vcon.lock, flags);
+        spinlock_unlock(&g_vcon.lock);
         return -(s64)EAGAIN;
     }
     virtqueue_kick(g_vcon.tx_vq);
     virtio_pci_notify(&g_vcon.vpci, VIRTIO_CONSOLE_TRANSMITQ, g_vcon.tx_vq);
 
     /* Reclaim the descriptor before releasing the bounce buffer.  Bounded, so
-     * a stalled host cannot wedge a writer forever. */
+     * a stalled host cannot wedge a writer forever. Interrupts stay enabled
+     * across the wait now — this no longer needs to be an _irqsave section
+     * (see vcon_read). */
     for (u32 spins = 0; spins < 1000000; spins++) {
         u32 used_len = 0;
         if (virtqueue_get_used(g_vcon.tx_vq, &used_len) != NULL) break;
         cpu_pause();
     }
 
-    spinlock_unlock_irqrestore(&g_vcon.lock, flags);
+    spinlock_unlock(&g_vcon.lock);
     return (s64)len;
 }
 
@@ -188,11 +193,11 @@ static int vcon_poll(file_t *filp)
     (void)filp;
     if (!g_vcon.ready) return POLLNVAL;
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_vcon.lock);
+    spinlock_lock(&g_vcon.lock);
     vcon_drain_rx();
     int mask = POLLOUT | POLLWRNORM;
     if (vcon_ring_used() > 0) mask |= POLLIN | POLLRDNORM;
-    spinlock_unlock_irqrestore(&g_vcon.lock, flags);
+    spinlock_unlock(&g_vcon.lock);
     return mask;
 }
 

@@ -11,6 +11,7 @@
 #include "../../kernel/mm/pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/hwaccel.h"
+#include "../../arch/x86_64/cpu/spinlock.h"
 #include "../../kernel/lib/string.h"
 #include "../../fs/vfs.h"
 
@@ -18,6 +19,13 @@ extern void net_process_incoming(const u8 *pkt, size_t len);
 extern int devfs_register_device(const char *name, file_operations_t *fops, void *private_data);
 
 static virtio_net_dev_t g_vnet;
+
+/* Serializes tx_vq submitters: virtio_net_send_packet had no lock at all, so
+ * two threads sending concurrently could interleave their virtqueue_add_chain
+ * calls (free_head/avail->idx are not atomic) and corrupt the ring. rx_vq is
+ * only ever touched from virtio_net_poll, which the caller already serializes
+ * one device at a time, so it does not need this lock. */
+static spinlock_t g_vnet_tx_lock = SPINLOCK_INIT;
 
 #define RX_BUFFER_COUNT 32
 #define RX_BUFFER_SIZE  2048
@@ -55,19 +63,34 @@ s64 virtio_net_send_packet(const void *data, size_t len)
     u32 lens[2] = { sizeof(hdr), (u32)len };
     bool is_write[2] = { false, false };
 
+    spinlock_lock(&g_vnet_tx_lock);
+
     if (virtqueue_add_chain(g_vnet.tx_vq, addrs, lens, is_write, 2, (void *)1) < 0) {
+        spinlock_unlock(&g_vnet_tx_lock);
         return -EIO;
     }
 
     virtqueue_kick(g_vnet.tx_vq);
     virtio_pci_notify(&g_vnet.vpci, 1, g_vnet.tx_vq);
 
+    /* Bounded, like every other virtio driver's completion wait here: a
+     * wedged host must fail the send, not hang the caller (and every other
+     * sender queued behind g_vnet_tx_lock) forever. */
     void *cookie = NULL;
-    for (u32 spins = 0; !cookie; spins++) {
+    u64 spins = 0;
+    const u64 SPIN_LIMIT = 200000000ULL;
+    while (!cookie) {
         cookie = virtqueue_get_used(g_vnet.tx_vq, NULL);
-        if (!cookie) hw_spin_wait(spins);
+        if (cookie) break;
+        if (++spins >= SPIN_LIMIT) {
+            spinlock_unlock(&g_vnet_tx_lock);
+            pr_debug("[VIRTIO-NET] tx request timed out\n");
+            return -EIO;
+        }
+        hw_spin_wait((u32)spins);
     }
 
+    spinlock_unlock(&g_vnet_tx_lock);
     return (s64)len;
 }
 

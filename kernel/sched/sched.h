@@ -65,6 +65,7 @@ typedef struct thread {
                                           * NULL" from "never set, inherit proc->fs_base".
                                           * Fixes TODO(T-01). */
     u64             clear_child_tid; /* CLONE_CHILD_CLEARTID / set_tid_address(2) futex */
+    u64             affinity_mask;   /* CPU affinity bitmask (bit k = CPU k allowed) */
     fpu_state_t     fpu_state;       /* XSAVE/FXSAVE area */
     struct thread  *next;            /* Ready queue / list pointer */
     struct thread  *proc_next;       /* Next thread in the same process */
@@ -354,6 +355,7 @@ typedef struct process {
      * where the kernel cannot yet act on them (house style, as with ioprio /
      * mempolicy above). */
     krlimit_t       rlimits[RLIMIT_NLIMITS];
+    u64             affinity_mask;     /* CPU affinity bitmask inherited by new threads */
 } process_t;
 
 /* wait4(2) option bits this kernel honours. */
@@ -424,6 +426,12 @@ void sched_apply_weight(process_t *proc);
  *  setpriority(2) selector (0=PRIO_PROCESS pid, 1=PRIO_PGRP pgid, 2=PRIO_USER
  *  uid). Returns the count written. */
 int sched_collect_pids(u32 *out, int max, int which, u32 who);
+
+/** sched_set_thread_affinity(t, mask) — Update allowed CPU mask for thread. Returns 0 or negative errno. */
+int sched_set_thread_affinity(thread_t *t, u64 mask);
+
+/** sched_set_proc_affinity(p, mask) — Update allowed CPU mask for process and its threads. Returns 0 or negative errno. */
+int sched_set_proc_affinity(process_t *p, u64 mask);
 
 /** thread_clear_child_tid() — Honour CLONE_CHILD_CLEARTID for a dying thread:
  *  zero the registered user word and wake one futex waiter on it. Must run in
