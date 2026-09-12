@@ -10,6 +10,7 @@
 #include "rtl8139.h"
 #include "../../hal/pci.h"
 #include "../../hal/device.h"
+#include "../base/pci_bus.h"
 #include "../../kernel/mm/pmm.h"
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/mm/vmm.h"
@@ -267,30 +268,16 @@ static file_operations_t g_rtl_fops = {
     .ioctl = rtl_devfs_ioctl,
 };
 
-int rtl8139_init(void)
+static int rtl8139_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
-    device_t *pci_bus = device_find("PCI0");
-    if (!pci_bus) return -1;
+    (void)id;
+    /* Single global instance: refuse a second card rather than remapping
+     * its rings out from under the first. */
+    if (g_rtl_ready) return -EBUSY;
 
-    device_t *pci_dev = NULL;
-    pci_device_info_t *info = NULL;
-
-    device_t *curr = pci_bus->children;
-    while (curr) {
-        if (curr->driver_data) {
-            pci_device_info_t *p = (pci_device_info_t *)curr->driver_data;
-            if (p->vendor_id == 0x10EC && p->device_id == 0x8139) {
-                pci_dev = curr;
-                info = p;
-                break;
-            }
-        }
-        curr = curr->sibling;
-    }
-
-    if (!pci_dev || !info) {
-        return -1;
-    }
+    device_t *pci_dev = dm->hal;
+    pci_device_info_t *info = to_pci_info(dm);
+    if (!info) return -ENODEV;
 
     pr_debug("[RTL8139] Found Realtek RTL8139 NIC at PCI %02x:%02x.%u\n",
              info->bus, info->slot, info->func);
@@ -365,9 +352,39 @@ int rtl8139_init(void)
 
     extern int devfs_register_device(const char *name, file_operations_t *fops, void *private_data);
     devfs_register_device("net0", &g_rtl_fops, NULL);
+    dm_set_drvdata(dm, &g_rtl_ready);
 
     pr_debug("[RTL8139] Initialized successfully.\n");
     return 0;
+}
+
+static void rtl8139_remove(dm_device_t *dm)
+{
+    (void)dm;
+    if (!g_rtl_ready) return;
+    outw(g_rtl_io_base + REG_IMR, 0);
+    if (g_rtl_irq) hal_irq_disable(g_rtl_irq);
+    g_rtl_ready = false;
+}
+
+static const pci_device_id_t rtl8139_pci_ids[] = {
+    { PCI_DEVICE(0x10EC, 0x8139) },
+    { 0 }
+};
+
+static pci_driver_t rtl8139_pci_driver = {
+    .drv      = { .name = "rtl8139" },
+    .id_table = rtl8139_pci_ids,
+    .probe    = rtl8139_probe,
+    .remove   = rtl8139_remove,
+};
+
+/** rtl8139_init() — Register the PCI driver; probe() binds to a matching
+ *  RTL8139 automatically, so this is safe to call whether or not the host
+ *  has one. */
+void rtl8139_init(void)
+{
+    pci_driver_register(&rtl8139_pci_driver);
 }
 
 void rtl8139_get_mac(u8 mac_out[6])

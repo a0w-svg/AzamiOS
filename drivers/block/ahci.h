@@ -147,6 +147,11 @@ typedef struct {
     u8  rsv1[4];    // Reserved
 } fis_reg_h2d_t;
 
-#define ATA_CMD_READ_DMA_EX     0x25
-#define ATA_CMD_WRITE_DMA_EX    0x35
-#define ATA_CMD_IDENTIFY        0xEC
+#define ATA_CMD_READ_DMA_EX         0x25
+#define ATA_CMD_WRITE_DMA_EX        0x35
+#define ATA_CMD_IDENTIFY            0xEC
+#define ATA_CMD_FLUSH_CACHE_EXT     0xEA
+#define ATA_CMD_PACKET              0xA0   /* ATAPI: CDB carried in the command table's acmd[] */
+#define ATA_CMD_DATA_SET_MANAGEMENT 0x06   /* TRIM: feature register bit0   */
+#define ATA_CMD_READ_FPDMA_QUEUED   0x60   /* NCQ */
+#define ATA_CMD_WRITE_FPDMA_QUEUED  0x61   /* NCQ */

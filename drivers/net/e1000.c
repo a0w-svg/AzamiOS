@@ -11,6 +11,7 @@
 #include "../../hal/pci.h"
 #include "../../hal/device.h"
 #include "../../hal/irq.h"
+#include "../base/pci_bus.h"
 #include "../../kernel/mm/pmm.h"
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/mm/vmm.h"
@@ -196,51 +197,16 @@ static file_operations_t g_net_fops = {
 
 /* ── PCI Device Probing & Initialization ─────────────────────────────────── */
 
-static bool is_e1000_device(u16 vendor, u16 device)
+static int e1000_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
-    if (vendor != 0x8086) return false;
-    switch (device) {
-        case 0x100E: /* 82540EM */
-        case 0x1004: /* 82543GC */
-        case 0x100F: /* 82545EM */
-        case 0x10D3: /* 82574L */
-        case 0x1079: /* 82546GB */
-        case 0x107C: /* 82541PI */
-        case 0x1019: /* 82547EI */
-        case 0x101E: /* 82540EP */
-        case 0x153A: /* I217-LM */
-        case 0x1533: /* I210 */
-            return true;
-        default:
-            return false;
-    }
-}
+    (void)id;
+    /* g_e1000_dev is a single global instance: refuse a second matching NIC
+     * rather than remapping its MMIO and rings out from under the first. */
+    if (g_e1000_ready) return -EBUSY;
 
-int e1000_init(void)
-{
-    device_t *pci_bus = device_find("PCI0");
-    if (!pci_bus) return -1;
-
-    device_t *pci_dev = NULL;
-    pci_device_info_t *info = NULL;
-
-    device_t *curr = pci_bus->children;
-    while (curr) {
-        if (curr->driver_data) {
-            pci_device_info_t *p = (pci_device_info_t *)curr->driver_data;
-            if (is_e1000_device(p->vendor_id, p->device_id)) {
-                pci_dev = curr;
-                info = p;
-                break;
-            }
-        }
-        curr = curr->sibling;
-    }
-
-    if (!pci_dev || !info) {
-        pr_debug("[E1000] No supported Intel Gigabit Ethernet controller found.\n");
-        return -1;
-    }
+    device_t *pci_dev = dm->hal;
+    pci_device_info_t *info = to_pci_info(dm);
+    if (!info) return -ENODEV;
 
     pr_debug("[E1000] Found Intel Ethernet Controller (PCI %02x:%02x.%u, %04x:%04x)\n",
              info->bus, info->slot, info->func, info->vendor_id, info->device_id);
@@ -319,9 +285,52 @@ int e1000_init(void)
 
     /* Register device file /dev/net0 */
     devfs_register_device("net0", &g_net_fops, &g_e1000_dev);
+    dm_set_drvdata(dm, &g_e1000_dev);
     pr_debug("[E1000] Registered /dev/net0 network interface successfully.\n");
 
     return 0;
+}
+
+static void e1000_remove(dm_device_t *dm)
+{
+    (void)dm;
+    if (!g_e1000_ready) return;
+    e1000_write32(E1000_IMC, 0xFFFFFFFF);
+    if (g_e1000_dev.irq) hal_irq_disable(g_e1000_dev.irq);
+    g_e1000_ready = false;
+}
+
+/* Every Intel Gigabit chip this driver understands (82540EM/82543GC/…/I210). */
+static const pci_device_id_t e1000_pci_ids[] = {
+    { PCI_DEVICE(0x8086, 0x100E) },   /* 82540EM */
+    { PCI_DEVICE(0x8086, 0x1004) },   /* 82543GC */
+    { PCI_DEVICE(0x8086, 0x100F) },   /* 82545EM */
+    { PCI_DEVICE(0x8086, 0x10D3) },   /* 82574L  */
+    { PCI_DEVICE(0x8086, 0x1079) },   /* 82546GB */
+    { PCI_DEVICE(0x8086, 0x107C) },   /* 82541PI */
+    { PCI_DEVICE(0x8086, 0x1019) },   /* 82547EI */
+    { PCI_DEVICE(0x8086, 0x101E) },   /* 82540EP */
+    { PCI_DEVICE(0x8086, 0x153A) },   /* I217-LM */
+    { PCI_DEVICE(0x8086, 0x1533) },   /* I210    */
+    { 0 }
+};
+
+static pci_driver_t e1000_pci_driver = {
+    .drv      = { .name = "e1000" },
+    .id_table = e1000_pci_ids,
+    .probe    = e1000_probe,
+    .remove   = e1000_remove,
+};
+
+/** e1000_init() — Register the PCI driver; probe() binds to a matching
+ *  Intel Gigabit NIC automatically, so this is safe to call whether or not
+ *  the host has one. Registering before rtl8139_init()/ne2k_pci_init() in
+ *  kernel/main.c keeps this NIC first in line for "primary interface" if
+ *  more than one happens to be present, same as the old
+ *  `if (e1000_init() != 0) rtl8139_init();` ordering intended. */
+void e1000_init(void)
+{
+    pci_driver_register(&e1000_pci_driver);
 }
 
 /*

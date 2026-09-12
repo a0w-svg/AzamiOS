@@ -642,3 +642,14 @@ process_t *sched_spawn_user(const char *path)
     const char *default_envp[] = { "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/", "TERM=azami", "USER=root", "HOME=/root", "SHELL=/bin/sh.elf", NULL };
     return sched_spawn_user_args(path, default_argv, default_envp);
 }
+
+process_t *sched_spawn_user_arg(const char *path, const char *arg)
+{
+    const char *default_envp[] = { "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/", "TERM=azami", "USER=root", "HOME=/root", "SHELL=/bin/sh.elf", NULL };
+    if (arg && arg[0]) {
+        const char *argv[] = { path, arg, NULL };
+        return sched_spawn_user_args(path, argv, default_envp);
+    }
+    const char *argv[] = { path, NULL };
+    return sched_spawn_user_args(path, argv, default_envp);
+}

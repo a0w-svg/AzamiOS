@@ -120,6 +120,15 @@ static unsigned int  g_wid  = 0;
 /* Start button hover state */
 static unsigned char g_sb_hot = 0;
 
+/* ── Animation state (driven by the 100ms AZ_WM_TIMER_TICK below) ────────── */
+#define SB_PRESS_TICKS   3   /* Start-button click flash: 3 * 100ms = 300ms  */
+#define SB_HOVER_STEP   64   /* hover blend moves this far toward its target
+                               * per tick (0..256 range) — ~4 ticks to settle */
+static unsigned int g_tick_count    = 0; /* increments every timer tick        */
+static int          g_colon_on      = 1; /* clock ":" blink phase              */
+static int          g_sb_hover_level = 0; /* 0..256 smoothed Start-button hover */
+static int          g_sb_press_anim = 0; /* ticks left in the click flash       */
+
 /* Window list */
 typedef struct {
     unsigned int  wid;
@@ -345,23 +354,41 @@ static void taskbar_draw(void)
     }
 
     /* ── Start button (pill-shaped with gradient) ────────────────────────── */
-    unsigned int sb_bg_l = g_sb_hot ? C_SB_HOT : C_SB_IDLE;
+    /* Hover fades smoothly (g_sb_hover_level, animated in the tick handler)
+     * rather than snapping between idle/hot, and border alpha rides the
+     * same value so it fades in/out with it. */
+    unsigned int sb_hover_a = (unsigned int)(g_sb_hover_level * 255 / 256);
+    unsigned int sb_bg_l = tb_blend(C_SB_IDLE, C_SB_HOT, sb_hover_a);
     unsigned int sb_bg_r = tb_blend(sb_bg_l, 0xFF000000, 40);
     tb_fill_rounded(SB_X, SB_Y, SB_W, SB_H, 10, sb_bg_l);
     /* Gradient overlay for depth */
     tb_fill_grad_h(SB_X + 10, SB_Y, SB_W - 20, SB_H, sb_bg_l, sb_bg_r);
 
-    /* Mauve border on hover */
-    if (g_sb_hot) {
-        /* Top+bottom border pixels of pill */
+    /* Mauve border, fading in with hover */
+    if (sb_hover_a > 0) {
         int bx, by;
         for (bx = SB_X + 2; bx < SB_X + SB_W - 2; bx++) {
-            tb_put_pixel(bx, SB_Y,          C_SB_BORDER);
-            tb_put_pixel(bx, SB_Y + SB_H - 1, C_SB_BORDER);
+            tb_put_pixel(bx, SB_Y,          tb_blend(sb_bg_l, C_SB_BORDER, sb_hover_a));
+            tb_put_pixel(bx, SB_Y + SB_H - 1, tb_blend(sb_bg_l, C_SB_BORDER, sb_hover_a));
         }
         for (by = SB_Y + 2; by < SB_Y + SB_H - 2; by++) {
-            tb_put_pixel(SB_X,          by, C_SB_BORDER);
-            tb_put_pixel(SB_X + SB_W - 1, by, C_SB_BORDER);
+            tb_put_pixel(SB_X,          by, tb_blend(sb_bg_l, C_SB_BORDER, sb_hover_a));
+            tb_put_pixel(SB_X + SB_W - 1, by, tb_blend(sb_bg_l, C_SB_BORDER, sb_hover_a));
+        }
+    }
+
+    /* Click flash: a brief white overlay that fades out over SB_PRESS_TICKS
+     * ticks, giving the Start button tactile feedback on click. */
+    if (g_sb_press_anim > 0) {
+        unsigned int flash_a = (unsigned int)(g_sb_press_anim * 130 / SB_PRESS_TICKS);
+        int fx, fy;
+        for (fy = SB_Y; fy < SB_Y + SB_H; fy++) {
+            if (fy < 0 || (unsigned int)fy >= g_h) continue;
+            for (fx = SB_X; fx < SB_X + SB_W; fx++) {
+                if (fx < 0 || (unsigned int)fx >= g_w) continue;
+                unsigned int idx = (unsigned int)fy * g_w + (unsigned int)fx;
+                g_px[idx] = tb_blend(g_px[idx], 0xFFFFFFFF, flash_a);
+            }
         }
     }
 
@@ -482,13 +509,19 @@ static void taskbar_draw(void)
     /* Lock icon */
     tb_draw_lock(tray_start_x + 52, SB_Y + 12, 0xFFCBA6F7);
 
-    /* Clock text "HH:MM" (large, right-aligned) */
+    /* Clock text "HH:MM" (large, right-aligned). The ":" is drawn separately
+     * so it can blink once a second like a real clock, without shifting the
+     * digits around it. */
     char clk[6];
     tb_build_clock(clk);
     int clk_len = tb_strlen(clk);
     int clk_x = tray_start_x + TRAY_W - clk_len * 8 - 8;
     int clk_y = SB_Y + 2;
-    tb_str(clk_x, clk_y, clk, C_CLOCK);
+    tb_char(clk_x,      clk_y, clk[0], C_CLOCK);
+    tb_char(clk_x + 8,  clk_y, clk[1], C_CLOCK);
+    tb_char(clk_x + 16, clk_y, ':',    g_colon_on ? C_CLOCK : tb_blend(C_TRAY_BG, C_CLOCK, 90));
+    tb_char(clk_x + 24, clk_y, clk[3], C_CLOCK);
+    tb_char(clk_x + 32, clk_y, clk[4], C_CLOCK);
 
     /* Date string "Mon Jan 14" (small, below clock) */
     char date_buf[20];
@@ -560,6 +593,7 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
 
     /* Left-click on Start → toggle launcher */
     if (lclick && g_sb_hot) {
+        g_sb_press_anim = SB_PRESS_TICKS;
         if (g_launcher_wid == 0) {
             az_wm_msg_t lmsg;
             memset(&lmsg, 0, sizeof(lmsg));
@@ -765,8 +799,12 @@ int main(int argc, char **argv)
     subpl->subscriber_chan = (unsigned int)g_cli;
     az_channel_send(g_srv, (az_ipc_msg_t *)&sub);
 
-    /* ── Register 1-second timer for autonomous clock update (Bug 3 fix) ─── */
-    az_set_timer(g_cli, 1000, 0);  /* 1000ms, repeating */
+    /* ── Register a 100ms timer: drives the once-a-second clock (Bug 3 fix)
+     * as well as the colon blink and Start-button hover/press animations.
+     * The clock itself only actually changes once a second — reformatting
+     * it 10x more often than that costs nothing since it's a cheap
+     * localtime_r() + snprintf() over a handful of bytes. */
+    az_set_timer(g_cli, 100, 0);
 
     taskbar_draw();
     de_log("[taskbar] Entering event loop.");
@@ -785,10 +823,24 @@ int main(int argc, char **argv)
             tb_handle_mouse(msg.mouse.abs_x, msg.mouse.abs_y, msg.mouse.buttons);
             break;
 
-        case AZ_WM_TIMER_TICK:
-            /* Real-time clock update — fires once per second autonomously */
+        case AZ_WM_TIMER_TICK: {
+            g_tick_count++;
+            if (g_tick_count % 5 == 0) g_colon_on = !g_colon_on; /* 500ms */
+
+            int sb_target = g_sb_hot ? 256 : 0;
+            if (g_sb_hover_level < sb_target) {
+                g_sb_hover_level += SB_HOVER_STEP;
+                if (g_sb_hover_level > sb_target) g_sb_hover_level = sb_target;
+            } else if (g_sb_hover_level > sb_target) {
+                g_sb_hover_level -= SB_HOVER_STEP;
+                if (g_sb_hover_level < sb_target) g_sb_hover_level = sb_target;
+            }
+
+            if (g_sb_press_anim > 0) g_sb_press_anim--;
+
             taskbar_draw();
             break;
+        }
 
         case AZ_WM_EVT_WINDOW_CREATED: {
             az_wm_evt_created_payload_t *p = AZ_WM_MSG_EVT_CREATED(&msg);

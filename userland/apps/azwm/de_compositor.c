@@ -350,8 +350,10 @@ int de_comp_handle_message(az_compositor_t *comp, de_comp_state_t *de,
         az_wm_launch_payload_t *pl = AZ_WM_MSG_LAUNCH(msg);
         /* Defensive null-terminate */
         pl->path[AZ_WM_LAUNCH_PATH_MAX - 1] = '\0';
+        pl->arg[AZ_WM_LAUNCH_ARG_MAX - 1] = '\0';
         de_log_fmt("[azwm/de] Launching: ", pl->path);
-        if (az_spawn(pl->path) < 0)
+        int rc = pl->arg[0] ? az_spawn_arg(pl->path, pl->arg) : az_spawn(pl->path);
+        if (rc < 0)
             de_log("[azwm/de] ERROR: az_spawn failed");
         return 0;
     }

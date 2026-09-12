@@ -8,6 +8,7 @@
 #include "bga.h"
 #include "../char/console.h"
 #include "../../hal/pci.h"
+#include "../base/pci_bus.h"
 #include "../../kernel/mm/pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../include/azami/defs.h"
@@ -250,65 +251,81 @@ static file_operations_t bga_fops = {
     .mmap = bga_mmap,
 };
 
-static void bga_scan_tree(device_t *node)
+static int bga_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
-    if (!node) return;
+    (void)id;
+    /* Single global instance: refuse a second card rather than remapping
+     * the aperture out from under the first. */
+    if (g_bga.fb_phys) return -EBUSY;
 
-    pci_device_info_t *pci = pci_get_device_info(node);
-    if (pci) {
-        if (pci->vendor_id == 0x1234 && pci->device_id == 0x1111) {
-            pr_debug("[BGA] Found Bochs Graphics Adapter at PCI %02x:%02x.%x\n",
-                     pci->bus, pci->slot, pci->func);
+    device_t *node = dm->hal;
+    pci_device_info_t *pci = to_pci_info(dm);
+    if (!pci) return -ENODEV;
 
-            /* Enable Memory Space and Bus Mastering so BAR0 responds to writes */
-            pci_enable_bus_mastering(node);
+    pr_debug("[BGA] Found Bochs Graphics Adapter at PCI %02x:%02x.%x\n",
+             pci->bus, pci->slot, pci->func);
 
-            /* Extract LFB physical base from BAR0 */
-            phys_addr_t fb_phys = pci_get_bar(node, 0);
-            if (!fb_phys) {
-                pr_debug("[BGA] Error: Invalid BAR0 for framebuffer.\n");
-                return;
-            }
+    /* Enable Memory Space and Bus Mastering so BAR0 responds to writes */
+    pci_enable_bus_mastering(node);
 
-            g_bga.fb_phys = fb_phys;
-            
-            /* Map it outside of HHDM to avoid shattering HHDM huge pages.
-             * 0xFFFFC00000000000 is safely above the HHDM limit. */
-            phys_addr_t fb_aligned = ALIGN_DOWN(fb_phys, 4096);
-            virt_addr_t fb_virt = 0xFFFFC00000000000;
-            
-            for (uint32_t offset = 0; offset < BGA_APERTURE_SIZE; offset += 4096) {
-                vmm_map(0, fb_virt + offset, fb_aligned + offset, VMM_MMIO);
-            }
-            g_bga.fb_virt = fb_virt;
-
-            uint16_t id = bga_read_reg(VBE_DISPI_INDEX_ID);
-            g_bga.version = id;
-            pr_debug("[BGA] Device Version ID: 0x%04X\n", id);
-
-            /* Set up display resolution (1280x800x32, enable LFB) */
-            bga_set_video_mode(1280, 800, 32, 1);
-
-            /* Clear screen to black as an example usage */
-            bga_clear_screen(0x00000000);
-
-            device_create("BGA0", DEVICE_TYPE_DISPLAY, node);
-            devfs_register_device("fb1", &bga_fops, &g_bga);
-            return;
-        }
+    /* Extract LFB physical base from BAR0 */
+    phys_addr_t fb_phys = pci_get_bar(node, 0);
+    if (!fb_phys) {
+        pr_debug("[BGA] Error: Invalid BAR0 for framebuffer.\n");
+        return -ENODEV;
     }
 
-    device_t *child = node->children;
-    while (child) {
-        bga_scan_tree(child);
-        child = child->sibling;
+    g_bga.fb_phys = fb_phys;
+
+    /* Map it outside of HHDM to avoid shattering HHDM huge pages.
+     * 0xFFFFC00000000000 is safely above the HHDM limit. */
+    phys_addr_t fb_aligned = ALIGN_DOWN(fb_phys, 4096);
+    virt_addr_t fb_virt = 0xFFFFC00000000000;
+
+    for (uint32_t offset = 0; offset < BGA_APERTURE_SIZE; offset += 4096) {
+        vmm_map(0, fb_virt + offset, fb_aligned + offset, VMM_MMIO);
     }
+    g_bga.fb_virt = fb_virt;
+
+    uint16_t bga_id = bga_read_reg(VBE_DISPI_INDEX_ID);
+    g_bga.version = bga_id;
+    pr_debug("[BGA] Device Version ID: 0x%04X\n", bga_id);
+
+    /* Set up display resolution (1280x800x32, enable LFB) */
+    bga_set_video_mode(1280, 800, 32, 1);
+
+    /* Clear screen to black as an example usage */
+    bga_clear_screen(0x00000000);
+
+    device_create("BGA0", DEVICE_TYPE_DISPLAY, node);
+    devfs_register_device("fb1", &bga_fops, &g_bga);
+    dm_set_drvdata(dm, &g_bga);
+    return 0;
 }
 
+static void bga_remove(dm_device_t *dm)
+{
+    (void)dm;
+}
+
+static const pci_device_id_t bga_pci_ids[] = {
+    { PCI_DEVICE(0x1234, 0x1111) },   /* QEMU/Bochs standard VGA */
+    { 0 }
+};
+
+static pci_driver_t bga_pci_driver = {
+    .drv      = { .name = "bga" },
+    .id_table = bga_pci_ids,
+    .probe    = bga_probe,
+    .remove   = bga_remove,
+};
+
+/** bga_init() — Register the PCI driver; probe() binds to a matching Bochs
+ *  Graphics Adapter automatically, so this is safe to call whether or not
+ *  the host has one. */
 void bga_init(void)
 {
-    pr_debug("[BGA] Probing for Bochs Graphics Adapter...\n");
-    bga_scan_tree(device_tree_root());
+    pci_driver_register(&bga_pci_driver);
 }
 
 phys_addr_t bga_get_fb_phys(void) { return g_bga.fb_phys; }

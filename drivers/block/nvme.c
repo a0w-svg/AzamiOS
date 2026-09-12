@@ -40,6 +40,7 @@
 #include "../../arch/x86_64/cpu/spinlock.h"
 #include "../../hal/pci.h"
 #include "../../hal/device.h"
+#include "../base/pci_bus.h"
 
 /* ── Controller register offsets (NVMe 1.4 §3.1) ─────────────────────────── */
 #define NVME_REG_CAP      0x00   /* u64 Controller Capabilities   */
@@ -634,23 +635,48 @@ static void nvme_controller_init(device_t *dev, pci_device_info_t *pci)
     nvme_scan_namespaces(c, nn);
 }
 
-static void nvme_walk(device_t *dev)
+static int nvme_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
-    for (; dev; dev = dev->sibling) {
-        pci_device_info_t *pci = pci_get_device_info(dev);
-        if (pci && pci->class_code == PCI_CLASS_MASS_STORAGE &&
-            pci->subclass == 0x08 && pci->prog_if == 0x02)
-            nvme_controller_init(dev, pci);
-        nvme_walk(dev->children);
-    }
+    (void)id;
+    pci_device_info_t *pci = to_pci_info(dm);
+    if (!pci) return -ENODEV;
+    /* nvme_controller_init() is "best effort" by design (see its many bare
+     * early returns above) and reports its own failures via pr_debug, so
+     * there is nothing more specific to hand back here. */
+    nvme_controller_init(dm->hal, pci);
+    return 0;
 }
 
+static void nvme_remove(dm_device_t *dm)
+{
+    (void)dm;
+    /* Controllers are brought up once and live for the lifetime of the
+     * system, same as AHCI — nothing to unwind on a re-probe. */
+}
+
+/* Class 0x01 (mass storage), subclass 0x08 (NVMe), prog-if 0x02 (NVM Express
+ * I/O controller). One driver instance binds every matching controller the
+ * bus finds. */
+static const pci_device_id_t nvme_pci_ids[] = {
+    { PCI_DEVICE_CLASS(0x010802, 0xFFFFFF) },
+    { 0 }
+};
+
+static pci_driver_t nvme_pci_driver = {
+    .drv      = { .name = "nvme" },
+    .id_table = nvme_pci_ids,
+    .probe    = nvme_probe,
+    .remove   = nvme_remove,
+};
+
+/* Registers the PCI driver; probe() binds to every matching NVMe controller
+ * the bus already enumerated, so this is safe to call whether or not the
+ * host has one. */
 void block_nvme_init(void)
 {
-    pr_debug("[NVME] scanning PCI for class 0x01 subclass 0x08 controllers...\n");
     g_ctrl_count = 0;
     g_ns_count   = 0;
-    nvme_walk(device_tree_root());
+    pci_driver_register(&nvme_pci_driver);
     if (g_ns_count == 0)
         pr_debug("[NVME] no NVMe namespaces found\n");
 }

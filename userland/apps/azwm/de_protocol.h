@@ -80,6 +80,9 @@
 /* ── Maximum length of a path passed in AZ_WM_LAUNCH_APP ────────────────── */
 #define AZ_WM_LAUNCH_PATH_MAX  128
 
+/* ── Maximum length of the optional argv[1] passed in AZ_WM_LAUNCH_APP ──── */
+#define AZ_WM_LAUNCH_ARG_MAX   64
+
 /* ── Maximum broadcast subscribers ──────────────────────────────────────── */
 #define AZ_WM_MAX_SUBSCRIBERS  8
 
@@ -127,6 +130,12 @@ typedef struct {
 /* AZ_WM_LAUNCH_APP payload (client -> server) */
 typedef struct {
     char path[AZ_WM_LAUNCH_PATH_MAX];  /* Absolute path to ELF binary       */
+    char arg[AZ_WM_LAUNCH_ARG_MAX];    /* Optional argv[1], e.g. a file to
+                                         * open — empty string if none. Every
+                                         * existing sender memsets the whole
+                                         * message before filling it in, so
+                                         * this is unset (and thus ignored)
+                                         * for callers that predate it. */
 } az_wm_launch_payload_t;
 
 /* AZ_WM_EVT_WINDOW_CREATED broadcast payload (server -> subscriber) */

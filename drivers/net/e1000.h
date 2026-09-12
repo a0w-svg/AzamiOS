@@ -134,7 +134,7 @@ typedef struct {
 } e1000_device_t;
 
 /* Public API */
-int  e1000_init(void);
+void e1000_init(void);
 s64  e1000_send_packet(const void *data, size_t len);
 s64  e1000_recv_packet(void *buf, size_t max_len);
 void e1000_poll_rx(void);

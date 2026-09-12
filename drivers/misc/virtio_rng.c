@@ -10,6 +10,7 @@
 #include "../../hal/device.h"
 #include "../../hal/virtio_pci.h"
 #include "../../hal/virtqueue.h"
+#include "../base/pci_bus.h"
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
@@ -85,22 +86,20 @@ static file_operations_t g_hwrng_fops = {
     .poll = NULL
 };
 
-int virtio_rng_init(device_t *dev)
+static int virtio_rng_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
-    if (!dev) return -EINVAL;
+    (void)id;
+    /* g_vrng_dev is a single global instance: refuse a second device rather
+     * than silently reinitializing the transport out from under the first. */
+    if (g_vrng_dev.active) return -EBUSY;
 
-    pci_device_info_t *info = pci_get_device_info(dev);
+    pci_device_info_t *info = to_pci_info(dm);
     if (!info) return -ENODEV;
-
-    if (info->vendor_id != 0x1AF4) return -ENODEV;
-    if (info->device_id != 0x1004 && info->device_id != 0x1044 && info->device_id != 0x1005) {
-        return -ENODEV;
-    }
 
     pr_debug("[RNG] Probing VirtIO-RNG device at PCI %02x:%02x.%x...\n",
              info->bus, info->slot, info->func);
 
-    if (virtio_pci_init_device(dev, &g_vrng_dev.vpci) < 0) {
+    if (virtio_pci_init_device(dm->hal, &g_vrng_dev.vpci) < 0) {
         return -ENODEV;
     }
 
@@ -128,7 +127,42 @@ int virtio_rng_init(device_t *dev)
     g_vrng_dev.active = true;
 
     devfs_register_device("hwrng", &g_hwrng_fops, NULL);
+    dm_set_drvdata(dm, &g_vrng_dev);
     pr_debug("[RNG] VirtIO-RNG entropy driver ready (/dev/hwrng)\n");
 
     return 0;
+}
+
+static void virtio_rng_remove(dm_device_t *dm)
+{
+    (void)dm;
+    if (!g_vrng_dev.active) return;
+    virtio_pci_set_status(&g_vrng_dev.vpci, 0);
+    g_vrng_dev.active = false;
+}
+
+/* 0x1005: legacy/transitional — confirmed against real QEMU virtio-rng-pci
+ * output (see the PCI enumeration log); 0x1044 = 0x1040 +
+ * VIRTIO_ID_ENTROPY(4), the modern-only id a strict VIRTIO_F_VERSION_1 host
+ * could use instead. 0x1004 belongs to virtio-scsi, not entropy — it used to
+ * be listed here too, which meant this driver's probe() would have raced
+ * drivers/block/virtio_scsi.c for the same PCI id and, on a host with an
+ * actual virtio-scsi-pci device, could have grabbed it first and left the
+ * SCSI driver with nothing to bind. */
+static const pci_device_id_t virtio_rng_pci_ids[] = {
+    { PCI_DEVICE(0x1AF4, 0x1044) },
+    { PCI_DEVICE(0x1AF4, 0x1005) },
+    { 0 }
+};
+
+static pci_driver_t virtio_rng_pci_driver = {
+    .drv      = { .name = "virtio_rng" },
+    .id_table = virtio_rng_pci_ids,
+    .probe    = virtio_rng_probe,
+    .remove   = virtio_rng_remove,
+};
+
+void virtio_rng_init(void)
+{
+    pci_driver_register(&virtio_rng_pci_driver);
 }

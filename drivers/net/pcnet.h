@@ -11,8 +11,10 @@
 #define PCNET_VENDOR_ID  0x1022
 #define PCNET_DEVICE_ID  0x2000
 
-/** pcnet_init() — Probe and initialize AMD PCnet-FAST III network controller. */
-int pcnet_init(device_t *dev);
+/** pcnet_init() — Register the PCI driver; probe() binds to a matching AMD
+ *  PCnet-FAST III automatically, so this is safe to call whether or not the
+ *  host has one. */
+void pcnet_init(void);
 
 /** pcnet_send_packet() — Transmit ethernet frame. */
 s64 pcnet_send_packet(const void *data, size_t len);

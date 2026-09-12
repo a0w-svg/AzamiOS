@@ -131,6 +131,11 @@ int az_spawn(const char *path)
     return (int)syscall1(SYS_AZ_SPAWN, (long)path);
 }
 
+int az_spawn_arg(const char *path, const char *arg)
+{
+    return (int)syscall2(SYS_AZ_SPAWN_ARG, (long)path, (long)arg);
+}
+
 void az_yield(void)
 {
     syscall0(SYS_AZ_YIELD);

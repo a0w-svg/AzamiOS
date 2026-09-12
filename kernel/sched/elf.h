@@ -180,3 +180,10 @@ process_t *sched_spawn_user(const char *path);
  * sched_spawn_user_args(path, argv, envp) — Create process and thread with custom arguments.
  */
 process_t *sched_spawn_user_args(const char *path, const char *const argv[], const char *const envp[]);
+
+/**
+ * sched_spawn_user_arg(path, arg) — Like sched_spawn_user(), but passes `arg`
+ * through as argv[1] when it is non-NULL and non-empty (e.g. a file for a
+ * GUI app to open); otherwise identical to sched_spawn_user(path).
+ */
+process_t *sched_spawn_user_arg(const char *path, const char *arg);

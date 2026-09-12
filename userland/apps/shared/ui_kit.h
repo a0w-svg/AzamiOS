@@ -361,6 +361,34 @@ static inline unsigned int uk_blend(unsigned int dst, unsigned int src, unsigned
     return 0xFF000000 | rb | g;
 }
 
+/* ============================================================================
+ * Shared motion helpers
+ *
+ * Fixed-point ease-out-quadratic + linear interpolation, both in the 0..256
+ * range — the same curve azwm's own compositor uses for window open/
+ * minimize/restore (see compositor_animate_step()). Apps that drive their
+ * own small UI animations (hover lifts, sliding indicators, modal pop-ins)
+ * off a timer tick should use these so in-app motion feels like the same
+ * system as window-level motion, not a different one bolted on.
+ * ============================================================================ */
+
+/* `t` is elapsed progress 0..256 (0 = just started, 256 = done); returns the
+ * eased progress, also 0..256, front-loaded (fast start, gentle settle). */
+static inline int uk_ease_out_quad(int t)
+{
+    if (t < 0) t = 0;
+    if (t > 256) t = 256;
+    return (t * (512 - t)) / 256;
+}
+
+/* Interpolates the integer range [a, b] at eased progress `ease256` (0..256). */
+static inline int uk_lerp(int a, int b, int ease256)
+{
+    if (ease256 < 0) ease256 = 0;
+    if (ease256 > 256) ease256 = 256;
+    return a + ((b - a) * ease256) / 256;
+}
+
 static inline void uk_fill_rect(uk_window_t *w,
                                 int rx, int ry, int rw, int rh,
                                 unsigned int col)
@@ -938,9 +966,11 @@ static inline void uk_subscribe_events(uk_window_t *win)
 }
 
 /*
- * uk_launch_app() — request azwm to spawn an ELF binary.
+ * uk_launch_app_arg() — request azwm to spawn an ELF binary, optionally
+ * passing `arg` through as its argv[1] (e.g. a specific file to open).
+ * Pass NULL or "" for `arg` to launch with no extra argument.
  */
-static inline void uk_launch_app(uk_window_t *win, const char *path)
+static inline void uk_launch_app_arg(uk_window_t *win, const char *path, const char *arg)
 {
     az_wm_msg_t lmsg;
     memset(&lmsg, 0, sizeof(lmsg));
@@ -950,7 +980,20 @@ static inline void uk_launch_app(uk_window_t *win, const char *path)
     for (j = 0; j < AZ_WM_LAUNCH_PATH_MAX - 1 && path[j]; j++)
         pl->path[j] = path[j];
     pl->path[j] = '\0';
+    if (arg) {
+        for (j = 0; j < AZ_WM_LAUNCH_ARG_MAX - 1 && arg[j]; j++)
+            pl->arg[j] = arg[j];
+        pl->arg[j] = '\0';
+    }
     az_channel_send(win->server_chan, (az_ipc_msg_t *)&lmsg);
+}
+
+/*
+ * uk_launch_app() — request azwm to spawn an ELF binary, with no argument.
+ */
+static inline void uk_launch_app(uk_window_t *win, const char *path)
+{
+    uk_launch_app_arg(win, path, NULL);
 }
 
 /*

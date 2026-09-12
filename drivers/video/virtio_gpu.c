@@ -115,19 +115,26 @@ bool virtio_gpu_edid_supported(void)
     return (g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_EDID)) != 0;
 }
 
-int virtio_gpu_init(device_t *pci_dev)
+/* Not its own pci_driver_t: virtgpu_drm.c already registers the sole PCI
+ * driver for 1AF4:1050/1010 (its KMS probe), and this device model only lets
+ * one driver bind a given device — a second registration with the same
+ * id_table here would just lose that race and never run. So this stays a
+ * plain bring-up function, called from virtgpu_pci_probe() once it already
+ * knows a real virtio-gpu device exists; that is what makes this dynamic
+ * rather than the old unconditional call from kernel/main.c. */
+int virtio_gpu_init(device_t *hal_dev)
 {
-    pci_device_info_t *info = pci_get_device_info(pci_dev);
-    if (!info) return -1;
+    /* g_gpu is a single global instance — this OS drives one display
+     * adapter — so a second call is refused rather than silently
+     * reinitializing the transport out from under the first. */
+    if (g_gpu.controlq) return -EBUSY;
 
-    /* Check vendor and device ID for VirtIO-GPU (1AF4:1050) */
-    if (info->vendor_id != 0x1AF4 || info->device_id != 0x1050) {
-        return -1;
-    }
+    pci_device_info_t *info = pci_get_device_info(hal_dev);
+    if (!info) return -ENODEV;
 
     pr_debug("[VIRTIO-GPU] Found VirtIO GPU at PCI %02x:%02x.%x\n", info->bus, info->slot, info->func);
 
-    if (virtio_pci_init_device(pci_dev, &g_gpu.vpci) < 0) {
+    if (virtio_pci_init_device(hal_dev, &g_gpu.vpci) < 0) {
         pr_debug("[VIRTIO-GPU] Failed to initialize VirtIO PCI transport\n");
         return -1;
     }

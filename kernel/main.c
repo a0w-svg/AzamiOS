@@ -286,9 +286,29 @@ void kernel_main(void)
     pci_bus_init();
     uevent_init();
 
-    /* Drivers that bind through the driver model instead of scanning the bus
-     * themselves.  Registration order does not matter — the core probes the
-     * devices already enumerated above. */
+    /* Every driver below binds through the driver model instead of scanning
+     * the bus itself: each call just registers a pci_driver_t (id_table +
+     * probe/remove), and the core immediately matches it against the
+     * devices pci_bus_init() already enumerated above. A driver whose
+     * hardware is not present therefore never runs its bring-up code at
+     * all — not even the cheap "check one ID and bail" a few of these used
+     * to do — instead of the previous mix of (a) an unconditional call for
+     * every driver regardless of whether its device existed, and (b) a
+     * couple of drivers (AHCI, NVMe, AC97, BGA) walking the entire device
+     * tree by hand to find their own hardware.
+     *
+     * Registration order still matters for exactly two things this refactor
+     * has to preserve:
+     *   - virtio_gpu's transport (drivers/video/virtio_gpu.c) is brought up
+     *     from *inside* virtgpu_drm's own probe() now, not as a separate
+     *     registration — the device model only lets one driver bind a given
+     *     PCI function, and virtgpu_drm already owns that match. See the
+     *     comment on virtio_gpu_init() for why.
+     *   - e1000 registers before rtl8139/ne2k so it still wins "primary
+     *     network interface" when more than one NIC is present, matching the
+     *     old `if (e1000_init() != 0) rtl8139_init();` intent — each driver
+     *     just binds to its own vendor:device ids now, so there is no real
+     *     exclusivity between them to preserve, only the tie-break order. */
     extern void virtio_input_init(void);
     extern void virtio_console_init(void);
     extern void i6300esb_init(void);
@@ -312,48 +332,42 @@ void kernel_main(void)
     extern int fdc_init(void);
     fdc_init();
 
-    /* Probe VirtIO and legacy PCI devices */
-    extern int virtio_blk_init(device_t *dev);
-    extern int virtio_net_init(device_t *dev);
-    extern int virtio_gpu_init(device_t *dev);
-    extern int virtio_rng_init(device_t *dev);
-    extern int pcnet_init(device_t *dev);
-    extern int hda_init(device_t *dev);
-    extern int e1000_init(void);
-    extern int rtl8139_init(void);
+    /* VirtIO and legacy PCI storage/network/RNG devices. */
+    extern void virtio_blk_init(void);
+    extern void virtio_scsi_init(void);
+    extern void virtio_net_init(void);
+    extern void virtio_rng_init(void);
+    extern void pcnet_init(void);
+    extern void hda_init(void);
+    extern void e1000_init(void);
+    extern void rtl8139_init(void);
     extern void net_init(void);
 
-    device_t *pci_bus = device_find("PCI0");
-    if (pci_bus) {
-        device_t *child = pci_bus->children;
-        while (child) {
-            virtio_blk_init(child);
-            virtio_net_init(child);
-            virtio_gpu_init(child);
-            virtio_rng_init(child);
-            pcnet_init(child);
-            hda_init(child);
-            child = child->sibling;
-        }
-    }
+    virtio_blk_init();
+    virtio_scsi_init();
+    virtio_net_init();
+    virtio_rng_init();
+    pcnet_init();
+    hda_init();
 
     extern void bga_init(void);
     bga_init();
+    /* virtgpu_drm's own probe() brings up the virtio-gpu transport (see the
+     * long comment above), so this is what actually drives virtio-gpu now —
+     * fbdev_init() below reads g_gpu's fields, hence the reordering. */
+    drm_subsystem_init();
     extern void fbdev_init(void);
     fbdev_init();
-    drm_subsystem_init();
     ac97_init();
     extern void sb16_init(void);
     sb16_init();
     extern void loop_init(void);
     loop_init();
 
-    /* Initialize Network Interface Drivers & Stack.
-     * Probe order is precedence order: the first interface to register becomes
-     * the stack's primary one, so the faster NICs are tried first and the
-     * NE2000 only takes over when nothing else is present. */
+    /* Initialize Network Interface Drivers & Stack. */
     extern void ne2k_pci_init(void);
-    if (e1000_init() != 0) rtl8139_init();
+    e1000_init();
+    rtl8139_init();
     ne2k_pci_init();
     net_init();
 

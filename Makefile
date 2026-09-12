@@ -233,6 +233,7 @@ KERNEL_C_SRCS := \
     drivers/net/rtl8139.c \
     drivers/net/virtio_net.c \
     drivers/block/virtio_blk.c \
+    drivers/block/virtio_scsi.c \
     drivers/video/virtio_gpu.c \
     drivers/video/virtio_gpu_cmd.c \
     drivers/video/fbdev.c \

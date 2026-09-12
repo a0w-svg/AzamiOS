@@ -30,6 +30,11 @@
 #define TASKBAR_H      52
 #define LAUNCHER_MAP  ((void *)0x68000000)
 
+/* Must track the Start button's position in apps/taskbar/main.c (SB_X) —
+ * the launcher opens flush against it, Windows Start-menu style, rather
+ * than floating in the middle of the screen. */
+#define SB_X            6
+
 /* Modal Geometry */
 #define MODAL_W       680
 #define MODAL_H       450
@@ -83,6 +88,13 @@ static uk_window_t  g_win;
 static int          g_hovered = -1;   /* index of hovered app slot, -1 = none */
 static int          g_launching = 0;
 
+/* ── Animation state (driven by the 100ms AZ_WM_TIMER_TICK below) ────────── */
+#define HOVER_ANIM_STEP  48   /* tile hover fade moves this far toward its
+                                * target per tick (0..256 range)             */
+static int g_hover_anim_idx   = -1;  /* which tile the fade level applies to */
+static int g_hover_anim_level = 0;   /* 0..256 */
+static int g_caret_on = 1;           /* search-box caret blink phase        */
+
 static char g_search_query[64] = "";
 static int  g_search_len = 0;
 static int  g_filtered_indices[MAX_APPS];
@@ -126,6 +138,7 @@ static void update_filter(void)
         }
     }
     if (g_hovered >= g_num_filtered) g_hovered = (g_num_filtered > 0) ? 0 : -1;
+    if (g_hovered >= 0) g_hover_anim_idx = g_hovered;
 }
 
 /* ── Cell geometry helpers ────────────────────────────────────────────────── */
@@ -164,13 +177,21 @@ static void draw_cell(int slot)
     int cx, cy, cw, ch;
     cell_rect(slot, &cx, &cy, &cw, &ch);
 
-    /* Erase cell background */
-    uk_fill_rect(&g_win, cx, cy, cw, ch, (slot == g_hovered) ? 0xFF242436 : UK_MANTLE);
+    /* Hover is a fade (g_hover_anim_level, animated in the tick handler)
+     * rather than an instant swap: the tile eases into its "lifted" look
+     * when the pointer lands on it, and eases back out when it leaves. */
+    int hover_a = (slot == g_hover_anim_idx) ? g_hover_anim_level : 0; /* 0..256 */
+    unsigned int hover_a8 = (unsigned int)(hover_a * 255 / 256);
 
-    if (slot == g_hovered) {
-        /* Hover card glow */
-        uk_fill_rounded_rect(&g_win, cx + 4, cy + 4, cw - 8, ch - 8, 10, UK_SURFACE0);
-        uk_draw_rounded_rect_outline(&g_win, cx + 4, cy + 4, cw - 8, ch - 8, 10, UK_MAUVE);
+    /* Erase cell background, cross-fading into the hover tint */
+    unsigned int cell_bg = uk_blend(UK_MANTLE, 0xFF242436, hover_a8);
+    uk_fill_rect(&g_win, cx, cy, cw, ch, cell_bg);
+
+    if (hover_a > 0) {
+        /* Hover card glow, fading in with the tile */
+        unsigned int glow_bg = uk_blend(cell_bg, UK_SURFACE0, hover_a8);
+        uk_fill_rounded_rect(&g_win, cx + 4, cy + 4, cw - 8, ch - 8, 10, glow_bg);
+        uk_draw_rounded_rect_outline(&g_win, cx + 4, cy + 4, cw - 8, ch - 8, 10, uk_blend(glow_bg, UK_MAUVE, hover_a8));
     }
 
     /* Icon box: centred horizontally */
@@ -182,7 +203,7 @@ static void draw_cell(int slot)
                          ICON_BOX_SIZE, ICON_BOX_SIZE, 10, 0x55000000);
     uk_fill_rounded_rect(&g_win, icon_x, icon_y,
                          ICON_BOX_SIZE, ICON_BOX_SIZE, 10,
-                         (slot == g_hovered) ? UK_SURFACE1 : UK_BASE);
+                         uk_blend(UK_BASE, UK_SURFACE1, hover_a8));
 
     int draw_x = icon_x + (ICON_BOX_SIZE - 32) / 2;
     int draw_y = icon_y + (ICON_BOX_SIZE - 32) / 2;
@@ -244,7 +265,7 @@ static void draw_cell(int slot)
     }
 
     /* App name (centred) */
-    unsigned int name_col = (slot == g_hovered) ? UK_TEXT : UK_SUBTEXT1;
+    unsigned int name_col = uk_blend(UK_SUBTEXT1, UK_TEXT, hover_a8);
     int nlen = strlen(g_apps[app_idx].name);
     int nx   = cx + cw / 2 - (nlen * 8) / 2;
     int ny   = icon_y + ICON_BOX_SIZE + 8;
@@ -296,8 +317,10 @@ static void draw_launcher(void)
         strncpy(sdisplay, g_search_query, sizeof(sdisplay) - 2);
         sdisplay[sizeof(sdisplay) - 2] = '\0';
         int sl = strlen(sdisplay);
-        sdisplay[sl] = '_';
-        sdisplay[sl + 1] = '\0';
+        if (g_caret_on) {
+            sdisplay[sl] = '_';
+            sdisplay[sl + 1] = '\0';
+        }
         uk_draw_text(&g_win, sb_x + 10, sb_y + 8, sdisplay, UK_MAUVE);
     } else {
         uk_draw_text(&g_win, sb_x + 10, sb_y + 8, "Search apps...", UK_OVERLAY1);
@@ -457,8 +480,13 @@ int main(int argc, char **argv)
         sh = fb.height;
     }
 
-    int win_x = (int)(sw - MODAL_W) / 2;
-    int win_y = (int)(sh - TASKBAR_H - MODAL_H) / 2;
+    /* Anchored above the Start button and flush with the taskbar, like the
+     * Windows Start menu — not centred on the screen. */
+    int win_x = SB_X;
+    if (win_x + MODAL_W > (int)sw) win_x = (int)sw - MODAL_W;
+    if (win_x < 0) win_x = 0;
+
+    int win_y = (int)sh - TASKBAR_H - MODAL_H;
     if (win_y < 20) win_y = 20;
 
     if (uk_window_connect(&g_win, "AzamiOS App Launcher", win_x, win_y, MODAL_W, MODAL_H,
@@ -517,6 +545,7 @@ int main(int argc, char **argv)
                 int new_hover = hit_cell(mx, my);
                 if (new_hover != g_hovered) {
                     g_hovered = new_hover;
+                    if (g_hovered >= 0) g_hover_anim_idx = g_hovered;
                     draw_launcher();
                 }
             }
@@ -557,6 +586,27 @@ int main(int argc, char **argv)
 
         case AZ_WM_TIMER_TICK: {
             g_open_ticks++;
+
+            bool caret_toggled = (g_open_ticks % 5 == 0); /* 500ms */
+            if (caret_toggled) g_caret_on = !g_caret_on;
+
+            int hover_target = (g_hover_anim_idx >= 0 && g_hover_anim_idx == g_hovered) ? 256 : 0;
+            bool hover_moving = (g_hover_anim_level != hover_target);
+            if (g_hover_anim_level < hover_target) {
+                g_hover_anim_level += HOVER_ANIM_STEP;
+                if (g_hover_anim_level > hover_target) g_hover_anim_level = hover_target;
+            } else if (g_hover_anim_level > hover_target) {
+                g_hover_anim_level -= HOVER_ANIM_STEP;
+                if (g_hover_anim_level < hover_target) g_hover_anim_level = hover_target;
+            }
+
+            /* Redraw only when something actually changed this tick — a
+             * hover fade still in motion, or the caret blinking (which only
+             * matters while a query is shown) — so an idle launcher with a
+             * settled hover and no search text doesn't redraw the whole
+             * grid 10x/sec for nothing. */
+            if (hover_moving || (caret_toggled && g_search_len > 0))
+                draw_launcher();
             break;
         }
 

@@ -400,6 +400,7 @@ static s64 sys_az_fb_info(pt_regs_t *r);
 static s64 sys_az_fb_map(pt_regs_t *r);
 static s64 sys_az_fb_flip(pt_regs_t *r);
 static s64 sys_az_spawn(pt_regs_t *r);
+static s64 sys_az_spawn_arg(pt_regs_t *r);
 static s64 sys_az_yield(pt_regs_t *r);
 static s64 sys_az_thread_create_impl(pt_regs_t *r);
 static s64 sys_az_thread_exit_impl(pt_regs_t *r);
@@ -1090,6 +1091,7 @@ void syscall_init(void)
     reg(SYS_AZ_FB_MAP,         sys_az_fb_map);
     reg(SYS_AZ_FB_FLIP,        sys_az_fb_flip);
     reg(SYS_AZ_SPAWN,          sys_az_spawn);
+    reg(SYS_AZ_SPAWN_ARG,      sys_az_spawn_arg);
     reg(SYS_AZ_YIELD,          sys_az_yield);
     reg(SYS_AZ_THREAD_CREATE,  sys_az_thread_create_impl);
     reg(SYS_AZ_THREAD_EXIT,    sys_az_thread_exit_impl);
@@ -5922,6 +5924,47 @@ static s64 sys_az_spawn(pt_regs_t *r)
     }
 
     process_t *child = sched_spawn_user(kpath);
+    if (!child) return -(s64)EINVAL;
+
+    process_t *parent = sched_current_process();
+    if (parent) child->parent = parent;
+
+    return (s64)child->pid;
+}
+
+/*
+ * Same as sys_az_spawn(), but rsi optionally names a second string passed
+ * to the child as argv[1] (e.g. a file for a GUI app to open). This is a
+ * distinct syscall number rather than sys_az_spawn() itself reading rsi
+ * unconditionally — every existing caller reaches sys_az_spawn() through
+ * syscall1(), whose inline asm leaves rsi unconstrained, so treating it as
+ * a pointer there would risk copy_from_user() on whatever garbage happened
+ * to be sitting in the register.
+ */
+static s64 sys_az_spawn_arg(pt_regs_t *r)
+{
+    const char *user_path = (const char *)r->rdi;
+    const char *user_arg  = (const char *)r->rsi;
+    if (!user_path || (uintptr_t)user_path >= 0x8000000000000000ULL) return -(s64)EFAULT;
+
+    char kpath[512];
+    __builtin_memset(kpath, 0, sizeof(kpath));
+    for (int i = 0; i < 255; i++) {
+        if (copy_from_user(&kpath[i], user_path + i, 1) != 0) return -(s64)EFAULT;
+        if (kpath[i] == '\0') break;
+    }
+
+    char karg[256];
+    __builtin_memset(karg, 0, sizeof(karg));
+    if (user_arg) {
+        if ((uintptr_t)user_arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        for (int i = 0; i < 255; i++) {
+            if (copy_from_user(&karg[i], user_arg + i, 1) != 0) return -(s64)EFAULT;
+            if (karg[i] == '\0') break;
+        }
+    }
+
+    process_t *child = sched_spawn_user_arg(kpath, user_arg ? karg : NULL);
     if (!child) return -(s64)EINVAL;
 
     process_t *parent = sched_current_process();

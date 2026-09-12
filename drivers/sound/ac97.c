@@ -10,6 +10,7 @@
 #include "sound.h"
 #include "../../hal/pci.h"
 #include "../../hal/device.h"
+#include "../base/pci_bus.h"
 #include "../../arch/x86_64/cpu/pic.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../kernel/mm/pmm.h"
@@ -144,93 +145,110 @@ static sound_ops_t g_ac97_ops = {
     .ioctl = ac97_ioctl
 };
 
-static void ac97_scan_tree(device_t *node)
+static int ac97_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
-    if (!node) return;
+    (void)id;
+    /* Single global instance: refuse a second card rather than remapping
+     * its BARs and DMA rings out from under the first. */
+    if (g_nam_bar || g_nabm_bar) return -EBUSY;
 
-    pci_device_info_t *pci = pci_get_device_info(node);
-    if (pci) {
-        if (pci->vendor_id == 0x8086 && pci->device_id == 0x2415) {
-            pr_debug("[AC97] Found Intel AC97 at PCI %02x:%02x.%x\n",
-                     pci->bus, pci->slot, pci->func);
+    device_t *node = dm->hal;
+    pci_device_info_t *pci = to_pci_info(dm);
+    if (!pci) return -ENODEV;
 
-            u16 cmd = pci_config_read16(pci->bus, pci->slot, pci->func, 0x04);
-            pci_config_write16(pci->bus, pci->slot, pci->func, 0x04, cmd | 0x05);
+    pr_debug("[AC97] Found Intel AC97 at PCI %02x:%02x.%x\n",
+             pci->bus, pci->slot, pci->func);
 
-            g_nam_bar  = pci_get_bar(node, 0) & ~1;
-            g_nabm_bar = pci_get_bar(node, 1) & ~1;
-            g_ac97_irq = pci_config_read8(pci->bus, pci->slot, pci->func, 0x3C);
+    u16 cmd = pci_config_read16(pci->bus, pci->slot, pci->func, 0x04);
+    pci_config_write16(pci->bus, pci->slot, pci->func, 0x04, cmd | 0x05);
 
-            if (!g_nam_bar || !g_nabm_bar) {
-                pr_debug("[AC97] Error: Invalid BARs.\n");
-                return;
+    g_nam_bar  = pci_get_bar(node, 0) & ~1;
+    g_nabm_bar = pci_get_bar(node, 1) & ~1;
+    g_ac97_irq = pci_config_read8(pci->bus, pci->slot, pci->func, 0x3C);
+
+    if (!g_nam_bar || !g_nabm_bar) {
+        pr_debug("[AC97] Error: Invalid BARs.\n");
+        return -ENODEV;
+    }
+
+    idt_register_irq(g_ac97_irq + 32, ac97_irq_handler, NULL);
+    hal_irq_enable(g_ac97_irq, g_ac97_irq + 32);
+
+    ac97_outd(g_nabm_bar, 0x2C, 0x02); /* Reset */
+    /* BUG-12 fix: use I/O-port reads for a portable delay instead of a
+     * CPU-speed-dependent busy loop.  Each inb on port 0x80 (POST port)
+     * costs roughly 1 µs, giving ~100 µs total. */
+    for (int _d = 0; _d < 100; _d++) inb(0x80);
+
+    ac97_outw(g_nam_bar, AC97_NAMBAR_MASTER_VOL, 0x0000);
+    ac97_outw(g_nam_bar, AC97_NAMBAR_PCM_OUT_VOL, 0x0000);
+
+    /* Allocate 32-bit low physical memory for DMA structures */
+    phys_addr_t bdl_phys = pmm_alloc_pages_32(1);
+    if (!bdl_phys) return -ENOMEM;
+    g_bdl = (ac97_bdl_entry_t *)PHYS_TO_VIRT(bdl_phys);
+
+    /* BUG-13 fix: track allocation count so we can free on failure */
+    int alloc_count = 0;
+    for (int i = 0; i < AC97_BDL_ENTRIES; i++) {
+        phys_addr_t buf_phys = pmm_alloc_pages_32(1);
+        if (!buf_phys) {
+            /* Free all previously allocated DMA buffers */
+            for (int j = 0; j < alloc_count; j++) {
+                pmm_free_pages(
+                    VIRT_TO_PHYS((virt_addr_t)g_audio_buffers[j]), 1);
+                g_audio_buffers[j] = NULL;
             }
-
-            idt_register_irq(g_ac97_irq + 32, ac97_irq_handler, NULL);
-            hal_irq_enable(g_ac97_irq, g_ac97_irq + 32);
-
-            ac97_outd(g_nabm_bar, 0x2C, 0x02); /* Reset */
-            /* BUG-12 fix: use I/O-port reads for a portable delay instead of a
-             * CPU-speed-dependent busy loop.  Each inb on port 0x80 (POST port)
-             * costs roughly 1 µs, giving ~100 µs total. */
-            for (int _d = 0; _d < 100; _d++) inb(0x80);
-
-            ac97_outw(g_nam_bar, AC97_NAMBAR_MASTER_VOL, 0x0000);
-            ac97_outw(g_nam_bar, AC97_NAMBAR_PCM_OUT_VOL, 0x0000);
-
-            /* Allocate 32-bit low physical memory for DMA structures */
-            phys_addr_t bdl_phys = pmm_alloc_pages_32(1);
-            if (!bdl_phys) return;
-            g_bdl = (ac97_bdl_entry_t *)PHYS_TO_VIRT(bdl_phys);
-
-            /* BUG-13 fix: track allocation count so we can free on failure */
-            int alloc_count = 0;
-            for (int i = 0; i < AC97_BDL_ENTRIES; i++) {
-                phys_addr_t buf_phys = pmm_alloc_pages_32(1);
-                if (!buf_phys) {
-                    /* Free all previously allocated DMA buffers */
-                    for (int j = 0; j < alloc_count; j++) {
-                        pmm_free_pages(
-                            VIRT_TO_PHYS((virt_addr_t)g_audio_buffers[j]), 1);
-                        g_audio_buffers[j] = NULL;
-                    }
-                    pmm_free_pages(bdl_phys, 1);
-                    g_bdl = NULL;
-                    pr_debug("[AC97] Failed to allocate low 32-bit DMA buffers.\n");
-                    return;
-                }
-                g_audio_buffers[i] = (u8 *)PHYS_TO_VIRT(buf_phys);
-                g_bdl[i].ptr = (u32)buf_phys;
-                g_bdl[i].samples = 0;
-                g_bdl[i].flags = 0;
-                alloc_count++;
-            }
-
-            ac97_outd(g_nabm_bar, AC97_PO_BDBAR, (u32)bdl_phys);
-            ac97_outb(g_nabm_bar, AC97_PO_LVI, 0);
-            ac97_outb(g_nabm_bar, AC97_PO_CR, 0x00);
-            g_ac97_lvi = 0;
-            g_ac97_started = false;
-
-            pr_debug("[AC97] Initialized on IRQ %d. NAM: 0x%x, NABM: 0x%x\n", g_ac97_irq, g_nam_bar, g_nabm_bar);
-
-            __builtin_memcpy(g_ac97_sound_dev.name, "Intel AC97", 11);
-            g_ac97_sound_dev.ops = &g_ac97_ops;
-            sound_register_device(&g_ac97_sound_dev);
-            
-            return;
+            pmm_free_pages(bdl_phys, 1);
+            g_bdl = NULL;
+            pr_debug("[AC97] Failed to allocate low 32-bit DMA buffers.\n");
+            return -ENOMEM;
         }
+        g_audio_buffers[i] = (u8 *)PHYS_TO_VIRT(buf_phys);
+        g_bdl[i].ptr = (u32)buf_phys;
+        g_bdl[i].samples = 0;
+        g_bdl[i].flags = 0;
+        alloc_count++;
     }
 
-    device_t *child = node->children;
-    while (child) {
-        ac97_scan_tree(child);
-        child = child->sibling;
-    }
+    ac97_outd(g_nabm_bar, AC97_PO_BDBAR, (u32)bdl_phys);
+    ac97_outb(g_nabm_bar, AC97_PO_LVI, 0);
+    ac97_outb(g_nabm_bar, AC97_PO_CR, 0x00);
+    g_ac97_lvi = 0;
+    g_ac97_started = false;
+
+    pr_debug("[AC97] Initialized on IRQ %d. NAM: 0x%x, NABM: 0x%x\n", g_ac97_irq, g_nam_bar, g_nabm_bar);
+
+    __builtin_memcpy(g_ac97_sound_dev.name, "Intel AC97", 11);
+    g_ac97_sound_dev.ops = &g_ac97_ops;
+    sound_register_device(&g_ac97_sound_dev);
+    dm_set_drvdata(dm, &g_ac97_sound_dev);
+
+    return 0;
 }
 
+static void ac97_remove(dm_device_t *dm)
+{
+    (void)dm;
+    if (g_ac97_irq) hal_irq_disable(g_ac97_irq);
+}
+
+static const pci_device_id_t ac97_pci_ids[] = {
+    { PCI_DEVICE(0x8086, 0x2415) },   /* Intel 82801AA AC'97 */
+    { 0 }
+};
+
+static pci_driver_t ac97_pci_driver = {
+    .drv      = { .name = "ac97" },
+    .id_table = ac97_pci_ids,
+    .probe    = ac97_probe,
+    .remove   = ac97_remove,
+};
+
+/** ac97_init() — Register the PCI driver; probe() binds to a matching Intel
+ *  AC97 controller automatically, so this is safe to call whether or not
+ *  the host has one. */
 void ac97_init(void)
 {
-    pr_debug("[AC97] Probing for Intel AC97...\n");
-    ac97_scan_tree(device_tree_root());
+    pci_driver_register(&ac97_pci_driver);
 }

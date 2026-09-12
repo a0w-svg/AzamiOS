@@ -7,6 +7,7 @@
 #include "../../include/azami/debug.h"
 #include "../../include/azami/net.h"
 #include "virtio_net.h"
+#include "../base/pci_bus.h"
 #include "../../kernel/mm/kmalloc.h"
 #include "../../kernel/mm/pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
@@ -145,19 +146,21 @@ static file_operations_t g_vnet_fops = {
     .ioctl = net_fops_ioctl,
 };
 
-int virtio_net_init(device_t *pci_dev)
+static int virtio_net_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
-    pci_device_info_t *info = pci_get_device_info(pci_dev);
-    if (!info) return -1;
+    (void)id;
+    /* g_vnet and g_rx_buffers are single global instances: a second matching
+     * device would silently overwrite the first rather than gaining a second
+     * NIC, so refuse it explicitly instead of corrupting the first. */
+    if (g_vnet.active) return -EBUSY;
 
-    if (info->vendor_id != 0x1AF4 || (info->device_id != 0x1000 && info->device_id != 0x1041)) {
-        return -1;
-    }
+    pci_device_info_t *info = to_pci_info(dm);
+    if (!info) return -ENODEV;
 
     pr_debug("[VIRTIO-NET] Found VirtIO Network Controller at PCI %02x:%02x.%x\n",
              info->bus, info->slot, info->func);
 
-    if (virtio_pci_init_device(pci_dev, &g_vnet.vpci) < 0) {
+    if (virtio_pci_init_device(dm->hal, &g_vnet.vpci) < 0) {
         pr_debug("[VIRTIO-NET] Failed to initialize VirtIO PCI transport\n");
         return -1;
     }
@@ -210,10 +213,38 @@ int virtio_net_init(device_t *pci_dev)
 
 
     devfs_register_device("net0", &g_vnet_fops, &g_vnet);
+    dm_set_drvdata(dm, &g_vnet);
 
     pr_debug("[VIRTIO-NET] MAC: %02x:%02x:%02x:%02x:%02x:%02x initialized successfully\n",
              g_vnet.mac[0], g_vnet.mac[1], g_vnet.mac[2],
              g_vnet.mac[3], g_vnet.mac[4], g_vnet.mac[5]);
 
     return 0;
+}
+
+static void virtio_net_remove(dm_device_t *dm)
+{
+    (void)dm;
+    if (!g_vnet.active) return;
+    virtio_pci_set_status(&g_vnet.vpci, 0);
+    g_vnet.active = false;
+}
+
+/* 1000/1041: transitional and modern (VIRTIO_F_VERSION_1) device ids. */
+static const pci_device_id_t virtio_net_pci_ids[] = {
+    { PCI_DEVICE(0x1AF4, 0x1000) },
+    { PCI_DEVICE(0x1AF4, 0x1041) },
+    { 0 }
+};
+
+static pci_driver_t virtio_net_pci_driver = {
+    .drv      = { .name = "virtio_net" },
+    .id_table = virtio_net_pci_ids,
+    .probe    = virtio_net_probe,
+    .remove   = virtio_net_remove,
+};
+
+void virtio_net_init(void)
+{
+    pci_driver_register(&virtio_net_pci_driver);
 }

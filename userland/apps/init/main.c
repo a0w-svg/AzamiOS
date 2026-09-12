@@ -1463,8 +1463,17 @@ int main(int argc, char **argv)
     puts("===============================================================================");
     puts("             AzamiOS v7.0 — Modular Ring 3 Userspace (init.elf)");
     puts("===============================================================================");
-    /* Run POSIX conformance and self-test verification suite */
-    run_posix_verification_suite();
+    /* Run POSIX conformance and self-test verification suite. ~200 syscall
+     * probes, each individually cheap, but they still add real time to every
+     * single boot. Off by default now, same as the toolchain smoke test
+     * below; `touch /etc/run-posix-selftest` before repacking the initrd
+     * re-enables it. */
+    if (access("/etc/run-posix-selftest", F_OK) == 0) {
+        run_posix_verification_suite();
+    } else {
+        puts("[INIT] Skipping POSIX & Network verification suite "
+             "(touch /etc/run-posix-selftest to re-enable)");
+    }
 
     /* Spawn Network DHCP Daemon */
     az_spawn("/sbin/dhcpcd.elf");

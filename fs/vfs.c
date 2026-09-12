@@ -210,14 +210,31 @@ void vfs_sync_all(void)
      * via ext2.h to keep the VFS free of a filesystem-specific include. */
     extern void ext2_sync(void);
     ext2_sync();
+
+    /* ext2_sync() above only gets this kernel's own dirty buffers onto the
+     * block device — a write_sectors() call completing is not the same
+     * guarantee as the disk having actually committed it to media, since
+     * the device (or a virtualized one) can hold its own volatile write
+     * cache underneath that. Flush every registered device's cache too, so
+     * sync(2) means what it says. */
+    extern void block_dev_flush_all(void);
+    block_dev_flush_all();
 }
 
 s64 vfs_sync_fs(struct super_block *sb)
 {
     if (!sb) return -(s64)EINVAL;
+    s64 ret = 0;
     if (sb->s_op && sb->s_op->sync_fs)
-        return sb->s_op->sync_fs(sb);
-    return 0;   /* nothing buffered → already durable */
+        ret = sb->s_op->sync_fs(sb);
+    /* Same reasoning as vfs_sync_all() above: this filesystem's own dirty
+     * buffers being written back is not a device write-cache flush. There is
+     * no per-superblock backing-device link to flush just this one, so this
+     * flushes every device — the same coarse-grained tradeoff sys_fsync_impl()
+     * already makes one layer up (see its comment). */
+    extern void block_dev_flush_all(void);
+    block_dev_flush_all();
+    return ret;
 }
 
 s64 vfs_fadvise(file_t *file, u64 offset, u64 len, int advice)

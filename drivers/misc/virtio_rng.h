@@ -19,8 +19,10 @@ typedef struct virtio_rng_dev {
     bool active;
 } virtio_rng_dev_t;
 
-/** virtio_rng_init() — Probe and initialize VirtIO-RNG device. */
-int virtio_rng_init(device_t *dev);
+/** virtio_rng_init() — Register the PCI driver; probe() binds to a matching
+ *  VirtIO-RNG device automatically, so this is safe to call whether or not
+ *  the host has one. */
+void virtio_rng_init(void);
 
 /** virtio_rng_get_bytes() — Fill buffer with hardware random bytes. */
 int virtio_rng_get_bytes(void *buf, size_t len);

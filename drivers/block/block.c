@@ -183,6 +183,39 @@ block_dev_t *block_dev_get(const char *name)
     return NULL;
 }
 
+s64 block_dev_flush(block_dev_t *dev)
+{
+    if (!dev) return -(s64)EINVAL;
+    if (!dev->ops || !dev->ops->flush) return 0;   /* nothing to ask it to do */
+    return dev->ops->flush(dev);
+}
+
+s64 block_dev_trim(block_dev_t *dev, u64 lba, u32 count)
+{
+    if (!dev || count == 0) return -(s64)EINVAL;
+    if (dev->sector_count && lba + count > dev->sector_count) return -(s64)EINVAL;
+    if (!dev->ops || !dev->ops->trim) return 0;   /* advisory only: nothing to ask it to do */
+    return dev->ops->trim(dev, lba, count);
+}
+
+void block_dev_flush_all(void)
+{
+    /* g_block_devices is append-(prepend-)only — nothing ever unregisters a
+     * block device — so walking it after a single lock/unlock is safe even
+     * if another device registers concurrently; that new node just would
+     * not be in this snapshot's chain yet. */
+    spinlock_lock(&g_block_lock);
+    block_dev_t *curr = g_block_devices;
+    spinlock_unlock(&g_block_lock);
+
+    for (; curr; curr = curr->next) {
+        s64 ret = block_dev_flush(curr);
+        if (ret < 0) {
+            pr_debug("[BLOCK] flush of '%s' failed: %lld\n", curr->name, (long long)ret);
+        }
+    }
+}
+
 /* ── RAM Disk (ram0) Driver ──────────────────────────────────────────────── */
 
 typedef struct {

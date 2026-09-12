@@ -30,7 +30,10 @@ typedef struct {
     bool                active;
 } virtio_net_dev_t;
 
-int virtio_net_init(device_t *pci_dev);
+/** virtio_net_init() — Register the PCI driver; probe() binds to a matching
+ *  device automatically, so this is safe to call whether or not the host has
+ *  a virtio-net-pci device. */
+void virtio_net_init(void);
 s64 virtio_net_send_packet(const void *data, size_t len);
 void virtio_net_get_mac(u8 mac_out[6]);
 void virtio_net_poll(void);

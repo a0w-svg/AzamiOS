@@ -550,6 +550,15 @@ struct futex_waitv {
 #define SYS_AZ_KTRACE_READ    543
 #define SYS_AZ_KTRACE_CLEAR   544
 
+/* Spawns like SYS_AZ_SPAWN, but with a second string (rsi) passed through as
+ * argv[1] — e.g. a file path for a GUI app to open. rsi may be NULL/absent,
+ * in which case behaviour is identical to SYS_AZ_SPAWN. Kept as a separate
+ * number rather than overloading SYS_AZ_SPAWN's rsi so every existing
+ * single-argument caller (built with syscall1(), which never constrains
+ * rsi) keeps working unaffected by whatever garbage happens to sit in rsi
+ * at their call site. */
+#define SYS_AZ_SPAWN_ARG      545
+
 /* ── System Telemetry (SYS_AZ_SYSSTAT) ──────────────────────────────────── */
 typedef struct {
     uint64_t idle_ticks[16];

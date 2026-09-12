@@ -290,11 +290,17 @@ static int virtgpu_pci_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
     (void)id;
 
-    /* The VirtIO transport is brought up during PCI enumeration; without a
-     * control queue there is nothing to talk to. */
+    /* This probe only ever runs when the PCI bus actually matched a
+     * virtio-gpu device against virtgpu_pci_ids below, so this is where the
+     * transport gets brought up too — one dynamic bring-up for the whole
+     * device, transport and KMS together, instead of the old unconditional
+     * call from kernel/main.c. virtio_gpu_init() is idempotent (refuses a
+     * second call with -EBUSY), so a rescan or hotplug re-probe is safe. */
     if (!g_gpu.controlq) {
-        pr_debug("[VIRTIO-GPU-DRM] transport not initialised — declining\n");
-        return -ENODEV;
+        if (virtio_gpu_init(dm->hal) < 0) {
+            pr_debug("[VIRTIO-GPU-DRM] transport bring-up failed — declining\n");
+            return -ENODEV;
+        }
     }
 
     /* Create the host resource and its backing on first use. */

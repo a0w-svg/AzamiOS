@@ -100,6 +100,11 @@ int az_fb_flip(unsigned int buffer_index);
 /** az_spawn(path) — Spawn a new process from an ELF binary. Returns child PID or negative errno. */
 int az_spawn(const char *path);
 
+/** az_spawn_arg(path, arg) — Like az_spawn(), but passes `arg` through as argv[1]
+ *  (e.g. a file for a GUI app to open). Pass NULL for `arg` to behave exactly
+ *  like az_spawn(). Returns child PID or negative errno. */
+int az_spawn_arg(const char *path, const char *arg);
+
 /** az_yield() — Voluntarily yield CPU. */
 void az_yield(void);
 

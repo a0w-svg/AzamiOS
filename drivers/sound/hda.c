@@ -9,6 +9,7 @@
 #include "hda.h"
 #include "../../hal/pci.h"
 #include "../../hal/device.h"
+#include "../base/pci_bus.h"
 #include "../../kernel/mm/pmm.h"
 #include "../../kernel/mm/kmalloc.h"
 #include "../../arch/x86_64/mm/vmm.h"
@@ -101,19 +102,17 @@ static file_operations_t g_hda_fops = {
     .poll = NULL
 };
 
-int hda_init(device_t *dev)
+static int hda_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
-    if (!dev) return -EINVAL;
+    (void)id;
+    /* Single global controller instance: refuse a second card rather than
+     * remapping MMIO out from under the first. */
+    if (g_hda_ready) return -EBUSY;
 
-    pci_device_info_t *pci = pci_get_device_info(dev);
-    if (!pci) return -ENODEV;
-
-    if (pci->class_code != 0x04 || pci->subclass != 0x03) return -ENODEV;
-
-    phys_addr_t mmio_phys = pci_get_bar(dev, 0);
+    phys_addr_t mmio_phys = pci_get_bar(dm->hal, 0);
     if (!mmio_phys) return -ENODEV;
 
-    pci_enable_bus_mastering(dev);
+    pci_enable_bus_mastering(dm->hal);
 
     /* Map MMIO region into kernel virtual address space */
     void *virt = vmm_map_io(mmio_phys, 16384);
@@ -142,7 +141,34 @@ int hda_init(device_t *dev)
     g_hda_ready = true;
 
     devfs_register_device("dsp1", &g_hda_fops, NULL);
+    dm_set_drvdata(dm, &g_hda_ready);
     pr_debug("[HDA] Intel HDA audio sink online and registered as /dev/dsp1\n");
 
     return 0;
+}
+
+static void hda_remove(dm_device_t *dm)
+{
+    (void)dm;
+    if (!g_hda_ready) return;
+    hda_write32(HDA_REG_GCTL, hda_read32(HDA_REG_GCTL) & ~1u);   /* assert CRST */
+    g_hda_ready = false;
+}
+
+/* Class 0x04 (multimedia), subclass 0x03 (HD Audio) — any vendor. */
+static const pci_device_id_t hda_pci_ids[] = {
+    { PCI_DEVICE_CLASS(0x040300, 0xFFFF00) },
+    { 0 }
+};
+
+static pci_driver_t hda_pci_driver = {
+    .drv      = { .name = "hda" },
+    .id_table = hda_pci_ids,
+    .probe    = hda_probe,
+    .remove   = hda_remove,
+};
+
+void hda_init(void)
+{
+    pci_driver_register(&hda_pci_driver);
 }

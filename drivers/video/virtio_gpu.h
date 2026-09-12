@@ -195,10 +195,15 @@ typedef struct virtio_gpu_state {
 } virtio_gpu_state_t;
 
 /**
- * virtio_gpu_init - Initialize the VirtIO-GPU driver.
- * Returns 0 on success.
+ * virtio_gpu_init(hal_dev) - Bring up the VirtIO-GPU transport (queues,
+ * feature negotiation) against one already-matched PCI device. Not a
+ * self-registering driver: drivers/gpu/drm/virtgpu_drm.c owns the PCI id
+ * match for this device (1AF4:1050/1010) and calls this from its own probe()
+ * the first time it runs, so this only ever executes when that hardware is
+ * actually present. Returns 0 on success, or -EBUSY if the transport is
+ * already up.
  */
-int virtio_gpu_init(device_t *pci_dev);
+int virtio_gpu_init(device_t *hal_dev);
 
 /**
  * virtio_gpu_send_command - Submit on the control queue and wait for response.
