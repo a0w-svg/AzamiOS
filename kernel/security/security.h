@@ -182,3 +182,11 @@ void security_caps_on_exec(process_t *proc);
 /** security_seccomp_check(proc, syscall_nr) — Returns true when the syscall is
  *  permitted under the process's seccomp mode. */
 bool security_seccomp_check(process_t *proc, u64 syscall_nr);
+
+/* Security knobs / sysctls */
+extern u64 g_mmap_min_addr;
+extern u32 g_dmesg_restrict;
+extern u32 g_kptr_restrict;
+extern u32 g_yama_ptrace_scope;
+extern u32 g_protected_hardlinks;
+extern u32 g_protected_symlinks;

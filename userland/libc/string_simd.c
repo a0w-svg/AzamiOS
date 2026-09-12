@@ -176,6 +176,72 @@ void *memchr(const void *s, int c, size_t n)
     return __libc_simd_tier ? memchr_avx2(s, c, n) : memchr_sse2(s, c, n);
 }
 
+/* ── memrchr (bounded reverse scan) ──────────────────────────────────────── */
+
+static void *memrchr_sse2(const void *s, int c, size_t n)
+{
+    const unsigned char *p = (const unsigned char *)s + n;
+    unsigned char cc = (unsigned char)c;
+    __m128i v = _mm_set1_epi8((char)cc);
+
+    while (n >= 16) {
+        p -= 16;
+        n -= 16;
+        unsigned m = (unsigned)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)p), v));
+        if (m) {
+            unsigned bit = 31 - (unsigned)__builtin_clz(m);
+            return (void *)(p + bit);
+        }
+    }
+    while (n--) {
+        --p;
+        if (*p == cc) return (void *)p;
+    }
+    return NULL;
+}
+
+__attribute__((target("avx2")))
+static void *memrchr_avx2(const void *s, int c, size_t n)
+{
+    const unsigned char *p = (const unsigned char *)s + n;
+    unsigned char cc = (unsigned char)c;
+    __m256i v = _mm256_set1_epi8((char)cc);
+
+    while (n >= 32) {
+        p -= 32;
+        n -= 32;
+        unsigned m = (unsigned)_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)p), v));
+        if (m) {
+            unsigned bit = 31 - (unsigned)__builtin_clz(m);
+            return (void *)(p + bit);
+        }
+    }
+    while (n >= 16) {
+        p -= 16;
+        n -= 16;
+        unsigned m = (unsigned)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)p),
+                               _mm256_castsi256_si128(v)));
+        if (m) {
+            unsigned bit = 31 - (unsigned)__builtin_clz(m);
+            return (void *)(p + bit);
+        }
+    }
+    while (n--) {
+        --p;
+        if (*p == cc) return (void *)p;
+    }
+    return NULL;
+}
+
+void *memrchr(const void *s, int c, size_t n)
+{
+    if (!s || n == 0) return NULL;
+    return __libc_simd_tier ? memrchr_avx2(s, c, n) : memrchr_sse2(s, c, n);
+}
+
 /* ── rawmemchr (unbounded, always finds) ─────────────────────────────────── */
 
 static void *rawmemchr_sse2(const void *s, int c)
@@ -198,9 +264,30 @@ static void *rawmemchr_sse2(const void *s, int c)
     }
 }
 
+__attribute__((target("avx2")))
+static void *rawmemchr_avx2(const void *s, int c)
+{
+    __m256i v = _mm256_set1_epi8((char)(unsigned char)c);
+    uintptr_t a = (uintptr_t)s;
+    const unsigned char *p = (const unsigned char *)(a & ~(uintptr_t)31);
+    unsigned off = (unsigned)(a & 31);
+
+    unsigned m = (unsigned)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(_mm256_load_si256((const __m256i *)p), v));
+    m >>= off;
+    if (m) return (void *)((const unsigned char *)s + __builtin_ctz(m));
+
+    for (;;) {
+        p += 32;
+        m = (unsigned)_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(_mm256_load_si256((const __m256i *)p), v));
+        if (m) return (void *)(p + __builtin_ctz(m));
+    }
+}
+
 void *rawmemchr(const void *s, int c)
 {
-    return rawmemchr_sse2(s, c);
+    return __libc_simd_tier ? rawmemchr_avx2(s, c) : rawmemchr_sse2(s, c);
 }
 
 /* ── strchr / strchrnul ─────────────────────────────────────────────────── */
@@ -297,10 +384,42 @@ static char *strrchr_sse2(const char *s, int c)
     }
 }
 
+__attribute__((target("avx2")))
+static char *strrchr_avx2(const char *s, int c)
+{
+    const __m256i vc = _mm256_set1_epi8((char)c);
+    const __m256i z  = _mm256_setzero_si256();
+    uintptr_t a = (uintptr_t)s;
+    const char *p = (const char *)(a & ~(uintptr_t)31);
+    unsigned off = (unsigned)(a & 31);
+    const char *last = NULL;
+
+    __m256i x = _mm256_load_si256((const __m256i *)p);
+    unsigned cm = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, vc)) >> off;
+    unsigned zm = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, z)) >> off;
+    const char *base = s;
+
+    for (;;) {
+        if (zm) {
+            unsigned nul = (unsigned)__builtin_ctz(zm);
+            unsigned keep = (nul >= 31) ? ~0u : ((1u << (nul + 1)) - 1);
+            cm &= keep;
+            if (cm) last = base + (31 - __builtin_clz(cm));
+            return (char *)last;
+        }
+        if (cm) last = base + (31 - __builtin_clz(cm));
+        p += 32;
+        base = p;
+        x = _mm256_load_si256((const __m256i *)p);
+        cm = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, vc));
+        zm = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, z));
+    }
+}
+
 char *strrchr(const char *s, int c)
 {
     if (!s) return NULL;
-    return strrchr_sse2(s, c);
+    return __libc_simd_tier ? strrchr_avx2(s, c) : strrchr_sse2(s, c);
 }
 
 /* ── memcmp (bounded) ───────────────────────────────────────────────────── */
@@ -790,4 +909,128 @@ int strncmp(const char *s1, const char *s2, size_t n)
     if (!s1 || !s2) { if (s1 == s2) return 0; return s1 ? 1 : -1; }
     return __libc_simd_tier ? strncmp_avx2(s1, s2, n) : strncmp_sse2(s1, s2, n);
 }
+
+/* ── Constant-Time Cryptographic Primitives & Memory Wiping ──────────────── */
+
+void explicit_bzero(void *s, size_t n)
+{
+    if (!s || n == 0) return;
+    volatile unsigned char *p = (volatile unsigned char *)s;
+    while (n && ((uintptr_t)p & 7)) {
+        *p++ = 0;
+        n--;
+    }
+    volatile uint64_t *q = (volatile uint64_t *)p;
+    while (n >= 8) {
+        *q++ = 0;
+        n -= 8;
+    }
+    p = (volatile unsigned char *)q;
+    while (n--) {
+        *p++ = 0;
+    }
+    /* Hardware memory clobber & store fence prevents dead-store elimination & delays */
+    __asm__ volatile("" : : "r"(s) : "memory");
+    _mm_sfence();
+}
+
+int timingsafe_bcmp(const void *b1, const void *b2, size_t n)
+{
+    const unsigned char *p1 = (const unsigned char *)b1;
+    const unsigned char *p2 = (const unsigned char *)b2;
+    uint64_t res64 = 0;
+
+    while (n >= 8) {
+        uint64_t v1, v2;
+        __builtin_memcpy(&v1, p1, 8);
+        __builtin_memcpy(&v2, p2, 8);
+        res64 |= (v1 ^ v2);
+        p1 += 8;
+        p2 += 8;
+        n -= 8;
+    }
+
+    uint8_t res8 = (uint8_t)((res64 >> 56) | (res64 >> 48) | (res64 >> 40) | (res64 >> 32) |
+                             (res64 >> 24) | (res64 >> 16) | (res64 >> 8) | res64);
+
+    while (n--) {
+        res8 |= (*p1++ ^ *p2++);
+    }
+
+    return (res8 != 0);
+}
+
+int timingsafe_memcmp(const void *b1, const void *b2, size_t n)
+{
+    const unsigned char *p1 = (const unsigned char *)b1;
+    const unsigned char *p2 = (const unsigned char *)b2;
+    int res = 0;
+    int done = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        int diff = (int)p1[i] - (int)p2[i];
+        if (diff != 0 && !done) {
+            res = diff;
+            done = 1;
+        }
+    }
+    return res;
+}
+
+/* ── CRC-32C (Hardware SSE4.2 / Castagnoli Table Fallback) ─────────────────── */
+
+static uint32_t s_user_crc32c_table[256];
+static int      s_user_crc32c_table_init = 0;
+
+static void user_crc32c_init_table(void)
+{
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
+        s_user_crc32c_table[i] = c;
+    }
+    s_user_crc32c_table_init = 1;
+}
+
+static int cpu_has_sse42(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    unsigned a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    cached = (c & (1u << 20)) ? 1 : 0;
+    return cached;
+}
+
+uint32_t crc32c(uint32_t crc, const void *buf, size_t len)
+{
+    const unsigned char *p = (const unsigned char *)buf;
+    if (!p || len == 0) return crc;
+
+    if (cpu_has_sse42()) {
+        while (len && ((uintptr_t)p & 7)) {
+            __asm__("crc32b %1, %0" : "+r"(crc) : "rm"(*p));
+            p++; len--;
+        }
+        uint64_t c64 = crc;
+        while (len >= 8) {
+            __asm__("crc32q %1, %0" : "+r"(c64) : "rm"(*(const uint64_t *)p));
+            p += 8; len -= 8;
+        }
+        crc = (uint32_t)c64;
+        while (len--) {
+            __asm__("crc32b %1, %0" : "+r"(crc) : "rm"(*p));
+            p++;
+        }
+        return crc;
+    }
+
+    if (!s_user_crc32c_table_init) user_crc32c_init_table();
+    while (len--) {
+        crc = s_user_crc32c_table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    }
+    return crc;
+}
+
 

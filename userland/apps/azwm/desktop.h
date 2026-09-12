@@ -15,17 +15,19 @@ void desktop_draw_taskbar(unsigned int *buf, unsigned int w, unsigned int h, uns
 
 /** desktop_draw_cursor — Render mouse cursor sprite at (cx, cy). */
 void desktop_draw_cursor(unsigned int *buf, unsigned int w, unsigned int h, unsigned int pitch_px,
-                         int cx, int cy);
+                         int cx, int cy, unsigned int cursor_type);
 
 /* Native size of the pointer sprite, and its hotspot (the arrow tip). */
-#define DESKTOP_CURSOR_W    14
+#define DESKTOP_CURSOR_W    16
 #define DESKTOP_CURSOR_H    21
 #define DESKTOP_CURSOR_HX   0
 #define DESKTOP_CURSOR_HY   0
 
-/** desktop_cursor_blit_bgra — write the pointer sprite into a caller buffer of
- *  @dst_w x @dst_h BGRA8888 pixels, top-left aligned, rest left untouched. */
+/** desktop_cursor_blit_bgra — write default pointer sprite into caller buffer */
 void desktop_cursor_blit_bgra(unsigned int *dst, unsigned int dst_w, unsigned int dst_h);
+
+/** desktop_cursor_blit_bgra_type — write specific cursor sprite into caller buffer */
+void desktop_cursor_blit_bgra_type(unsigned int *dst, unsigned int dst_w, unsigned int dst_h, unsigned int cursor_type);
 
 /** desktop_draw_char_at — Draw a single character using the embedded 8x16 font. */
 void desktop_draw_char_at(unsigned int *buf, unsigned int w, unsigned int h, unsigned int pitch_px,

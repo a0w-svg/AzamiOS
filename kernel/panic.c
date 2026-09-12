@@ -113,6 +113,12 @@ __noreturn void kernel_panic(const char *fmt, ...)
 
     kprintf("\n\n  System halted.\n");
 
+    /* Notify hypervisors (QEMU pvpanic) and fast debug ports */
+    extern void pvpanic_notify(u8 event);
+    extern void debugcon_puts(const char *s);
+    pvpanic_notify(1); /* PVPANIC_PANICKED */
+    debugcon_puts("\n[PANIC] Kernel Panic: system halted.\n");
+
     /* This is the guaranteed terminal point — the __noreturn is satisfied. */
     cpu_halt_loop();
     __builtin_unreachable();

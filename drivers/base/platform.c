@@ -170,14 +170,34 @@ static const platform_resource_t lpt_res[] = {
     { PLATFORM_RES_IO,  0x378, 3, "lpt1" },
     { PLATFORM_RES_IRQ, 7,     1, NULL   },
 };
+static const platform_resource_t fw_cfg_res[] = {
+    { PLATFORM_RES_IO,  0x510, 2, "fw_cfg" },
+};
+static const platform_resource_t debugcon_res[] = {
+    { PLATFORM_RES_IO,  0xE9,  1, "debugcon" },
+};
+static const platform_resource_t pvpanic_res[] = {
+    { PLATFORM_RES_IO,  0x505, 1, "pvpanic" },
+};
+static const platform_resource_t mpu401_res[] = {
+    { PLATFORM_RES_IO,  0x330, 2, "mpu401" },
+};
+static const platform_resource_t pm_timer_res[] = {
+    { PLATFORM_RES_IO,  0x408, 4, "pm_timer" },
+};
 
 static platform_device_t g_board_devices[] = {
-    { .name = "serial8250", .id = 0, .res = uart0_res,  .nres = ARRAY_SIZE(uart0_res)  },
-    { .name = "serial8250", .id = 1, .res = uart1_res,  .nres = ARRAY_SIZE(uart1_res)  },
-    { .name = "rtc_cmos",   .id = 0, .res = rtc_res,    .nres = ARRAY_SIZE(rtc_res)    },
-    { .name = "i8042",      .id = 0, .res = i8042_res,  .nres = ARRAY_SIZE(i8042_res)  },
-    { .name = "pcspkr",     .id = 0, .res = pcspkr_res, .nres = ARRAY_SIZE(pcspkr_res) },
-    { .name = "parport_pc", .id = 0, .res = lpt_res,    .nres = ARRAY_SIZE(lpt_res)    },
+    { .name = "serial8250",  .id = 0, .res = uart0_res,    .nres = ARRAY_SIZE(uart0_res)    },
+    { .name = "serial8250",  .id = 1, .res = uart1_res,    .nres = ARRAY_SIZE(uart1_res)    },
+    { .name = "rtc_cmos",    .id = 0, .res = rtc_res,      .nres = ARRAY_SIZE(rtc_res)      },
+    { .name = "i8042",       .id = 0, .res = i8042_res,    .nres = ARRAY_SIZE(i8042_res)    },
+    { .name = "pcspkr",      .id = 0, .res = pcspkr_res,   .nres = ARRAY_SIZE(pcspkr_res)   },
+    { .name = "parport_pc",  .id = 0, .res = lpt_res,      .nres = ARRAY_SIZE(lpt_res)      },
+    { .name = "qemu_fw_cfg", .id = 0, .res = fw_cfg_res,   .nres = ARRAY_SIZE(fw_cfg_res)   },
+    { .name = "debugcon",    .id = 0, .res = debugcon_res, .nres = ARRAY_SIZE(debugcon_res) },
+    { .name = "pvpanic",     .id = 0, .res = pvpanic_res,  .nres = ARRAY_SIZE(pvpanic_res)  },
+    { .name = "mpu401",      .id = 0, .res = mpu401_res,   .nres = ARRAY_SIZE(mpu401_res)   },
+    { .name = "pm_timer",    .id = 0, .res = pm_timer_res, .nres = ARRAY_SIZE(pm_timer_res) },
 };
 
 /* The bootloader framebuffer, described the way Linux's simple-framebuffer

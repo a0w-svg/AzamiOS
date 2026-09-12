@@ -1475,6 +1475,117 @@ int main(int argc, char **argv)
              "(touch /etc/run-posix-selftest to re-enable)");
     }
 
+    if (access("/etc/run-hwtest", F_OK) == 0) {
+        puts("-------------------------------------------------------------------------------");
+        puts("      Running Hardware Acceleration & Performance Benchmark (/bin/hwtest.elf)");
+        puts("-------------------------------------------------------------------------------");
+        pid_t p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/hwtest.elf", NULL };
+            execve("/bin/hwtest.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+    }
+
+    if (access("/etc/run-userspace-test", F_OK) == 0) {
+        puts("-------------------------------------------------------------------------------");
+        puts("      Running Userspace Improvements Test Suite (/etc/run-userspace-test)");
+        puts("-------------------------------------------------------------------------------");
+        pid_t p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/sysctl.elf", "-p", "/etc/sysctl.conf", NULL };
+            execve("/bin/sysctl.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/sysctl.elf", "-a", NULL };
+            execve("/bin/sysctl.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/fetch.elf", NULL };
+            execve("/bin/fetch.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/sh.elf", "-c", "export TEST_VAR=AzamiUserspace; echo 'SHELL TEST: TEST_VAR='$TEST_VAR 'USER='$USER 'HOME='$HOME 'PWD='$PWD 'EXIT='$?", NULL };
+            execve("/bin/sh.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/uname.elf", "-a", NULL };
+            execve("/bin/uname.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/free.elf", "-h", NULL };
+            execve("/bin/free.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/uptime.elf", "-p", NULL };
+            execve("/bin/uptime.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/id.elf", NULL };
+            execve("/bin/id.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/which.elf", "-a", "sh", NULL };
+            execve("/bin/which.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+        puts("-------------------------------------------------------------------------------");
+    }
+
     /* Spawn Network DHCP Daemon */
     az_spawn("/sbin/dhcpcd.elf");
 

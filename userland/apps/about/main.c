@@ -133,6 +133,12 @@ int main(int argc, char **argv)
         if (r < 0) break;
         if (r != 0) continue;
         if (msg.type == AZ_WM_DESTROY_WINDOW) break;
+
+        if (msg.type == AZ_WM_WINDOW_RESIZED) {
+            if (!uk_handle_resize(&g_win, &msg)) break;
+            draw_about();
+            continue;
+        }
     }
     sys_exit(0);
 }

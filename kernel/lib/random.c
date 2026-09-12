@@ -20,6 +20,7 @@
 #include "random.h"
 #include "string.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/cpu/hwaccel.h"
 
 /* ── x86 primitives ──────────────────────────────────────────────────────── */
 
@@ -30,49 +31,10 @@ static inline u64 rdtsc64(void)
     return ((u64)hi << 32) | lo;
 }
 
-static inline void cpuid_count(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d)
+static inline bool get_hw_seed(u64 *out)
 {
-    __asm__ volatile("cpuid"
-                     : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)
-                     : "a"(leaf), "c"(sub));
-}
-
-static int g_has_rdrand = -1;
-static int g_has_rdseed = -1;
-
-static void hw_rng_detect(void)
-{
-    u32 a, b, c, d;
-    cpuid_count(1, 0, &a, &b, &c, &d);
-    g_has_rdrand = (c >> 30) & 1;
-    cpuid_count(7, 0, &a, &b, &c, &d);
-    g_has_rdseed = (b >> 18) & 1;
-}
-
-static int rdrand64(u64 *out)
-{
-    if (g_has_rdrand < 0) hw_rng_detect();
-    if (!g_has_rdrand) return 0;
-    for (int i = 0; i < 32; i++) {
-        u64 v;
-        u8 ok;
-        __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok));
-        if (ok) { *out = v; return 1; }
-    }
-    return 0;
-}
-
-static int rdseed64(u64 *out)
-{
-    if (g_has_rdseed < 0) hw_rng_detect();
-    if (!g_has_rdseed) return 0;
-    for (int i = 0; i < 64; i++) {
-        u64 v;
-        u8 ok;
-        __asm__ volatile("rdseed %0; setc %1" : "=r"(v), "=qm"(ok));
-        if (ok) { *out = v; return 1; }
-    }
-    return 0;
+    if (hw_rdseed64(out)) return true;
+    return hw_rdrand64(out);
 }
 
 /* ── ChaCha20 block function (RFC 8439, 20 rounds) ───────────────────────── */
@@ -131,7 +93,7 @@ static void gather_seed_locked(void)
     u64 w[8] = {0};
     for (int i = 0; i < 6; i++) {
         u64 v = 0;
-        if (!rdseed64(&v) && !rdrand64(&v)) v = 0;
+        if (!get_hw_seed(&v)) v = 0;
         w[i] = v ^ rdtsc64();
     }
     /* Address-space layout + timing entropy as a backstop when no HW RNG. */
@@ -172,16 +134,23 @@ static void refill_locked(void)
     /* Fast key erasure. */
     memcpy(g_key, block, 32);
 
+    /* Hardware serialization: prevent speculative access or leakage across key boundary */
+    hw_serialize();
+
     /* Continuous hardware-entropy injection (only ever helps). */
     u64 hw;
-    if (rdrand64(&hw)) {
+    if (hw_rdrand64(&hw)) {
         g_key[0] ^= (u32)hw;
         g_key[7] ^= (u32)(hw >> 32);
     }
 
     memcpy(g_pool, block + 32, 32);
     g_pool_pos = 0;
-    __builtin_memset(block, 0, sizeof(block));
+
+    /* Securely wipe temporary block buffer */
+    volatile u64 *wb = (volatile u64 *)block;
+    for (size_t i = 0; i < sizeof(block) / sizeof(u64); i++) wb[i] = 0;
+    __asm__ volatile("" : : "r"(block) : "memory");
 }
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
@@ -216,7 +185,9 @@ void krandom_bytes(void *buf, size_t n)
         size_t k = n < avail ? n : avail;
         memcpy(d, &g_pool[g_pool_pos], k);
         /* Wipe consumed pool bytes so a later state capture can't reveal them. */
-        __builtin_memset(&g_pool[g_pool_pos], 0, k);
+        volatile u8 *p = (volatile u8 *)&g_pool[g_pool_pos];
+        for (size_t i = 0; i < k; i++) p[i] = 0;
+        __asm__ volatile("" : : "r"(&g_pool[g_pool_pos]) : "memory");
         g_pool_pos += (int)k;
         d += k;
         n -= k;

@@ -118,7 +118,7 @@ static s64 fbdev_flip_to(u32 buf_idx, bool wait_vsync)
 {
     if (!g_fb_state.has_hw_flip || buf_idx >= g_fb_state.buffers) return -(s64)EINVAL;
 
-    if (wait_vsync) vsync_wait(0);
+    if (wait_vsync && bga_get_fb_phys() == 0) vsync_wait(0);
 
     if (g_fb_state.is_virtio) {
         u32 y_off = buf_idx * g_fb_state.height;

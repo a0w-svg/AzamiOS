@@ -4,7 +4,7 @@
  * ============================================================================ */
 #pragma once
 
-#include "stdint.h"
+#include <stdint.h>
 
 #define PRId8   "d"
 #define PRId16  "d"
@@ -44,3 +44,13 @@
 #define SCNx16  "hx"
 #define SCNx32  "x"
 #define SCNx64  "llx"
+
+typedef struct {
+    intmax_t quot;
+    intmax_t rem;
+} imaxdiv_t;
+
+intmax_t  imaxabs(intmax_t j);
+imaxdiv_t imaxdiv(intmax_t numer, intmax_t denom);
+intmax_t  strtoimax(const char *nptr, char **endptr, int base);
+uintmax_t strtoumax(const char *nptr, char **endptr, int base);

@@ -50,3 +50,7 @@ int    vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap);
  */
 int    scnprintf(char *buf, size_t size, const char *fmt, ...);
 int    vscnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap);
+
+/* Security and crypto memory utilities */
+void   memzero_explicit(void *s, size_t count);
+int    crypto_memneq(const void *a, const void *b, size_t size);

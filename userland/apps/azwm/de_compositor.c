@@ -129,6 +129,27 @@ void de_comp_broadcast_focus(de_comp_state_t *de,
     broadcast(de, &msg);
 }
 
+void de_comp_broadcast_title(de_comp_state_t *de,
+                              unsigned int wid, const char *title)
+{
+    az_wm_msg_t msg;
+    az_wm_evt_title_payload_t *pl;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.type = AZ_WM_EVT_WINDOW_TITLE_CHANGED;
+    pl = AZ_WM_MSG_EVT_TITLE(&msg);
+    pl->wid = wid;
+    if (title) {
+        int i;
+        for (i = 0; i < 63 && title[i]; i++) pl->title[i] = title[i];
+        pl->title[i] = '\0';
+    } else {
+        pl->title[0] = '\0';
+    }
+
+    broadcast(de, &msg);
+}
+
 /* ---- Z-order enforcement ------------------------------------------------- */
 
 /*

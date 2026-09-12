@@ -27,6 +27,7 @@
 #include "include/sys/select.h"
 #include "include/grp.h"
 #include "include/limits.h"
+#include "include/utime.h"
 
 __thread int errno = 0;
 
@@ -822,7 +823,7 @@ int reboot(int cmd)
     return (int)__syscall_ret(syscall4(SYS_reboot, 0xfee1dead, 672274793, (long)cmd, 0));
 }
 
-int utime(const char *filename, const void *times)
+int utime(const char *filename, const struct utimbuf *times)
 {
     return (int)__syscall_ret(syscall2(SYS_utime, (long)filename, (long)times));
 }

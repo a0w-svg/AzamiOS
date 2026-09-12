@@ -689,3 +689,141 @@ static inline void gfx_draw_circle_aa(gfx_surface_t *surf, int cx, int cy, int r
     }
 }
 
+/* ── Radial and Diagonal Gradient Rendering ───────────────────────────────── */
+
+static inline void gfx_draw_gradient_radial(gfx_surface_t *surf, int cx, int cy, int radius,
+                                            uint32_t inner_col, uint32_t outer_col)
+{
+    if (!surf || !surf->pixels || radius <= 0) return;
+    int x1 = cx - radius;
+    int y1 = cy - radius;
+    int x2 = cx + radius;
+    int y2 = cy + radius;
+
+    if (x1 < surf->clip.x) x1 = surf->clip.x;
+    if (y1 < surf->clip.y) y1 = surf->clip.y;
+    if (x2 >= surf->clip.x + surf->clip.w) x2 = surf->clip.x + surf->clip.w - 1;
+    if (y2 >= surf->clip.y + surf->clip.h) y2 = surf->clip.y + surf->clip.h - 1;
+    if (x1 > x2 || y1 > y2) return;
+
+    int r2 = radius * radius;
+    for (int y = y1; y <= y2; y++) {
+        int dy = y - cy;
+        int dy2 = dy * dy;
+        for (int x = x1; x <= x2; x++) {
+            int dx = x - cx;
+            int dist2 = dx * dx + dy2;
+            if (dist2 <= r2) {
+                /* Integer square root calculation */
+                int op = dist2;
+                int res = 0;
+                int one = 1 << 30;
+                while (one > op) one >>= 2;
+                while (one != 0) {
+                    if (op >= res + one) {
+                        op -= res + one;
+                        res = (res >> 1) + one;
+                    } else {
+                        res >>= 1;
+                    }
+                    one >>= 2;
+                }
+                int dist = res;
+                if (dist > radius) dist = radius;
+                uint32_t c = gfx_lerp_color(inner_col, outer_col, dist, radius);
+                gfx_draw_pixel(surf, x, y, c);
+            }
+        }
+    }
+}
+
+static inline void gfx_draw_gradient_diagonal(gfx_surface_t *surf, int x, int y, int w, int h,
+                                              uint32_t top_left, uint32_t bottom_right)
+{
+    if (!surf || !surf->pixels || w <= 0 || h <= 0) return;
+    int x1 = x < surf->clip.x ? surf->clip.x : x;
+    int y1 = y < surf->clip.y ? surf->clip.y : y;
+    int x2 = (x + w) > (surf->clip.x + surf->clip.w) ? (surf->clip.x + surf->clip.w) : (x + w);
+    int y2 = (y + h) > (surf->clip.y + surf->clip.h) ? (surf->clip.y + surf->clip.h) : (y + h);
+    if (x1 >= x2 || y1 >= y2) return;
+
+    int max_dist = (w - 1) + (h - 1);
+    if (max_dist <= 0) max_dist = 1;
+
+    for (int py = y1; py < y2; py++) {
+        int dy = py - y;
+        for (int px = x1; px < x2; px++) {
+            int dx = px - x;
+            int t = dx + dy;
+            uint32_t c = gfx_lerp_color(top_left, bottom_right, t, max_dist);
+            gfx_draw_pixel(surf, px, py, c);
+        }
+    }
+}
+
+/* ── Thick Outline and Ambient Glow Primitives ────────────────────────────── */
+
+static inline void gfx_draw_rounded_rect_outline_thick(gfx_surface_t *surf, int x, int y, int w, int h,
+                                                       int r, int thickness, uint32_t color)
+{
+    if (!surf || !surf->pixels || thickness <= 0 || w <= 0 || h <= 0) return;
+    if (r <= 0) {
+        gfx_draw_rect(surf, x, y, w, h, thickness, color);
+        return;
+    }
+    for (int t = 0; t < thickness; t++) {
+        int cur_w = w - 2 * t;
+        int cur_h = h - 2 * t;
+        int cur_r = r - t;
+        if (cur_w <= 0 || cur_h <= 0) break;
+        if (cur_r < 0) cur_r = 0;
+
+        int rx = x + t;
+        int ry = y + t;
+        if (cur_r == 0) {
+            gfx_draw_rect(surf, rx, ry, cur_w, cur_h, 1, color);
+        } else {
+            gfx_fill_rect(surf, rx + cur_r, ry, cur_w - 2 * cur_r, 1, color);
+            gfx_fill_rect(surf, rx + cur_r, ry + cur_h - 1, cur_w - 2 * cur_r, 1, color);
+            gfx_fill_rect(surf, rx, ry + cur_r, 1, cur_h - 2 * cur_r, color);
+            gfx_fill_rect(surf, rx + cur_w - 1, ry + cur_r, 1, cur_h - 2 * cur_r, color);
+
+            int r2 = cur_r * cur_r;
+            int r_inner2 = (cur_r - 1) * (cur_r - 1);
+            for (int dy = 0; dy < cur_r; dy++) {
+                for (int dx = 0; dx < cur_r; dx++) {
+                    int cx = cur_r - 1 - dx;
+                    int cy = cur_r - 1 - dy;
+                    int d2 = cx * cx + cy * cy;
+                    if (d2 <= r2 && d2 >= r_inner2) {
+                        gfx_draw_pixel(surf, rx + dx, ry + dy, color);
+                        gfx_draw_pixel(surf, rx + cur_w - 1 - dx, ry + dy, color);
+                        gfx_draw_pixel(surf, rx + dx, ry + cur_h - 1 - dy, color);
+                        gfx_draw_pixel(surf, rx + cur_w - 1 - dx, ry + cur_h - 1 - dy, color);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static inline void gfx_draw_pill_glow(gfx_surface_t *surf, int x, int y, int w, int h,
+                                      uint32_t glow_color, int blur_spread)
+{
+    if (!surf || !surf->pixels || blur_spread <= 0 || w <= 0 || h <= 0) return;
+    uint8_t base_a = (glow_color >> 24) & 0xFF;
+    if (base_a == 0) base_a = 255;
+    uint32_t rgb = glow_color & 0x00FFFFFF;
+
+    int r = h / 2;
+    for (int i = 1; i <= blur_spread; i++) {
+        int spread = i;
+        uint8_t a = (uint8_t)((base_a * (blur_spread - i + 1)) / (blur_spread * 3));
+        if (a == 0) continue;
+        uint32_t col = rgb | ((uint32_t)a << 24);
+        gfx_fill_rounded_rect(surf, x - spread, y - spread, w + 2 * spread, h + 2 * spread,
+                              r + spread, col);
+    }
+}
+
+

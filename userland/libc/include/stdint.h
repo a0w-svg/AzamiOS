@@ -4,21 +4,26 @@
  * ============================================================================ */
 #pragma once
 
+#if !defined(_STDINT_H) && !defined(__CLANG_STDINT_H) && !defined(_GCC_WRAP_STDINT_H)
+#define _STDINT_H
+#define __CLANG_STDINT_H
+#define _GCC_WRAP_STDINT_H
+
 typedef signed char        int8_t;
 typedef short              int16_t;
 typedef int                int32_t;
-typedef long long          int64_t;
+typedef long               int64_t;
 
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-typedef unsigned long long uint64_t;
+typedef unsigned long      uint64_t;
 
 typedef long               intptr_t;
 typedef unsigned long      uintptr_t;
 
-typedef long long          intmax_t;
-typedef unsigned long long uintmax_t;
+typedef long               intmax_t;
+typedef unsigned long      uintmax_t;
 
 #define INT8_MIN   (-128)
 #define INT8_MAX   127
@@ -41,3 +46,5 @@ typedef unsigned long long uintmax_t;
 #define UINTPTR_MAX UINT64_MAX
 
 #define SIZE_MAX   UINT64_MAX
+
+#endif /* _STDINT_H */

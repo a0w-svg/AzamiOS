@@ -14,7 +14,12 @@
 #define AZWM_ANIM_OPEN     1
 #define AZWM_ANIM_MINIMIZE 2
 #define AZWM_ANIM_RESTORE  3
-#define AZWM_ANIM_STEPS    6
+
+/* Window open/minimize/restore animations are timed against wall-clock
+ * nanoseconds (anim_start_ns below), not counted in fixed loop iterations —
+ * see compositor_animate_step()'s comment for why a step count doesn't work
+ * here. 180ms is snappy without being so short it reads as a flicker. */
+#define AZWM_ANIM_DURATION_NS (180LL * 1000000LL)
 
 /* A screen-space rectangle; x1/y1 are exclusive.  `valid` is 0 for "empty",
  * which is not the same as a zero-sized rect at the origin. */
@@ -37,13 +42,16 @@ typedef struct az_window_t {
     unsigned char  visible;
     unsigned char  focused;
     unsigned char  maximized;     /* Non-zero if window is currently maximized */
-    unsigned char  _pad;
+    unsigned char  blur_backdrop; /* AZ_WIN_FLAG_BLUR_BACKDROP was set at create time */
+    unsigned char  opacity;       /* Window alpha: 0 = transparent, 255 = fully opaque */
+    unsigned char  pinned;        /* 1 = always on top, 0 = normal */
+    unsigned int   cursor_type;   /* Client-requested cursor shape */
     /* Pre-maximize geometry, restored on un-maximize */
     int            saved_x, saved_y;
     unsigned int   saved_w, saved_h;
     /* Smooth animation state */
     int            anim_state;    /* AZWM_ANIM_* */
-    int            anim_step;     /* 0 .. AZWM_ANIM_STEPS */
+    long long      anim_start_ns; /* CLOCK_MONOTONIC timestamp the animation began at */
     int            anim_start_x, anim_start_y;
     unsigned int   anim_start_w, anim_start_h;
     int            anim_target_x, anim_target_y;
@@ -91,6 +99,7 @@ typedef struct {
     int           cursor_y;
     int           old_cursor_x;
     int           old_cursor_y;
+    unsigned int  current_cursor_type; /* Active cursor shape (AZ_CURSOR_*) */
     int           hw_cursor;      /* 1 when the display drives the pointer overlay */
     int           hw_cursor_fd;   /* /dev/fb0, held open for the cursor ioctls */
 
@@ -134,7 +143,24 @@ typedef struct {
     unsigned long long last_fps_time;        /* CLOCK_MONOTONIC ns of last sample, 0 = not yet sampled */
     unsigned long long last_fps_frame_count; /* frame_count as of that sample */
     int           fps_hud_visible;           /* 1 = draw the on-screen FPS counter (F12 toggles it) */
+
+    /* Titlebar button hover — which decoration circle (if any) the pointer
+     * currently sits over, so render_window() can lift/brighten it instead
+     * of every titlebar button being a dead flat circle regardless of the
+     * pointer. 0 = none, matching AZWM_BTN_* below; hover_btn_wid pins it to
+     * one window so a stale hover can't paint on the wrong one after focus
+     * changes or windows close. Also covers the resize grip (AZWM_BTN_RESIZE)
+     * even though it isn't a titlebar circle — it's the same "give some
+     * visual answer to the pointer" idea, and it needs a home somewhere. */
+    unsigned int  hover_btn_wid;
+    int           hover_btn;
 } az_compositor_t;
+
+#define AZWM_BTN_NONE   0
+#define AZWM_BTN_CLOSE  1
+#define AZWM_BTN_MIN    2
+#define AZWM_BTN_MAX    3
+#define AZWM_BTN_RESIZE 4
 
 /* ── API ──────────────────────────────────────────────────────────────────── */
 
@@ -151,17 +177,32 @@ void compositor_damage(az_compositor_t *comp, int x, int y, int w, int h);
 /** compositor_damage_all(comp) — Mark entire screen as dirty. */
 void compositor_damage_all(az_compositor_t *comp);
 
-/** compositor_create_window(comp, ...) — Create a new window and allocate its pixel buffer. */
+/** compositor_create_window(comp, ...) — Create a new window and allocate its pixel buffer.
+ *  `flags` is the client's requested AZ_WIN_FLAG_* bitset (0 for a plain window). */
 int compositor_create_window(az_compositor_t *comp,
                              unsigned int owner_pid,
                              unsigned int client_chan,
                              int x, int y,
                              unsigned int w, unsigned int h,
                              const char *title,
+                             unsigned int flags,
                              unsigned int *out_shmem_id);
 
 /** compositor_destroy_window(comp, wid) — Destroy a window by ID. */
 void compositor_destroy_window(az_compositor_t *comp, unsigned int wid);
+
+/** compositor_resize_window(comp, win, new_w, new_h, out_shmem_id) —
+ *  reallocate a window's content surface to a new (clamped) size, remapped
+ *  into azwm's own address space at its existing per-slot VA. Returns 0 and
+ *  fills *out_shmem_id on success (a no-op returning the current shmem_id
+ *  when the clamped size already matches); returns -1 and leaves the window
+ *  with no valid surface on failure, in which case the caller must destroy
+ *  it. The caller is responsible for forwarding *out_shmem_id to the client
+ *  (AZ_WM_WINDOW_RESIZED) so its own mapping follows — this only resizes
+ *  azwm's side. */
+int compositor_resize_window(az_compositor_t *comp, az_window_t *win,
+                             unsigned int new_w, unsigned int new_h,
+                             unsigned int *out_shmem_id);
 
 /** compositor_find_window_at(comp, x, y) — Find topmost window at screen coordinates. */
 int compositor_find_window_at(az_compositor_t *comp, int x, int y);
@@ -205,4 +246,15 @@ void compositor_trigger_open_animation(az_compositor_t *comp, az_window_t *win);
 void compositor_trigger_minimize_animation(az_compositor_t *comp, az_window_t *win, int dock_x, int dock_y);
 void compositor_trigger_restore_animation(az_compositor_t *comp, az_window_t *win, int dock_x, int dock_y);
 int  compositor_animate_step(az_compositor_t *comp);
+
+/** Cursor, Opacity, and Title API Helpers */
+void compositor_set_cursor(az_compositor_t *comp, unsigned int cursor_type);
+void compositor_set_window_opacity(az_compositor_t *comp, az_window_t *win, unsigned char opacity);
+void compositor_set_window_title(az_compositor_t *comp, az_window_t *win, const char *title);
+void compositor_set_window_pinned(az_compositor_t *comp, az_window_t *win, unsigned char pinned);
+
+/* CLOCK_MONOTONIC in nanoseconds (0 on failure). Exposed so main()'s frame
+ * pacing can measure against the same clock compositor.c's own animation
+ * timing and FPS counter use, instead of a second reimplementation. */
+long long compositor_now_ns(void);
 

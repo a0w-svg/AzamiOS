@@ -249,20 +249,8 @@ int strerror_r(int errnum, char *buf, size_t buflen)
 
 /* ── Memory ──────────────────────────────────────────────────────────────── */
 
-/* memset(), memcpy(), memmove(), memcmp(), and memchr() are the SSE2/AVX2 versions in string_simd.c. */
+/* memset(), memcpy(), memmove(), memcmp(), memchr(), and memrchr() are the SSE2/AVX2 versions in string_simd.c. */
 
-/* memcmp() and memchr() are the SSE2/AVX2 versions in string_simd.c. */
-
-void *memrchr(const void *s, int c, size_t n)
-{
-    const unsigned char *p = (const unsigned char *)s + n;
-    unsigned char ch = (unsigned char)c;
-    while (n--) {
-        p--;
-        if (*p == ch) return (void *)p;
-    }
-    return 0;
-}
 
 void *memmem(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen)
 {
@@ -622,22 +610,8 @@ int strverscmp(const char *s1, const char *s2)
     return strcmp(s1, s2);
 }
 
-void explicit_bzero(void *s, size_t n)
-{
-    volatile unsigned char *p = (volatile unsigned char *)s;
-    while (n--) *p++ = 0;
-}
-
-int timingsafe_bcmp(const void *b1, const void *b2, size_t n)
-{
-    const unsigned char *p1 = (const unsigned char *)b1;
-    const unsigned char *p2 = (const unsigned char *)b2;
-    int res = 0;
-    for (size_t i = 0; i < n; i++) {
-        res |= p1[i] ^ p2[i];
-    }
-    return res;
-}
+/* explicit_bzero(), timingsafe_bcmp(), timingsafe_memcmp(), and crc32c()
+ * are the hardened/SIMD accelerated versions in string_simd.c. */
 
 void *mempcpy(void *dest, const void *src, size_t n)
 {

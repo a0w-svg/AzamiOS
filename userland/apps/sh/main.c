@@ -306,7 +306,7 @@ static void expand_line(const char *src, char *dst, size_t max_len)
                 }
             }
 
-            /* 2d. Special Variables: $?, $$, $# */
+            /* 2d. Special Variables: $?, $$, $#, $! */
             if (*src == '?') {
                 src++;
                 char cstr[16];
@@ -321,6 +321,16 @@ static void expand_line(const char *src, char *dst, size_t max_len)
                 for (char *p = pstr; *p && dst < end; p++) *dst++ = *p;
                 continue;
             }
+            if (*src == '#') {
+                src++;
+                if (dst < end) *dst++ = '0';
+                continue;
+            }
+            if (*src == '!') {
+                src++;
+                if (dst < end) *dst++ = '0';
+                continue;
+            }
 
             /* 2e. Standard $VAR */
             char var_name[64];
@@ -331,9 +341,25 @@ static void expand_line(const char *src, char *dst, size_t max_len)
             }
             var_name[vi] = '\0';
 
+            if (vi == 0) {
+                if (dst < end) *dst++ = '$';
+                continue;
+            }
+
             const char *val = NULL;
             if (strcmp(var_name, "PWD") == 0 || strcmp(var_name, "CWD") == 0) {
                 val = g_cwd;
+            } else if (strcmp(var_name, "USER") == 0) {
+                val = getenv("USER");
+                if (!val) val = "root";
+            } else if (strcmp(var_name, "HOME") == 0) {
+                val = getenv("HOME");
+                if (!val) val = "/root";
+            } else if (strcmp(var_name, "SHELL") == 0) {
+                val = getenv("SHELL");
+                if (!val) val = "/bin/sh.elf";
+            } else if (strcmp(var_name, "0") == 0) {
+                val = "sh";
             } else {
                 val = getenv(var_name);
             }
@@ -512,11 +538,24 @@ static int execute_single_command(char *cmd_str)
     }
 
     if (strcmp(argv[0], "export") == 0) {
-        if (argc > 1) {
-            char *eq = strchr(argv[1], '=');
+        if (argc == 1) {
+            if (environ) {
+                for (int i = 0; environ[i]; i++) {
+                    printf("export %s\n", environ[i]);
+                }
+            }
+            g_last_exit_code = 0;
+            return 0;
+        }
+        for (int i = 1; i < argc; i++) {
+            char *eq = strchr(argv[i], '=');
             if (eq) {
                 *eq = '\0';
-                setenv(argv[1], eq + 1, 1);
+                setenv(argv[i], eq + 1, 1);
+            } else {
+                if (!getenv(argv[i])) {
+                    setenv(argv[i], "", 1);
+                }
             }
         }
         g_last_exit_code = 0;
@@ -586,19 +625,45 @@ static int execute_single_command(char *cmd_str)
         exit(code);
     }
 
+    if (strcmp(argv[0], "exec") == 0) {
+        if (argc <= 1) return 0;
+        char resolved[256];
+        if (find_in_path(argv[1], resolved, sizeof(resolved))) {
+            execv(resolved, &argv[1]);
+        } else {
+            execv(argv[1], &argv[1]);
+        }
+        fprintf(stderr, "sh: exec: %s: not found\n", argv[1]);
+        exit(127);
+    }
+
     if (strcmp(argv[0], "source") == 0 || strcmp(argv[0], ".") == 0) {
         if (argc > 1) {
-            FILE *f = fopen(argv[1], "r");
+            char path[256];
+            if (argv[1][0] == '/') {
+                strncpy(path, argv[1], sizeof(path) - 1);
+                path[sizeof(path) - 1] = '\0';
+            } else {
+                snprintf(path, sizeof(path), "%s/%s", g_cwd, argv[1]);
+            }
+            FILE *f = fopen(path, "r");
+            if (!f) {
+                f = fopen(argv[1], "r");
+            }
             if (f) {
                 char line[CMD_BUF_SIZE];
                 while (fgets(line, sizeof(line), f)) {
+                    char *p = line;
+                    while (*p == ' ' || *p == '\t') p++;
+                    if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0')
+                        continue;
                     execute_command(line);
                 }
                 fclose(f);
                 g_last_exit_code = 0;
                 return 0;
             } else {
-                fprintf(stderr, "source: %s: No such file\n", argv[1]);
+                fprintf(stderr, "%s: %s: No such file or directory\n", argv[0], argv[1]);
                 g_last_exit_code = 1;
                 return 1;
             }
@@ -719,6 +784,7 @@ static int execute_single_command(char *cmd_str)
         puts("  history          - View command history");
         puts("  source <script>  - Run commands from file in current shell");
         puts("  clear            - Clear terminal screen");
+        puts("  exec <cmd>       - Replace shell with command");
         puts("  exit [code]      - Exit shell");
         puts("\nPOSIX Features:");
         puts("  $(( a + b * c )) - Arithmetic expansion");
@@ -776,18 +842,13 @@ static int execute_single_command(char *cmd_str)
 /* ── Command Chain & Control Flow Execution ──────────────────────────────── */
 static int execute_command(char *raw_cmd)
 {
-    char expanded[CMD_BUF_SIZE];
-    expand_line(raw_cmd, expanded, sizeof(expanded));
-
-    char *cmd_str = expanded;
+    char *cmd_str = raw_cmd;
     while (*cmd_str == ' ' || *cmd_str == '\t') cmd_str++;
     size_t len = strlen(cmd_str);
     while (len > 0 && (cmd_str[len - 1] == ' ' || cmd_str[len - 1] == '\t' || cmd_str[len - 1] == '\r' || cmd_str[len - 1] == '\n')) {
         cmd_str[--len] = '\0';
     }
     if (len == 0 || cmd_str[0] == '#') return 0;
-
-    add_history(cmd_str);
 
     /* Handle 'if ... then ... else ... fi' */
     if (strncmp(cmd_str, "if ", 3) == 0) {
@@ -829,7 +890,7 @@ static int execute_command(char *raw_cmd)
     char *semi = strchr(cmd_str, ';');
     if (semi) {
         *semi = '\0';
-        execute_single_command(cmd_str);
+        execute_command(cmd_str);
         return execute_command(semi + 1);
     }
 
@@ -837,7 +898,7 @@ static int execute_command(char *raw_cmd)
     char *and_and = strstr(cmd_str, "&&");
     if (and_and) {
         *and_and = '\0';
-        int ret = execute_single_command(cmd_str);
+        int ret = execute_command(cmd_str);
         if (ret == 0) {
             return execute_command(and_and + 2);
         }
@@ -848,7 +909,7 @@ static int execute_command(char *raw_cmd)
     char *or_or = strstr(cmd_str, "||");
     if (or_or) {
         *or_or = '\0';
-        int ret = execute_single_command(cmd_str);
+        int ret = execute_command(cmd_str);
         if (ret != 0) {
             return execute_command(or_or + 2);
         }
@@ -864,7 +925,9 @@ static int execute_command(char *raw_cmd)
         }
         pid_t pid = fork();
         if (pid == 0) {
-            execute_single_command(cmd_str);
+            char expanded[CMD_BUF_SIZE];
+            expand_line(cmd_str, expanded, sizeof(expanded));
+            execute_single_command(expanded);
             _exit(0);
         } else if (pid > 0) {
             printf("[1] %d\n", pid);
@@ -872,7 +935,10 @@ static int execute_command(char *raw_cmd)
         }
     }
 
-    return execute_single_command(cmd_str);
+    char expanded[CMD_BUF_SIZE];
+    expand_line(cmd_str, expanded, sizeof(expanded));
+    add_history(expanded);
+    return execute_single_command(expanded);
 }
 
 static void check_dir_matches(const char *dirpath, const char *prefix, int plen, char *match, int *match_count)
@@ -984,15 +1050,52 @@ int main(int argc, char **argv)
     char cmd_buf[CMD_BUF_SIZE];
 
     for (;;) {
-        printf("\033[1;34mazami\033[0m:\033[1;33m%s\033[0m$ ", g_cwd);
+        const char *user = getenv("USER");
+        if (!user || !*user) user = "root";
+        char prompt_char = (strcmp(user, "root") == 0) ? '#' : '$';
+        printf("\033[1;32m%s\033[0m:\033[1;34m%s\033[0m%c ", user, g_cwd, prompt_char);
+        fflush(stdout);
 
         int idx = 0;
         int hist_idx = g_history_count;
 
         while (idx < (int)sizeof(cmd_buf) - 1) {
             char c;
-            if (read(STDIN_FILENO, &c, 1) > 0) {
-                if (c == '\n' || c == '\r') {
+            ssize_t n = read(STDIN_FILENO, &c, 1);
+            if (n > 0) {
+                if (c == 0x04) { /* Ctrl+D: Exit on empty line */
+                    if (idx == 0) {
+                        putchar('\n');
+                        exit(g_last_exit_code);
+                    }
+                } else if (c == 0x03) { /* Ctrl+C: Cancel current line */
+                    printf("^C\n");
+                    cmd_buf[0] = '\0';
+                    idx = 0;
+                    g_last_exit_code = 130;
+                    break;
+                } else if (c == 0x0C) { /* Ctrl+L: Clear screen & redraw */
+                    printf("\033[2J\033[H");
+                    printf("\033[1;32m%s\033[0m:\033[1;34m%s\033[0m%c ", user, g_cwd, prompt_char);
+                    for (int i = 0; i < idx; i++) putchar(cmd_buf[i]);
+                    fflush(stdout);
+                } else if (c == 0x15) { /* Ctrl+U: Clear line backwards */
+                    while (idx > 0) {
+                        printf("\b \b");
+                        idx--;
+                    }
+                    cmd_buf[0] = '\0';
+                } else if (c == 0x17) { /* Ctrl+W: Delete word backwards */
+                    while (idx > 0 && (cmd_buf[idx - 1] == ' ' || cmd_buf[idx - 1] == '\t')) {
+                        printf("\b \b");
+                        idx--;
+                    }
+                    while (idx > 0 && cmd_buf[idx - 1] != ' ' && cmd_buf[idx - 1] != '\t') {
+                        printf("\b \b");
+                        idx--;
+                    }
+                    cmd_buf[idx] = '\0';
+                } else if (c == '\n' || c == '\r') {
                     putchar('\n');
                     break;
                 } else if (c == '\b' || c == 0x7F) {
@@ -1034,12 +1137,23 @@ int main(int argc, char **argv)
                     putchar(c);
                     cmd_buf[idx++] = c;
                 }
+            } else if (n == 0) {
+                /* Clean EOF on STDIN */
+                if (idx == 0) {
+                    putchar('\n');
+                    exit(g_last_exit_code);
+                } else {
+                    putchar('\n');
+                    break;
+                }
             } else {
                 az_yield();
             }
         }
         cmd_buf[idx] = '\0';
-        execute_command(cmd_buf);
+        if (idx > 0) {
+            execute_command(cmd_buf);
+        }
     }
     return 0;
 }

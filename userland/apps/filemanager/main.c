@@ -26,6 +26,7 @@
 #include "../../libc/include/unistd.h"
 #include "../../libc/include/dirent.h"
 #include "../../libc/include/sys/stat.h"
+#include "../../libc/include/sys/statvfs.h"
 #include "../../libc/include/sys/syscall.h"
 #include "../../libc/include/sys/acl.h"
 #include "../azwm/protocol.h"
@@ -100,12 +101,12 @@ static int g_ctx_hover = -1;
 static int g_ctx_target = -1; /* file index the menu was opened on, or -1 */
 
 static const char *g_ctx_items_file[] = {
-    "Open", "Rename", "Properties", "Delete",
+    "Open", "Edit", "Copy Path", "Open Terminal", "Rename", "Properties", "Delete",
 };
 #define NUM_CTX_FILE ((int)(sizeof(g_ctx_items_file)/sizeof(g_ctx_items_file[0])))
 
 static const char *g_ctx_items_blank[] = {
-    "New Folder", "New Note", "Refresh",
+    "New Folder", "New Note", "Open Terminal", "Refresh",
 };
 #define NUM_CTX_BLANK ((int)(sizeof(g_ctx_items_blank)/sizeof(g_ctx_items_blank[0])))
 
@@ -134,26 +135,83 @@ static const toolbar_btn_t g_toolbar[] = {
 #define TOOLBAR_GAP 8
 #define TOOLBAR_X0  12
 
-/* Places / Sidebar bookmarks */
+/* ── Places / Sidebar bookmarks ───────────────────────────────────────────
+ * Loaded from /etc/filemanager_places.conf ("label|path|icon" per line,
+ * '#' comments and blank lines skipped) so the sidebar can be customised
+ * without recompiling; load_default_places() covers a missing or
+ * unreadable file with the same list this used to have hardcoded. */
 typedef struct {
-    const char *label;
-    const char *path;
-    const char *icon;
+    char label[24];
+    char path[128];
+    char icon[4];
 } place_item_t;
 
-static const place_item_t g_places[] = {
-    { "Root",        "/",                  "/" },
-    { "Desktop",     "/home/azami/Desktop", "D" },
-    { "Hard Disk",   "/hdd",               "H" },
-    { "Binaries",    "/bin",               "B" },
-    { "System",      "/sbin",              "S" },
-    { "Config",      "/etc",               "E" },
-    { "Proc FS",     "/proc",              "P" },
-    { "Devices",     "/dev",               "D" },
-    { "Temporary",   "/tmp",               "T" },
-};
-#define NUM_PLACES ((int)(sizeof(g_places)/sizeof(g_places[0])))
+#define MAX_PLACES 16
+static place_item_t g_places[MAX_PLACES];
+static int g_num_places = 0;
 static int g_selected_place = 0;
+
+static void load_default_places(void)
+{
+    static const struct { const char *label, *path, *icon; } defaults[] = {
+        { "Root",      "/",                   "/" },
+        { "Desktop",   "/home/azami/Desktop", "D" },
+        { "Hard Disk", "/hdd",                "H" },
+        { "Binaries",  "/bin",                "B" },
+        { "System",    "/sbin",               "S" },
+        { "Config",    "/etc",                "E" },
+        { "Proc FS",   "/proc",               "P" },
+        { "Devices",   "/dev",                "D" },
+        { "Temporary", "/tmp",                "T" },
+    };
+    g_num_places = 0;
+    for (unsigned int i = 0; i < sizeof(defaults) / sizeof(defaults[0]) && g_num_places < MAX_PLACES; i++) {
+        place_item_t *p = &g_places[g_num_places++];
+        strncpy(p->label, defaults[i].label, sizeof(p->label) - 1);
+        p->label[sizeof(p->label) - 1] = '\0';
+        strncpy(p->path, defaults[i].path, sizeof(p->path) - 1);
+        p->path[sizeof(p->path) - 1] = '\0';
+        strncpy(p->icon, defaults[i].icon, sizeof(p->icon) - 1);
+        p->icon[sizeof(p->icon) - 1] = '\0';
+    }
+}
+
+static void load_places_config(void)
+{
+    int fd = sys_open("/etc/filemanager_places.conf", 0, 0);
+    if (fd < 0) { load_default_places(); return; }
+
+    static char buf[2048];
+    int n = sys_read(fd, buf, sizeof(buf) - 1);
+    sys_close(fd);
+    if (n <= 0) { load_default_places(); return; }
+    buf[n] = '\0';
+
+    g_num_places = 0;
+    char *saveptr = NULL;
+    char *line = strtok_r(buf, "\n", &saveptr);
+    while (line && g_num_places < MAX_PLACES) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line == '\0' || *line == '#') { line = strtok_r(NULL, "\n", &saveptr); continue; }
+
+        char *fsave = NULL;
+        char *label_s = strtok_r(line,  "|", &fsave);
+        char *path_s  = strtok_r(NULL, "|", &fsave);
+        char *icon_s  = strtok_r(NULL, "|", &fsave);
+        if (label_s && path_s && icon_s) {
+            place_item_t *p = &g_places[g_num_places++];
+            strncpy(p->label, label_s, sizeof(p->label) - 1);
+            p->label[sizeof(p->label) - 1] = '\0';
+            strncpy(p->path, path_s, sizeof(p->path) - 1);
+            p->path[sizeof(p->path) - 1] = '\0';
+            strncpy(p->icon, icon_s, sizeof(p->icon) - 1);
+            p->icon[sizeof(p->icon) - 1] = '\0';
+        }
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    if (g_num_places == 0) load_default_places();
+}
 
 /* Dynamically loaded filesystem entries */
 typedef struct {
@@ -185,35 +243,88 @@ static bool file_has_ext(const char *name, const char *ext)
     return strcasecmp(suffix, ext) == 0;
 }
 
-/* Extension → GUI app to open it with. Checked in order, first match wins. */
+/* ── Extension → GUI app associations ─────────────────────────────────────
+ * Loaded from /etc/mime.conf ("ext=/path/to/app.elf" per line, '#' comments
+ * and blank lines skipped, first match for a given extension wins) so file
+ * associations can be edited without recompiling; load_default_file_assoc()
+ * covers a missing or unreadable file with the same list this used to have
+ * hardcoded. */
 typedef struct {
-    const char *ext;
-    const char *app_path;
+    char ext[8];
+    char app_path[64];
 } file_assoc_t;
 
-static const file_assoc_t g_file_assoc[] = {
-    { "txt",  "/bin/texteditor.elf" },
-    { "md",   "/bin/texteditor.elf" },
-    { "c",    "/bin/texteditor.elf" },
-    { "h",    "/bin/texteditor.elf" },
-    { "conf", "/bin/texteditor.elf" },
-    { "cfg",  "/bin/texteditor.elf" },
-    { "ini",  "/bin/texteditor.elf" },
-    { "log",  "/bin/texteditor.elf" },
-    { "sh",   "/bin/texteditor.elf" },
-    { "json", "/bin/texteditor.elf" },
-    { "bmp",  "/bin/paint.elf" },
-    { "png",  "/bin/paint.elf" },
-    { "wav",  "/bin/audioplayer.elf" },
-};
-#define NUM_FILE_ASSOC ((int)(sizeof(g_file_assoc)/sizeof(g_file_assoc[0])))
+#define MAX_FILE_ASSOC 32
+static file_assoc_t g_file_assoc[MAX_FILE_ASSOC];
+static int g_num_file_assoc = 0;
+
+static void load_default_file_assoc(void)
+{
+    static const struct { const char *ext, *app_path; } defaults[] = {
+        { "txt",  "/bin/texteditor.elf" },
+        { "md",   "/bin/texteditor.elf" },
+        { "c",    "/bin/texteditor.elf" },
+        { "h",    "/bin/texteditor.elf" },
+        { "conf", "/bin/texteditor.elf" },
+        { "cfg",  "/bin/texteditor.elf" },
+        { "ini",  "/bin/texteditor.elf" },
+        { "log",  "/bin/texteditor.elf" },
+        { "sh",   "/bin/texteditor.elf" },
+        { "json", "/bin/texteditor.elf" },
+        { "bmp",  "/bin/paint.elf" },
+        { "png",  "/bin/paint.elf" },
+        { "wav",  "/bin/audioplayer.elf" },
+    };
+    g_num_file_assoc = 0;
+    for (unsigned int i = 0; i < sizeof(defaults) / sizeof(defaults[0]) && g_num_file_assoc < MAX_FILE_ASSOC; i++) {
+        file_assoc_t *a = &g_file_assoc[g_num_file_assoc++];
+        strncpy(a->ext, defaults[i].ext, sizeof(a->ext) - 1);
+        a->ext[sizeof(a->ext) - 1] = '\0';
+        strncpy(a->app_path, defaults[i].app_path, sizeof(a->app_path) - 1);
+        a->app_path[sizeof(a->app_path) - 1] = '\0';
+    }
+}
+
+static void load_file_assoc_config(void)
+{
+    int fd = sys_open("/etc/mime.conf", 0, 0);
+    if (fd < 0) { load_default_file_assoc(); return; }
+
+    static char buf[2048];
+    int n = sys_read(fd, buf, sizeof(buf) - 1);
+    sys_close(fd);
+    if (n <= 0) { load_default_file_assoc(); return; }
+    buf[n] = '\0';
+
+    g_num_file_assoc = 0;
+    char *saveptr = NULL;
+    char *line = strtok_r(buf, "\n", &saveptr);
+    while (line && g_num_file_assoc < MAX_FILE_ASSOC) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line == '\0' || *line == '#') { line = strtok_r(NULL, "\n", &saveptr); continue; }
+
+        char *fsave = NULL;
+        char *ext_s  = strtok_r(line,  "=", &fsave);
+        char *path_s = strtok_r(NULL, "=", &fsave);
+        if (ext_s && path_s) {
+            file_assoc_t *a = &g_file_assoc[g_num_file_assoc++];
+            strncpy(a->ext, ext_s, sizeof(a->ext) - 1);
+            a->ext[sizeof(a->ext) - 1] = '\0';
+            strncpy(a->app_path, path_s, sizeof(a->app_path) - 1);
+            a->app_path[sizeof(a->app_path) - 1] = '\0';
+        }
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    if (g_num_file_assoc == 0) load_default_file_assoc();
+}
 
 /* Picks the GUI app best suited to open `name`, based on its extension.
  * Falls back to the text editor, a reasonable default on a system where
  * most non-executable files are small text/config files. */
 static const char *resolve_app_for_file(const char *name)
 {
-    for (int i = 0; i < NUM_FILE_ASSOC; i++) {
+    for (int i = 0; i < g_num_file_assoc; i++) {
         if (file_has_ext(name, g_file_assoc[i].ext))
             return g_file_assoc[i].app_path;
     }
@@ -230,10 +341,18 @@ static void build_full_path(char *out, size_t out_len, const char *name)
 
 static void format_file_size(size_t size, char *out, size_t out_len)
 {
-    if (size >= 1024 * 1024) {
-        snprintf(out, out_len, "%u.%u MB", (unsigned int)(size / (1024 * 1024)), (unsigned int)((size % (1024 * 1024)) / 100000));
+    if (size >= 1024 * 1024 * 1024) {
+        unsigned int gib = (unsigned int)(size / (1024 * 1024 * 1024));
+        unsigned int rem = (unsigned int)(((size % (1024 * 1024 * 1024)) * 10) / (1024 * 1024 * 1024));
+        snprintf(out, out_len, "%u.%u GB", gib, rem);
+    } else if (size >= 1024 * 1024) {
+        unsigned int mib = (unsigned int)(size / (1024 * 1024));
+        unsigned int rem = (unsigned int)(((size % (1024 * 1024)) * 10) / (1024 * 1024));
+        snprintf(out, out_len, "%u.%u MB", mib, rem);
     } else if (size >= 1024) {
-        snprintf(out, out_len, "%u.%u KB", (unsigned int)(size / 1024), (unsigned int)((size % 1024) / 100));
+        unsigned int kib = (unsigned int)(size / 1024);
+        unsigned int rem = (unsigned int)(((size % 1024) * 10) / 1024);
+        snprintf(out, out_len, "%u.%u KB", kib, rem);
     } else {
         snprintf(out, out_len, "%u B", (unsigned int)size);
     }
@@ -267,7 +386,7 @@ static void load_directory(const char *path)
     g_prompt_mode = PROMPT_NONE;
 
     /* Update selected place if matching */
-    for (int p = 0; p < NUM_PLACES; p++) {
+    for (int p = 0; p < g_num_places; p++) {
         if (strcmp(g_current_path, g_places[p].path) == 0) {
             g_selected_place = p;
             break;
@@ -614,7 +733,7 @@ static void draw_filemanager(void)
 
     uk_draw_text(&g_win, 12, 84, "PLACES", UK_OVERLAY0);
 
-    for (int p = 0; p < NUM_PLACES; p++) {
+    for (int p = 0; p < g_num_places; p++) {
         int py = 104 + p * 26;
         bool is_sel = (p == g_selected_place);
         if (is_sel) {
@@ -688,7 +807,15 @@ static void draw_filemanager(void)
     uk_fill_rect(&g_win, SIDEBAR_W, (int)h - 24, (int)w - SIDEBAR_W, 24, UK_MANTLE);
     uk_hline(&g_win, SIDEBAR_W, (int)h - 24, (int)w - SIDEBAR_W, UK_SURFACE0);
 
-    char status_str[160];
+    struct statvfs svfs;
+    char free_str[48] = "";
+    if (statvfs(g_current_path, &svfs) == 0) {
+        unsigned long long bsize = svfs.f_frsize ? svfs.f_frsize : (svfs.f_bsize ? svfs.f_bsize : 1024ULL);
+        unsigned long long free_mb = ((unsigned long long)svfs.f_bavail * bsize) / (1024ULL * 1024ULL);
+        snprintf(free_str, sizeof(free_str), "Free: %llu MB", free_mb);
+    }
+
+    char status_str[200];
     if (g_selected >= 0 && g_selected < NFILES) {
         snprintf(status_str, sizeof(status_str), "%s  —  %s, %s, %s",
                  g_files[g_selected].name, g_files[g_selected].type,
@@ -697,6 +824,11 @@ static void draw_filemanager(void)
         snprintf(status_str, sizeof(status_str), "%d item(s) in %s", NFILES, g_current_path);
     }
     uk_draw_text(&g_win, SIDEBAR_W + 12, (int)h - 18, status_str, UK_SUBTEXT0);
+
+    if (free_str[0]) {
+        int flen = uk_strlen(free_str);
+        uk_draw_text(&g_win, (int)w - flen * 8 - 16, (int)h - 18, free_str, UK_OVERLAY1);
+    }
 
     /* ── New Folder Prompt Modal ──────────────────────────────────────────── */
     if (g_prompt_mode == PROMPT_NEW_FOLDER) {
@@ -715,14 +847,10 @@ static void draw_filemanager(void)
         int modal_w = 340, modal_h = 120;
         int mx = ((int)w - modal_w) / 2;
         int my = ((int)h - modal_h) / 2 + modal_anim_dy();
-        uk_fill_rounded_rect(&g_win, mx, my, modal_w, modal_h, 10, UK_CRUST);
-        uk_draw_rounded_rect_outline(&g_win, mx, my, modal_w, modal_h, 10, UK_RED);
-        uk_draw_text(&g_win, mx + 16, my + 14, "Delete this item?", UK_RED);
         char msg[128];
         snprintf(msg, sizeof(msg), "\"%s\" will be permanently removed.", g_files[g_selected].name);
-        uk_draw_text(&g_win, mx + 16, my + 40, msg, UK_TEXT);
-        uk_draw_button(&g_win, mx + modal_w - 170, my + modal_h - 38, 75, 26, "Cancel", UK_BTN_NORMAL);
-        uk_draw_button(&g_win, mx + modal_w - 85, my + modal_h - 38, 70, 26, "Delete", UK_BTN_PRESSED);
+        uk_draw_confirm_dialog(&g_win, mx, my, modal_w, modal_h,
+                               "Delete this item?", UK_RED, msg, "Delete", NULL, NULL);
     }
 
     /* ── Properties Modal Dialog (if open) ────────────────────────────────── */
@@ -862,15 +990,42 @@ static void handle_context_menu_select(int item)
     if (g_ctx_target >= 0) {
         switch (item) {
         case 0: activate_entry(g_ctx_target); break;                 /* Open */
-        case 1: begin_rename(g_ctx_target); break;                   /* Rename */
-        case 2: show_file_properties(g_ctx_target); break;           /* Properties */
-        case 3: g_selected = g_ctx_target; open_delete_confirm(); break;   /* Delete */
+        case 1: {                                                    /* Edit */
+            if (!g_files[g_ctx_target].is_dir) {
+                char edit_path[512];
+                build_full_path(edit_path, sizeof(edit_path), g_files[g_ctx_target].name);
+                uk_launch_app_arg(&g_win, "/bin/texteditor.elf", edit_path);
+            } else {
+                uk_launch_app(&g_win, "/bin/texteditor.elf");
+            }
+            break;
+        }
+        case 2: {                                                    /* Copy Path */
+            char copy_path[512];
+            build_full_path(copy_path, sizeof(copy_path), g_files[g_ctx_target].name);
+            uk_clipboard_set(&g_win, copy_path);
+            break;
+        }
+        case 3: {                                                    /* Open Terminal */
+            if (g_files[g_ctx_target].is_dir) {
+                char term_path[512];
+                build_full_path(term_path, sizeof(term_path), g_files[g_ctx_target].name);
+                uk_launch_app_arg(&g_win, "/bin/terminal.elf", term_path);
+            } else {
+                uk_launch_app_arg(&g_win, "/bin/terminal.elf", g_current_path);
+            }
+            break;
+        }
+        case 4: begin_rename(g_ctx_target); break;                   /* Rename */
+        case 5: show_file_properties(g_ctx_target); break;           /* Properties */
+        case 6: g_selected = g_ctx_target; open_delete_confirm(); break;   /* Delete */
         }
     } else {
         switch (item) {
         case 0: begin_new_folder(); break;      /* New Folder */
         case 1: create_new_note(); break;       /* New Note */
-        case 2: load_directory(g_current_path); break; /* Refresh */
+        case 2: uk_launch_app_arg(&g_win, "/bin/terminal.elf", g_current_path); break; /* Open Terminal */
+        case 3: load_directory(g_current_path); break; /* Refresh */
         }
     }
 }
@@ -896,6 +1051,8 @@ int main(int argc, char **argv)
     /* Drives the modal entrance animation — see modal_anim_dy(). */
     az_set_timer(g_win.client_chan, 100, 0);
 
+    load_places_config();
+    load_file_assoc_config();
     load_directory("/");
     draw_filemanager();
 
@@ -904,7 +1061,12 @@ int main(int argc, char **argv)
     unsigned int prev_buttons = 0;
 
     for (;;) {
-        if (az_channel_recv(g_win.client_chan, &raw_msg) != 0) continue;
+        /* See sysmon's identical fix: `continue` here means a closed window
+         * (channel -> -EPIPE on every further call, never blocking again)
+         * never reaches sys_exit and instead retries as fast as the CPU
+         * allows, forever. `break` falls through to the same `return 0;`
+         * every sibling app in the DE already uses for this. */
+        if (az_channel_recv(g_win.client_chan, &raw_msg) != 0) break;
 
         switch (msg->type) {
         case AZ_WM_MOUSE_EVENT: {
@@ -965,16 +1127,15 @@ int main(int argc, char **argv)
                     int modal_w = 340, modal_h = 120;
                     int mmx = ((int)g_win.width - modal_w) / 2;
                     int mmy = ((int)g_win.height - modal_h) / 2 + modal_anim_dy();
-                    int cancel_x0 = mmx + modal_w - 170, cancel_x1 = cancel_x0 + 75;
-                    int delete_x0 = mmx + modal_w - 85, delete_x1 = delete_x0 + 70;
-                    int by0 = mmy + modal_h - 38, by1 = by0 + 26;
-                    if (my >= by0 && my <= by1) {
-                        if (mx >= cancel_x0 && mx <= cancel_x1) {
-                            g_confirm_delete = false;
-                        } else if (mx >= delete_x0 && mx <= delete_x1) {
-                            g_confirm_delete = false;
-                            perform_delete(g_selected);
-                        }
+                    uk_rect_t cancel_rect, delete_rect;
+                    uk_confirm_dialog_layout(mmx, mmy, modal_w, modal_h, "Delete",
+                                             &cancel_rect, &delete_rect);
+                    if (uk_hit_rect(cancel_rect, mx, my)) {
+                        g_confirm_delete = false;
+                        draw_filemanager();
+                    } else if (uk_hit_rect(delete_rect, mx, my)) {
+                        g_confirm_delete = false;
+                        perform_delete(g_selected);
                         draw_filemanager();
                     }
                     break;
@@ -1013,7 +1174,7 @@ int main(int argc, char **argv)
                 /* Sidebar Places click */
                 if (mx < SIDEBAR_W && my >= 104) {
                     int p = (my - 104) / 26;
-                    if (p >= 0 && p < NUM_PLACES) {
+                    if (p >= 0 && p < g_num_places) {
                         g_selected_place = p;
                         load_directory(g_places[p].path);
                         draw_filemanager();
@@ -1144,6 +1305,17 @@ int main(int argc, char **argv)
         case AZ_WM_TIMER_TICK: {
             if (g_modal_anim_step < MODAL_ANIM_STEPS) {
                 g_modal_anim_step++;
+                draw_filemanager();
+            }
+            break;
+        }
+
+        case AZ_WM_WINDOW_RESIZED: {
+            /* A failed remap leaves no valid surface to draw into — skip
+             * the redraw rather than paint into it, matching how this loop
+             * has no AZ_WM_DESTROY_WINDOW case either (nothing here tears
+             * the window down itself; that happens elsewhere). */
+            if (uk_handle_resize(&g_win, msg)) {
                 draw_filemanager();
             }
             break;

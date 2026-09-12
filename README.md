@@ -11,7 +11,7 @@
 Key technical highlights include:
 - **64-bit Native Architecture**: Designed purely for 64-bit `x86_64` Long Mode with PML4 paging.
 - **Filesystem Hierarchy Standard (FHS)**: Full Unix-like directory tree populated dynamically at boot (`/bin`, `/sbin`, `/etc`, `/dev`, `/proc`, `/var`, `/home`).
-- **Rich Hardware & Paravirtualization Drivers**: ATA IDE, Floppy DMA/FDC, VirtIO block/net/GPU/RNG, Intel e1000, Realtek RTL8139, AMD PCNet, AC'97/Intel HDA audio, BGA display, and DRM.
+- **Rich Hardware & Paravirtualization Drivers**: ATA IDE, Floppy DMA/FDC, VirtIO block/net/GPU/RNG/9P, Intel e1000/e100 (PRO/100), Realtek RTL8139/RTL8169 (Gigabit), AMD PCNet, VMware VMXNET3, AC'97/Intel HDA/ES1370 audio, MPU-401 MIDI, PC Speaker, USB (UHCI/EHCI), PIIX4 ACPI PM & Timer, QEMU fw_cfg & pvpanic, Bochs debugcon, PCI 16550A Serial, CPU Digital Thermal Sensor (coretemp), BGA display, and DRM.
 - **POSIX-Compliant Custom libc**: A full freestanding C runtime — `stdio`, `stdlib`, `string`, `math`, `pthread`, `socket`, `setjmp`, `wchar`, and more — with zero kernel leakage into userspace.
 - **Compositing GUI**: Azami Window Manager (`azwm`) with a desktop environment, taskbar, terminal emulator, text editor, file manager, system monitor, and X11 client protocol support.
 
@@ -126,6 +126,7 @@ AzamiOS ships an extensive set of POSIX shell utilities:
 | `du`, `stat`, `cksum` | Disk usage, file metadata, and CRC32 checksums |
 | `nohup`, `nl` | Process execution immune to hangups and line numbering |
 | `chroot` | Run command or interactive shell with new root directory |
+| `hwtest`, `testarch` | Hardware instruction regression test suite (BMI1/2, RDRAND, SIMD) & architecture probe |
 
 ### Networking
 | Utility | Description |
@@ -210,6 +211,8 @@ AzamiOS includes a fully custom freestanding C runtime (`userland/libc/`) target
 | `numaif.h` | NUMA memory policy (`set_mempolicy`, `get_mempolicy`, `mbind`, `migrate_pages`) |
 | `linux/futex.h` | `futex` plus the futex2 calls (`futex_wake`, `futex_wait`, `futex_requeue`, `futex_waitv`) |
 | `spawn.h` | `posix_spawn` and `posix_spawnp` |
+| `wordexp.h` | POSIX word expansion (`wordexp`, `wordfree`, `WRDE_APPEND`, `WRDE_DOOFFS`) |
+| `ftw.h` | POSIX file tree walk (`nftw`, `ftw`, `FTW_PHYS`, `FTW_MOUNT`, `FTW_DEPTH`) |
 
 ---
 

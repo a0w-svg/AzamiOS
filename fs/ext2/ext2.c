@@ -72,7 +72,100 @@ typedef struct {
 
 static ext2_bcache_slot_t g_ext2_bcache[EXT2_BCACHE_BUCKETS][EXT2_BCACHE_WAYS];
 static u32 g_ext2_bcache_timer = 0;
-static spinlock_t g_ext2_bcache_lock = SPINLOCK_INIT;
+#define EXT2_BCACHE_STRIPES 16
+static spinlock_t g_ext2_bcache_locks[EXT2_BCACHE_STRIPES] = {
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+};
+
+static inline spinlock_t *ext2_bcache_bucket_lock(u32 bucket)
+{
+    return &g_ext2_bcache_locks[bucket % EXT2_BCACHE_STRIPES];
+}
+
+/* ============================================================================
+ * Ext2 Inode Cache (icache)
+ *
+ * 2-way set-associative cache of unpacked ext2_inode_t structs (512 entries).
+ * Slashes path traversal and stat() cycle latency by serving inodes directly
+ * from memory without block cache lookups or 4 KB heap allocation churn.
+ * ============================================================================ */
+#define EXT2_ICACHE_BUCKETS 256
+#define EXT2_ICACHE_WAYS    2
+
+typedef struct {
+    ext2_fs_info_t *fs;
+    u32 ino;
+    bool valid;
+    u32 access_count;
+    ext2_inode_t inode;
+} ext2_icache_entry_t;
+
+static ext2_icache_entry_t g_ext2_icache[EXT2_ICACHE_BUCKETS][EXT2_ICACHE_WAYS];
+static spinlock_t g_ext2_icache_lock = SPINLOCK_INIT;
+static u32 g_ext2_icache_timer = 0;
+
+static bool ext2_icache_lookup(ext2_fs_info_t *fs, u32 ino, ext2_inode_t *out)
+{
+    u32 bucket = (u32)(((uintptr_t)fs ^ ino ^ (ino >> 4)) % EXT2_ICACHE_BUCKETS);
+    spinlock_lock(&g_ext2_icache_lock);
+    for (int way = 0; way < EXT2_ICACHE_WAYS; way++) {
+        ext2_icache_entry_t *entry = &g_ext2_icache[bucket][way];
+        if (entry->valid && entry->fs == fs && entry->ino == ino) {
+            entry->access_count = ++g_ext2_icache_timer;
+            if (out) __builtin_memcpy(out, &entry->inode, sizeof(ext2_inode_t));
+            spinlock_unlock(&g_ext2_icache_lock);
+            return true;
+        }
+    }
+    spinlock_unlock(&g_ext2_icache_lock);
+    return false;
+}
+
+static void ext2_icache_put(ext2_fs_info_t *fs, u32 ino, const ext2_inode_t *inode)
+{
+    u32 bucket = (u32)(((uintptr_t)fs ^ ino ^ (ino >> 4)) % EXT2_ICACHE_BUCKETS);
+    spinlock_lock(&g_ext2_icache_lock);
+    int target_way = 0;
+    u32 min_access = 0xFFFFFFFF;
+    for (int way = 0; way < EXT2_ICACHE_WAYS; way++) {
+        ext2_icache_entry_t *entry = &g_ext2_icache[bucket][way];
+        if (entry->valid && entry->fs == fs && entry->ino == ino) {
+            target_way = way;
+            break;
+        }
+        if (!entry->valid) {
+            target_way = way;
+            break;
+        }
+        if (entry->access_count < min_access) {
+            min_access = entry->access_count;
+            target_way = way;
+        }
+    }
+    ext2_icache_entry_t *slot = &g_ext2_icache[bucket][target_way];
+    slot->fs = fs;
+    slot->ino = ino;
+    slot->valid = true;
+    slot->access_count = ++g_ext2_icache_timer;
+    __builtin_memcpy(&slot->inode, inode, sizeof(ext2_inode_t));
+    spinlock_unlock(&g_ext2_icache_lock);
+}
+
+static void ext2_icache_invalidate(ext2_fs_info_t *fs, u32 ino)
+{
+    u32 bucket = (u32)(((uintptr_t)fs ^ ino ^ (ino >> 4)) % EXT2_ICACHE_BUCKETS);
+    spinlock_lock(&g_ext2_icache_lock);
+    for (int way = 0; way < EXT2_ICACHE_WAYS; way++) {
+        ext2_icache_entry_t *entry = &g_ext2_icache[bucket][way];
+        if (entry->valid && (!fs || entry->fs == fs) && (!ino || entry->ino == ino)) {
+            entry->valid = false;
+        }
+    }
+    spinlock_unlock(&g_ext2_icache_lock);
+}
 
 /* Writeback thread cadence. 10 ms/tick, so 500 ticks ≈ 5 s — the same order as
  * a stock Linux dirty_writeback_centisecs, and the upper bound on how much
@@ -85,12 +178,8 @@ static inline u32 ext2_bcache_hash(ext2_fs_info_t *fs, u32 block)
 }
 
 /*
- * Push one slot to disk. Caller holds g_ext2_bcache_lock; the slot must be
- * valid and belong to a live fs. Matches ext2_read_block()'s existing habit of
- * doing block I/O with the cache lock held — the devices this runs against
- * (AHCI, virtio-blk, ramdisk) complete a single-block transfer without
- * sleeping. Clears the dirty flag only when the write succeeds, so a failed
- * slot is retried by the next sync.
+ * Push one slot to disk. Caller holds the bucket's lock; the slot must be
+ * valid and belong to a live fs.
  */
 static s64 ext2_bcache_flush_slot(ext2_bcache_slot_t *slot)
 {
@@ -110,11 +199,7 @@ static s64 ext2_bcache_flush_slot(ext2_bcache_slot_t *slot)
 
 /*
  * Choose a way in @bucket to recycle for a new block. Caller holds
- * g_ext2_bcache_lock. Prefers a slot that is empty or clean so eviction never
- * blocks on device I/O; only when all four ways hold unwritten data does it
- * flush the least-recently-used one. Returns the way index, or -1 when the
- * whole set is dirty and that flush failed — the caller must then propagate
- * the error rather than clobber a slot whose write is still owed to disk.
+ * the bucket's stripe lock.
  */
 static int ext2_bcache_take_victim(u32 bucket)
 {
@@ -140,30 +225,28 @@ static s64 ext2_read_block(ext2_fs_info_t *fs, u32 block, void *buf)
 {
     if (!fs || !fs->bdev || !fs->bdev->ops || !fs->bdev->ops->read_sectors) return -(s64)EINVAL;
     if (!buf) return -(s64)EINVAL;
-    /* Belt-and-braces: ext2_validate_sb() already refused anything outside this
-     * range, but a slot overflow here is a global-array smash, so the invariant
-     * is re-asserted at the point that depends on it. */
     if (fs->block_size == 0 || fs->block_size > EXT2_MAX_BLOCK_SIZE ||
         fs->bdev->sector_size == 0 || fs->block_size % fs->bdev->sector_size)
         return -(s64)EINVAL;
     if (block >= fs->sb->s_blocks_count) return -(s64)EINVAL;
 
     u32 bucket = ext2_bcache_hash(fs, block);
+    spinlock_t *lock = ext2_bcache_bucket_lock(bucket);
 
-    spinlock_lock(&g_ext2_bcache_lock);
+    spinlock_lock(lock);
     for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
         ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
         if (slot->valid && slot->fs == fs && slot->block == block) {
             slot->access_count = ++g_ext2_bcache_timer;
             __builtin_memcpy(buf, slot->data, fs->block_size);
-            spinlock_unlock(&g_ext2_bcache_lock);
+            spinlock_unlock(lock);
             return 0;
         }
     }
 
     int vway = ext2_bcache_take_victim(bucket);
     if (vway < 0) {
-        spinlock_unlock(&g_ext2_bcache_lock);
+        spinlock_unlock(lock);
         return -(s64)EIO;
     }
     ext2_bcache_slot_t *victim = &g_ext2_bcache[bucket][vway];
@@ -172,7 +255,7 @@ static s64 ext2_read_block(ext2_fs_info_t *fs, u32 block, void *buf)
     u32 count = fs->block_size / fs->bdev->sector_size;
     s64 ret = fs->bdev->ops->read_sectors(fs->bdev, lba, count, victim->data);
     if (ret < 0) {
-        spinlock_unlock(&g_ext2_bcache_lock);
+        spinlock_unlock(lock);
         return ret;
     }
 
@@ -183,18 +266,10 @@ static s64 ext2_read_block(ext2_fs_info_t *fs, u32 block, void *buf)
     victim->access_count = ++g_ext2_bcache_timer;
 
     __builtin_memcpy(buf, victim->data, fs->block_size);
-    spinlock_unlock(&g_ext2_bcache_lock);
+    spinlock_unlock(lock);
     return 0;
 }
 
-/*
- * Write-back: the new contents land in the cache and the slot is marked dirty;
- * the device is touched only when the slot is evicted (ext2_read_block above)
- * or when something calls ext2_sync(). Metadata-heavy paths — every create,
- * unlink or truncate rewrites the same bitmap and inode-table blocks several
- * times — now coalesce those into a single device write per block per sync
- * interval instead of one synchronous transfer each.
- */
 static s64 ext2_write_block(ext2_fs_info_t *fs, u32 block, void *buf)
 {
     if (!fs || !fs->bdev || !fs->bdev->ops || !fs->bdev->ops->write_sectors) return -(s64)ENOSYS;
@@ -205,24 +280,23 @@ static s64 ext2_write_block(ext2_fs_info_t *fs, u32 block, void *buf)
     if (block >= fs->sb->s_blocks_count) return -(s64)EINVAL;
 
     u32 bucket = ext2_bcache_hash(fs, block);
+    spinlock_t *lock = ext2_bcache_bucket_lock(bucket);
 
-    spinlock_lock(&g_ext2_bcache_lock);
+    spinlock_lock(lock);
     for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
         ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
         if (slot->valid && slot->fs == fs && slot->block == block) {
             __builtin_memcpy(slot->data, buf, fs->block_size);
             slot->dirty = true;
             slot->access_count = ++g_ext2_bcache_timer;
-            spinlock_unlock(&g_ext2_bcache_lock);
+            spinlock_unlock(lock);
             return 0;
         }
     }
 
-    /* Block not resident — claim a slot. take_victim() flushes a dirty LRU
-     * only if every way is dirty, and fails rather than drop unwritten data. */
     int vway = ext2_bcache_take_victim(bucket);
     if (vway < 0) {
-        spinlock_unlock(&g_ext2_bcache_lock);
+        spinlock_unlock(lock);
         return -(s64)EIO;
     }
     ext2_bcache_slot_t *victim = &g_ext2_bcache[bucket][vway];
@@ -233,22 +307,21 @@ static s64 ext2_write_block(ext2_fs_info_t *fs, u32 block, void *buf)
     victim->valid = true;
     victim->dirty = true;
     victim->access_count = ++g_ext2_bcache_timer;
-    spinlock_unlock(&g_ext2_bcache_lock);
+    spinlock_unlock(lock);
     return 0;
 }
 
-/* Flush every dirty slot belonging to one instance. @only_fs == NULL means all
- * instances (used by the global ext2_sync()). */
 static void ext2_bcache_writeback(ext2_fs_info_t *only_fs)
 {
     for (u32 bucket = 0; bucket < EXT2_BCACHE_BUCKETS; bucket++) {
-        spinlock_lock(&g_ext2_bcache_lock);
+        spinlock_t *lock = ext2_bcache_bucket_lock(bucket);
+        spinlock_lock(lock);
         for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
             ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
             if (slot->valid && slot->dirty && (!only_fs || slot->fs == only_fs))
                 ext2_bcache_flush_slot(slot);
         }
-        spinlock_unlock(&g_ext2_bcache_lock);
+        spinlock_unlock(lock);
     }
 }
 
@@ -319,10 +392,11 @@ static void ext2_writeback_thread(void *arg)
  */
 static void ext2_bcache_overlay(ext2_fs_info_t *fs, u32 start, u32 count, u8 *dst)
 {
-    spinlock_lock(&g_ext2_bcache_lock);
     for (u32 i = 0; i < count; i++) {
         u32 blk = start + i;
         u32 bucket = ext2_bcache_hash(fs, blk);
+        spinlock_t *lock = ext2_bcache_bucket_lock(bucket);
+        spinlock_lock(lock);
         for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
             ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
             if (slot->valid && slot->dirty && slot->fs == fs && slot->block == blk) {
@@ -331,8 +405,28 @@ static void ext2_bcache_overlay(ext2_fs_info_t *fs, u32 start, u32 count, u8 *ds
                 break;
             }
         }
+        spinlock_unlock(lock);
     }
-    spinlock_unlock(&g_ext2_bcache_lock);
+}
+
+static void ext2_bcache_update_burst(ext2_fs_info_t *fs, u32 start, u32 count, const u8 *src)
+{
+    for (u32 i = 0; i < count; i++) {
+        u32 blk = start + i;
+        u32 bucket = ext2_bcache_hash(fs, blk);
+        spinlock_t *lock = ext2_bcache_bucket_lock(bucket);
+        spinlock_lock(lock);
+        for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
+            ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
+            if (slot->valid && slot->fs == fs && slot->block == blk) {
+                __builtin_memcpy(slot->data, src + (size_t)i * fs->block_size, fs->block_size);
+                slot->dirty = false;
+                slot->access_count = ++g_ext2_bcache_timer;
+                break;
+            }
+        }
+        spinlock_unlock(lock);
+    }
 }
 
 /* On-disk inode size. Rev-0 filesystems have no s_inode_size field at all and
@@ -379,16 +473,38 @@ static s64 ext2_locate_inode(ext2_fs_info_t *fs, u32 ino, u32 *block_out, u32 *o
     return 0;
 }
 
-/* Helper: Read an inode from disk */
+/* Helper: Read an inode from cache or disk */
 static s64 ext2_read_inode(ext2_fs_info_t *fs, u32 ino, ext2_inode_t *out_inode)
 {
     if (!out_inode) return -(s64)EINVAL;
+
+    /* Fast path 1: Check Inode Cache (icache) */
+    if (ext2_icache_lookup(fs, ino, out_inode)) {
+        return 0;
+    }
 
     u32 block, offset;
     s64 err = ext2_locate_inode(fs, ino, &block, &offset);
     if (err < 0) return err;
 
-    void *buf = kzalloc(fs->block_size);
+    /* Fast path 2: Direct hit in Block Cache without 4 KB heap alloc/free */
+    u32 bucket = ext2_bcache_hash(fs, block);
+    spinlock_t *lock = ext2_bcache_bucket_lock(bucket);
+    spinlock_lock(lock);
+    for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
+        ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
+        if (slot->valid && slot->fs == fs && slot->block == block) {
+            slot->access_count = ++g_ext2_bcache_timer;
+            __builtin_memcpy(out_inode, slot->data + offset, sizeof(ext2_inode_t));
+            spinlock_unlock(lock);
+            ext2_icache_put(fs, ino, out_inode);
+            return 0;
+        }
+    }
+    spinlock_unlock(lock);
+
+    /* Slow path: Read block into temporary buffer, cache in icache */
+    void *buf = kmalloc(fs->block_size);
     if (!buf) return -(s64)ENOMEM;
 
     err = ext2_read_block(fs, block, buf);
@@ -396,6 +512,8 @@ static s64 ext2_read_inode(ext2_fs_info_t *fs, u32 ino, ext2_inode_t *out_inode)
 
     __builtin_memcpy(out_inode, (u8*)buf + offset, sizeof(ext2_inode_t));
     kfree(buf);
+
+    ext2_icache_put(fs, ino, out_inode);
     return 0;
 }
 
@@ -746,7 +864,38 @@ static void ext2_sync_inode(ext2_fs_info_t *fs, struct inode *inode)
     u32 block, offset;
     if (ext2_locate_inode(fs, inode->i_ino, &block, &offset) < 0) return;
 
-    void *buf = kzalloc(fs->block_size);
+    /* Fast path: If the block is already resident in bcache, update in place */
+    u32 bucket = ext2_bcache_hash(fs, block);
+    spinlock_t *lock = ext2_bcache_bucket_lock(bucket);
+    spinlock_lock(lock);
+    for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
+        ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
+        if (slot->valid && slot->fs == fs && slot->block == block) {
+            ext2_inode_t *ino_disk = (ext2_inode_t *)(slot->data + offset);
+            ino_disk->i_mode = inode->i_mode;
+            ino_disk->i_links_count = (u16)inode->i_nlink;
+            ino_disk->i_size = inode->i_size;
+            ino_disk->i_blocks = inode->i_blocks;
+            ino_disk->i_atime = inode->i_atime;
+            ino_disk->i_mtime = inode->i_mtime;
+            ino_disk->i_ctime = inode->i_ctime;
+            ino_disk->i_uid = inode->i_uid;
+            ino_disk->i_gid = inode->i_gid;
+
+            ext2_inode_info_t *priv = (ext2_inode_info_t *)inode->i_private;
+            __builtin_memcpy(ino_disk->i_block, priv->i_block, sizeof(priv->i_block));
+
+            slot->dirty = true;
+            slot->access_count = ++g_ext2_bcache_timer;
+            ext2_icache_put(fs, inode->i_ino, ino_disk);
+            spinlock_unlock(lock);
+            return;
+        }
+    }
+    spinlock_unlock(lock);
+
+    /* Slow path: fetch block, update, writeback, update icache */
+    void *buf = kmalloc(fs->block_size);
     if (!buf) return;
 
     if (ext2_read_block(fs, block, buf) < 0) { kfree(buf); return; }
@@ -766,6 +915,7 @@ static void ext2_sync_inode(ext2_fs_info_t *fs, struct inode *inode)
     __builtin_memcpy(ino_disk->i_block, priv->i_block, sizeof(priv->i_block));
     
     ext2_write_block(fs, block, buf);
+    ext2_icache_put(fs, inode->i_ino, ino_disk);
     kfree(buf);
 }
 
@@ -1061,13 +1211,14 @@ static s64 ext2_file_read(struct file *filp, void *buf, size_t len, u64 *offset)
 #define EXT2_FADV_MAX_BLOCKS 256   /* up to 1 MiB at a 4 KiB block size */
 
 /* Evict [start, start+count) of @fs from the block cache, flushing any dirty
- * slot first. Caller must not hold g_ext2_bcache_lock. */
+ * slot first. */
 static void ext2_bcache_drop(ext2_fs_info_t *fs, u32 start, u32 count)
 {
-    spinlock_lock(&g_ext2_bcache_lock);
     for (u32 i = 0; i < count; i++) {
         u32 blk = start + i;
         u32 bucket = ext2_bcache_hash(fs, blk);
+        spinlock_t *lock = ext2_bcache_bucket_lock(bucket);
+        spinlock_lock(lock);
         for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
             ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
             if (slot->valid && slot->fs == fs && slot->block == blk) {
@@ -1078,9 +1229,9 @@ static void ext2_bcache_drop(ext2_fs_info_t *fs, u32 start, u32 count)
                 break;
             }
         }
+        spinlock_unlock(lock);
         if (blk == 0xFFFFFFFFu) break;
     }
-    spinlock_unlock(&g_ext2_bcache_lock);
 }
 
 static s64 ext2_file_fadvise(struct file *filp, u64 offset, u64 len, int advice)
@@ -1165,34 +1316,67 @@ static s64 ext2_file_fallocate(struct file *filp, int mode, u64 offset, u64 len)
 
 static s64 ext2_file_write(struct file *filp, const void *buf, size_t len, u64 *offset)
 {
+    if (!filp || !filp->f_inode || !filp->f_inode->i_sb || !buf) return -(s64)EINVAL;
     ext2_fs_info_t *fs = (ext2_fs_info_t *)filp->f_inode->i_sb->s_fs_info;
-    
-    void *block_buf = kzalloc(fs->block_size);
-    if (!block_buf) return -(s64)ENOMEM;
-    
+    if (!fs || fs->block_size == 0) return -(s64)EINVAL;
+
+    const u8 *src = (const u8 *)buf;
     size_t bytes_written = 0;
+    void *temp_buf = NULL;
+
     while (bytes_written < len) {
-        u32 lblk = (*offset + bytes_written) / fs->block_size;
-        u32 blk_offset = (*offset + bytes_written) % fs->block_size;
-        
+        u64 cur_pos = *offset + bytes_written;
+        u32 lblk = (u32)(cur_pos / fs->block_size);
+        u32 blk_offset = (u32)(cur_pos % fs->block_size);
+
         u32 pblk = ext2_get_pblk(filp->f_inode, lblk, true);
         if (!pblk) break; /* Out of space */
-        
-        size_t chunk = fs->block_size - blk_offset;
-        if (chunk > len - bytes_written) chunk = len - bytes_written;
-        
-        if (chunk < fs->block_size) {
-            ext2_read_block(fs, pblk, block_buf);
+
+        /* If offset is not block-aligned or remaining length is smaller than a block */
+        if (blk_offset != 0 || (len - bytes_written) < fs->block_size) {
+            size_t chunk = fs->block_size - blk_offset;
+            if (chunk > len - bytes_written) chunk = len - bytes_written;
+
+            if (!temp_buf) {
+                temp_buf = kzalloc(fs->block_size);
+                if (!temp_buf) break;
+            }
+            if (blk_offset != 0 || chunk < fs->block_size) {
+                ext2_read_block(fs, pblk, temp_buf);
+            }
+            __builtin_memcpy((u8 *)temp_buf + blk_offset, src + bytes_written, chunk);
+            ext2_write_block(fs, pblk, temp_buf);
+            bytes_written += chunk;
+            continue;
         }
-        
-        __builtin_memcpy((u8*)block_buf + blk_offset, (const u8*)buf + bytes_written, chunk);
-        ext2_write_block(fs, pblk, block_buf);
-        
-        bytes_written += chunk;
+
+        /* Block-aligned run: detect contiguous blocks */
+        u32 run_blocks = 1;
+        size_t max_blocks = (len - bytes_written) / fs->block_size;
+        if (max_blocks > 64) max_blocks = 64;
+
+        while (run_blocks < max_blocks) {
+            u32 next_pblk = ext2_get_pblk(filp->f_inode, lblk + run_blocks, true);
+            if (next_pblk != pblk + run_blocks) break;
+            run_blocks++;
+        }
+
+        if (run_blocks > 1 && fs->bdev && fs->bdev->ops && fs->bdev->ops->write_sectors && fs->bdev->sector_size > 0) {
+            u32 ss = fs->bdev->sector_size;
+            u64 lba = (u64)pblk * (fs->block_size / ss);
+            u32 sec_count = run_blocks * (fs->block_size / ss);
+            fs->bdev->ops->write_sectors(fs->bdev, lba, sec_count, src + bytes_written);
+            ext2_bcache_update_burst(fs, pblk, run_blocks, src + bytes_written);
+        } else {
+            /* Single block write directly from source into cache */
+            ext2_write_block(fs, pblk, (void *)(src + bytes_written));
+        }
+
+        bytes_written += run_blocks * fs->block_size;
     }
-    
-    kfree(block_buf);
-    
+
+    if (temp_buf) kfree(temp_buf);
+
     if (bytes_written > 0) {
         *offset += bytes_written;
         if (*offset > filp->f_inode->i_size) {
@@ -1205,7 +1389,7 @@ static s64 ext2_file_write(struct file *filp, const void *buf, size_t len, u64 *
         filp->f_inode->i_ctime = unix_t;
         ext2_sync_inode(fs, filp->f_inode);
     }
-    
+
     return bytes_written == 0 && len > 0 ? -(s64)ENOSPC : (s64)bytes_written;
 }
 
@@ -1990,6 +2174,8 @@ u32 ext2_alloc_inode(ext2_fs_info_t *fs) {
 void ext2_free_inode(ext2_fs_info_t *fs, u32 ino) {
     if (ino < 1 || ino > fs->sb->s_inodes_count) return;
     if (fs->inodes_per_group == 0) return;
+
+    ext2_icache_invalidate(fs, ino);
 
     u32 bg = (ino - 1) / fs->inodes_per_group;
     u32 bit = (ino - 1) % fs->inodes_per_group;

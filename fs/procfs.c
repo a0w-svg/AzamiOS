@@ -96,6 +96,15 @@ typedef enum {
     PROCFS_TYPE_SECURITY,
     PROCFS_TYPE_MCELOG,
     PROCFS_TYPE_SLABINFO,
+
+    /* Security sysctl endpoints */
+    PROCFS_TYPE_SYS_KERNEL_DMESG_RESTRICT,
+    PROCFS_TYPE_SYS_KERNEL_KPTR_RESTRICT,
+    PROCFS_TYPE_SYS_KERNEL_MMAP_MIN_ADDR,
+    PROCFS_TYPE_SYS_KERNEL_YAMA_DIR,
+    PROCFS_TYPE_SYS_KERNEL_YAMA_PTRACE_SCOPE,
+    PROCFS_TYPE_SYS_FS_PROTECTED_HARDLINKS,
+    PROCFS_TYPE_SYS_FS_PROTECTED_SYMLINKS,
 } procfs_node_type_t;
 
 typedef struct {
@@ -107,6 +116,7 @@ typedef struct {
 /* Forward declarations */
 static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry);
 static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offset);
+static s64 procfs_file_write(struct file *filp, const void *buf, size_t len, u64 *offset);
 static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u64 *offset);
 static s64 procfs_readlink(struct dentry *dentry, char *buf, size_t bufsiz);
 
@@ -117,6 +127,7 @@ static inode_operations_t g_procfs_inode_ops = {
 
 static file_operations_t g_procfs_file_ops = {
     .read = procfs_file_read,
+    .write = procfs_file_write,
     .readdir = procfs_dir_readdir,
 };
 
@@ -842,6 +853,18 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 314, S_IFREG | 0644, PROCFS_TYPE_SYS_PID_MAX, 0);
         } else if (strcmp(name, "random") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 315, S_IFDIR | 0555, PROCFS_TYPE_SYS_KERNEL_RANDOM_DIR, 0);
+        } else if (strcmp(name, "dmesg_restrict") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 340, S_IFREG | 0644, PROCFS_TYPE_SYS_KERNEL_DMESG_RESTRICT, 0);
+        } else if (strcmp(name, "kptr_restrict") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 341, S_IFREG | 0644, PROCFS_TYPE_SYS_KERNEL_KPTR_RESTRICT, 0);
+        } else if (strcmp(name, "mmap_min_addr") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 342, S_IFREG | 0644, PROCFS_TYPE_SYS_KERNEL_MMAP_MIN_ADDR, 0);
+        } else if (strcmp(name, "yama") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 343, S_IFDIR | 0555, PROCFS_TYPE_SYS_KERNEL_YAMA_DIR, 0);
+        }
+    } else if (dir_priv->type == PROCFS_TYPE_SYS_KERNEL_YAMA_DIR) {
+        if (strcmp(name, "ptrace_scope") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 344, S_IFREG | 0644, PROCFS_TYPE_SYS_KERNEL_YAMA_PTRACE_SCOPE, 0);
         }
     } else if (dir_priv->type == PROCFS_TYPE_SYS_KERNEL_RANDOM_DIR) {
         if (strcmp(name, "boot_id") == 0) {
@@ -854,6 +877,10 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 320, S_IFREG | 0444, PROCFS_TYPE_SYS_FILEMAX, 0);
         } else if (strcmp(name, "inotify") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 321, S_IFDIR | 0555, PROCFS_TYPE_SYS_FS_INOTIFY_DIR, 0);
+        } else if (strcmp(name, "protected_hardlinks") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 345, S_IFREG | 0644, PROCFS_TYPE_SYS_FS_PROTECTED_HARDLINKS, 0);
+        } else if (strcmp(name, "protected_symlinks") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 346, S_IFREG | 0644, PROCFS_TYPE_SYS_FS_PROTECTED_SYMLINKS, 0);
         }
     } else if (dir_priv->type == PROCFS_TYPE_SYS_FS_INOTIFY_DIR) {
         if (strcmp(name, "max_user_watches") == 0) {
@@ -1059,6 +1086,24 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
     case PROCFS_TYPE_SYS_NET_TCP_FIN_TIMEOUT:
         total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "60\n");
         break;
+    case PROCFS_TYPE_SYS_KERNEL_DMESG_RESTRICT:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "%u\n", (unsigned int)g_dmesg_restrict);
+        break;
+    case PROCFS_TYPE_SYS_KERNEL_KPTR_RESTRICT:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "%u\n", (unsigned int)g_kptr_restrict);
+        break;
+    case PROCFS_TYPE_SYS_KERNEL_MMAP_MIN_ADDR:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "%llu\n", (unsigned long long)g_mmap_min_addr);
+        break;
+    case PROCFS_TYPE_SYS_KERNEL_YAMA_PTRACE_SCOPE:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "%u\n", (unsigned int)g_yama_ptrace_scope);
+        break;
+    case PROCFS_TYPE_SYS_FS_PROTECTED_HARDLINKS:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "%u\n", (unsigned int)g_protected_hardlinks);
+        break;
+    case PROCFS_TYPE_SYS_FS_PROTECTED_SYMLINKS:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "%u\n", (unsigned int)g_protected_symlinks);
+        break;
     case PROCFS_TYPE_PID_STATUS:
         total_len = format_pid_status(priv->pid, tmp, PROCFS_TMP_SIZE);
         break;
@@ -1090,6 +1135,60 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
 
     kfree(tmp);
     return (s64)copy_cnt;
+}
+
+static s64 procfs_file_write(struct file *filp, const void *buf, size_t len, u64 *offset)
+{
+    (void)offset;
+    if (!filp || !buf || !filp->f_inode || !filp->f_inode->i_private)
+        return -(s64)EINVAL;
+
+    procfs_priv_t *priv = (procfs_priv_t *)filp->f_inode->i_private;
+    process_t *proc = sched_current_process();
+    if (!proc || (proc->euid != 0 && !security_check_permission(proc, CAP_SYS_ADMIN))) {
+        return -(s64)EPERM;
+    }
+
+    if (len == 0) return 0;
+
+    char kbuf[64];
+    size_t copy_sz = (len < sizeof(kbuf) - 1) ? len : sizeof(kbuf) - 1;
+    memcpy(kbuf, buf, copy_sz);
+    kbuf[copy_sz] = '\0';
+
+    size_t i = 0;
+    while (kbuf[i] == ' ' || kbuf[i] == '\t' || kbuf[i] == '\r' || kbuf[i] == '\n') i++;
+    u64 val = 0;
+    while (kbuf[i] >= '0' && kbuf[i] <= '9') {
+        val = val * 10 + (kbuf[i] - '0');
+        i++;
+    }
+
+    switch (priv->type) {
+    case PROCFS_TYPE_SYS_KERNEL_DMESG_RESTRICT:
+        g_dmesg_restrict = (u32)val;
+        return (s64)len;
+    case PROCFS_TYPE_SYS_KERNEL_KPTR_RESTRICT:
+        g_kptr_restrict = (u32)val;
+        return (s64)len;
+    case PROCFS_TYPE_SYS_KERNEL_MMAP_MIN_ADDR:
+        g_mmap_min_addr = val;
+        return (s64)len;
+    case PROCFS_TYPE_SYS_KERNEL_YAMA_PTRACE_SCOPE:
+        if (val <= 3) {
+            g_yama_ptrace_scope = (u32)val;
+            return (s64)len;
+        }
+        return -(s64)EINVAL;
+    case PROCFS_TYPE_SYS_FS_PROTECTED_HARDLINKS:
+        g_protected_hardlinks = (u32)val;
+        return (s64)len;
+    case PROCFS_TYPE_SYS_FS_PROTECTED_SYMLINKS:
+        g_protected_symlinks = (u32)val;
+        return (s64)len;
+    default:
+        return -(s64)EACCES;
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -1209,11 +1308,32 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
             idx++;
         }
     } else if (priv->type == PROCFS_TYPE_SYS_KERNEL_DIR) {
-        const char *kentries[] = { ".", "..", "osrelease", "ostype", "hostname", "version", "pid_max", "random" };
-        u64 total_entries = 8;
+        const char *kentries[] = { ".", "..", "osrelease", "ostype", "hostname", "version", "pid_max", "random", "dmesg_restrict", "kptr_restrict", "mmap_min_addr", "yama" };
+        u64 total_entries = 12;
         while (idx < total_entries) {
             const char *name = kentries[idx];
-            u8 dtype = (idx < 2 || strcmp(name, "random") == 0) ? DT_DIR : DT_REG;
+            u8 dtype = (idx < 2 || strcmp(name, "random") == 0 || strcmp(name, "yama") == 0) ? DT_DIR : DT_REG;
+            size_t nlen = strlen(name);
+            size_t reclen = ALIGN_UP(sizeof(struct linux_dirent64) + nlen + 1, 8);
+            if (written + reclen > len) {
+                if (written == 0) return -(s64)EINVAL;
+                break;
+            }
+            struct linux_dirent64 *d = (struct linux_dirent64 *)(out_ptr + written);
+            d->d_ino = idx + 1;
+            d->d_off = idx + 1;
+            d->d_reclen = (unsigned short)reclen;
+            d->d_type = dtype;
+            memcpy(d->d_name, name, nlen + 1);
+            written += reclen;
+            idx++;
+        }
+    } else if (priv->type == PROCFS_TYPE_SYS_KERNEL_YAMA_DIR) {
+        const char *yentries[] = { ".", "..", "ptrace_scope" };
+        u64 total_entries = 3;
+        while (idx < total_entries) {
+            const char *name = yentries[idx];
+            u8 dtype = (idx < 2) ? DT_DIR : DT_REG;
             size_t nlen = strlen(name);
             size_t reclen = ALIGN_UP(sizeof(struct linux_dirent64) + nlen + 1, 8);
             if (written + reclen > len) {
@@ -1251,8 +1371,8 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
             idx++;
         }
     } else if (priv->type == PROCFS_TYPE_SYS_FS_DIR) {
-        const char *fsentries[] = { ".", "..", "file-max", "inotify" };
-        u64 total_entries = 4;
+        const char *fsentries[] = { ".", "..", "file-max", "inotify", "protected_hardlinks", "protected_symlinks" };
+        u64 total_entries = 6;
         while (idx < total_entries) {
             const char *name = fsentries[idx];
             u8 dtype = (idx < 2 || strcmp(name, "inotify") == 0) ? DT_DIR : DT_REG;

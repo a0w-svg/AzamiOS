@@ -200,9 +200,8 @@ static bool handle_user_page_fault(pt_regs_t *r, uintptr_t fault_addr)
         if (pte_fl & (1ULL << 10) /* VMM_F_COW */) {
             u32 vma_prot = 0;
             bool vma_ok = vma_probe(proc, fault_addr, &vma_prot);
-            /* VMM_F_COW is only set on pages that were writable before fork.
-             * Accept unless the VMA was deliberately set to PROT_NONE. */
-            if (!vma_ok || vma_prot != 0) {
+            /* Only resolve COW if the region actually has PROT_WRITE permission */
+            if (vma_ok && (vma_prot & VMA_PROT_WRITE)) {
                 if (vmm_cow_fault(proc->pml4_phys, fault_addr) == 0) {
                     proc->nr_minor_faults++;
                     return true; /* COW resolved; resume instruction */

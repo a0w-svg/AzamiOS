@@ -29,6 +29,14 @@
 __attribute__((used))
 uintptr_t __stack_chk_guard = 0x595E9FBD94FDA766ULL;
 
+/* Security configuration knobs (also exposed through /proc/sys) */
+u64 g_mmap_min_addr        = 0x10000ULL;
+u32 g_dmesg_restrict       = 1;
+u32 g_kptr_restrict        = 1;
+u32 g_yama_ptrace_scope    = 1;
+u32 g_protected_hardlinks  = 1;
+u32 g_protected_symlinks   = 1;
+
 /* Whether the guard actually got replaced with unpredictable bits, so the
  * report below can say so rather than implying a protection we do not have. */
 static bool s_canary_random = false;
@@ -112,6 +120,16 @@ size_t security_format_status(char *buf, size_t max)
     off += scnprintf(buf + off, max > off ? max - off : 0,
                      "%-22s %llu\n", "split_lock_faults:",
                      (unsigned long long)cpu_split_lock_count());
+    off += scnprintf(buf + off, max > off ? max - off : 0,
+                     "%-22s 0x%llx\n", "mmap_min_addr:",
+                     (unsigned long long)g_mmap_min_addr);
+    ROW("dmesg_restrict",      g_dmesg_restrict ? "enabled" : "disabled");
+    ROW("kptr_restrict",       g_kptr_restrict ? "enabled" : "disabled");
+    ROW("protected_hardlinks", g_protected_hardlinks ? "enabled" : "disabled");
+    ROW("protected_symlinks",  g_protected_symlinks ? "enabled" : "disabled");
+    off += scnprintf(buf + off, max > off ? max - off : 0,
+                     "%-22s %u\n", "yama_ptrace_scope:",
+                     (unsigned int)g_yama_ptrace_scope);
     #undef ROW
     return off;
 }

@@ -36,6 +36,16 @@ CFLAGS = -std=c11 -ffreestanding -fstack-protector-strong -mstack-protector-guar
          -ffunction-sections -fdata-sections \
          -I. -Ilibc/include -Iapps/shared -Iapps/azwm
 
+# Header dependency tracking (libc/Makefile already does this for libc itself;
+# this is the same fix for the app layer). Without it, editing a shared header
+# like apps/shared/ui_kit.h or apps/azwm/protocol.h rebuilt nothing here until
+# the next full `make clean` — every app silently kept linking whatever it last
+# compiled against, headers included. -MMD emits a .d file next to each object
+# naming the headers it read; -MP adds phony targets so deleting a header does
+# not wedge the build. See "Header dependencies" near the bottom of this file
+# for where these get pulled back in.
+CFLAGS += -MMD -MP
+
 LDFLAGS = -T ../scripts/user.ld -nostdlib -z max-page-size=0x1000 --gc-sections
 
 BUILD_DIR = build
@@ -61,6 +71,8 @@ SBIN_APPS = \
     $(SBIN_DIR)/lockscreen.elf
 
 BIN_APPS = \
+    $(BIN_DIR)/testarch.elf \
+    $(BIN_DIR)/hwtest.elf \
     $(BIN_DIR)/sh.elf \
     $(BIN_DIR)/strace.elf \
     $(BIN_DIR)/ktrace.elf \
@@ -206,15 +218,17 @@ BIN_APPS = \
     $(BIN_DIR)/inotifywait.elf \
     $(BIN_DIR)/vmstat.elf \
     $(BIN_DIR)/getfattr.elf \
-    $(BIN_DIR)/setfattr.elf
+    $(BIN_DIR)/setfattr.elf \
+    $(BIN_DIR)/autoaccept.elf \
+    $(BIN_DIR)/setfont.elf
 
 
-.PHONY: all clean libc apps skeleton etc icons toolchain
+.PHONY: all clean libc apps skeleton etc icons fonts toolchain
 
-all: skeleton libc apps toolchain etc icons
+all: skeleton libc apps toolchain etc icons fonts
 
 skeleton:
-	@mkdir -p $(BUILD_DIR) $(BIN_DIR) $(SBIN_DIR) $(OBJ_DIR) $(BUILD_DIR)/etc $(BUILD_DIR)/dev $(BUILD_DIR)/proc $(BUILD_DIR)/sys $(BUILD_DIR)/root $(BUILD_DIR)/home/azami/Desktop $(BUILD_DIR)/desktop $(BUILD_DIR)/usr/bin $(BUILD_DIR)/usr/sbin $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/share/icons $(BUILD_DIR)/usr/share/wallpapers $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/var $(BUILD_DIR)/tmp
+	@mkdir -p $(BUILD_DIR) $(BIN_DIR) $(SBIN_DIR) $(OBJ_DIR) $(BUILD_DIR)/etc $(BUILD_DIR)/dev $(BUILD_DIR)/proc $(BUILD_DIR)/sys $(BUILD_DIR)/root $(BUILD_DIR)/home/azami/Desktop $(BUILD_DIR)/desktop $(BUILD_DIR)/usr/bin $(BUILD_DIR)/usr/sbin $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/share/icons $(BUILD_DIR)/usr/share/wallpapers $(BUILD_DIR)/usr/share/fonts $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/var $(BUILD_DIR)/tmp
 
 libc: skeleton libc/libc.a
 
@@ -387,12 +401,29 @@ etc: skeleton
 	@printf "[theme]\ntheme_id=0\nname=Catppuccin Mocha\nwallpaper=/usr/share/wallpapers/default.raw\n\n[display]\nvsync=1\ncompositing=1\ncursor_aa=1\nfps=60\n\n[panel]\nposition=bottom\nheight=32\nautohide=0\nshow_clock=1\n" > $(BUILD_DIR)/etc/desktop.conf
 	@printf "[terminal]\ntheme=catppuccin\nfont_size=12\nopacity=95\nscrollback=500\ncursor_blink=1\nhistory_size=100\nprompt=root@azamios:\w$$ \n" > $(BUILD_DIR)/etc/terminal.conf
 	@printf "[audio]\nvolume=80\nmaster_mute=0\nsample_rate=44100\nchannels=2\ndefault_sink=/dev/dsp\n" > $(BUILD_DIR)/etc/audio.conf
-	@printf "[network]\ninterface=eth0\ndhcp=1\nip=10.0.2.15\nnetmask=255.255.255.0\ngateway=10.0.2.2\ndns=10.0.2.3\n" > $(BUILD_DIR)/etc/network.conf
+	@printf "[network]\ninterface=eth0\ndhcp=0\nip=10.0.2.15\nnetmask=255.255.255.0\ngateway=10.0.2.2\ndns=10.0.2.3\n" > $(BUILD_DIR)/etc/network.conf
+	@printf "[power]\nprofile=1\nscreen_timeout=15\nacpi_pm=1\n" > $(BUILD_DIR)/etc/power.conf
+	@printf "# AzamiOS Security & Auto-Accept Configuration\nipc_autoaccept=1\nadmin_autoaccept=1\ndhcp_autoaccept=1\ntrace_autoaccept=1\n" > $(BUILD_DIR)/etc/security.conf
+	@# ── Desktop app config: taskbar dock, launcher registry, filemanager
+	@# places, and MIME associations. Each app ships a compiled-in default
+	@# matching this exact content (see tb_load_default_dock(),
+	@# load_default_registry(), load_default_places(),
+	@# load_default_file_assoc()) so a missing/corrupt file degrades
+	@# gracefully — but these are the real, editable source of truth.
+	@printf "# Quick Launch Dock entries: glyph|label|path|0xAARRGGBB\nT|Terminal|/bin/terminal.elf|0xFFA6E3A1\nF|Files|/bin/filemanager.elf|0xFFF9E2AF\nE|Editor|/bin/texteditor.elf|0xFF89B4FA\nC|Calc|/bin/calculator.elf|0xFFFAB387\nP|Paint|/bin/paint.elf|0xFFCBA6F7\nA|Audio|/bin/audioplayer.elf|0xFFF38BA8\nS|Settings|/bin/settings.elf|0xFF74C7EC\nM|Sysmon|/bin/sysmon.elf|0xFF94E2D5\nX|XClock|/bin/xclock.elf|0xFF89DCEB\nY|XEyes|/bin/xeyes.elf|0xFFF5C2E7\nK|XCalc|/bin/xcalc.elf|0xFFF9E2AF\nG|XDemo|/bin/xgui_demo.elf|0xFFB4BEFE\n" > $(BUILD_DIR)/etc/taskbar_dock.conf
+	@printf "# App Launcher registry: appname=category:subtitle, or appname=hidden\nterminal=system:Command Terminal\nfilemanager=system:Files & Storage\ntexteditor=productivity:Code & Text Editor\nsysmon=system:Activity Monitor\ncalculator=productivity:Math & Calculations\nclock=productivity:Clock & World Times\nsettings=system:System Control\nabout=system:System Info\nfetch=system:System Telemetry\nscreenshot=system:Screen Capture\npaint=productivity:Paint & Sketch\naudioplayer=media:Music & Synthwave\nminesweeper=games:Minesweeper Puzzle\n2048=games:2048 Number Puzzle\nsnake=games:Arcade Snake Game\n# Internal services & CLI tools: excluded from the app grid\ninit=hidden\nsessiond=hidden\nazwm=hidden\nwallpaper=hidden\ntaskbar=hidden\nlauncher=hidden\ngui_test=hidden\nsh=hidden\nplay=hidden\nls=hidden\ncat=hidden\necho=hidden\npwd=hidden\nuname=hidden\nhead=hidden\ntail=hidden\nwc=hidden\ngrep=hidden\nmkdir=hidden\nrm=hidden\ntouch=hidden\ncp=hidden\nmv=hidden\ndate=hidden\nuptime=hidden\ndf=hidden\nfree=hidden\nifconfig=hidden\nping=hidden\nlspci=hidden\nenv=hidden\nwhich=hidden\nsleep=hidden\nkill=hidden\nchmod=hidden\nclear=hidden\nhexdump=hidden\nbase64=hidden\nmd5sum=hidden\ncut=hidden\nsort=hidden\nuniq=hidden\nps=hidden\ntop=hidden\ndmesg=hidden\ntree=hidden\ncal=hidden\nwatch=hidden\nnetstat=hidden\npoweroff=hidden\nreboot=hidden\ngetfacl=hidden\nsetfacl=hidden\n" > $(BUILD_DIR)/etc/launcher.conf
+	@printf "# File manager sidebar places: label|path|icon\nRoot|/|/\nDesktop|/home/azami/Desktop|D\nHard Disk|/hdd|H\nBinaries|/bin|B\nSystem|/sbin|S\nConfig|/etc|E\nProc FS|/proc|P\nDevices|/dev|D\nTemporary|/tmp|T\n" > $(BUILD_DIR)/etc/filemanager_places.conf
+	@printf "# AzamiOS Kernel Runtime Configuration\n# File: /etc/sysctl.conf\n\n# Security Hardening Mitigations\nkernel.dmesg_restrict = 1\nkernel.kptr_restrict = 1\nkernel.mmap_min_addr = 65536\nkernel.yama.ptrace_scope = 1\nfs.protected_hardlinks = 1\nfs.protected_symlinks = 1\n\n# System & Hostname Defaults\nkernel.hostname = azamios\nfs.file-max = 65536\n" > $(BUILD_DIR)/etc/sysctl.conf
+	@printf "# File extension -> GUI app associations: ext=/path/to/app.elf\ntxt=/bin/texteditor.elf\nmd=/bin/texteditor.elf\nc=/bin/texteditor.elf\nh=/bin/texteditor.elf\nconf=/bin/texteditor.elf\ncfg=/bin/texteditor.elf\nini=/bin/texteditor.elf\nlog=/bin/texteditor.elf\nsh=/bin/texteditor.elf\njson=/bin/texteditor.elf\nbmp=/bin/paint.elf\npng=/bin/paint.elf\nwav=/bin/audioplayer.elf\n" > $(BUILD_DIR)/etc/mime.conf
+	@printf "/bin/sh\n/bin/sh.elf\n/bin/bash\n/usr/bin/sh\n" > $(BUILD_DIR)/etc/shells
+	@printf "Welcome to AzamiOS 7.0 (x86_64) - \\\\l\n\n" > $(BUILD_DIR)/etc/issue
+	@printf "ext2\nprocfs\ndevfs\n*\n" > $(BUILD_DIR)/etc/filesystems
+	@printf "PATH=/bin:/sbin:/usr/bin:/usr/sbin\nLANG=C.UTF-8\nEDITOR=/bin/texteditor.elf\nPAGER=cat\n" > $(BUILD_DIR)/etc/environment
 	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/home/a0wsvg/opt/cross-x86_64/bin:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin:/\nexport USER=root\nexport HOME=/root\nexport TERM=azami\nexport SHELL=/bin/sh.elf\nexport TMPDIR=/tmp\nexport COMPILER_PATH=/home/a0wsvg/opt/cross-x86_64/libexec/gcc/x86_64-elf/14.2.0/:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin/:/usr/bin:/bin\nexport LIBRARY_PATH=/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/:/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib\nexport C_INCLUDE_PATH=/usr/include:/usr/local/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/sys-include\nexport CPATH=/usr/include:/usr/local/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include\nexport PS1=\"root@azamios:\w$$ \"\n" > $(BUILD_DIR)/etc/profile
 	@cp $(BUILD_DIR)/etc/profile $(BUILD_DIR)/root/.profile
 	@cp $(BUILD_DIR)/etc/profile $(BUILD_DIR)/home/azami/.profile
 	@mkdir -p $(BUILD_DIR)/tmp $(BUILD_DIR)/var/tmp $(BUILD_DIR)/var/log $(BUILD_DIR)/var/run
-	@touch $(BUILD_DIR)/var/run/utmp $(BUILD_DIR)/var/log/wtmp 2>/dev/null || true
+	@touch $(BUILD_DIR)/var/run/utmp $(BUILD_DIR)/var/log/wtmp $(BUILD_DIR)/etc/run-userspace-test 2>/dev/null || true
 	@mkdir -p $(BUILD_DIR)/examples
 	@mkdir -p $(BUILD_DIR)/usr/src/examples
 	@mkdir -p $(BUILD_DIR)/usr/src/libc
@@ -452,6 +483,11 @@ icons: skeleton
 		fi \
 	done
 
+fonts: skeleton
+	@echo "  ↓  Compiling font subsystem binary fonts..."
+	@python3 ../scripts/generate_fonts.py
+	@printf "[font]\nsystem_font=/usr/share/fonts/vga_regular.azf\nmono_font=/usr/share/fonts/terminus_regular.azf\nsmall_font=/usr/share/fonts/vga_small.azf\nsize=16\n" > $(BUILD_DIR)/etc/font.conf
+
 # ── System binaries (/sbin) + user utilities & applications (/bin) ──────────
 #
 # Every target in SBIN_APPS and BIN_APPS used to carry its own explicit
@@ -469,21 +505,51 @@ icons: skeleton
 
 SBIN_APPS_SIMPLE := $(filter-out $(SBIN_DIR)/azwm.elf,$(SBIN_APPS))
 
-$(SBIN_APPS_SIMPLE): $(SBIN_DIR)/%.elf: apps/%/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/$*.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/$*.o libc/libc.a -o $@
+# Compiling and linking used to be one recipe keyed only off main.c, which
+# hid the .o from make's dependency graph entirely: filemanager.elf's only
+# real prerequisite was apps/filemanager/main.c, so build/obj/filemanager.o
+# — the file -MMD's generated .d actually attaches header prerequisites to —
+# was never itself something anything depended on. Touching a shared header
+# like ui_kit.h left every consumer looking up to date; only a full `make
+# clean` ever picked it up. Splitting compile and link into separate rules
+# gives the .o a real place in the graph: the .elf depends on the .o, the .o
+# rule's prerequisites are extended by its .d file (see the "Header
+# dependencies" section below), and a stale header now reaches the link the
+# normal way — through an .o that's actually stale.
+$(OBJ_DIR)/%.o: apps/%/main.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BIN_APPS): $(BIN_DIR)/%.elf: apps/%/main.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c $< -o $(OBJ_DIR)/$*.o
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/$*.o libc/libc.a -o $@
+$(SBIN_APPS_SIMPLE): $(SBIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $< libc/libc.a -o $@
+
+$(BIN_APPS): $(BIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $< libc/libc.a -o $@
 
 # ── azwm.elf (window manager + compositor + DE extension + desktop) ─────────
-$(SBIN_DIR)/azwm.elf: apps/azwm/main.c apps/azwm/compositor.c apps/azwm/de_compositor.c apps/azwm/desktop.c libc/libc.a libc/crt0.o | skeleton
-	$(CC) $(CFLAGS) -c apps/azwm/main.c -o $(OBJ_DIR)/azwm_main.o
-	$(CC) $(CFLAGS) -c apps/azwm/compositor.c -o $(OBJ_DIR)/azwm_comp.o
-	$(CC) $(CFLAGS) -c apps/azwm/de_compositor.c -o $(OBJ_DIR)/azwm_de.o
-	$(CC) $(CFLAGS) -c apps/azwm/desktop.c -o $(OBJ_DIR)/azwm_desk.o
+$(OBJ_DIR)/azwm_main.o: apps/azwm/main.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/azwm_comp.o: apps/azwm/compositor.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/azwm_de.o: apps/azwm/de_compositor.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/azwm_desk.o: apps/azwm/desktop.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(SBIN_DIR)/azwm.elf: $(OBJ_DIR)/azwm_main.o $(OBJ_DIR)/azwm_comp.o $(OBJ_DIR)/azwm_de.o $(OBJ_DIR)/azwm_desk.o libc/libc.a libc/crt0.o | skeleton
 	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/azwm_main.o $(OBJ_DIR)/azwm_comp.o $(OBJ_DIR)/azwm_de.o $(OBJ_DIR)/azwm_desk.o libc/libc.a -o $@
+
+# ── Header dependencies (must stay last; see CFLAGS += -MMD -MP above) ──────
+#
+# Every SBIN_APPS_SIMPLE/BIN_APPS object lands at $(OBJ_DIR)/<name>.o, so its
+# .d sits right beside it at $(OBJ_DIR)/<name>.d; azwm's four objects are
+# named explicitly in its own rule above and listed here the same way. An
+# `include` contributes rules, and the first rule make sees sets the default
+# goal — including these any earlier would make a stray .o the default
+# target instead of `apps`/`all`.
+SIMPLE_APP_NAMES := $(notdir $(basename $(SBIN_APPS_SIMPLE) $(BIN_APPS)))
+DEPFILES := $(addprefix $(OBJ_DIR)/,$(addsuffix .d,$(SIMPLE_APP_NAMES))) \
+            $(OBJ_DIR)/azwm_main.d $(OBJ_DIR)/azwm_comp.d $(OBJ_DIR)/azwm_de.d $(OBJ_DIR)/azwm_desk.d
+-include $(DEPFILES)
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 

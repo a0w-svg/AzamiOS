@@ -285,7 +285,23 @@ KERNEL_C_SRCS := \
     fs/sysfs.c \
     fs/devpts.c \
     fs/squashfs/squashfs.c \
-    drivers/char/pty.c
+    drivers/char/pty.c \
+    drivers/misc/fw_cfg.c \
+    drivers/misc/pvpanic.c \
+    drivers/char/debugcon.c \
+    drivers/char/pci_serial.c \
+    drivers/net/rtl8169.c \
+    drivers/sound/es1370.c \
+    drivers/hwmon/coretemp.c \
+    drivers/usb/core/usb.c \
+    drivers/usb/host/uhci.c \
+    drivers/net/vmxnet3.c \
+    drivers/acpi/pm_timer.c \
+    drivers/sound/mpu401.c \
+    drivers/misc/virtio_9p.c \
+    drivers/usb/host/ehci.c \
+    drivers/net/e100.c \
+    drivers/acpi/piix4_pm.c
 
 # ── Object file lists ─────────────────────────────────────────────────────────
 BOOT_OBJS   := $(patsubst %.asm, $(OBJ_DIR)/%.o, $(BOOT_ASM_SRCS))
@@ -386,7 +402,13 @@ QEMU_FLAGS := \
     -audiodev pa,id=snd0 \
     -device AC97,audiodev=snd0 \
     -device intel-hda -device hda-duplex,audiodev=snd0 \
-    -device virtio-rng-pci
+    -device ES1370,audiodev=snd0 \
+    -device virtio-rng-pci \
+    -device pvpanic-pci \
+    -device pci-serial \
+    -device ich9-usb-uhci1 \
+    -device ich9-usb-ehci1 \
+    -device vmxnet3
 
 # Limine-based ISO run (GUI window + serial terminal)
 run: iso
@@ -502,7 +524,8 @@ linux-clean:
 
 hdd.img:
 	@echo "  ↓  Generating persistent storage disk (hdd.img)..."
-	@mkdir -p hdd_root
+	@mkdir -p hdd_root/fonts
+	@python3 scripts/generate_fonts.py >/dev/null 2>&1 || true
 	@printf "Welcome to AzamiOS Persistent Storage!\n\nThis file is saved directly to the SATA drive (AHCI).\nEdit this text and press Ctrl+S to save it persistently!\n" > hdd_root/notes.txt
 	@truncate -s 4096 hdd_root/notes.txt
 	@mke2fs -F -t ext2 -d hdd_root hdd.img 32M >/dev/null 2>&1 || true

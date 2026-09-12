@@ -50,11 +50,21 @@ static s64 pipe_read(file_t *filp, void *buf, size_t len, u64 *offset)
         spinlock_lock(&pipe->lock);
 
         if (pipe->count > 0) {
-            while (bytes_read < len && pipe->count > 0) {
-                dst[bytes_read++] = pipe->buffer[pipe->read_pos];
-                pipe->read_pos = (pipe->read_pos + 1) % PIPE_BUFFER_SIZE;
-                pipe->count--;
+            size_t to_read = len - bytes_read;
+            if (to_read > pipe->count) to_read = pipe->count;
+
+            size_t part1 = PIPE_BUFFER_SIZE - pipe->read_pos;
+            if (part1 > to_read) part1 = to_read;
+            size_t part2 = to_read - part1;
+
+            memcpy(dst + bytes_read, &pipe->buffer[pipe->read_pos], part1);
+            if (part2 > 0) {
+                memcpy(dst + bytes_read + part1, &pipe->buffer[0], part2);
             }
+
+            pipe->read_pos = (pipe->read_pos + to_read) % PIPE_BUFFER_SIZE;
+            pipe->count -= to_read;
+            bytes_read += to_read;
 
             thread_t *writer = pipe_wait_pop(&pipe->write_wait);
             spinlock_unlock(&pipe->lock);
@@ -116,11 +126,22 @@ static s64 pipe_write(file_t *filp, const void *buf, size_t len, u64 *offset)
         }
 
         if (pipe->count < PIPE_BUFFER_SIZE) {
-            while (bytes_written < len && pipe->count < PIPE_BUFFER_SIZE) {
-                pipe->buffer[pipe->write_pos] = src[bytes_written++];
-                pipe->write_pos = (pipe->write_pos + 1) % PIPE_BUFFER_SIZE;
-                pipe->count++;
+            size_t avail = PIPE_BUFFER_SIZE - pipe->count;
+            size_t to_write = len - bytes_written;
+            if (to_write > avail) to_write = avail;
+
+            size_t part1 = PIPE_BUFFER_SIZE - pipe->write_pos;
+            if (part1 > to_write) part1 = to_write;
+            size_t part2 = to_write - part1;
+
+            memcpy(&pipe->buffer[pipe->write_pos], src + bytes_written, part1);
+            if (part2 > 0) {
+                memcpy(&pipe->buffer[0], src + bytes_written + part1, part2);
             }
+
+            pipe->write_pos = (pipe->write_pos + to_write) % PIPE_BUFFER_SIZE;
+            pipe->count += to_write;
+            bytes_written += to_write;
 
             thread_t *reader = pipe_wait_pop(&pipe->read_wait);
             spinlock_unlock(&pipe->lock);

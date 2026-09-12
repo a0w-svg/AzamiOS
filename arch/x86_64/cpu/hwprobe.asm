@@ -26,6 +26,16 @@ hwaccel_probe_asm:
     je   .tpause
     cmp  esi, 4                  ; PROBE_RDPMC
     je   .rdpmc
+    cmp  esi, 5                  ; PROBE_CLFLUSHOPT
+    je   .clflushopt
+    cmp  esi, 6                  ; PROBE_CLWB
+    je   .clwb
+    cmp  esi, 7                  ; PROBE_SERIALIZE
+    je   .serialize
+    cmp  esi, 8                  ; PROBE_RDRAND
+    je   .rdrand
+    cmp  esi, 9                  ; PROBE_RDSEED
+    je   .rdseed
     mov  eax, 1                  ; unknown selector — report unusable
     ret
 
@@ -58,6 +68,31 @@ hwaccel_probe_asm:
     rdpmc
     jmp  .ok
 
+.clflushopt:
+.probe_clflushopt:
+    clflushopt [rdi]
+    jmp  .ok
+
+.clwb:
+.probe_clwb:
+    clwb [rdi]
+    jmp  .ok
+
+.serialize:
+.probe_serialize:
+    db 0x0f, 0x01, 0xe8          ; serialize instruction
+    jmp  .ok
+
+.rdrand:
+.probe_rdrand:
+    rdrand eax
+    jmp  .ok
+
+.rdseed:
+.probe_rdseed:
+    rdseed eax
+    jmp  .ok
+
 .ok:
     xor  eax, eax
     ret
@@ -78,4 +113,19 @@ align 8
     dq hwaccel_probe_asm.probe_fault
 
     dq hwaccel_probe_asm.probe_rdpmc
+    dq hwaccel_probe_asm.probe_fault
+
+    dq hwaccel_probe_asm.probe_clflushopt
+    dq hwaccel_probe_asm.probe_fault
+
+    dq hwaccel_probe_asm.probe_clwb
+    dq hwaccel_probe_asm.probe_fault
+
+    dq hwaccel_probe_asm.probe_serialize
+    dq hwaccel_probe_asm.probe_fault
+
+    dq hwaccel_probe_asm.probe_rdrand
+    dq hwaccel_probe_asm.probe_fault
+
+    dq hwaccel_probe_asm.probe_rdseed
     dq hwaccel_probe_asm.probe_fault

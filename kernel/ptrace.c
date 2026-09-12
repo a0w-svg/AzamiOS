@@ -28,18 +28,39 @@
 
 /* ── Access control ──────────────────────────────────────────────────────── */
 
-/* Linux's PTRACE_MODE_ATTACH_REALCREDS, same rule do_process_vm() applies:
- * CAP_SYS_PTRACE, or a tracer whose *real* uid/gid match every one of the
- * target's real, effective and saved ids. Anything weaker would let a process
- * attach to a setuid peer that dropped euid but still holds suid == 0. */
+static bool is_descendant(process_t *tracer, process_t *target)
+{
+    if (!tracer || !target) return false;
+    process_t *curr = target->parent;
+    for (int depth = 0; depth < 16 && curr; depth++) {
+        if (curr->pid == tracer->pid) return true;
+        if (curr->pid <= 1) break;
+        curr = curr->parent;
+    }
+    return false;
+}
+
+/* Linux's PTRACE_MODE_ATTACH_REALCREDS plus Yama ptrace_scope:
+ * Scope 0: Classic ptrace (credentials match).
+ * Scope 1: Restricted (default) — target must be descendant of tracer, or tracer holds CAP_SYS_PTRACE.
+ * Scope 2: Admin only — tracer must hold CAP_SYS_PTRACE or euid == 0.
+ * Scope 3: No attach — cannot attach to running processes via PTRACE_ATTACH. */
 static bool may_trace(process_t *tracer, process_t *target)
 {
     if (!tracer || !target || tracer == target) return false;
     if (target->is_zombie) return false;
     if (target->pid <= 1) return false;             /* never the kernel or init */
 
-    if (security_check_permission(tracer, CAP_SYS_PTRACE)) return true;
-    if (tracer->euid == 0) return true;
+    if (g_yama_ptrace_scope >= 3) return false;
+
+    bool is_admin = (tracer->euid == 0 || security_check_permission(tracer, CAP_SYS_PTRACE));
+    if (g_yama_ptrace_scope == 2 && !is_admin) return false;
+
+    if (is_admin) return true;
+
+    /* Scope 1 (Restricted): Tracer must be ancestor of target */
+    if (g_yama_ptrace_scope == 1 && !is_descendant(tracer, target))
+        return false;
 
     if (tracer->uid != target->uid  || tracer->uid != target->euid ||
         tracer->uid != target->suid || tracer->gid != target->gid  ||

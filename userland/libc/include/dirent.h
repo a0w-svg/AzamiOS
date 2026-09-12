@@ -37,3 +37,9 @@ int            closedir(DIR *dirp);
 void           rewinddir(DIR *dirp);
 long           telldir(DIR *dirp);
 void           seekdir(DIR *dirp, long loc);
+int            readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result);
+int            scandir(const char *dirp, struct dirent ***namelist,
+                       int (*filter)(const struct dirent *),
+                       int (*compar)(const struct dirent **, const struct dirent **));
+int            alphasort(const struct dirent **a, const struct dirent **b);
+int            versionsort(const struct dirent **a, const struct dirent **b);

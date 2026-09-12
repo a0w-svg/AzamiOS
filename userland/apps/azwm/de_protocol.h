@@ -61,6 +61,7 @@
 #define AZ_WM_EVT_WINDOW_DESTROYED 41  /* Broadcast: a window was destroyed         */
 #define AZ_WM_EVT_FOCUS_CHANGED    42  /* Broadcast: focus moved to another window  */
 #define AZ_WM_EVT_THEME_CHANGED    43  /* Broadcast: theme changed across system    */
+#define AZ_WM_EVT_WINDOW_TITLE_CHANGED 44 /* Broadcast: window title was updated      */
 #define AZ_WM_SESSION_READY        50  /* sessiond -> subscribers: DE fully started */
 #define AZ_WM_TIMER_TICK           51  /* Kernel timer -> client: periodic tick     */
 
@@ -158,10 +159,16 @@ typedef struct {
     unsigned int  new_wid;      /* Newly focused window (0 if none)          */
 } az_wm_evt_focus_payload_t;
 
-/* AZ_WM_SET_THEME / AZ_WM_EVT_THEME_CHANGED payload */
+/* AZ_WM_EVT_THEME_CHANGED payload */
 typedef struct {
     unsigned int  theme_id;     /* AZ_THEME_*                                */
 } az_wm_theme_payload_t;
+
+/* AZ_WM_EVT_WINDOW_TITLE_CHANGED payload */
+typedef struct {
+    unsigned int  wid;
+    char          title[64];
+} az_wm_evt_title_payload_t;
 
 /* ── Convenience cast helpers ─────────────────────────────────────────────── */
 #define AZ_WM_MSG_ZORDER(msg_ptr) \
@@ -188,6 +195,9 @@ typedef struct {
 #define AZ_WM_MSG_THEME(msg_ptr) \
     ((az_wm_theme_payload_t *)((msg_ptr)->_raw))
 
+#define AZ_WM_MSG_EVT_TITLE(msg_ptr) \
+    ((az_wm_evt_title_payload_t *)((msg_ptr)->_raw))
+
 /* ── Static assertion: payloads fit in _raw[200] ─────────────────────────── */
 _Static_assert(sizeof(az_wm_zorder_payload_t)       <= 200, "zorder payload overflow");
 _Static_assert(sizeof(az_wm_subscribe_payload_t)    <= 200, "subscribe payload overflow");
@@ -197,6 +207,7 @@ _Static_assert(sizeof(az_wm_evt_created_payload_t)   <= 200, "evt_created payloa
 _Static_assert(sizeof(az_wm_evt_destroyed_payload_t) <= 200, "evt_destroyed payload overflow");
 _Static_assert(sizeof(az_wm_evt_focus_payload_t)     <= 200, "evt_focus payload overflow");
 _Static_assert(sizeof(az_wm_theme_payload_t)         <= 200, "theme payload overflow");
+_Static_assert(sizeof(az_wm_evt_title_payload_t)     <= 200, "evt_title payload overflow");
 
 /* ── Clipboard payload (both SET and DATA use the same struct) ──────────── */
 /* Max clipboard text: 195 bytes — leaves 5 bytes for length + NUL.         */

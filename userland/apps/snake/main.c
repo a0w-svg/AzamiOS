@@ -362,6 +362,12 @@ int main(int argc, char **argv)
 
         if (msg.type == AZ_WM_DESTROY_WINDOW) break;
 
+        if (msg.type == AZ_WM_WINDOW_RESIZED) {
+            if (!uk_handle_resize(&g_win, &msg)) break;
+            draw_snake_game();
+            continue;
+        }
+
         if (msg.type == AZ_WM_TIMER_TICK) {
             update_game_tick();
             draw_snake_game();

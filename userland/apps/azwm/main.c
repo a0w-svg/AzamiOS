@@ -31,6 +31,10 @@
 #define DISPLAY_HEIGHT_DEFAULT   800
 #define AZWM_TASKBAR_H           52
 
+/* Frame-rate cap for the main loop's "actively doing something" path — see
+ * the comment where it's used, by last_frame_ns in main(). */
+#define AZWM_FRAME_INTERVAL_NS (1000000000LL / 60)
+
 /* ── Framebuffer mapping ────────────────────────────────────────────────────── */
 /* What the display turned out to be capable of, filled in by map_shared_memory. */
 typedef struct {
@@ -233,6 +237,52 @@ static az_window_t *find_window_at(az_compositor_t *comp, int mx, int my)
     return (az_window_t *)0;
 }
 
+/*
+ * Reallocate @win's content surface for its *current* width/height and push
+ * the new surface to its client — the one place every geometry change that
+ * needs a matching content buffer (drag-resize release, edge-snap, maximize
+ * toggle) routes through, instead of each writing win->width/height and
+ * leaving the surface to drift out of sync with them.
+ *
+ * A no-op (compositor_resize_window() returns the existing shmem_id and
+ * skips the message) when the window's surface already matches — so the
+ * common case, e.g. finishing a snap onto a size the window already had,
+ * costs nothing.
+ */
+static void sync_window_surface(az_compositor_t *comp, az_window_t *win)
+{
+    if (!win || win->wid == 0) return;
+
+    unsigned int prev_shmem_id = win->shmem_id;
+    unsigned int new_shmem_id  = 0;
+    if (compositor_resize_window(comp, win, win->width, win->height, &new_shmem_id) != 0) {
+        /* Reallocation failed (out of memory/shmem slots) — the window has
+         * no valid surface left to composite or hand to its client, so
+         * there is nothing safer to do than close it. */
+        compositor_destroy_window(comp, win->wid);
+        return;
+    }
+    /* compositor_resize_window() clamps independently of whatever bound the
+     * caller applied to win->width/height before calling here — force chrome
+     * to match the buffer it actually got rather than assume the two clamps
+     * always agree. */
+    win->width  = win->buffer_w;
+    win->height = win->buffer_h;
+
+    /* Geometry clamped to the same buffer size compositor_resize_window()
+     * already has: nothing changed, so nothing to tell the client. */
+    if (new_shmem_id == prev_shmem_id) return;
+
+    az_wm_msg_t rmsg;
+    memset(&rmsg, 0, sizeof(rmsg));
+    rmsg.type            = AZ_WM_WINDOW_RESIZED;
+    rmsg.wid              = win->wid;
+    rmsg.resized.shmem_id = new_shmem_id;
+    rmsg.resized.width    = win->buffer_w;
+    rmsg.resized.height   = win->buffer_h;
+    az_channel_send_nb((int)win->client_chan, (az_ipc_msg_t *)&rmsg);
+}
+
 /* ============================================================================
  * _start
  * ============================================================================ */
@@ -334,6 +384,20 @@ int main(int argc, char **argv)
     unsigned int last_click_time = 0;
     int last_click_x = 0, last_click_y = 0;
 
+    /* Frame-rate cap for the "actively doing something" path below (a
+     * redraw, a cursor move, or a running window animation): that path used
+     * to have no sleep in it at all, so a drag, a resize, or the 180ms of a
+     * window opening had this loop spinning through compose_screen() as
+     * fast as the scheduler would allow — thousands of presents a second on
+     * an idle box, all but a handful of them thrown away since nothing can
+     * display them, for CPU time every other process on the system would
+     * rather have had. Capping to 60 Hz here doesn't cost animations
+     * anything (compositor_animate_step() times itself against wall-clock
+     * ns, not against how often it gets called — see its comment), so this
+     * is pure waste eliminated, not a smoothness trade-off.
+     */
+    long long last_frame_ns = compositor_now_ns();
+
     bool running = true;
     while (running) {
         bool redraw_needed = false;
@@ -362,6 +426,63 @@ int main(int argc, char **argv)
                 comp.cursor_x = abs_x;
                 comp.cursor_y = abs_y;
                 cursor_moved = true;
+
+                /* Titlebar button hover (close/minimize/maximize) plus the
+                 * resize grip — skipped mid-drag/resize so the halo doesn't
+                 * flicker under a grip the pointer is only passing over
+                 * while moving a window. */
+                if (drag_wid == 0 && resize_wid == 0) {
+                    az_window_t *hov_win = find_window_at(&comp, abs_x, abs_y);
+                    unsigned int new_hover_wid = 0;
+                    int new_hover_btn = AZWM_BTN_NONE;
+                    if (hov_win) {
+                        if (hit_close_button(hov_win, abs_x, abs_y)) {
+                            new_hover_wid = hov_win->wid; new_hover_btn = AZWM_BTN_CLOSE;
+                        } else if (hit_minimize_button(hov_win, abs_x, abs_y)) {
+                            new_hover_wid = hov_win->wid; new_hover_btn = AZWM_BTN_MIN;
+                        } else if (hit_maximize_button(hov_win, abs_x, abs_y)) {
+                            new_hover_wid = hov_win->wid; new_hover_btn = AZWM_BTN_MAX;
+                        } else if (hit_resize_grip(hov_win, abs_x, abs_y)) {
+                            new_hover_wid = hov_win->wid; new_hover_btn = AZWM_BTN_RESIZE;
+                        }
+                    }
+                    if (new_hover_wid != comp.hover_btn_wid || new_hover_btn != comp.hover_btn) {
+                        /* Damage whichever (window, decoration) pair is
+                         * losing the halo and whichever is gaining it — the
+                         * titlebar strip for the three circular buttons, or
+                         * the bottom-right corner for the resize grip, since
+                         * that one lives outside the titlebar entirely. */
+                        struct { unsigned int wid; int btn; } edges[2] = {
+                            { comp.hover_btn_wid, comp.hover_btn },
+                            { new_hover_wid,      new_hover_btn  },
+                        };
+                        for (int ei = 0; ei < 2; ei++) {
+                            if (edges[ei].wid == 0 || edges[ei].btn == AZWM_BTN_NONE) continue;
+                            az_window_t *tw = (az_window_t *)0;
+                            for (int wi = 0; wi < AZWM_MAX_WINDOWS; wi++) {
+                                if (comp.window_pool[wi].wid == edges[ei].wid) {
+                                    tw = &comp.window_pool[wi];
+                                    break;
+                                }
+                            }
+                            if (!tw) continue;
+                            if (edges[ei].btn == AZWM_BTN_RESIZE) {
+                                compositor_damage(&comp, tw->x + (int)tw->width - 16,
+                                                  tw->y + (int)tw->height - 16,
+                                                  16 + AZWM_BORDER_W + 4,
+                                                  16 + AZWM_BORDER_W + 4);
+                            } else {
+                                compositor_damage(&comp, tw->x - AZWM_BORDER_W,
+                                                  tw->y - AZWM_TITLEBAR_H - AZWM_BORDER_W,
+                                                  (int)tw->width + 2 * AZWM_BORDER_W,
+                                                  AZWM_TITLEBAR_H + AZWM_BORDER_W);
+                            }
+                        }
+                        comp.hover_btn_wid = new_hover_wid;
+                        comp.hover_btn     = new_hover_btn;
+                        redraw_needed = true;
+                    }
+                }
 
                 bool lclick_now = (ev.mouse_buttons & AZ_MOUSE_BTN_LEFT) != 0;
                 bool lclick = lclick_now && !(prev_buttons & AZ_MOUSE_BTN_LEFT);
@@ -435,8 +556,25 @@ int main(int argc, char **argv)
                                 dwin->width = (screen_w / 2) - 2 * AZWM_BORDER_W;
                                 dwin->height = (screen_h - AZWM_TASKBAR_H) / 2 - AZWM_TITLEBAR_H - 2 * AZWM_BORDER_W;
                             }
+                            sync_window_surface(&comp, dwin);
                             redraw_needed = true;
                         }
+                    }
+                    if (resize_wid != 0) {
+                        az_window_t *rwin_done = (az_window_t *)0;
+                        for (int i = 0; i < AZWM_MAX_WINDOWS; i++) {
+                            if (comp.window_pool[i].wid == resize_wid) {
+                                rwin_done = &comp.window_pool[i];
+                                break;
+                            }
+                        }
+                        if (rwin_done) {
+                            sync_window_surface(&comp, rwin_done);
+                            redraw_needed = true;
+                        }
+                    }
+                    if (comp.snap_preview_mode != 0) {
+                        compositor_damage_all(&comp);
                     }
                     comp.snap_preview_mode = 0;
                     drag_wid = 0;
@@ -507,11 +645,15 @@ int main(int argc, char **argv)
                         }
 
                         if (prev_mode != comp.snap_preview_mode) {
+                            compositor_damage_all(&comp);
                             redraw_needed = true;
                         }
                         redraw_needed = true;
                     } else {
                         drag_wid = 0;
+                        if (comp.snap_preview_mode != 0) {
+                            compositor_damage_all(&comp);
+                        }
                         comp.snap_preview_mode = 0;
                     }
                 } else if (btn_press) {
@@ -541,6 +683,15 @@ int main(int argc, char **argv)
                                 }
                             }
                         }
+                        int mx = comp.ctx_menu_x;
+                        int my = comp.ctx_menu_y;
+                        int mw = 176;
+                        int mh = 8 * 26 + 12;
+                        if (mx + mw > (int)screen_w - 8) mx = (int)screen_w - mw - 8;
+                        if (my + mh > (int)screen_h - 48) my = (int)screen_h - mh - 48;
+                        if (mx < 8) mx = 8;
+                        if (my < 8) my = 8;
+                        compositor_damage(&comp, mx - 16, my - 16, mw + 32, mh + 32);
                         comp.ctx_menu_active = 0;
                         redraw_needed = true;
                     } else {
@@ -602,6 +753,7 @@ int main(int argc, char **argv)
                                     hit->height = hit->saved_h;
                                     hit->maximized = 0;
                                 }
+                                sync_window_surface(&comp, hit);
                                 redraw_needed = true;
                             } else if (lclick && hit_resize_grip(hit, abs_x, abs_y)) {
                                 /* Start window resizing */
@@ -648,6 +800,7 @@ int main(int argc, char **argv)
                                             hit->width = hit->saved_w; hit->height = hit->saved_h;
                                             hit->maximized = 0;
                                         }
+                                        sync_window_surface(&comp, hit);
                                         redraw_needed = true;
                                         drag_wid = 0;
                                         last_click_time = 0;
@@ -693,6 +846,15 @@ int main(int argc, char **argv)
                             comp.ctx_menu_x = abs_x;
                             comp.ctx_menu_y = abs_y;
                             comp.ctx_menu_hover = -1;
+                            int mx = abs_x;
+                            int my = abs_y;
+                            int mw = 176;
+                            int mh = 8 * 26 + 12;
+                            if (mx + mw > (int)screen_w - 8) mx = (int)screen_w - mw - 8;
+                            if (my + mh > (int)screen_h - 48) my = (int)screen_h - mh - 48;
+                            if (mx < 8) mx = 8;
+                            if (my < 8) my = 8;
+                            compositor_damage(&comp, mx - 16, my - 16, mw + 32, mh + 32);
                             redraw_needed = true;
                         }
                     }
@@ -712,10 +874,12 @@ int main(int argc, char **argv)
                             int item = (abs_y - (my + 6)) / 26;
                             if (item != comp.ctx_menu_hover) {
                                 comp.ctx_menu_hover = item;
+                                compositor_damage(&comp, mx, my, mw, mh);
                                 redraw_needed = true;
                             }
                         } else if (comp.ctx_menu_hover != -1) {
                             comp.ctx_menu_hover = -1;
+                            compositor_damage(&comp, mx, my, mw, mh);
                             redraw_needed = true;
                         }
                     }
@@ -751,6 +915,37 @@ int main(int argc, char **argv)
                     }
                 }
 
+                /* Dynamic cursor selection based on interaction state and window under pointer */
+                unsigned int desired_cursor = AZ_CURSOR_DEFAULT;
+                if (resize_wid != 0) {
+                    desired_cursor = AZ_CURSOR_RESIZE_NWSE;
+                } else if (drag_wid != 0) {
+                    desired_cursor = AZ_CURSOR_MOVE;
+                } else if (comp.ctx_menu_active) {
+                    desired_cursor = AZ_CURSOR_POINTER;
+                } else {
+                    az_window_t *hov_win = find_window_at(&comp, abs_x, abs_y);
+                    if (hov_win) {
+                        if (hit_close_button(hov_win, abs_x, abs_y) ||
+                            hit_minimize_button(hov_win, abs_x, abs_y) ||
+                            hit_maximize_button(hov_win, abs_x, abs_y)) {
+                            desired_cursor = AZ_CURSOR_POINTER;
+                        } else if (hit_resize_grip(hov_win, abs_x, abs_y)) {
+                            desired_cursor = AZ_CURSOR_RESIZE_NWSE;
+                        } else if (abs_x >= hov_win->x && abs_x < hov_win->x + (int)hov_win->width &&
+                                   abs_y >= hov_win->y && abs_y < hov_win->y + (int)hov_win->height) {
+                            desired_cursor = hov_win->cursor_type;
+                        } else {
+                            desired_cursor = AZ_CURSOR_DEFAULT;
+                        }
+                    } else {
+                        desired_cursor = AZ_CURSOR_DEFAULT;
+                    }
+                }
+                if (comp.current_cursor_type != desired_cursor) {
+                    compositor_set_cursor(&comp, desired_cursor);
+                    redraw_needed = true;
+                }
             } else if (ev.type == AZ_INPUT_EVENT_KEY) {
                 bool is_alt = (ev.flags & AZ_KEY_FLAG_ALT) != 0;
                 bool is_ctrl = (ev.flags & AZ_KEY_FLAG_CTRL) != 0;
@@ -771,11 +966,21 @@ int main(int argc, char **argv)
                             if (comp.alt_tab_count > 0) {
                                 comp.alt_tab_active = 1;
                                 comp.alt_tab_idx = (comp.alt_tab_count > 1) ? 1 : 0;
+                                int hud_w = 460;
+                                int hud_h = 56 + comp.alt_tab_count * 34;
+                                int hx = ((int)comp.fb_width - hud_w) / 2;
+                                int hy = ((int)comp.fb_height - hud_h) / 2;
+                                compositor_damage(&comp, hx - 16, hy - 16, hud_w + 32, hud_h + 32);
                                 redraw_needed = true;
                             }
                         } else {
                             if (comp.alt_tab_count > 0) {
                                 comp.alt_tab_idx = (comp.alt_tab_idx + 1) % comp.alt_tab_count;
+                                int hud_w = 460;
+                                int hud_h = 56 + comp.alt_tab_count * 34;
+                                int hx = ((int)comp.fb_width - hud_w) / 2;
+                                int hy = ((int)comp.fb_height - hud_h) / 2;
+                                compositor_damage(&comp, hx - 16, hy - 16, hud_w + 32, hud_h + 32);
                                 redraw_needed = true;
                             }
                         }
@@ -785,6 +990,8 @@ int main(int argc, char **argv)
                     /* F12: Toggle on-screen FPS counter */
                     if (ev.scancode == 0x58 || ev.keycode == 139 /* F12 */) {
                         comp.fps_hud_visible = !comp.fps_hud_visible;
+                        int hud_x = (int)comp.fb_width - 120;
+                        compositor_damage(&comp, hud_x, 0, 120, 40);
                         redraw_needed = true;
                         continue;
                     }
@@ -887,6 +1094,7 @@ int main(int argc, char **argv)
                         fwin->y = AZWM_TITLEBAR_H + AZWM_BORDER_W;
                         fwin->width = (screen_w / 2) - 2 * AZWM_BORDER_W;
                         fwin->height = screen_h - AZWM_TASKBAR_H - AZWM_TITLEBAR_H - 2 * AZWM_BORDER_W;
+                        sync_window_surface(&comp, fwin);
                         redraw_needed = true;
                         continue;
                     }
@@ -903,6 +1111,7 @@ int main(int argc, char **argv)
                         fwin->y = AZWM_TITLEBAR_H + AZWM_BORDER_W;
                         fwin->width = (screen_w / 2) - 2 * AZWM_BORDER_W;
                         fwin->height = screen_h - AZWM_TASKBAR_H - AZWM_TITLEBAR_H - 2 * AZWM_BORDER_W;
+                        sync_window_surface(&comp, fwin);
                         redraw_needed = true;
                         continue;
                     }
@@ -918,6 +1127,7 @@ int main(int argc, char **argv)
                             fwin->y = AZWM_TITLEBAR_H + AZWM_BORDER_W;
                             fwin->width = screen_w - 2 * AZWM_BORDER_W;
                             fwin->height = screen_h - AZWM_TASKBAR_H - AZWM_TITLEBAR_H - 2 * AZWM_BORDER_W;
+                            sync_window_surface(&comp, fwin);
                             redraw_needed = true;
                         }
                         continue;
@@ -930,6 +1140,7 @@ int main(int argc, char **argv)
                             fwin->x = fwin->saved_x; fwin->y = fwin->saved_y;
                             fwin->width = fwin->saved_w; fwin->height = fwin->saved_h;
                             fwin->maximized = 0;
+                            sync_window_surface(&comp, fwin);
                             redraw_needed = true;
                         }
                         continue;
@@ -937,6 +1148,11 @@ int main(int argc, char **argv)
                 } else {
                     /* Key released: If Alt+Tab was active and Alt is released, switch to selected window */
                     if (comp.alt_tab_active && !is_alt) {
+                        int hud_w = 460;
+                        int hud_h = 56 + comp.alt_tab_count * 34;
+                        int hx = ((int)comp.fb_width - hud_w) / 2;
+                        int hy = ((int)comp.fb_height - hud_h) / 2;
+                        compositor_damage(&comp, hx - 16, hy - 16, hud_w + 32, hud_h + 32);
                         comp.alt_tab_active = 0;
                         if (comp.alt_tab_count > 0 && comp.alt_tab_idx < comp.alt_tab_count) {
                             unsigned int target_wid = comp.alt_tab_wids[comp.alt_tab_idx];
@@ -1011,21 +1227,20 @@ int main(int argc, char **argv)
                                                    msg.create.x, msg.create.y,
                                                    msg.create.w, msg.create.h,
                                                    msg.create.title,
+                                                   msg.create.flags,
                                                    &shmem_id);
                 if (wid > 0) {
-                    /* Reply to client */
-                    az_wm_msg_t reply;
-                    int j;
-                    for (j = 0; j < (int)sizeof(reply); j++)
-                        ((char*)&reply)[j] = 0;
-                    reply.type = AZ_WM_WINDOW_CREATED;
-                    reply.created.shmem_id     = shmem_id;
-                    reply.created.assigned_wid = (unsigned int)wid;
-                    reply.created.width        = msg.create.w;
-                    reply.created.height       = msg.create.h;
-                    az_channel_send_nb(msg.client_chan, (az_ipc_msg_t *)&reply);
-
-                    /* Broadcast to DE subscribers */
+                    /* Find the window first so the reply can echo back what
+                     * compositor_create_window() actually allocated — it
+                     * clamps w/h to [100..fb_width]x[60..fb_height] and sizes
+                     * the shmem surface to the clamped value, so echoing the
+                     * client's raw, pre-clamp msg.create.w/h here (as this
+                     * used to) would hand a client whose request got clamped
+                     * a width/height bigger than the surface it was actually
+                     * given — the same "client trusts a size that outgrew
+                     * its own mapping" shape as the uk_commit_frame overrun
+                     * this session started from, just via a wrong reply
+                     * instead of a wrong page count. */
                     az_window_t *win = (az_window_t *)0;
                     unsigned int i;
                     for (i = 0; i < AZWM_MAX_WINDOWS; i++) {
@@ -1034,6 +1249,20 @@ int main(int argc, char **argv)
                             break;
                         }
                     }
+
+                    /* Reply to client */
+                    az_wm_msg_t reply;
+                    int j;
+                    for (j = 0; j < (int)sizeof(reply); j++)
+                        ((char*)&reply)[j] = 0;
+                    reply.type = AZ_WM_WINDOW_CREATED;
+                    reply.created.shmem_id     = shmem_id;
+                    reply.created.assigned_wid = (unsigned int)wid;
+                    reply.created.width        = win ? win->buffer_w : msg.create.w;
+                    reply.created.height       = win ? win->buffer_h : msg.create.h;
+                    az_channel_send_nb(msg.client_chan, (az_ipc_msg_t *)&reply);
+
+                    /* Broadcast to DE subscribers */
                     if (win) {
                         int slot = (int)(win - comp.window_pool);
                         if (slot >= 0 && slot < AZWM_MAX_WINDOWS) {
@@ -1083,8 +1312,31 @@ int main(int argc, char **argv)
                     }
                 }
                 if (iwin && iwin->visible) {
-                    compositor_damage(&comp, iwin->x - AZWM_BORDER_W, iwin->y - AZWM_TITLEBAR_H - AZWM_BORDER_W,
-                                      (int)iwin->width + 2 * AZWM_BORDER_W, (int)iwin->height + AZWM_TITLEBAR_H + 2 * AZWM_BORDER_W);
+                    /* w == 0 && h == 0 is every legacy sender (the field
+                     * didn't exist before uk_invalidate_rect()) and every
+                     * plain uk_invalidate() call: damage the full frame,
+                     * exactly as this always has. A real sub-rect names
+                     * only content that changed, so it needs none of the
+                     * border/titlebar margin the full-frame case carries —
+                     * translate it from the client's window-local
+                     * coordinates to screen space and damage just that,
+                     * clamped against the window's *current* size in case
+                     * this message was already in flight when a resize
+                     * landed. */
+                    if (msg.invalidate.w == 0 && msg.invalidate.h == 0) {
+                        compositor_damage(&comp, iwin->x - AZWM_BORDER_W, iwin->y - AZWM_TITLEBAR_H - AZWM_BORDER_W,
+                                          (int)iwin->width + 2 * AZWM_BORDER_W, (int)iwin->height + AZWM_TITLEBAR_H + 2 * AZWM_BORDER_W);
+                    } else {
+                        int rx = msg.invalidate.x, ry = msg.invalidate.y;
+                        int rw = (int)msg.invalidate.w, rh = (int)msg.invalidate.h;
+                        if (rx < 0) { rw += rx; rx = 0; }
+                        if (ry < 0) { rh += ry; ry = 0; }
+                        if (rx + rw > (int)iwin->width)  rw = (int)iwin->width  - rx;
+                        if (ry + rh > (int)iwin->height) rh = (int)iwin->height - ry;
+                        if (rw > 0 && rh > 0) {
+                            compositor_damage(&comp, iwin->x + rx, iwin->y + ry, rw, rh);
+                        }
+                    }
                 } else {
                     compositor_damage_all(&comp);
                 }
@@ -1164,13 +1416,74 @@ int main(int argc, char **argv)
             case AZ_WM_LAUNCH_APP:
             case AZ_WM_SET_STRUT:
             case AZ_WM_SET_THEME:
-            /* 25002500 Clipboard & notifications 250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500 */
+            /* Clipboard & notifications */
             case AZ_WM_CLIPBOARD_SET:
             case AZ_WM_CLIPBOARD_GET:
             case AZ_WM_NOTIFY:
                 if (de_comp_handle_message(&comp, &de_state, &msg))
                     redraw_needed = true;
                 break;
+
+            case AZ_WM_SET_OPACITY: {
+                az_window_t *win = (az_window_t *)0;
+                for (unsigned int i = 0; i < AZWM_MAX_WINDOWS; i++) {
+                    if (comp.window_pool[i].wid == msg.wid) {
+                        win = &comp.window_pool[i];
+                        break;
+                    }
+                }
+                if (win) {
+                    compositor_set_window_opacity(&comp, win, msg.opacity.opacity);
+                    redraw_needed = true;
+                }
+                break;
+            }
+
+            case AZ_WM_SET_TITLE: {
+                az_window_t *win = (az_window_t *)0;
+                for (unsigned int i = 0; i < AZWM_MAX_WINDOWS; i++) {
+                    if (comp.window_pool[i].wid == msg.wid) {
+                        win = &comp.window_pool[i];
+                        break;
+                    }
+                }
+                if (win) {
+                    compositor_set_window_title(&comp, win, msg.set_title.title);
+                    de_comp_broadcast_title(&de_state, msg.wid, msg.set_title.title);
+                    redraw_needed = true;
+                }
+                break;
+            }
+
+            case AZ_WM_SET_CURSOR: {
+                for (unsigned int i = 0; i < AZWM_MAX_WINDOWS; i++) {
+                    if (comp.window_pool[i].wid == msg.wid) {
+                        comp.window_pool[i].cursor_type = msg.set_cursor.cursor;
+                        if (comp.focused_window == &comp.window_pool[i]) {
+                            compositor_set_cursor(&comp, msg.set_cursor.cursor);
+                            redraw_needed = true;
+                        }
+                        break;
+                    }
+                }
+                break;
+            }
+
+            case AZ_WM_SET_PINNED: {
+                az_window_t *win = (az_window_t *)0;
+                for (unsigned int i = 0; i < AZWM_MAX_WINDOWS; i++) {
+                    if (comp.window_pool[i].wid == msg.wid) {
+                        win = &comp.window_pool[i];
+                        break;
+                    }
+                }
+                if (win) {
+                    compositor_set_window_pinned(&comp, win, msg.pinned.pinned);
+                    de_comp_enforce_zorder(&comp, &de_state);
+                    redraw_needed = true;
+                }
+                break;
+            }
 
             default:
                 break;
@@ -1191,7 +1504,21 @@ int main(int argc, char **argv)
         }
 
         if (!redraw_needed && !cursor_moved && !comp.has_animating_windows) {
+            /* Nothing to do: short poll sleep, not the frame cap below —
+             * this path cares about input latency, not throughput. */
             usleep(2000);
+            last_frame_ns = compositor_now_ns();
+        } else {
+            /* Did a present (or a cursor-only move) this iteration: hold to
+             * AZWM_FRAME_INTERVAL_NS instead of looping straight back into
+             * another one. */
+            long long now_ns = compositor_now_ns();
+            long long elapsed = now_ns - last_frame_ns;
+            if (elapsed >= 0 && elapsed < AZWM_FRAME_INTERVAL_NS) {
+                usleep((unsigned long)((AZWM_FRAME_INTERVAL_NS - elapsed) / 1000));
+                now_ns = compositor_now_ns();
+            }
+            last_frame_ns = now_ns;
         }
     }
 

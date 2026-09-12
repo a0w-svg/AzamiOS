@@ -633,3 +633,20 @@ char *strtok_r(char *str, const char *delim, char **saveptr)
     }
     return token;
 }
+
+void memzero_explicit(void *s, size_t count)
+{
+    memset(s, 0, count);
+    __asm__ volatile("" : : "r"(s) : "memory");
+}
+
+int crypto_memneq(const void *a, const void *b, size_t size)
+{
+    const unsigned char *pa = (const unsigned char *)a;
+    const unsigned char *pb = (const unsigned char *)b;
+    unsigned char res = 0;
+    for (size_t i = 0; i < size; i++) {
+        res |= (pa[i] ^ pb[i]);
+    }
+    return res != 0;
+}

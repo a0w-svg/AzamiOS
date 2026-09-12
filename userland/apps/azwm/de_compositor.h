@@ -42,6 +42,10 @@ void de_comp_broadcast_destroyed(de_comp_state_t *de, unsigned int wid);
 void de_comp_broadcast_focus(de_comp_state_t *de,
                               unsigned int prev_wid, unsigned int new_wid);
 
+/** de_comp_broadcast_title — push EVT_WINDOW_TITLE_CHANGED to all subscribers. */
+void de_comp_broadcast_title(de_comp_state_t *de,
+                              unsigned int wid, const char *title);
+
 /** de_comp_enforce_zorder — re-sort window list to honour Z-order band hints. */
 void de_comp_enforce_zorder(az_compositor_t *comp, de_comp_state_t *de);
 

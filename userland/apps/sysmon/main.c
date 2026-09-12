@@ -259,7 +259,12 @@ static void draw_sysmon(void)
 
     char foot[80];
     snprintf(foot, sizeof(foot), "Tasks: %d  |  [k / Del] End Task  |  Uptime: %u sec", g_proc_count, g_tick);
-    uk_draw_text(&g_win, 12, (int)h - 24, foot, UK_OVERLAY0);
+    /* Compact face (de_font_small, 8px tall) for this status line: it's
+     * secondary information, not something read at a glance the way the
+     * table above is, so trading Regular's size for a line that fits the
+     * 34px action bar with room to spare (and centres cleanly in it,
+     * unlike Regular's 16px cell) reads as tidier without losing anything. */
+    uk_draw_text_small(&g_win, 12, (int)h - 21, foot, UK_OVERLAY0);
 
     /* End Process Button */
     uk_draw_button(&g_win, (int)w - 110, (int)h - 29, 98, 24, "End Task", UK_BTN_PRESSED);
@@ -365,7 +370,16 @@ int main(int argc, char **argv)
     az_wm_msg_t *msg = (az_wm_msg_t *)&raw_msg;
 
     for (;;) {
-        if (az_channel_recv(g_win.client_chan, &raw_msg) != 0) continue;
+        /* az_channel_recv() blocks until a message arrives *or* the channel
+         * errors — once the window is closed the compositor marks the
+         * channel closed and every further call returns -EPIPE immediately
+         * rather than blocking, so `continue` here turned into an infinite
+         * fast retry: a closed-window sysmon never reached sys_exit and sat
+         * pegging a core at 100% forever instead. Every sibling app in the
+         * DE (taskbar, terminal, clock, ...) already breaks out and exits
+         * on this same condition; sysmon was the one built before that
+         * became the pattern. */
+        if (az_channel_recv(g_win.client_chan, &raw_msg) != 0) break;
 
         switch (msg->type) {
         case AZ_WM_TIMER_TICK:
@@ -422,6 +436,12 @@ int main(int argc, char **argv)
             }
             break;
         }
+
+        case AZ_WM_WINDOW_RESIZED:
+            if (uk_handle_resize(&g_win, msg)) {
+                draw_sysmon();
+            }
+            break;
 
         default:
             break;

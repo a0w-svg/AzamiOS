@@ -210,6 +210,12 @@ int main(int argc, char **argv)
         de_log("[sessiond] notifyd.elf spawned.");
     }
 
+    /* Auto-launch settings on startup */
+    int set_pid = az_spawn("/bin/settings.elf");
+    if (set_pid >= 0) {
+        de_log("[sessiond] settings.elf auto-spawned successfully.");
+    }
+
     /* Auto-launch terminal emulator on startup */
     int term_pid = az_spawn("/bin/terminal.elf");
     if (term_pid >= 0) {

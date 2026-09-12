@@ -661,6 +661,12 @@ int main(int argc, char **argv)
 
         if (msg.type == AZ_WM_DESTROY_WINDOW) break;
 
+        if (msg.type == AZ_WM_WINDOW_RESIZED) {
+            if (!uk_handle_resize(&g_win, &msg)) break;
+            draw_editor();
+            continue;
+        }
+
         if (msg.type == AZ_WM_KEY_EVENT) {
             handle_key(msg.key.keycode, msg.key.scancode, msg.key.pressed, msg.key.modifiers);
             draw_editor();

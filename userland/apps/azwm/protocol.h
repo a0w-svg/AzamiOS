@@ -23,7 +23,29 @@ enum az_wm_msg_type {
     AZ_WM_FOCUS_CHANGE     = 21,   /* Notify: focus gained/lost */
     AZ_WM_RESTORE_WINDOW   = 22,   /* Request: restore & focus minimized window */
     AZ_WM_MINIMIZE_WINDOW  = 23,   /* Request: minimize window */
+    AZ_WM_WINDOW_RESIZED   = 24,   /* Notify: window's content surface was reallocated */
+    AZ_WM_SET_OPACITY      = 25,   /* Request: set window alpha opacity (0..255) */
+    AZ_WM_SET_TITLE        = 26,   /* Request: update window title dynamically */
+    AZ_WM_SET_CURSOR       = 27,   /* Request: set active cursor shape */
+    AZ_WM_SET_PINNED       = 28,   /* Request: toggle always-on-top */
 };
+
+/* ── Standard Cursor Types ────────────────────────────────────────────────── */
+#define AZ_CURSOR_DEFAULT       0   /* Classic modern arrow pointer */
+#define AZ_CURSOR_POINTER       1   /* Hand pointing finger (buttons, links) */
+#define AZ_CURSOR_IBEAM         2   /* Text I-Beam (text inputs, editors) */
+#define AZ_CURSOR_CROSSHAIR     3   /* Precision reticle (canvas, paint) */
+#define AZ_CURSOR_MOVE          4   /* 4-way move cross (window dragging) */
+#define AZ_CURSOR_RESIZE_NWSE   5   /* Diagonal resize (\) */
+#define AZ_CURSOR_RESIZE_NESW   6   /* Diagonal resize (/) */
+#define AZ_CURSOR_RESIZE_EW     7   /* Horizontal resize (<->) */
+#define AZ_CURSOR_RESIZE_NS     8   /* Vertical resize (up-down) */
+#define AZ_CURSOR_WAIT          9   /* Spinner / busy indicator */
+#define AZ_CURSOR_COUNT         10
+
+/* ── Window creation flags (msg.create.flags) ─────────────────────────────── */
+#define AZ_WIN_FLAG_BLUR_BACKDROP  (1u << 0)
+#define AZ_WIN_FLAG_TRANSLUCENT    (1u << 1)
 
 /* ── Standard Keycode Definitions (matches drivers/input/input.h) ────────── */
 #ifndef KEY_ESC
@@ -96,6 +118,7 @@ typedef struct {
             int x, y;
             unsigned int w, h;
             char title[64];
+            unsigned int flags;  /* AZ_WIN_FLAG_* above; 0 for a plain window */
         } create;
 
         /* AZ_WM_WINDOW_CREATED: server → client */
@@ -139,10 +162,58 @@ typedef struct {
             int x, y;
         } move;
 
+        /*
+         * AZ_WM_INVALIDATE: client → server.
+         *
+         * (x, y, w, h) is the changed rectangle, in the client's own window-
+         * local coordinates (0,0 = top-left of its content area) — the
+         * server adds the window's screen position itself. w == 0 && h == 0
+         * means "the whole client area", which is what every sender that
+         * predates this field means too: az_wm_msg_t is always zeroed
+         * before the type/wid fields are set (see uk_invalidate() and the
+         * few call sites that build this message by hand), so an old
+         * binary and a client that never calls uk_invalidate_rect() both
+         * land on that same fallback for free — see AZ_WM_INVALIDATE's
+         * handler in azwm's main loop for the compositor-side half of this.
+         */
+        struct {
+            int x, y;
+            unsigned int w, h;
+        } invalidate;
+
         /* AZ_WM_FOCUS_CHANGE: server → client */
         struct {
             unsigned char focused;  /* 1 = gained, 0 = lost */
         } focus;
+
+        /* AZ_WM_WINDOW_RESIZED: server → client */
+        struct {
+            unsigned int shmem_id;  /* New surface — remap in place of the old one */
+            unsigned int width;
+            unsigned int height;
+        } resized;
+
+        /* AZ_WM_SET_OPACITY: client → server */
+        struct {
+            unsigned char opacity;  /* 0 = transparent, 255 = fully opaque */
+            unsigned char _pad[3];
+        } opacity;
+
+        /* AZ_WM_SET_TITLE: client → server */
+        struct {
+            char title[64];
+        } set_title;
+
+        /* AZ_WM_SET_CURSOR: client → server */
+        struct {
+            unsigned int cursor;    /* AZ_CURSOR_* */
+        } set_cursor;
+
+        /* AZ_WM_SET_PINNED: client → server */
+        struct {
+            unsigned char pinned;   /* 1 = always on top, 0 = normal */
+            unsigned char _pad[3];
+        } pinned;
 
         /* Generic padding to ensure struct matches 272-byte ipc_msg_t size */
         unsigned char _raw[256];

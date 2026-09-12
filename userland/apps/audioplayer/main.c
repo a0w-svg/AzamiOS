@@ -662,6 +662,12 @@ int main(int argc, char **argv)
         while (az_channel_recv_nb(g_win.client_chan, (az_ipc_msg_t *)&msg) == 0) {
             if (msg.type == AZ_WM_DESTROY_WINDOW) { quit = 1; break; }
 
+            if (msg.type == AZ_WM_WINDOW_RESIZED) {
+                if (!uk_handle_resize(&g_win, &msg)) { quit = 1; break; }
+                g_ui_dirty = 1;
+                continue;
+            }
+
             if (msg.type == AZ_WM_KEY_EVENT && msg.key.pressed) {
                 if (msg.key.scancode == 57 || msg.key.keycode == ' ') {
                     g_is_playing = !g_is_playing;

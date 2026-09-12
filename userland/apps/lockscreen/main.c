@@ -142,6 +142,13 @@ static void sha256_hash_string(const char *str, char out_hex[65])
     out_hex[64] = '\0';
 }
 
+static void hex_to_lower(char *s)
+{
+    for (; *s; s++) {
+        if (*s >= 'A' && *s <= 'Z') *s += ('a' - 'A');
+    }
+}
+
 /* ── Hash Verification against /etc/shadow ────────────────────────────────── */
 static int verify_user_password(const char *user, const char *pass)
 {
@@ -149,7 +156,18 @@ static int verify_user_password(const char *user, const char *pass)
     if (!fp) fp = fopen("/etc/passwd", "r");
     char line[256];
     char stored_hash[128];
-    stored_hash[0] = '\0';
+    char entered_hex[65];
+    char salted[256];
+    char salted_hex[65];
+    char salt[64];
+    int matched = 0;
+
+    memset(line, 0, sizeof(line));
+    memset(stored_hash, 0, sizeof(stored_hash));
+    memset(entered_hex, 0, sizeof(entered_hex));
+    memset(salted, 0, sizeof(salted));
+    memset(salted_hex, 0, sizeof(salted_hex));
+    memset(salt, 0, sizeof(salt));
 
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
@@ -171,18 +189,30 @@ static int verify_user_password(const char *user, const char *pass)
         fclose(fp);
     }
 
+    /* Compute SHA-256 hash of entered password */
+    sha256_hash_string(pass, entered_hex);
+    hex_to_lower(entered_hex);
+
     /* Fallback if no stored hash exists in shadow or entry is empty/'x'/'!' */
     if (stored_hash[0] == '\0' || strcmp(stored_hash, "x") == 0 || strcmp(stored_hash, "!") == 0) {
-        return (strcmp(pass, "azami") == 0);
+        char fallback_hex[65];
+        sha256_hash_string("azami", fallback_hex);
+        hex_to_lower(fallback_hex);
+        if (timingsafe_bcmp(entered_hex, fallback_hex, 64) == 0) {
+            matched = 1;
+        }
+        explicit_bzero(fallback_hex, sizeof(fallback_hex));
+        goto cleanup;
     }
 
-    /* Compute SHA-256 hash of entered password */
-    char entered_hex[65];
-    sha256_hash_string(pass, entered_hex);
+    hex_to_lower(stored_hash);
 
-    /* 1. Direct hex comparison */
-    if (strcasecmp(entered_hex, stored_hash) == 0) {
-        return 1;
+    /* 1. Direct hex comparison (constant-time against 64-char hex digest) */
+    if (strlen(stored_hash) == 64) {
+        if (timingsafe_bcmp(entered_hex, stored_hash, 64) == 0) {
+            matched = 1;
+            goto cleanup;
+        }
     }
 
     /* 2. Check if formatted as $5$salt$hash or $sha256$salt$hash */
@@ -191,22 +221,32 @@ static int verify_user_password(const char *user, const char *pass)
         if (p1) {
             char *p2 = strchr(p1 + 1, '$');
             if (p2) {
-                char salt[64];
                 size_t slen = (size_t)(p2 - (p1 + 1));
                 if (slen < sizeof(salt)) {
                     memcpy(salt, p1 + 1, slen);
                     salt[slen] = '\0';
-                    char salted[256];
                     snprintf(salted, sizeof(salted), "%s%s", salt, pass);
-                    char salted_hex[65];
                     sha256_hash_string(salted, salted_hex);
-                    if (strcasecmp(salted_hex, p2 + 1) == 0) return 1;
+                    hex_to_lower(salted_hex);
+                    char *stored_salt_hash = p2 + 1;
+                    if (strlen(stored_salt_hash) == 64) {
+                        if (timingsafe_bcmp(salted_hex, stored_salt_hash, 64) == 0) {
+                            matched = 1;
+                        }
+                    }
                 }
             }
         }
     }
 
-    return 0;
+cleanup:
+    explicit_bzero(line, sizeof(line));
+    explicit_bzero(stored_hash, sizeof(stored_hash));
+    explicit_bzero(entered_hex, sizeof(entered_hex));
+    explicit_bzero(salt, sizeof(salt));
+    explicit_bzero(salted, sizeof(salted));
+    explicit_bzero(salted_hex, sizeof(salted_hex));
+    return matched;
 }
 
 /* ── UI Drawing ───────────────────────────────────────────────────────────── */
@@ -216,8 +256,12 @@ static void draw_lockscreen(uk_window_t *w, const char *pass_buf, int pass_len,
     unsigned int width  = w->width;
     unsigned int height = w->height;
 
-    /* Background: deep Catppuccin Mocha crust */
-    uk_fill_rect(w, 0, 0, (int)width, (int)height, 0xFF11111B);
+    /* Background: deep Catppuccin Mocha crust, left translucent (0xCC, not
+     * 0xFF) so the compositor's blurred backdrop (AZ_WIN_FLAG_BLUR_BACKDROP,
+     * see uk_window_connect_ex() above) actually shows through it — an
+     * opaque fill here would composite over the blur and hide it entirely,
+     * same as painting a wall in front of a window. */
+    uk_fill_rect(w, 0, 0, (int)width, (int)height, 0xCC11111B);
 
     /* Ambient decorative gradient orbs */
     int cx = (int)width / 2;
@@ -311,8 +355,12 @@ int main(void)
     }
 
     uk_window_t win;
-    /* Create fullscreen frameless window */
-    if (uk_window_connect(&win, "", 0, 0, sw, sh, LOCK_MAP_ADDR, SERVER_CHAN) != 0) {
+    /* Create fullscreen frameless window, with the desktop behind it blurred
+     * by the compositor — the "blurred backdrop" this file's header comment
+     * already promised, rather than the sharp curtain a lock screen without
+     * AZ_WIN_FLAG_BLUR_BACKDROP would otherwise draw over. */
+    if (uk_window_connect_ex(&win, "", 0, 0, sw, sh, LOCK_MAP_ADDR, SERVER_CHAN,
+                             AZ_WIN_FLAG_BLUR_BACKDROP) != 0) {
         puts("[lockscreen] ERROR: uk_window_connect failed");
         return 1;
     }
@@ -339,13 +387,15 @@ int main(void)
                     if (verify_user_password("azami", pass) ||
                         verify_user_password("root", pass)) {
                         /* Unlocked successfully! */
+                        explicit_bzero(pass, sizeof(pass));
+                        pass_len = 0;
                         running = 0;
                         break;
                     } else {
                         /* Authentication failed */
                         error_state = 1;
+                        explicit_bzero(pass, sizeof(pass));
                         pass_len = 0;
-                        pass[0] = '\0';
                     }
                 } else if (key == '\b' || key == 127) {
                     if (pass_len > 0) {
@@ -354,8 +404,8 @@ int main(void)
                         error_state = 0;
                     }
                 } else if (key == 27) { /* ESC */
+                    explicit_bzero(pass, sizeof(pass));
                     pass_len = 0;
-                    pass[0] = '\0';
                     error_state = 0;
                 } else if (key >= 32 && key <= 126 && pass_len < 60) {
                     pass[pass_len++] = (char)key;
@@ -372,7 +422,8 @@ int main(void)
         usleep(33000);
     }
 
-    /* Destroy lock overlay window before exiting */
+    /* Wipe password memory and destroy lock overlay window before exiting */
+    explicit_bzero(pass, sizeof(pass));
     uk_window_destroy(&win);
     return 0;
 }

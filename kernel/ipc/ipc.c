@@ -353,7 +353,25 @@ s64 ipc_shmem_map(ipc_shmem_t *shmem, process_t *target_proc, virt_addr_t virt_a
     spinlock_unlock(&g_ipc_lock);
 
     for (size_t i = 0; i < shmem->page_count; i++) {
-        vmm_map(pml4, virt_addr + i * PAGE_SIZE, shmem->phys_pages[i], flags | VMM_F_SHARED);
+        if (vmm_map(pml4, virt_addr + i * PAGE_SIZE, shmem->phys_pages[i], flags | VMM_F_SHARED) != 0) {
+            /* A partial mapping is worse than none: the caller (and every
+             * client that trusts az_shmem_map succeeding) would go on
+             * writing/reading up to page_count pages, walking straight off
+             * the end of what's actually mapped and into a not-present
+             * page fault — this is what silently discarding vmm_map()'s
+             * return value used to let happen. Tear down what did map and
+             * fail the call cleanly instead. */
+            vmm_unmap_range(pml4, virt_addr, i, false);
+
+            spinlock_lock(&g_ipc_lock);
+            target_proc->shmem_maps[slot].shmem_id  = 0;
+            target_proc->shmem_maps[slot].virt_addr = 0;
+            target_proc->shmem_maps[slot].shmem_ptr = NULL;
+            spinlock_unlock(&g_ipc_lock);
+            ipc_shmem_put(shmem); /* release the refcount taken above */
+
+            return -(s64)ENOMEM;
+        }
     }
 
     return 0;

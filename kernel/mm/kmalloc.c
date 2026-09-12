@@ -27,6 +27,7 @@ typedef struct block_hdr {
 } block_hdr_t;
 
 #define KMALLOC_MAGIC  0x4B4D414CU
+#define KMALLOC_POISON_BYTE 0x6BU
 
 typedef struct free_block {
     struct free_block *next;
@@ -408,6 +409,17 @@ void kfree(void *ptr)
     }
 
     hdr->magic = 0; /* Invalidate magic to catch double-free */
+
+    /* Security hardening: poison freed payload to eliminate stale sensitive data
+     * and turn use-after-free bugs into deterministic corruptions. */
+    if (hdr->size > 0 && hdr->size <= (1024ULL * 1024 * 1024)) {
+        size_t psize = (size_t)hdr->size;
+        if (hdr->bucket_idx != 0xFF && hdr->bucket_idx < BUCKET_COUNT) {
+            size_t max_psize = g_buckets[hdr->bucket_idx].block_size - sizeof(block_hdr_t);
+            if (psize > max_psize) psize = max_psize;
+        }
+        __builtin_memset(ptr, KMALLOC_POISON_BYTE, psize);
+    }
 
     if (hdr->bucket_idx == 0xFF) {
         /* H-05: hdr->size is the requested size; recompute page count for freeing */

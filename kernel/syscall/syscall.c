@@ -31,6 +31,7 @@
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/boot/limine_req.h"
 #include "../../drivers/misc/bga.h"
+#include "../../drivers/video/virtio_gpu.h"
 #include "../../include/azami/defs.h"
 #include "../../kernel/uaccess.h"
 #include "../../fs/pipe.h"
@@ -1360,9 +1361,23 @@ static s64 sys_read_impl(pt_regs_t *r)
     if (!file) return -(s64)EBADF;
 
     s64 total_read = 0;
-    char kbuf[512];
+    char stack_buf[4096];
+    char *kbuf = stack_buf;
+    size_t max_chunk = sizeof(stack_buf);
+    bool allocated = false;
+
+    if (count > (s64)sizeof(stack_buf)) {
+        size_t alloc_sz = (count > 65536) ? 65536 : (size_t)count;
+        char *dyn = (char *)kmalloc(alloc_sz);
+        if (dyn) {
+            kbuf = dyn;
+            max_chunk = alloc_sz;
+            allocated = true;
+        }
+    }
+
     while (count > 0) {
-        size_t chunk = count > 512 ? 512 : (size_t)count;
+        size_t chunk = count > (s64)max_chunk ? max_chunk : (size_t)count;
         s64 ret = (s64)vfs_read(file, kbuf, chunk);
         if (ret < 0) {
             if (total_read == 0) total_read = ret;
@@ -1377,6 +1392,7 @@ static s64 sys_read_impl(pt_regs_t *r)
         count -= ret;
         if (ret < (s64)chunk) break;
     }
+    if (allocated) kfree(kbuf);
     fput(file);
     return total_read;
 }
@@ -1393,10 +1409,10 @@ static s64 sys_write_impl(pt_regs_t *r)
     file_t *file = fget(proc, fd);
 
     if ((fd == 1 || fd == 2) && !file) {
-        char kbuf[512];
+        char kbuf[1024];
         s64 total_written = 0;
         while (count > 0) {
-            size_t chunk = count > 512 ? 512 : (size_t)count;
+            size_t chunk = (size_t)count > sizeof(kbuf) ? sizeof(kbuf) : (size_t)count;
             if (copy_from_user(kbuf, buf + total_written, chunk) != 0) break;
             extern void uart_write(u16 port, const char *buf, size_t len);
             uart_write(0x3F8, kbuf, chunk);
@@ -1410,9 +1426,23 @@ static s64 sys_write_impl(pt_regs_t *r)
     if (!file) return -(s64)EBADF;
 
     s64 total_written = 0;
-    char kbuf[512];
+    char stack_buf[4096];
+    char *kbuf = stack_buf;
+    size_t max_chunk = sizeof(stack_buf);
+    bool allocated = false;
+
+    if (count > (s64)sizeof(stack_buf)) {
+        size_t alloc_sz = (count > 65536) ? 65536 : (size_t)count;
+        char *dyn = (char *)kmalloc(alloc_sz);
+        if (dyn) {
+            kbuf = dyn;
+            max_chunk = alloc_sz;
+            allocated = true;
+        }
+    }
+
     while (count > 0) {
-        size_t chunk = count > 512 ? 512 : (size_t)count;
+        size_t chunk = count > (s64)max_chunk ? max_chunk : (size_t)count;
         if (copy_from_user(kbuf, buf + total_written, chunk) != 0) {
             if (total_written == 0) total_written = -(s64)EFAULT;
             break;
@@ -1430,6 +1460,7 @@ static s64 sys_write_impl(pt_regs_t *r)
         count -= ret;
         if (ret < (s64)chunk) break;
     }
+    if (allocated) kfree(kbuf);
     fput(file);
     return total_written;
 }
@@ -1747,7 +1778,7 @@ static s64 sys_mmap_impl(pt_regs_t *r)
 
     if (!map_fixed) {
         bool need_alloc = false;
-        if (!target_addr || target_addr < 0x1000 || target_addr + aligned_len >= 0x0000800000000000ULL) {
+        if (!target_addr || target_addr < g_mmap_min_addr || target_addr + aligned_len >= 0x0000800000000000ULL) {
             need_alloc = true;
         } else {
             /* Check collision with existing mappings */
@@ -1772,9 +1803,18 @@ static s64 sys_mmap_impl(pt_regs_t *r)
             proc->mmap_current += aligned_len;
         }
     } else {
-        /* Guard against integer overflow in range check */
+        /* Guard against integer overflow and non-canonical address ranges */
         if (target_addr + aligned_len < target_addr || target_addr + aligned_len >= 0x0000800000000000ULL) {
             return -(s64)EINVAL;
+        }
+        /* NULL-pointer dereference prevention: address 0 is strictly forbidden */
+        if (target_addr == 0) {
+            return -(s64)EINVAL;
+        }
+        /* Mapping below mmap_min_addr requires CAP_SYS_RAWIO or euid 0 */
+        if (target_addr < g_mmap_min_addr &&
+            !security_check_permission(proc, CAP_SYS_RAWIO) && proc->euid != 0) {
+            return -(s64)EPERM;
         }
         /* MAP_FIXED over a live range: drop whatever was there first. The
          * range walk also picks up PROT_NONE pages, which keep their frame
@@ -1940,8 +1980,9 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
     }
 
     /* Network configuration ioctl privilege checks */
-    if (cmd == 0x8916 /* SIOCSIFADDR */ || cmd == 0x891C /* SIOCSIFNETMASK */ ||
-        cmd == 0x892A /* SIOCSIFGW */   || cmd == 0x892B /* SIOCSIFDNS */ ||
+    if (cmd == 0x8916 /* SIOCSIFADDR */ || cmd == 0x891c /* SIOCSIFNETMASK */ ||
+        cmd == 0x891e /* SIOCSIFGW */   || cmd == 0x8921 /* SIOCSIFDNS */ ||
+        cmd == 0x892a || cmd == 0x892b ||
         cmd == 0x8914 /* SIOCSIFFLAGS */ || cmd == 0x8990 /* SIOCSIFDHCP */) {
         if (!security_check_permission(proc, CAP_NET_ADMIN)) {
             return -(s64)EPERM;
@@ -5841,6 +5882,8 @@ static s64 sys_az_shmem_unmap(pt_regs_t *r)
     return ipc_shmem_unmap(NULL, proc, virt);
 }
 
+extern virtio_gpu_state_t g_gpu;
+
 static s64 sys_az_fb_info(pt_regs_t *r)
 {
     az_fb_info_t *user_info = (az_fb_info_t *)r->rdi;
@@ -5849,6 +5892,17 @@ static s64 sys_az_fb_info(pt_regs_t *r)
     az_fb_info_t info;
     __builtin_memset(&info, 0, sizeof(info));
 
+    /* Same backend priority as drivers/video/fbdev.c's fbdev_init(): BGA
+     * first, then VirtIO-GPU, then the Limine boot GOP framebuffer last —
+     * when a virtio-gpu is present, QEMU may also have exposed a std-VGA
+     * whose Limine GOP aperture points at *different* memory with a
+     * *different* pitch, so checking it first would hand back geometry that
+     * does not describe the surface azwm and every client actually end up
+     * mapped to via /dev/fb0. Before this matched only BGA-or-GOP, every
+     * caller of az_fb_info() (azwm's own screen_w/h/pitch, and every client
+     * app's window centring) silently got the wrong pitch under virtio-gpu —
+     * right width/height by coincidence (same negotiated mode), wrong
+     * stride, which is what a sheared/garbled-looking composite is. */
     phys_addr_t bga_phys = bga_get_fb_phys();
     if (bga_phys) {
         info.width     = bga_get_width();
@@ -5856,6 +5910,12 @@ static s64 sys_az_fb_info(pt_regs_t *r)
         info.pitch     = bga_get_pitch();
         info.bpp       = bga_get_bpp();
         info.phys_addr = bga_phys;
+    } else if (g_gpu.framebuffer_phys != 0) {
+        info.width     = g_gpu.screen_width  ? g_gpu.screen_width  : 1280;
+        info.height    = g_gpu.screen_height ? g_gpu.screen_height : 800;
+        info.pitch     = info.width * 4;
+        info.bpp       = 32;
+        info.phys_addr = g_gpu.framebuffer_phys;
     } else {
         struct limine_framebuffer *fb = az_boot_framebuffer();
         if (!fb) return -(s64)ENODEV;
@@ -5884,6 +5944,15 @@ static s64 sys_az_fb_map(pt_regs_t *r)
 
     if (fb_phys) {
         fb_size = bga_get_fb_total_size();
+    } else if (g_gpu.framebuffer_phys != 0) {
+        /* Same backend priority as sys_az_fb_info() / fbdev.c — see the
+         * comment there. This path is only reached by a caller whose
+         * /dev/fb0 open failed (map_shared_memory()'s fallback), but it
+         * needs to be virtio-gpu-aware for the same reason: mapping the
+         * Limine boot GOP aperture instead of the actual scanout resource
+         * would hand back memory the compositor never reads from. */
+        fb_phys = g_gpu.framebuffer_phys;
+        fb_size = g_gpu.framebuffer_size;
     } else {
         struct limine_framebuffer *fb = az_boot_framebuffer();
         if (!fb) return -(s64)ENODEV;
@@ -7281,6 +7350,21 @@ static s64 sys_syslog_impl(pt_regs_t *r)
     int type = (int)r->rdi;
     char *user_buf = (char *)r->rsi;
     int len = (int)r->rdx;
+
+    process_t *proc = sched_current_process();
+    bool has_priv = proc && (proc->euid == 0 ||
+                             security_check_permission(proc, CAP_SYSLOG) ||
+                             security_check_permission(proc, CAP_SYS_ADMIN));
+
+    /* Privileged syslog actions always require CAP_SYSLOG or CAP_SYS_ADMIN */
+    if (type == 1 || type == 5 || type == 6 || type == 7 || type == 8) {
+        if (!has_priv) return -(s64)EPERM;
+    }
+
+    /* Reading or sizing kernel log buffer requires privilege when dmesg_restrict is enabled */
+    if (g_dmesg_restrict && !has_priv) {
+        return -(s64)EPERM;
+    }
 
     extern s64 console_read_klog(void *buf, size_t max_len, u64 *offset);
     extern u64 console_get_klog_size(void);

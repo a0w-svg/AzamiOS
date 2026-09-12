@@ -100,11 +100,19 @@ void hw_copy_to_vram(void *dst, const void *src, size_t len);
  */
 void hw_fill_vram(void *dst, u32 val, size_t count);
 
-/* ── Bit scanning ────────────────────────────────────────────────────────── */
+/* ── Bit scanning & manipulation ─────────────────────────────────────────── */
 
 /* Set by hwaccel_init() when CPUID reports POPCNT. Read directly by the inline
  * below so a bitmap loop pays one predictable branch, not a call. */
 extern u8 g_popcnt_enabled;
+extern u8 g_lzcnt_enabled;
+extern u8 g_bmi1_enabled;
+extern u8 g_bmi2_enabled;
+extern u8 g_clflushopt_enabled;
+extern u8 g_clwb_enabled;
+extern u8 g_serialize_enabled;
+extern u8 g_rdrand_enabled;
+extern u8 g_rdseed_enabled;
 
 /**
  * hw_popcnt64(word) — count set bits.
@@ -119,7 +127,7 @@ static inline unsigned hw_popcnt64(u64 word)
 {
     if (g_popcnt_enabled) {
         u64 r;
-        __asm__("popcnt %1, %0" : "=r"(r) : "rm"(word) : "cc");
+        __asm__("popcntq %1, %0" : "=r"(r) : "rm"(word) : "cc");
         return (unsigned)r;
     }
     /* Classic SWAR: pairwise sums, then nibbles, then a multiply that
@@ -130,17 +138,18 @@ static inline unsigned hw_popcnt64(u64 word)
     return (unsigned)((word * 0x0101010101010101ULL) >> 56);
 }
 
-/* Set by hwaccel_init() when CPUID reports true LZCNT (AMD ABM, or Intel via
- * BMI1 — cpu.c only sets has_lzcnt once has_bmi1 is confirmed, for the reason
- * hw_clz64() below depends on). Read directly by that inline for the same
- * one-branch-not-a-call reason as g_popcnt_enabled. */
-extern u8 g_lzcnt_enabled;
-
-/* Set by hwaccel_init() when CPUID reports BMI2. Unlike TZCNT/LZCNT, BZHI has
- * no legacy opcode to fall back to — it is a VEX-only encoding that faults on
- * a CPU that doesn't claim it, so hw_bzhi64() must gate on this rather than
- * just emitting the instruction and hoping. */
-extern u8 g_bmi2_enabled;
+static inline unsigned hw_popcnt32(u32 word)
+{
+    if (g_popcnt_enabled) {
+        u32 r;
+        __asm__("popcntl %1, %0" : "=r"(r) : "rm"(word) : "cc");
+        return (unsigned)r;
+    }
+    word = word - ((word >> 1) & 0x55555555U);
+    word = (word & 0x33333333U) + ((word >> 2) & 0x33333333U);
+    word = (word + (word >> 4)) & 0x0F0F0F0FU;
+    return (unsigned)((word * 0x01010101U) >> 24);
+}
 
 /**
  * hw_ctz64(word) — count trailing zero bits; 64 for word == 0.
@@ -151,15 +160,21 @@ extern u8 g_bmi2_enabled;
  * numerically identical to TZCNT's — both are "the position of the lowest set
  * bit". The only place they disagree is a zero input, which this handles in
  * software before the asm ever runs, so the BSF fallback is always correct,
- * not just usually. (This is why cpu.c warns that blind TZCNT/LZCNT emission
- * gives "the wrong answer for a zero input rather than faulting" — the
- * warning is about that one input, not about needing BMI1 to be safe here.)
+ * not just usually.
  */
 static inline unsigned hw_ctz64(u64 word)
 {
     if (word == 0) return 64;
     u64 r;
-    __asm__("tzcnt %1, %0" : "=r"(r) : "rm"(word) : "cc");
+    __asm__("tzcntq %1, %0" : "=r"(r) : "rm"(word) : "cc");
+    return (unsigned)r;
+}
+
+static inline unsigned hw_ctz32(u32 word)
+{
+    if (word == 0) return 32;
+    u32 r;
+    __asm__("tzcntl %1, %0" : "=r"(r) : "rm"(word) : "cc");
     return (unsigned)r;
 }
 
@@ -171,37 +186,293 @@ static inline unsigned hw_ctz64(u64 word)
  * highest set bit — a different number from "count of leading zeros", not
  * the same value under a different name (they're related by `63 - index`,
  * but the raw registers disagree for every nonzero input, not just zero).
- * Emitting LZCNT and trusting the legacy decode here would silently return
- * bit-index instead of leading-zero-count on any pre-BMI1/ABM part.
  */
 static inline unsigned hw_clz64(u64 word)
 {
     if (word == 0) return 64;
     u64 r;
     if (g_lzcnt_enabled) {
-        __asm__("lzcnt %1, %0" : "=r"(r) : "rm"(word) : "cc");
+        __asm__("lzcntq %1, %0" : "=r"(r) : "rm"(word) : "cc");
         return (unsigned)r;
     }
-    __asm__("bsr %1, %0" : "=r"(r) : "rm"(word) : "cc");
+    __asm__("bsrq %1, %0" : "=r"(r) : "rm"(word) : "cc");
     return (unsigned)(63 - r);
+}
+
+static inline unsigned hw_clz32(u32 word)
+{
+    if (word == 0) return 32;
+    u32 r;
+    if (g_lzcnt_enabled) {
+        __asm__("lzcntl %1, %0" : "=r"(r) : "rm"(word) : "cc");
+        return (unsigned)r;
+    }
+    __asm__("bsrl %1, %0" : "=r"(r) : "rm"(word) : "cc");
+    return (unsigned)(31 - r);
 }
 
 /**
  * hw_bzhi64(src, n) — the low @n bits of @src, all others cleared
  * (n >= 64 returns @src unchanged, matching BZHI's own out-of-range rule).
- *
- * BZHI (BMI2) is a VEX-only opcode with no pre-BMI2 decode to fall back
- * through — unlike TZCNT/LZCNT it simply doesn't exist on an older part, so
- * this checks g_bmi2_enabled rather than emitting it unconditionally.
  */
 static inline u64 hw_bzhi64(u64 src, u32 n)
 {
     if (g_bmi2_enabled) {
         u64 r;
-        __asm__("bzhi %2, %1, %0" : "=r"(r) : "rm"(src), "r"((u64)n) : "cc");
+        __asm__("bzhiq %2, %1, %0" : "=r"(r) : "rm"(src), "r"((u64)n) : "cc");
         return r;
     }
     return (n >= 64) ? src : (src & ((1ULL << n) - 1));
+}
+
+static inline u32 hw_bzhi32(u32 src, u32 n)
+{
+    if (g_bmi2_enabled) {
+        u32 r;
+        __asm__("bzhil %2, %1, %0" : "=r"(r) : "rm"(src), "r"(n) : "cc");
+        return r;
+    }
+    return (n >= 32) ? src : (src & ((1U << n) - 1));
+}
+
+/**
+ * hw_bextr64(src, start, len) — extract bitfield [start, start + len)
+ */
+static inline u64 hw_bextr64(u64 src, u32 start, u32 len)
+{
+    if (g_bmi1_enabled) {
+        u64 control = ((u64)(start & 0xFF)) | (((u64)(len & 0xFF)) << 8);
+        u64 r;
+        __asm__("bextrq %2, %1, %0" : "=r"(r) : "rm"(src), "r"(control) : "cc");
+        return r;
+    }
+    if (start >= 64 || len == 0) return 0;
+    u64 shifted = src >> start;
+    if (len >= 64) return shifted;
+    return shifted & ((1ULL << len) - 1);
+}
+
+static inline u32 hw_bextr32(u32 src, u32 start, u32 len)
+{
+    if (g_bmi1_enabled) {
+        u32 control = (start & 0xFF) | ((len & 0xFF) << 8);
+        u32 r;
+        __asm__("bextrl %2, %1, %0" : "=r"(r) : "rm"(src), "r"(control) : "cc");
+        return r;
+    }
+    if (start >= 32 || len == 0) return 0;
+    u32 shifted = src >> start;
+    if (len >= 32) return shifted;
+    return shifted & ((1U << len) - 1);
+}
+
+/**
+ * hw_blsr64(src) — clear lowest set bit: src & (src - 1)
+ */
+static inline u64 hw_blsr64(u64 src)
+{
+    if (g_bmi1_enabled) {
+        u64 r;
+        __asm__("blsrq %1, %0" : "=r"(r) : "rm"(src) : "cc");
+        return r;
+    }
+    return src & (src - 1);
+}
+
+static inline u32 hw_blsr32(u32 src)
+{
+    if (g_bmi1_enabled) {
+        u32 r;
+        __asm__("blsrl %1, %0" : "=r"(r) : "rm"(src) : "cc");
+        return r;
+    }
+    return src & (src - 1);
+}
+
+/**
+ * hw_blsi64(src) — extract lowest set bit: src & (-src)
+ */
+static inline u64 hw_blsi64(u64 src)
+{
+    if (g_bmi1_enabled) {
+        u64 r;
+        __asm__("blsiq %1, %0" : "=r"(r) : "rm"(src) : "cc");
+        return r;
+    }
+    return src & (-(int64_t)src);
+}
+
+static inline u32 hw_blsi32(u32 src)
+{
+    if (g_bmi1_enabled) {
+        u32 r;
+        __asm__("blsil %1, %0" : "=r"(r) : "rm"(src) : "cc");
+        return r;
+    }
+    return src & (-(int32_t)src);
+}
+
+/**
+ * hw_blsmsk64(src) — get mask up to lowest set bit: src ^ (src - 1)
+ */
+static inline u64 hw_blsmsk64(u64 src)
+{
+    if (g_bmi1_enabled) {
+        u64 r;
+        __asm__("blsmskq %1, %0" : "=r"(r) : "rm"(src) : "cc");
+        return r;
+    }
+    return src ^ (src - 1);
+}
+
+static inline u32 hw_blsmsk32(u32 src)
+{
+    if (g_bmi1_enabled) {
+        u32 r;
+        __asm__("blsmskl %1, %0" : "=r"(r) : "rm"(src) : "cc");
+        return r;
+    }
+    return src ^ (src - 1);
+}
+
+/**
+ * hw_andn64(a, b) — bitwise NOT of @a AND @b: (~a) & b
+ */
+static inline u64 hw_andn64(u64 a, u64 b)
+{
+    if (g_bmi1_enabled) {
+        u64 r;
+        __asm__("andnq %1, %2, %0" : "=r"(r) : "rm"(b), "r"(a) : "cc");
+        return r;
+    }
+    return (~a) & b;
+}
+
+static inline u32 hw_andn32(u32 a, u32 b)
+{
+    if (g_bmi1_enabled) {
+        u32 r;
+        __asm__("andnl %1, %2, %0" : "=r"(r) : "rm"(b), "r"(a) : "cc");
+        return r;
+    }
+    return (~a) & b;
+}
+
+/**
+ * hw_mulx64(a, b, hi) — unsigned 64x64 -> 128 multiply using BMI2 MULX
+ * does not affect flags; returns low 64 bits and stores high 64 bits in @hi.
+ */
+static inline u64 hw_mulx64(u64 a, u64 b, u64 *hi)
+{
+    if (g_bmi2_enabled) {
+        u64 lo, h;
+        __asm__("mulxq %2, %0, %1" : "=r"(lo), "=r"(h) : "rm"(b), "d"(a));
+        if (hi) *hi = h;
+        return lo;
+    }
+    __uint128_t prod = (__uint128_t)a * (__uint128_t)b;
+    if (hi) *hi = (u64)(prod >> 64);
+    return (u64)prod;
+}
+
+/**
+ * hw_rorx64(src, count) — rotate right without modifying condition codes.
+ */
+#define hw_rorx64(src, imm) \
+    (__builtin_constant_p(imm) && ((imm) < 64) ? ({ \
+        u64 _r; \
+        if (g_bmi2_enabled) { \
+            __asm__("rorxq %1, %2, %0" : "=r"(_r) : "i"(imm), "rm"(src)); \
+        } else { \
+            _r = ((u64)(src) >> (imm)) | ((u64)(src) << ((64 - (imm)) & 63)); \
+        } \
+        _r; \
+    }) : ({ \
+        unsigned _c = (imm) & 63; \
+        u64 _s = (src); \
+        (_c == 0) ? _s : ((_s >> _c) | (_s << (64 - _c))); \
+    }))
+
+/* ── Cache management & Memory ordering ───────────────────────────────────── */
+
+static inline void hw_sfence(void)
+{
+    __asm__ volatile("sfence" ::: "memory");
+}
+
+static inline void hw_lfence(void)
+{
+    __asm__ volatile("lfence" ::: "memory");
+}
+
+static inline void hw_mfence(void)
+{
+    __asm__ volatile("mfence" ::: "memory");
+}
+
+static inline void hw_clflush(const void *p)
+{
+    __asm__ volatile("clflush %0" : : "m"(*(const char *)p) : "memory");
+}
+
+static inline void hw_clflushopt(const void *p)
+{
+    if (g_clflushopt_enabled) {
+        __asm__ volatile("clflushopt %0" : : "m"(*(const char *)p) : "memory");
+    } else {
+        hw_clflush(p);
+    }
+}
+
+static inline void hw_clwb(const void *p)
+{
+    if (g_clwb_enabled) {
+        __asm__ volatile("clwb %0" : : "m"(*(const char *)p) : "memory");
+    } else {
+        hw_clflushopt(p);
+    }
+}
+
+/**
+ * hw_serialize() — serialize instruction execution and memory transactions.
+ * Uses SERIALIZE instruction if available, otherwise serializes via CPUID.
+ */
+static inline void hw_serialize(void)
+{
+    if (g_serialize_enabled) {
+        __asm__ volatile(".byte 0x0f, 0x01, 0xe8" ::: "memory");
+    } else {
+        u32 eax = 0, ebx, ecx, edx;
+        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(eax) : "memory");
+    }
+}
+
+/* ── Hardware Entropy Generation ─────────────────────────────────────────── */
+
+static inline bool hw_rdrand64(u64 *val)
+{
+    if (!g_rdrand_enabled) return false;
+    unsigned char ok;
+    u64 v;
+    __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok) : : "cc");
+    if (ok) {
+        if (val) *val = v;
+        return true;
+    }
+    return false;
+}
+
+static inline bool hw_rdseed64(u64 *val)
+{
+    if (!g_rdseed_enabled) return false;
+    unsigned char ok;
+    u64 v;
+    __asm__ volatile("rdseed %0; setc %1" : "=r"(v), "=qm"(ok) : : "cc");
+    if (ok) {
+        if (val) *val = v;
+        return true;
+    }
+    return false;
 }
 
 /* ── Contention backoff ──────────────────────────────────────────────────── */
@@ -218,3 +489,4 @@ static inline u64 hw_bzhi64(u64 src, u32 n)
  * changes the caller's correctness obligations.
  */
 void hw_spin_wait(u32 spins);
+

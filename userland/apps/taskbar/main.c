@@ -18,6 +18,8 @@
 
 #include "../../libc/include/az/ipc.h"
 #include "../../libc/include/stdio.h"
+#include "../../libc/include/stdlib.h"
+#include "../../libc/include/stdbool.h"
 #include "../../libc/include/string.h"
 #include "../azwm/protocol.h"
 #include "../azwm/de_protocol.h"
@@ -48,34 +50,34 @@
 #define WB_MAX        12  /* maximum visible window buttons before overflow */
 #define WB_RADIUS     8   /* pill corner radius */
 
-/* Quick Launch Dock */
+/* ── Quick Launch Dock ─────────────────────────────────────────────────────
+ * Entries load from /etc/taskbar_dock.conf ("glyph|label|path|0xAARRGGBB"
+ * per line) so the dock can be edited without recompiling; a compiled-in
+ * default list (tb_load_default_dock(), further down) covers a missing or
+ * unreadable file. Each entry also tries to load a real icon file
+ * (/usr/share/icons/<name>.icn, matching the convention the launcher and
+ * `make icons` already use) and falls back to the coloured glyph when one
+ * isn't shipped for that app. */
+#define TB_ICON_DIM     32
+#define TB_ICON_PIXELS  (TB_ICON_DIM * TB_ICON_DIM)
+
 typedef struct {
     char glyph;
-    const char *label;
-    const char *path;
+    char label[16];
+    char path[64];
     unsigned int color;
+    unsigned int icon[TB_ICON_PIXELS];
+    int has_icon;
 } dock_app_t;
 
-static const dock_app_t g_dock_apps[] = {
-    { 'T', "Terminal",    "/bin/terminal.elf",    0xFFA6E3A1 }, /* Green */
-    { 'F', "Files",       "/bin/filemanager.elf", 0xFFF9E2AF }, /* Yellow */
-    { 'E', "Editor",      "/bin/texteditor.elf",  0xFF89B4FA }, /* Blue */
-    { 'C', "Calc",        "/bin/calculator.elf",  0xFFFAB387 }, /* Peach */
-    { 'P', "Paint",       "/bin/paint.elf",       0xFFCBA6F7 }, /* Mauve */
-    { 'A', "Audio",       "/bin/audioplayer.elf", 0xFFF38BA8 }, /* Flamingo/Pink */
-    { 'S', "Settings",    "/bin/settings.elf",    0xFF74C7EC }, /* Sapphire */
-    { 'M', "Sysmon",      "/bin/sysmon.elf",      0xFF94E2D5 }, /* Teal */
-    { 'X', "XClock",      "/bin/xclock.elf",      0xFF89DCEB }, /* Sky */
-    { 'Y', "XEyes",       "/bin/xeyes.elf",       0xFFF5C2E7 }, /* Pink */
-    { 'K', "XCalc",       "/bin/xcalc.elf",       0xFFF9E2AF }, /* Yellow */
-    { 'G', "XDemo",       "/bin/xgui_demo.elf",   0xFFB4BEFE }, /* Lavender */
-};
-#define NUM_DOCK_APPS ((int)(sizeof(g_dock_apps) / sizeof(g_dock_apps[0])))
+#define MAX_DOCK_APPS 24
+static dock_app_t   g_dock_apps[MAX_DOCK_APPS];
+static int          g_num_dock_apps = 0;
+
 #define DOCK_X        (SB_X + SB_W + 12)
 #define DOCK_BTN_W    30
 #define DOCK_BTN_H    36
 #define DOCK_GAP      4
-#define WB_ORIGIN     (DOCK_X + NUM_DOCK_APPS * (DOCK_BTN_W + DOCK_GAP) + 8)
 
 /* ── Catppuccin Mocha palette (ARGB) ────────────────────────────────────────── */
 #define C_BG          0xFF0A0A14  /* deeper than crust — premium dark panel      */
@@ -128,6 +130,14 @@ static unsigned int g_tick_count    = 0; /* increments every timer tick        *
 static int          g_colon_on      = 1; /* clock ":" blink phase              */
 static int          g_sb_hover_level = 0; /* 0..256 smoothed Start-button hover */
 static int          g_sb_press_anim = 0; /* ticks left in the click flash       */
+static int          g_dock_hovered  = -1; /* hovered Quick Launch Dock slot, -1 = none */
+/* Per-slot smoothed hover (0..256) and click-flash countdown, animated in the
+ * tick handler exactly like g_sb_hover_level/g_sb_press_anim above — the
+ * dock used to just swap its background between two flat colours on the
+ * frame the hovered slot changed, which read as dead next to the Start
+ * button's eased fade and press flash right beside it. */
+static int          g_dock_hover_level[MAX_DOCK_APPS];
+static int          g_dock_press_anim[MAX_DOCK_APPS];
 
 /* Window list */
 typedef struct {
@@ -146,6 +156,23 @@ static int           g_overflow   = 0;
 /* Volume state */
 static int           g_vol_level = 80; /* 0..100 */
 static int           g_vol_muted = 0;
+
+/* Toast & Tooltip overlay state */
+static char          g_toast_msg[48] = "";
+static int           g_toast_ticks = 0;   /* countdown in 100ms ticks */
+static char          g_hover_tooltip[48] = "";
+static int           g_hover_x = 0;
+
+static void tb_show_toast(const char *msg)
+{
+    if (!msg || msg[0] == '\0') {
+        g_toast_ticks = 0;
+        return;
+    }
+    strncpy(g_toast_msg, msg, sizeof(g_toast_msg) - 1);
+    g_toast_msg[sizeof(g_toast_msg) - 1] = '\0';
+    g_toast_ticks = 25; /* 2.5 seconds display */
+}
 
 /* ── Real-time clock (Bug 3 fix) ─────────────────────────────────────────── */
 #include "../../libc/include/time.h"
@@ -259,6 +286,139 @@ static void tb_str_clip(int x, int y, const char *s, unsigned int col, int max_w
 
 static int tb_strlen(const char *s) { int i = 0; while (s[i]) i++; return i; }
 
+/* ── Quick Launch Dock: config + icon loading ────────────────────────────── */
+
+/* Extracts "terminal" out of "/bin/terminal.elf" — used to look up
+ * /usr/share/icons/<name>.icn for a dock entry. */
+static void tb_app_basename(const char *path, char *out, size_t out_len)
+{
+    const char *slash = strrchr(path, '/');
+    const char *name = slash ? slash + 1 : path;
+    size_t n = strlen(name);
+    if (n > 4 && strcmp(name + n - 4, ".elf") == 0) n -= 4;
+    if (n >= out_len) n = out_len - 1;
+    memcpy(out, name, n);
+    out[n] = '\0';
+}
+
+static int tb_load_icon32(const char *app_name, unsigned int *out)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "/usr/share/icons/%s.icn", app_name);
+    int fd = sys_open(path, 0, 0);
+    if (fd < 0) return 0;
+    int nr = sys_read(fd, out, TB_ICON_PIXELS * sizeof(unsigned int));
+    sys_close(fd);
+    return nr == (int)(TB_ICON_PIXELS * sizeof(unsigned int));
+}
+
+static void tb_draw_icon32(int x, int y, const unsigned int *icon)
+{
+    for (int py = 0; py < TB_ICON_DIM; py++) {
+        for (int px = 0; px < TB_ICON_DIM; px++) {
+            unsigned int c = icon[py * TB_ICON_DIM + px];
+            unsigned char a = (unsigned char)(c >> 24);
+            if (a == 0) continue;
+            if (a == 255) { tb_put_pixel(x + px, y + py, c); continue; }
+            int dx = x + px, dy = y + py;
+            if (dx < 0 || dy < 0 || (unsigned int)dx >= g_w || (unsigned int)dy >= g_h) continue;
+            unsigned int bg = g_px[(unsigned int)dy * g_w + (unsigned int)dx];
+            tb_put_pixel(dx, dy, tb_blend(bg, c, a));
+        }
+    }
+}
+
+/* Compiled-in fallback, used only when /etc/taskbar_dock.conf is missing or
+ * unreadable (e.g. a partial/corrupt install) so the dock is never just
+ * empty. The shipped config (see userland/Makefile's `etc:` target) starts
+ * out with this exact same list — edit the .conf to customise the dock. */
+static void tb_load_default_dock(void)
+{
+    static const struct { char glyph; const char *label; const char *path; unsigned int color; } defaults[] = {
+        { 'T', "Terminal", "/bin/terminal.elf",    0xFFA6E3A1 },
+        { 'F', "Files",    "/bin/filemanager.elf", 0xFFF9E2AF },
+        { 'E', "Editor",   "/bin/texteditor.elf",  0xFF89B4FA },
+        { 'C', "Calc",     "/bin/calculator.elf",  0xFFFAB387 },
+        { 'P', "Paint",    "/bin/paint.elf",       0xFFCBA6F7 },
+        { 'A', "Audio",    "/bin/audioplayer.elf", 0xFFF38BA8 },
+        { 'S', "Settings", "/bin/settings.elf",    0xFF74C7EC },
+        { 'M', "Sysmon",   "/bin/sysmon.elf",      0xFF94E2D5 },
+        { 'X', "XClock",   "/bin/xclock.elf",      0xFF89DCEB },
+        { 'Y', "XEyes",    "/bin/xeyes.elf",       0xFFF5C2E7 },
+        { 'K', "XCalc",    "/bin/xcalc.elf",       0xFFF9E2AF },
+        { 'G', "XDemo",    "/bin/xgui_demo.elf",   0xFFB4BEFE },
+    };
+    g_num_dock_apps = 0;
+    for (unsigned int i = 0; i < sizeof(defaults) / sizeof(defaults[0]) && g_num_dock_apps < MAX_DOCK_APPS; i++) {
+        dock_app_t *e = &g_dock_apps[g_num_dock_apps++];
+        e->glyph = defaults[i].glyph;
+        strncpy(e->label, defaults[i].label, sizeof(e->label) - 1);
+        e->label[sizeof(e->label) - 1] = '\0';
+        strncpy(e->path, defaults[i].path, sizeof(e->path) - 1);
+        e->path[sizeof(e->path) - 1] = '\0';
+        e->color = defaults[i].color;
+    }
+}
+
+/* Parses "/etc/taskbar_dock.conf": one entry per line, formatted
+ * "glyph|label|path|0xAARRGGBB" ('#' starts a comment, blank lines skipped).
+ * Falls back to tb_load_default_dock() if the file is missing, empty, or
+ * every line fails to parse. */
+static void tb_load_dock_config(void)
+{
+    int fd = sys_open("/etc/taskbar_dock.conf", 0, 0);
+    if (fd < 0) { tb_load_default_dock(); return; }
+
+    static char buf[4096];
+    int n = sys_read(fd, buf, sizeof(buf) - 1);
+    sys_close(fd);
+    if (n <= 0) { tb_load_default_dock(); return; }
+    buf[n] = '\0';
+
+    g_num_dock_apps = 0;
+    char *saveptr = NULL;
+    char *line = strtok_r(buf, "\n", &saveptr);
+    while (line && g_num_dock_apps < MAX_DOCK_APPS) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line == '\0' || *line == '#') { line = strtok_r(NULL, "\n", &saveptr); continue; }
+
+        char *fsave = NULL;
+        char *glyph_s = strtok_r(line,  "|", &fsave);
+        char *label_s = strtok_r(NULL, "|", &fsave);
+        char *path_s  = strtok_r(NULL, "|", &fsave);
+        char *color_s = strtok_r(NULL, "|", &fsave);
+        if (glyph_s && label_s && path_s && color_s) {
+            dock_app_t *e = &g_dock_apps[g_num_dock_apps++];
+            e->glyph = glyph_s[0];
+            strncpy(e->label, label_s, sizeof(e->label) - 1);
+            e->label[sizeof(e->label) - 1] = '\0';
+            strncpy(e->path, path_s, sizeof(e->path) - 1);
+            e->path[sizeof(e->path) - 1] = '\0';
+            e->color = (unsigned int)strtoul(color_s, NULL, 0);
+        }
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    if (g_num_dock_apps == 0) tb_load_default_dock();
+}
+
+static void tb_init_dock(void)
+{
+    tb_load_dock_config();
+    for (int i = 0; i < g_num_dock_apps; i++) {
+        char name[32];
+        tb_app_basename(g_dock_apps[i].path, name, sizeof(name));
+        g_dock_apps[i].has_icon = tb_load_icon32(name, g_dock_apps[i].icon);
+    }
+}
+
+/* Where the window-button strip starts: right after the dock, whatever its
+ * (config-controlled) length turns out to be. */
+static int tb_wb_origin(void)
+{
+    return DOCK_X + g_num_dock_apps * (DOCK_BTN_W + DOCK_GAP) + 8;
+}
+
 /* ── WiFi icon ──────────────────────────────────────────────────────────────── */
 static void tb_draw_wifi(int bx, int by, unsigned int col)
 {
@@ -336,6 +496,57 @@ static void taskbar_invalidate(void)
     az_channel_send(g_srv, (az_ipc_msg_t *)&inv);
 }
 
+/* Invalidate just a sub-rectangle of the panel — see draw_clock_only()
+ * below, the one place that needs this instead of a full taskbar_invalidate(). */
+static void taskbar_invalidate_rect(int x, int y, int w, int h)
+{
+    az_wm_msg_t inv;
+    memset(&inv, 0, sizeof(inv));
+    inv.type = AZ_WM_INVALIDATE;
+    inv.wid  = g_wid;
+    inv.invalidate.x = x;
+    inv.invalidate.y = y;
+    inv.invalidate.w = (unsigned int)w;
+    inv.invalidate.h = (unsigned int)h;
+    az_channel_send(g_srv, (az_ipc_msg_t *)&inv);
+}
+
+/*
+ * draw_clock_only() — the AZ_WM_TIMER_TICK fast path for a tick whose only
+ * job is the colon blink (see the handler below): repaints the whole clock
+ * text — both digit pairs *and* the colon, not just the colon glyph —
+ * because a minute rollover is only ever caught by whichever tick happens
+ * to redraw this region, and on an idle panel the colon-blink tick is the
+ * only one that ever fires. Publishes just that rect instead of the whole
+ * panel.
+ *
+ * Clears the region to C_TRAY_BG before drawing the glyphs: de_font_draw_char()
+ * only ever sets the pixels a glyph's own strokes cover and never clears
+ * the ones around them, so drawing "0" straight over a previously-drawn
+ * "5" without clearing first would leave whichever of "5"'s strokes "0"
+ * doesn't share permanently stuck on screen — exactly the kind of bug this
+ * fast path has to not introduce.
+ */
+static void draw_clock_only(void)
+{
+    int tray_start_x = (int)g_w - TRAY_W - TRAY_M;
+
+    char clk[6];
+    tb_build_clock(clk);
+    int clk_len = tb_strlen(clk);
+    int clk_x = tray_start_x + TRAY_W - clk_len * 8 - 8;
+    int clk_y = SB_Y + 2;
+
+    tb_fill_rect(clk_x, clk_y, clk_len * 8, 16, C_TRAY_BG);
+    tb_char(clk_x,      clk_y, clk[0], C_CLOCK);
+    tb_char(clk_x + 8,  clk_y, clk[1], C_CLOCK);
+    tb_char(clk_x + 16, clk_y, ':',    g_colon_on ? C_CLOCK : tb_blend(C_TRAY_BG, C_CLOCK, 90));
+    tb_char(clk_x + 24, clk_y, clk[3], C_CLOCK);
+    tb_char(clk_x + 32, clk_y, clk[4], C_CLOCK);
+
+    taskbar_invalidate_rect(clk_x, clk_y, clk_len * 8, 16);
+}
+
 /* ============================================================================
  * taskbar_draw — rebuild the panel pixel buffer
  * ============================================================================ */
@@ -406,10 +617,59 @@ static void taskbar_draw(void)
     /* Separator after start button */
     tb_separator(SB_X + SB_W + 6);
 
+    /* ── Quick Launch Dock ─────────────────────────────────────────────────── */
+    for (int i = 0; i < g_num_dock_apps; i++) {
+        int dx = DOCK_X + i * (DOCK_BTN_W + DOCK_GAP);
+        int dy = SB_Y + 2;
+
+        /* Eased blend toward the hot colour, same curve as the Start
+         * button, instead of an instant flat-colour swap. */
+        unsigned int hover_a = (unsigned int)(g_dock_hover_level[i] * 255 / 256);
+        unsigned int bg = tb_blend(C_WB_BG, C_WB_ACTIVE, hover_a);
+        tb_fill_rounded(dx, dy, DOCK_BTN_W, DOCK_BTN_H, 6, bg);
+
+        const dock_app_t *e = &g_dock_apps[i];
+        if (e->has_icon) {
+            tb_draw_icon32(dx + (DOCK_BTN_W - TB_ICON_DIM) / 2, dy + 1, e->icon);
+        } else {
+            /* No shipped icon file for this app — fall back to its
+             * single-letter glyph in its assigned colour. */
+            char glyph_s[2] = { e->glyph, '\0' };
+            tb_str(dx + (DOCK_BTN_W - 8) / 2, dy + (DOCK_BTN_H - 16) / 2, glyph_s, e->color);
+        }
+
+        /* Active-app indicator: a thin accent bar under the icon that grows
+         * in from the centre as the hover level rises — the same "something
+         * is alive here" cue the Start button's border fade gives it. */
+        if (hover_a > 0) {
+            int full_w = DOCK_BTN_W - 10;
+            int bar_w  = (full_w * (int)hover_a) / 255;
+            if (bar_w > 0) {
+                int bar_x = dx + (DOCK_BTN_W - bar_w) / 2;
+                tb_fill_rect(bar_x, dy + DOCK_BTN_H - 3, bar_w, 2,
+                            tb_blend(bg, e->color, hover_a));
+            }
+        }
+
+        /* Click flash: brief white overlay fading out over SB_PRESS_TICKS
+         * ticks, matching the Start button's tactile click feedback. */
+        if (g_dock_press_anim[i] > 0) {
+            unsigned int flash_a = (unsigned int)(g_dock_press_anim[i] * 130 / SB_PRESS_TICKS);
+            for (int fy = dy; fy < dy + DOCK_BTN_H; fy++) {
+                if (fy < 0 || (unsigned int)fy >= g_h) continue;
+                for (int fx = dx; fx < dx + DOCK_BTN_W; fx++) {
+                    if (fx < 0 || (unsigned int)fx >= g_w) continue;
+                    unsigned int idx = (unsigned int)fy * g_w + (unsigned int)fx;
+                    g_px[idx] = tb_blend(g_px[idx], 0xFFFFFFFF, flash_a);
+                }
+            }
+        }
+    }
+
     /* ── Window button strip (pill-shaped buttons) ───────────────────────── */
     int tray_start_x = (int)g_w - TRAY_W - TRAY_M;
     int strip_end_x  = tray_start_x - 8;
-    int bx = WB_ORIGIN;
+    int bx = tb_wb_origin();
     int visible = 0;
     g_overflow = 0;
 
@@ -532,6 +792,29 @@ static void taskbar_draw(void)
     if (date_y + 16 < (int)g_h)
         tb_str(date_x, date_y, date_buf, C_DATE);
 
+    /* Toast notification / overlay (Volume, WiFi, etc.) */
+    if (g_toast_ticks > 0 && g_toast_msg[0]) {
+        int tlen = tb_strlen(g_toast_msg);
+        int tw = tlen * 8 + 24;
+        int tx = tray_start_x - tw - 12;
+        if (tx < (int)g_w / 2) tx = (int)g_w / 2;
+        int ty = 8;
+        int th = 36;
+        tb_fill_rounded(tx, ty, tw, th, 8, 0xFF181825);
+        tb_fill_rect(tx + 2, ty + 2, 3, th - 4, 0xFFCBA6F7);
+        tb_str(tx + 12, ty + 10, g_toast_msg, 0xFFCDD6F4);
+    } else if (g_hover_tooltip[0] != '\0') {
+        int tlen = tb_strlen(g_hover_tooltip);
+        int tw = tlen * 8 + 16;
+        int tx = g_hover_x - tw / 2;
+        if (tx < 10) tx = 10;
+        if (tx + tw > (int)g_w - 10) tx = (int)g_w - tw - 10;
+        int ty = 10;
+        int th = 32;
+        tb_fill_rounded(tx, ty, tw, th, 6, 0xFF1E1E2E);
+        tb_str(tx + 8, ty + 8, g_hover_tooltip, 0xFFBAC2DE);
+    }
+
     taskbar_invalidate();
 }
 
@@ -591,6 +874,51 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
     g_sb_hot = (lx >= SB_X && lx < SB_X + SB_W && ly >= SB_Y && ly < SB_Y + SB_H) ? 1 : 0;
     if (g_sb_hot != was_hot) { taskbar_draw(); }
 
+    /* Quick Launch Dock hover */
+    int dock_hit = -1;
+    for (int i = 0; i < g_num_dock_apps; i++) {
+        int btn_x = DOCK_X + i * (DOCK_BTN_W + DOCK_GAP);
+        int btn_y = SB_Y + 2;
+        if (lx >= btn_x && lx < btn_x + DOCK_BTN_W && ly >= btn_y && ly < btn_y + DOCK_BTN_H) {
+            dock_hit = i;
+            break;
+        }
+    }
+    if (dock_hit != g_dock_hovered) { g_dock_hovered = dock_hit; taskbar_draw(); }
+
+    int tray_start_x = (int)g_w - TRAY_W - TRAY_M;
+
+    /* Tray & Dock tooltips on hover */
+    const char *new_tooltip = "";
+    int hover_x = lx;
+    if (g_sb_hot) {
+        new_tooltip = "Applications";
+        hover_x = SB_X + SB_W / 2;
+    } else if (dock_hit >= 0 && dock_hit < g_num_dock_apps) {
+        new_tooltip = g_dock_apps[dock_hit].label;
+        hover_x = DOCK_X + dock_hit * (DOCK_BTN_W + DOCK_GAP) + DOCK_BTN_W / 2;
+    } else if (lx >= tray_start_x && lx < (int)g_w) {
+        if (lx < tray_start_x + 20) {
+            new_tooltip = "Network (eth0)";
+            hover_x = tray_start_x + 10;
+        } else if (lx < tray_start_x + 50) {
+            new_tooltip = g_vol_muted ? "Volume: Muted" : "Volume Control";
+            hover_x = tray_start_x + 35;
+        } else if (lx < tray_start_x + 68) {
+            new_tooltip = "Lock Screen";
+            hover_x = tray_start_x + 58;
+        } else {
+            new_tooltip = "Clock & Calendar";
+            hover_x = tray_start_x + 120;
+        }
+    }
+    if (strcmp(g_hover_tooltip, new_tooltip) != 0) {
+        strncpy(g_hover_tooltip, new_tooltip, sizeof(g_hover_tooltip) - 1);
+        g_hover_tooltip[sizeof(g_hover_tooltip) - 1] = '\0';
+        g_hover_x = hover_x;
+        taskbar_draw();
+    }
+
     /* Left-click on Start → toggle launcher */
     if (lclick && g_sb_hot) {
         g_sb_press_anim = SB_PRESS_TICKS;
@@ -618,10 +946,11 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
 
     /* Left-click on Quick Launch Dock icons */
     if (lclick) {
-        for (int i = 0; i < NUM_DOCK_APPS; i++) {
+        for (int i = 0; i < g_num_dock_apps; i++) {
             int btn_x = DOCK_X + i * (DOCK_BTN_W + DOCK_GAP);
             int btn_y = SB_Y + 2;
             if (lx >= btn_x && lx < btn_x + DOCK_BTN_W && ly >= btn_y && ly < btn_y + DOCK_BTN_H) {
+                g_dock_press_anim[i] = SB_PRESS_TICKS;
                 az_wm_msg_t lmsg;
                 memset(&lmsg, 0, sizeof(lmsg));
                 lmsg.type = AZ_WM_LAUNCH_APP;
@@ -638,17 +967,40 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
         }
     }
 
+    /* Left-click on Tray WiFi icon → launch Settings (Network) */
+    if (lclick && lx >= tray_start_x && lx < tray_start_x + 20) {
+        az_wm_msg_t lmsg;
+        memset(&lmsg, 0, sizeof(lmsg));
+        lmsg.type = AZ_WM_LAUNCH_APP;
+        az_wm_launch_payload_t *pl = AZ_WM_MSG_LAUNCH(&lmsg);
+        const char *path = "/bin/settings.elf";
+        unsigned int j;
+        for (j = 0; j < AZ_WM_LAUNCH_PATH_MAX - 1 && path[j]; j++)
+            pl->path[j] = path[j];
+        pl->path[j] = '\0';
+        az_channel_send(g_srv, (az_ipc_msg_t *)&lmsg);
+        tb_show_toast("Network: eth0 (10.0.2.15)");
+        taskbar_draw();
+        return;
+    }
+
     /* Left-click on Tray Sound / Volume area → cycle volume / toggle mute */
-    int tray_start_x = (int)g_w - TRAY_W - TRAY_M;
     if (lclick && lx >= tray_start_x + 20 && lx < tray_start_x + 50) {
         if (g_vol_muted) {
             g_vol_muted = 0;
+            char msg[32];
+            snprintf(msg, sizeof(msg), "Volume: %d%%", g_vol_level);
+            tb_show_toast(msg);
         } else if (g_vol_level >= 100) {
             g_vol_muted = 1;
             g_vol_level = 0;
+            tb_show_toast("Audio Muted");
         } else {
             g_vol_level = (g_vol_level + 25);
             if (g_vol_level > 100) g_vol_level = 100;
+            char msg[32];
+            snprintf(msg, sizeof(msg), "Volume: %d%%", g_vol_level);
+            tb_show_toast(msg);
         }
         taskbar_draw();
         return;
@@ -688,7 +1040,7 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
 
     /* Left-click on a window button */
     if (lclick) {
-        int wbx = WB_ORIGIN;
+        int wbx = tb_wb_origin();
         int tray_end = (int)g_w - TRAY_W - TRAY_M;
         unsigned int i;
         for (i = 0; i < DE_TASKBAR_MAX_WINDOWS; i++) {
@@ -731,6 +1083,8 @@ int main(int argc, char **argv)
     for (i = 0; i < DE_TASKBAR_MAX_WINDOWS; i++) {
         g_wins[i].active = 0; g_wins[i].wid = 0;
     }
+
+    tb_init_dock();
 
     /* ── Screen geometry ──────────────────────────────────────────────────── */
     az_fb_info_t fb;
@@ -824,21 +1178,63 @@ int main(int argc, char **argv)
             break;
 
         case AZ_WM_TIMER_TICK: {
+            /* This 100ms tick used to call taskbar_draw() — a full repaint
+             * of the whole bar: dock, systray, clock, start button — on
+             * every single firing, even the (overwhelming, on an idle
+             * desktop with the pointer elsewhere) majority where nothing
+             * animating actually moved and the colon didn't blink. `colon_dirty`
+             * and `other_dirty` are tracked separately (instead of one
+             * combined flag) so the very common "only the colon blinked"
+             * tick can take draw_clock_only()'s narrow repaint below
+             * instead of a full taskbar_draw() — anything else changing
+             * still falls back to the full repaint. Each level's "did this
+             * actually change" check runs against its pre-step value,
+             * mirroring launcher's hover-fade gate, so the tick that lands
+             * a fade exactly on its target still counts as dirty and
+             * paints that settled frame (see the compositor's identical
+             * fix for what goes wrong if it didn't). */
             g_tick_count++;
-            if (g_tick_count % 5 == 0) g_colon_on = !g_colon_on; /* 500ms */
+            bool colon_dirty = (g_tick_count % 5 == 0); /* colon blink, 500ms */
+            if (colon_dirty) g_colon_on = !g_colon_on;
+
+            bool other_dirty = false;
 
             int sb_target = g_sb_hot ? 256 : 0;
-            if (g_sb_hover_level < sb_target) {
-                g_sb_hover_level += SB_HOVER_STEP;
-                if (g_sb_hover_level > sb_target) g_sb_hover_level = sb_target;
-            } else if (g_sb_hover_level > sb_target) {
-                g_sb_hover_level -= SB_HOVER_STEP;
-                if (g_sb_hover_level < sb_target) g_sb_hover_level = sb_target;
+            if (g_sb_hover_level != sb_target) {
+                other_dirty = true;
+                if (g_sb_hover_level < sb_target) {
+                    g_sb_hover_level += SB_HOVER_STEP;
+                    if (g_sb_hover_level > sb_target) g_sb_hover_level = sb_target;
+                } else {
+                    g_sb_hover_level -= SB_HOVER_STEP;
+                    if (g_sb_hover_level < sb_target) g_sb_hover_level = sb_target;
+                }
             }
 
-            if (g_sb_press_anim > 0) g_sb_press_anim--;
+            if (g_sb_press_anim > 0) { other_dirty = true; g_sb_press_anim--; }
 
-            taskbar_draw();
+            for (int i = 0; i < g_num_dock_apps; i++) {
+                int dock_target = (i == g_dock_hovered) ? 256 : 0;
+                if (g_dock_hover_level[i] != dock_target) {
+                    other_dirty = true;
+                    if (g_dock_hover_level[i] < dock_target) {
+                        g_dock_hover_level[i] += SB_HOVER_STEP;
+                        if (g_dock_hover_level[i] > dock_target) g_dock_hover_level[i] = dock_target;
+                    } else {
+                        g_dock_hover_level[i] -= SB_HOVER_STEP;
+                        if (g_dock_hover_level[i] < dock_target) g_dock_hover_level[i] = dock_target;
+                    }
+                }
+                if (g_dock_press_anim[i] > 0) { other_dirty = true; g_dock_press_anim[i]--; }
+            }
+
+            if (g_toast_ticks > 0) { other_dirty = true; g_toast_ticks--; }
+
+            if (other_dirty) {
+                taskbar_draw();
+            } else if (colon_dirty) {
+                draw_clock_only();
+            }
             break;
         }
 
@@ -876,6 +1272,22 @@ int main(int argc, char **argv)
             az_wm_evt_focus_payload_t *p = AZ_WM_MSG_EVT_FOCUS(&msg);
             g_focus_wid = p->new_wid;
             taskbar_draw();
+            break;
+        }
+
+        case AZ_WM_EVT_WINDOW_TITLE_CHANGED: {
+            az_wm_evt_title_payload_t *p = AZ_WM_MSG_EVT_TITLE(&msg);
+            for (unsigned int i = 0; i < DE_TASKBAR_MAX_WINDOWS; i++) {
+                if (g_wins[i].active && g_wins[i].wid == p->wid) {
+                    unsigned int j;
+                    for (j = 0; j < 63 && p->title[j]; j++) {
+                        g_wins[i].title[j] = p->title[j];
+                    }
+                    g_wins[i].title[j] = '\0';
+                    taskbar_draw();
+                    break;
+                }
+            }
             break;
         }
 

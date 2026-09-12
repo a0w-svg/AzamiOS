@@ -35,6 +35,7 @@
 #include "../azwm/de_protocol.h"
 #include "../azwm/de_font.h"
 #include "../shared/de_log.h"
+#include "../shared/png_decode.h"
 
 /* ── Build-time defaults ───────────────────────────────────────────────────── */
 #define DEFAULT_WIDTH   1280
@@ -412,9 +413,10 @@ static void wp_add_icon_entry(const char *label, const char *path, const char *g
 {
     if (g_num_desktop_icons >= MAX_DESKTOP_ICONS) return;
 
-    /* Avoid duplicates */
+    /* Avoid duplicates by path or by label */
     for (int i = 0; i < g_num_desktop_icons; i++) {
-        if (strcmp(g_desktop_icons[i].path, path) == 0) return;
+        if (strcmp(g_desktop_icons[i].path, path) == 0 ||
+            strcmp(g_desktop_icons[i].label, label) == 0) return;
     }
 
     int idx = g_num_desktop_icons++;
@@ -691,8 +693,61 @@ static void wp_draw_context_menu(unsigned int *pixels, unsigned int w, unsigned 
 #define FRAME_BUF_MAP_ADDR ((void *)0x78000000)
 static unsigned int *g_bg_cache = (unsigned int *)0;
 
+/* Path from desktop.conf's "wallpaper=" key (see the config parse below);
+ * empty until read, in which case wp_load_image_wallpaper() falls back to
+ * a conventional default path instead of giving up outright. */
+static char g_wallpaper_image_path[128] = "";
+
+/*
+ * wp_load_image_wallpaper() — fill px (w*h) from a real image file instead
+ * of the procedural background, if one is configured/present.
+ *
+ * Nearest-neighbour scale-to-fill: simplest way to make an arbitrary-size
+ * PNG cover the screen exactly regardless of the image's native resolution,
+ * and entirely adequate for a wallpaper (unlike, say, an icon) since it's
+ * viewed as a whole rather than pixel-inspected. Returns false — leaving px
+ * untouched — for no configured/default file, or one uk_load_png() can't
+ * decode, so the caller's existing procedural background is the fallback
+ * for both "no image" and "unsupported image" alike.
+ */
+static bool wp_load_image_wallpaper(unsigned int *px, unsigned int w, unsigned int h)
+{
+    const char *path = g_wallpaper_image_path[0] ? g_wallpaper_image_path
+                                                  : "/usr/share/wallpapers/default.png";
+    unsigned int *img;
+    int iw, ih;
+    if (!uk_load_png(path, &img, &iw, &ih)) return false;
+    if (iw <= 0 || ih <= 0) { uk_free_png(img); return false; }
+
+    for (unsigned int y = 0; y < h; y++) {
+        int sy = (int)((unsigned long long)y * (unsigned int)ih / h);
+        if (sy >= ih) sy = ih - 1;
+        const unsigned int *srow = img + (size_t)sy * iw;
+        unsigned int *drow = px + (size_t)y * w;
+        for (unsigned int x = 0; x < w; x++) {
+            int sx = (int)((unsigned long long)x * (unsigned int)iw / w);
+            if (sx >= iw) sx = iw - 1;
+            drow[x] = srow[sx] | 0xFF000000u; /* a wallpaper is always opaque */
+        }
+    }
+    uk_free_png(img);
+    return true;
+}
+
+/* Set once wp_load_image_wallpaper() has actually filled g_bg_cache with a
+ * real image, so wallpaper_render_frame() below knows to blit that instead
+ * of painting the animated gradient — and so a later theme change doesn't
+ * re-decode + re-scale the same file from disk again for no visual change
+ * (a custom image wallpaper has no per-theme variant to switch to). */
+static bool g_has_image_wallpaper = false;
+
 static void wallpaper_render_base(unsigned int *px, unsigned int w, unsigned int h)
 {
+    if (g_has_image_wallpaper) return; /* already decoded once; nothing to redo */
+    if (wp_load_image_wallpaper(px, w, h)) {
+        g_has_image_wallpaper = true;
+        return;
+    }
     wp_render_animated_gradient(px, w, h, 0);
     wp_render_grain(px, w, h);
     wp_render_logo(px, w, h);
@@ -744,7 +799,16 @@ static unsigned int *g_frame_buf = 0;
 
 static void wallpaper_render_frame(unsigned int *pixels, unsigned int w, unsigned int h, unsigned int phase)
 {
-    wp_render_animated_gradient(pixels, w, h, phase);
+    /* An image wallpaper was already decoded once into g_bg_cache by
+     * wallpaper_render_base() — every frame after that is just a copy of
+     * it, the same "decode once, blit every frame" split any wallpaper
+     * that isn't regenerated procedurally needs, rather than re-running
+     * uk_load_png() (file read + inflate + un-filter) 60 times a second. */
+    if (g_has_image_wallpaper && g_bg_cache) {
+        memcpy(pixels, g_bg_cache, (size_t)w * (size_t)h * sizeof(unsigned int));
+    } else {
+        wp_render_animated_gradient(pixels, w, h, phase);
+    }
     wp_render_stars_animated(pixels, w, h, phase);
     wp_render_logo(pixels, w, h);
 
@@ -861,6 +925,18 @@ int main(int argc, char **argv)
                 } else if (cbuf[0] >= '0' && cbuf[0] <= '9') {
                     int id = atoi(cbuf);
                     if (id >= 0 && id < 5) g_wallpaper_theme = id;
+                }
+
+                char *wpk = strstr(cbuf, "wallpaper=");
+                if (wpk) {
+                    wpk += 10; /* skip "wallpaper=" */
+                    int wi = 0;
+                    while (wpk[wi] && wpk[wi] != '\n' && wpk[wi] != '\r' &&
+                          wi < (int)sizeof(g_wallpaper_image_path) - 1) {
+                        g_wallpaper_image_path[wi] = wpk[wi];
+                        wi++;
+                    }
+                    g_wallpaper_image_path[wi] = '\0';
                 }
             }
         }

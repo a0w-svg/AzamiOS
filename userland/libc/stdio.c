@@ -45,6 +45,11 @@ static inline int _file_is_sentinel(FILE *f)
 
 int fputc(int c, FILE *stream)
 {
+    if (stream && !_file_is_sentinel(stream) && stream->is_memstream) {
+        unsigned char uc = (unsigned char)c;
+        if (fwrite(&uc, 1, 1, stream) == 1) return uc;
+        return -1;
+    }
     char ch = (char)c;
     if (sys_write(_file_fd(stream), &ch, 1) == 1) return (unsigned char)c;
     return -1; /* EOF */
@@ -560,17 +565,33 @@ int ungetc(int c, FILE *stream)
 int fgetc(FILE *stream)
 {
     if (!stream) return -1;
+    if (!_file_is_sentinel(stream) && stream->is_memstream) {
+        unsigned char uc;
+        if (fread(&uc, 1, 1, stream) == 1) return uc;
+        return -1;
+    }
     if (!_file_is_sentinel(stream) && stream->unget_char != -1) {
         int ch = stream->unget_char;
         stream->unget_char = -1;
         return ch;
     }
-    char c;
-    ssize_t n = sys_read(_file_fd(stream), &c, 1);
-    if (n == 1) return (unsigned char)c;
-    if (n == 0 && !_file_is_sentinel(stream)) stream->eof = 1;
-    if (n < 0 && !_file_is_sentinel(stream)) stream->err = 1;
-    return -1;
+    if (_file_is_sentinel(stream)) {
+        char c;
+        ssize_t n = sys_read(_file_fd(stream), &c, 1);
+        if (n == 1) return (unsigned char)c;
+        return -1;
+    }
+    if (stream->buf_pos >= stream->buf_len) {
+        ssize_t n = sys_read(stream->fd, stream->buf, sizeof(stream->buf));
+        if (n <= 0) {
+            if (n == 0) stream->eof = 1;
+            else stream->err = 1;
+            return -1;
+        }
+        stream->buf_len = (int)n;
+        stream->buf_pos = 0;
+    }
+    return (unsigned char)stream->buf[stream->buf_pos++];
 }
 
 /* ── getdelim & getline: POSIX.1-2008 ────────────────────────────────────── */
@@ -618,58 +639,171 @@ int vsscanf(const char *str, const char *fmt, va_list ap)
     int matched = 0;
     const char *s = str;
 
-    for (; *fmt && *s; fmt++) {
+    while (*fmt && *s) {
         if (*fmt != '%') {
-            if (*fmt == *s) s++;
+            if (*fmt == ' ' || (*fmt >= '\t' && *fmt <= '\r')) {
+                while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
+                fmt++;
+            } else {
+                if (*s != *fmt) goto done;
+                s++;
+                fmt++;
+            }
             continue;
         }
+
+        /* Skip '%' */
         fmt++;
         if (!*fmt) break;
-        if (*fmt != 'c') while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
+
+        if (*fmt == '%') {
+            if (*s != '%') goto done;
+            s++;
+            fmt++;
+            continue;
+        }
+
+        /* Check for assignment suppression flag '*' */
+        bool suppress = false;
+        if (*fmt == '*') {
+            suppress = true;
+            fmt++;
+        }
+
+        /* Parse field width */
+        int width = 0;
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt++ - '0');
+        }
+
+        /* Parse length modifier */
+        enum { LEN_DEFAULT, LEN_HH, LEN_H, LEN_L, LEN_LL, LEN_Z } len_mod = LEN_DEFAULT;
+        if (*fmt == 'h') {
+            fmt++;
+            if (*fmt == 'h') { len_mod = LEN_HH; fmt++; }
+            else { len_mod = LEN_H; }
+        } else if (*fmt == 'l') {
+            fmt++;
+            if (*fmt == 'l') { len_mod = LEN_LL; fmt++; }
+            else { len_mod = LEN_L; }
+        } else if (*fmt == 'z') {
+            len_mod = LEN_Z;
+            fmt++;
+        } else if (*fmt == 'j') {
+            len_mod = LEN_LL;
+            fmt++;
+        }
+
+        /* Leading whitespace skipping: all specifiers EXCEPT 'c' and '[' skip leading whitespace */
+        if (*fmt != 'c' && *fmt != '[') {
+            while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
+            if (!*s) goto done;
+        }
 
         switch (*fmt) {
-        case 'd': case 'i': {
-            int *p = va_arg(ap, int *);
-            int neg = 0;
-            if (*s == '-') { neg = 1; s++; }
-            else if (*s == '+') s++;
-            if (!(*s >= '0' && *s <= '9')) goto done;
-            long long v = 0;
-            while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
-            *p = (int)(neg ? -v : v);
-            matched++;
+        case 'd':
+        case 'i': {
+            int base = (*fmt == 'i') ? 0 : 10;
+            char *endp = NULL;
+            long long val = strtoll(s, &endp, base);
+            if (endp == s) goto done;
+            if (width > 0 && (endp - s) > width) {
+                char tmp[32];
+                int w = width < 31 ? width : 31;
+                for (int i = 0; i < w; i++) tmp[i] = s[i];
+                tmp[w] = '\0';
+                val = strtoll(tmp, &endp, base);
+                if (endp == tmp) goto done;
+                s += (endp - tmp);
+            } else {
+                s = endp;
+            }
+            if (!suppress) {
+                if (len_mod == LEN_HH) *(signed char *)va_arg(ap, signed char *) = (signed char)val;
+                else if (len_mod == LEN_H) *(short *)va_arg(ap, short *) = (short)val;
+                else if (len_mod == LEN_L) *(long *)va_arg(ap, long *) = (long)val;
+                else if (len_mod == LEN_LL) *(long long *)va_arg(ap, long long *) = (long long)val;
+                else if (len_mod == LEN_Z) *(ssize_t *)va_arg(ap, ssize_t *) = (ssize_t)val;
+                else *(int *)va_arg(ap, int *) = (int)val;
+                matched++;
+            }
             break;
         }
-        case 'u': {
-            unsigned int *p = va_arg(ap, unsigned int *);
-            if (!(*s >= '0' && *s <= '9')) goto done;
-            unsigned long long v = 0;
-            while (*s >= '0' && *s <= '9') v = v * 10 + (unsigned long long)(*s++ - '0');
-            *p = (unsigned int)v;
-            matched++;
+        case 'u':
+        case 'x':
+        case 'X':
+        case 'o':
+        case 'p': {
+            int base = 10;
+            if (*fmt == 'x' || *fmt == 'X' || *fmt == 'p') base = 16;
+            else if (*fmt == 'o') base = 8;
+
+            char *endp = NULL;
+            unsigned long long val = strtoull(s, &endp, base);
+            if (endp == s) goto done;
+            if (width > 0 && (endp - s) > width) {
+                char tmp[32];
+                int w = width < 31 ? width : 31;
+                for (int i = 0; i < w; i++) tmp[i] = s[i];
+                tmp[w] = '\0';
+                val = strtoull(tmp, &endp, base);
+                if (endp == tmp) goto done;
+                s += (endp - tmp);
+            } else {
+                s = endp;
+            }
+            if (!suppress) {
+                if (*fmt == 'p') *(void **)va_arg(ap, void **) = (void *)(uintptr_t)val;
+                else if (len_mod == LEN_HH) *(unsigned char *)va_arg(ap, unsigned char *) = (unsigned char)val;
+                else if (len_mod == LEN_H) *(unsigned short *)va_arg(ap, unsigned short *) = (unsigned short)val;
+                else if (len_mod == LEN_L) *(unsigned long *)va_arg(ap, unsigned long *) = (unsigned long)val;
+                else if (len_mod == LEN_LL) *(unsigned long long *)va_arg(ap, unsigned long long *) = (unsigned long long)val;
+                else if (len_mod == LEN_Z) *(size_t *)va_arg(ap, size_t *) = (size_t)val;
+                else *(unsigned int *)va_arg(ap, unsigned int *) = (unsigned int)val;
+                matched++;
+            }
             break;
         }
         case 's': {
-            char *p = va_arg(ap, char *);
             if (!*s) goto done;
-            while (*s && *s != ' ' && !(*s >= '\t' && *s <= '\r')) *p++ = *s++;
-            *p = '\0';
-            matched++;
+            char *p = suppress ? NULL : va_arg(ap, char *);
+            int count = 0;
+            while (*s && *s != ' ' && !(*s >= '\t' && *s <= '\r')) {
+                if (width > 0 && count >= width) break;
+                if (!suppress && p) *p++ = *s;
+                s++;
+                count++;
+            }
+            if (!suppress && p) {
+                *p = '\0';
+                matched++;
+            }
             break;
         }
         case 'c': {
-            char *p = va_arg(ap, char *);
-            *p = *s++;
-            matched++;
+            if (!*s) goto done;
+            char *p = suppress ? NULL : va_arg(ap, char *);
+            int count = width > 0 ? width : 1;
+            for (int i = 0; i < count && *s; i++) {
+                if (!suppress && p) *p++ = *s;
+                s++;
+            }
+            if (!suppress) matched++;
             break;
         }
-        case '%':
-            if (*s == '%') s++;
+        case 'n': {
+            if (!suppress) {
+                int *p = va_arg(ap, int *);
+                if (p) *p = (int)(s - str);
+            }
             break;
+        }
         default:
             goto done;
         }
+        fmt++;
     }
+
 done:
     return matched;
 }
@@ -711,6 +845,8 @@ FILE *fopen(const char *path, const char *mode)
     f->unget_char = -1;
     f->is_pipe = 0;
     f->pipe_pid = 0;
+    f->buf_pos = 0;
+    f->buf_len = 0;
     return f;
 }
 
@@ -726,6 +862,8 @@ FILE *fdopen(int fd, const char *mode)
     f->unget_char = -1;
     f->is_pipe = 0;
     f->pipe_pid = 0;
+    f->buf_pos = 0;
+    f->buf_len = 0;
     return f;
 }
 
@@ -742,6 +880,8 @@ FILE *freopen(const char *path, const char *mode, FILE *stream)
         stream->err = 0;
         stream->eof = 0;
         stream->unget_char = -1;
+        stream->buf_pos = 0;
+        stream->buf_len = 0;
         free(new_f);
         return stream;
     }
@@ -807,6 +947,13 @@ int pclose(FILE *stream)
 int fclose(FILE *stream)
 {
     if (!stream || _file_is_sentinel(stream)) return -1;
+    if (stream->is_memstream) {
+        if (stream->is_dynamic && !stream->mem_bufloc) {
+            free(stream->mem_buf);
+        }
+        free(stream);
+        return 0;
+    }
     int r = sys_close(stream->fd);
     free(stream);
     return r;
@@ -820,6 +967,19 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
     unsigned char *p = (unsigned char *)ptr;
     size_t done = 0;
 
+    if (!_file_is_sentinel(stream) && stream->is_memstream) {
+        if (stream->mem_pos >= stream->mem_size) {
+            stream->eof = 1;
+            return 0;
+        }
+        size_t avail = stream->mem_size - stream->mem_pos;
+        size_t to_read = total < avail ? total : avail;
+        memcpy(ptr, stream->mem_buf + stream->mem_pos, to_read);
+        stream->mem_pos += to_read;
+        if (to_read < total) stream->eof = 1;
+        return to_read / size;
+    }
+
     if (!_file_is_sentinel(stream) && stream->unget_char != -1) {
         *p++ = (unsigned char)stream->unget_char;
         stream->unget_char = -1;
@@ -827,10 +987,23 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
         if (done == total) return 1;
     }
 
-    ssize_t n = sys_read(_file_fd(stream), p, total - done);
-    if (n < 0) { if (!_file_is_sentinel(stream)) stream->err = 1; return done / size; }
-    if (n == 0) { if (!_file_is_sentinel(stream)) stream->eof = 1; }
-    done += (size_t)n;
+    if (!_file_is_sentinel(stream) && stream->buf_pos < stream->buf_len) {
+        size_t avail = (size_t)(stream->buf_len - stream->buf_pos);
+        size_t take = (total - done < avail) ? (total - done) : avail;
+        memcpy(p, stream->buf + stream->buf_pos, take);
+        stream->buf_pos += (int)take;
+        p += take;
+        done += take;
+        if (done == total) return done / size;
+    }
+
+    while (done < total) {
+        ssize_t n = sys_read(_file_fd(stream), p, total - done);
+        if (n < 0) { if (!_file_is_sentinel(stream)) stream->err = 1; return done / size; }
+        if (n == 0) { if (!_file_is_sentinel(stream)) stream->eof = 1; break; }
+        done += (size_t)n;
+        p += (size_t)n;
+    }
     return done / size;
 }
 
@@ -839,6 +1012,36 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
     if (!ptr || size == 0 || nmemb == 0 || !stream) return 0;
     if (nmemb > (size_t)-1 / size) return 0;
     size_t total = size * nmemb;
+
+    if (!_file_is_sentinel(stream) && stream->is_memstream) {
+        if (stream->is_dynamic) {
+            if (stream->mem_pos + total >= stream->mem_size) {
+                size_t new_cap = (stream->mem_pos + total + 1) * 2;
+                char *nb = (char *)realloc(stream->mem_buf, new_cap);
+                if (!nb) { stream->err = 1; return 0; }
+                stream->mem_buf = nb;
+                stream->mem_size = new_cap;
+                if (stream->mem_bufloc) *stream->mem_bufloc = nb;
+            }
+        } else {
+            if (stream->mem_pos >= stream->mem_size) {
+                stream->err = 1;
+                return 0;
+            }
+            if (stream->mem_pos + total > stream->mem_size) {
+                total = stream->mem_size - stream->mem_pos;
+            }
+        }
+        memcpy(stream->mem_buf + stream->mem_pos, ptr, total);
+        stream->mem_pos += total;
+        if (stream->is_dynamic && stream->mem_bufloc && stream->mem_sizeloc) {
+            stream->mem_buf[stream->mem_pos] = '\0';
+            *stream->mem_bufloc = stream->mem_buf;
+            *stream->mem_sizeloc = stream->mem_pos;
+        }
+        return total / size;
+    }
+
     ssize_t n = sys_write(_file_fd(stream), ptr, total);
     if (n < 0) { if (!_file_is_sentinel(stream)) stream->err = 1; return 0; }
     return (size_t)n / size;
@@ -847,7 +1050,22 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
 int fseek(FILE *stream, long offset, int whence)
 {
     if (!stream) return -1;
-    if (!_file_is_sentinel(stream)) stream->unget_char = -1;
+    if (!_file_is_sentinel(stream) && stream->is_memstream) {
+        long new_pos = (long)stream->mem_pos;
+        if (whence == SEEK_SET) new_pos = offset;
+        else if (whence == SEEK_CUR) new_pos += offset;
+        else if (whence == SEEK_END) new_pos = (long)(stream->is_dynamic && stream->mem_sizeloc ? *stream->mem_sizeloc : stream->mem_size) + offset;
+        if (new_pos < 0) return -1;
+        stream->mem_pos = (size_t)new_pos;
+        stream->eof = 0;
+        return 0;
+    }
+
+    if (!_file_is_sentinel(stream)) {
+        stream->unget_char = -1;
+        stream->buf_pos = 0;
+        stream->buf_len = 0;
+    }
     long r = syscall3(SYS_lseek, (long)_file_fd(stream), offset, (long)whence);
     return (r < 0) ? -1 : 0;
 }
@@ -855,6 +1073,9 @@ int fseek(FILE *stream, long offset, int whence)
 long ftell(FILE *stream)
 {
     if (!stream) return -1;
+    if (!_file_is_sentinel(stream) && stream->is_memstream) {
+        return (long)stream->mem_pos;
+    }
     return (long)syscall3(SYS_lseek, (long)_file_fd(stream), 0L, (long)SEEK_CUR);
 }
 
@@ -870,8 +1091,56 @@ off_t ftello(FILE *stream)
 
 int fflush(FILE *stream)
 {
-    (void)stream;
+    if (stream && !_file_is_sentinel(stream) && stream->is_memstream) {
+        if (stream->is_dynamic && stream->mem_bufloc && stream->mem_sizeloc && stream->mem_buf) {
+            stream->mem_buf[stream->mem_pos] = '\0';
+            *stream->mem_bufloc = stream->mem_buf;
+            *stream->mem_sizeloc = stream->mem_pos;
+        }
+    }
     return 0;
+}
+
+/* ── POSIX.1-2008 Memory Streams (fmemopen, open_memstream) ────────────────── */
+
+FILE *fmemopen(void *buf, size_t size, const char *mode)
+{
+    if (size == 0) { errno = EINVAL; return NULL; }
+    FILE *f = (FILE *)calloc(1, sizeof(FILE));
+    if (!f) return NULL;
+    f->fd = -1;
+    f->is_memstream = 1;
+    f->is_dynamic = (buf == NULL);
+    f->mem_size = size;
+    f->mem_pos = (mode && mode[0] == 'a' && buf) ? strlen((char *)buf) : 0;
+    if (buf) {
+        f->mem_buf = (char *)buf;
+    } else {
+        f->mem_buf = (char *)malloc(size);
+        if (!f->mem_buf) { free(f); return NULL; }
+        memset(f->mem_buf, 0, size);
+    }
+    return f;
+}
+
+FILE *open_memstream(char **bufloc, size_t *sizeloc)
+{
+    if (!bufloc || !sizeloc) { errno = EINVAL; return NULL; }
+    FILE *f = (FILE *)calloc(1, sizeof(FILE));
+    if (!f) return NULL;
+    f->fd = -1;
+    f->is_memstream = 1;
+    f->is_dynamic = 1;
+    f->mem_size = 64;
+    f->mem_pos = 0;
+    f->mem_buf = (char *)malloc(f->mem_size);
+    if (!f->mem_buf) { free(f); return NULL; }
+    f->mem_buf[0] = '\0';
+    f->mem_bufloc = bufloc;
+    f->mem_sizeloc = sizeloc;
+    *bufloc = f->mem_buf;
+    *sizeloc = 0;
+    return f;
 }
 
 int feof(FILE *stream)
@@ -888,7 +1157,13 @@ int ferror(FILE *stream)
 
 void clearerr(FILE *stream)
 {
-    if (stream && !_file_is_sentinel(stream)) { stream->err = 0; stream->eof = 0; stream->unget_char = -1; }
+    if (stream && !_file_is_sentinel(stream)) {
+        stream->err = 0;
+        stream->eof = 0;
+        stream->unget_char = -1;
+        stream->buf_pos = 0;
+        stream->buf_len = 0;
+    }
 }
 
 int fileno(FILE *stream)

@@ -122,46 +122,292 @@ void desktop_draw_taskbar(unsigned int *buf, unsigned int w, unsigned int h, uns
     }
 }
 
-/* ── Mouse cursor (pre-rendered 14×21 sprite with black border & white body) ─ */
+/* ── Mouse cursors (16×21 sprites with black border & white body) ─────────── */
 
 #define C_TRN 0x00000000U
 #define C_OUT 0xFF000000U
 #define C_WHT 0xFFFFFFFFU
+#define C_BLU 0xFF89B4FAU
 
-static const unsigned int g_cursor_sprite[21][14] = {
-    { C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_WHT, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_WHT, C_OUT, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_OUT, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
-    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+/* 0. Default Pointer Arrow */
+static const unsigned int g_cursor_default[21][16] = {
+    { C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_OUT, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_OUT, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
 };
 
-void desktop_draw_cursor(unsigned int *buf, unsigned int w, unsigned int h, unsigned int pitch_px,
-                         int cx, int cy)
+/* 1. Pointing Hand (Hand / Pointer) */
+static const unsigned int g_cursor_pointer[21][16] = {
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_OUT, C_WHT, C_WHT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_OUT, C_OUT, C_WHT, C_WHT, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+};
+
+/* 2. Text I-Beam */
+static const unsigned int g_cursor_ibeam[21][16] = {
+    { C_TRN, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_OUT, C_WHT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_OUT, C_WHT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+};
+
+/* 3. Crosshair */
+static const unsigned int g_cursor_crosshair[21][16] = {
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+};
+
+/* 4. Move (4-directional cross) */
+static const unsigned int g_cursor_move[21][16] = {
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_WHT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_OUT, C_OUT, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_OUT, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN },
+    { C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_WHT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+};
+
+/* 5. Resize NWSE (\) */
+static const unsigned int g_cursor_resize_nwse[21][16] = {
+    { C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_OUT, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_OUT, C_OUT, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+};
+
+/* 6. Resize NESW (/) */
+static const unsigned int g_cursor_resize_nesw[21][16] = {
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_WHT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_OUT, C_OUT, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_OUT, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+};
+
+/* 7. Resize EW (<->) */
+static const unsigned int g_cursor_resize_ew[21][16] = {
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN },
+    { C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+};
+
+/* 8. Resize NS (up-down) */
+static const unsigned int g_cursor_resize_ns[21][16] = {
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_WHT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+};
+
+/* 9. Wait / Spinner indicator */
+static const unsigned int g_cursor_wait[21][16] = {
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_OUT, C_BLU, C_BLU, C_BLU, C_BLU, C_BLU, C_BLU, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_BLU, C_BLU, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_BLU, C_BLU, C_OUT, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_BLU, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_BLU, C_OUT, C_TRN, C_TRN, C_TRN },
+    { C_OUT, C_BLU, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_BLU, C_OUT, C_TRN, C_TRN },
+    { C_OUT, C_BLU, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_BLU, C_OUT, C_TRN, C_TRN },
+    { C_OUT, C_BLU, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_OUT, C_BLU, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_OUT, C_BLU, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_OUT, C_WHT, C_WHT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_WHT, C_WHT, C_OUT, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_OUT, C_OUT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_WHT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_OUT, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+    { C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN, C_TRN },
+};
+
+static const unsigned int (*get_cursor_table(unsigned int cursor_type))[16]
 {
+    switch (cursor_type) {
+        case AZ_CURSOR_POINTER:     return g_cursor_pointer;
+        case AZ_CURSOR_IBEAM:       return g_cursor_ibeam;
+        case AZ_CURSOR_CROSSHAIR:   return g_cursor_crosshair;
+        case AZ_CURSOR_MOVE:        return g_cursor_move;
+        case AZ_CURSOR_RESIZE_NWSE: return g_cursor_resize_nwse;
+        case AZ_CURSOR_RESIZE_NESW: return g_cursor_resize_nesw;
+        case AZ_CURSOR_RESIZE_EW:   return g_cursor_resize_ew;
+        case AZ_CURSOR_RESIZE_NS:   return g_cursor_resize_ns;
+        case AZ_CURSOR_WAIT:        return g_cursor_wait;
+        case AZ_CURSOR_DEFAULT:
+        default:                    return g_cursor_default;
+    }
+}
+
+void desktop_draw_cursor(unsigned int *buf, unsigned int w, unsigned int h, unsigned int pitch_px,
+                         int cx, int cy, unsigned int cursor_type)
+{
+    const unsigned int (*sprite)[16] = get_cursor_table(cursor_type);
+
     for (int row = 0; row < 21; row++) {
         int py = cy + row;
         if (py < 0 || py >= (int)h) continue;
-        for (int col = 0; col < 14; col++) {
+        for (int col = 0; col < 16; col++) {
             int px = cx + col;
             if (px < 0 || px >= (int)w) continue;
-            unsigned int pixel = g_cursor_sprite[row][col];
+            unsigned int pixel = sprite[row][col];
             if (pixel != C_TRN) {
                 buf[(unsigned int)py * pitch_px + (unsigned int)px] = pixel;
             }
@@ -169,14 +415,17 @@ void desktop_draw_cursor(unsigned int *buf, unsigned int w, unsigned int h, unsi
     }
 }
 
-void desktop_cursor_blit_bgra(unsigned int *dst, unsigned int dst_w, unsigned int dst_h)
+void desktop_cursor_blit_bgra_type(unsigned int *dst, unsigned int dst_w, unsigned int dst_h, unsigned int cursor_type)
 {
-    /* The sprite is already 0xAARRGGBB, which is the byte order the display's
-     * BGRA8888 cursor resource expects on a little-endian guest — the same
-     * pixels the framebuffer path feeds. */
+    const unsigned int (*sprite)[16] = get_cursor_table(cursor_type);
     for (int row = 0; row < DESKTOP_CURSOR_H && (unsigned)row < dst_h; row++) {
         for (int col = 0; col < DESKTOP_CURSOR_W && (unsigned)col < dst_w; col++) {
-            dst[(unsigned)row * dst_w + (unsigned)col] = g_cursor_sprite[row][col];
+            dst[(unsigned)row * dst_w + (unsigned)col] = sprite[row][col];
         }
     }
+}
+
+void desktop_cursor_blit_bgra(unsigned int *dst, unsigned int dst_w, unsigned int dst_h)
+{
+    desktop_cursor_blit_bgra_type(dst, dst_w, dst_h, AZ_CURSOR_DEFAULT);
 }

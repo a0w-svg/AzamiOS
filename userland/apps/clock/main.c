@@ -350,12 +350,29 @@ int main(int argc, char **argv)
 
         if (msg.type == AZ_WM_DESTROY_WINDOW) break;
 
+        if (msg.type == AZ_WM_WINDOW_RESIZED) {
+            if (!uk_handle_resize(&g_win, &msg)) break;
+            draw_clock_app();
+            continue;
+        }
+
         if (msg.type == AZ_WM_TIMER_TICK) {
+            /* This timer fires every 100ms so the stopwatch (Timer tab) can
+             * show tenths while running, but the Clock/World tabs only ever
+             * change once a second — so 9 out of 10 ticks used to repaint
+             * the whole window (clock face, both tabs' worth of state, the
+             * stopwatch box, the lap list) for a frame that looks pixel-for-
+             * pixel identical to the one before it. Redraw only when the
+             * displayed second actually rolled over, or the stopwatch is
+             * live and genuinely needs the finer cadence. */
+            int prev_secs = g_secs;
             update_system_time();
             if (g_sw_running) {
                 g_sw_elapsed_ms += 100;
             }
-            draw_clock_app();
+            if (g_secs != prev_secs || g_sw_running) {
+                draw_clock_app();
+            }
         } else if (msg.type == AZ_WM_MOUSE_EVENT) {
             int mx = msg.mouse.abs_x;
             int my = msg.mouse.abs_y;

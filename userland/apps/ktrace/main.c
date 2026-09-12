@@ -19,10 +19,13 @@ static void print_usage(const char *prog)
     printf("Commands:\n");
     printf("  enable <func...>   Enable tracing for named function(s) or 'all'\n");
     printf("  disable <func...>  Disable tracing for named function(s) or 'all'\n");
+    printf("  profile <bundle>   Enable tracing bundle (syscalls, vfs, sched, ipc, all)\n");
     printf("  list               List currently traced functions\n");
     printf("  pipe / dump        Read and print pending trace events\n");
     printf("  stream             Stream trace events continuously (Ctrl-C to stop)\n");
     printf("  clear              Clear the kernel trace ring buffer\n");
+    printf("  -V, --version      Display version information\n");
+    printf("  -h, --help         Display this help message\n");
 }
 
 static int do_enable(const char *name)
@@ -259,6 +262,36 @@ int main(int argc, char **argv)
             }
         }
         return 0;
+    } else if (strcmp(cmd, "profile") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Error: missing profile name (syscalls, vfs, sched, ipc, all)\n");
+            return 1;
+        }
+        const char *prof = argv[2];
+        if (strcmp(prof, "syscalls") == 0) {
+            const char *fns[] = { "sys_read", "sys_write", "sys_open", "sys_close", "sys_ioctl", "sys_mmap", "sys_fork", NULL };
+            for (int i = 0; fns[i]; i++) do_enable(fns[i]);
+            printf("Enabled trace profile: syscalls\n");
+        } else if (strcmp(prof, "vfs") == 0) {
+            const char *fns[] = { "vfs_read", "vfs_write", "vfs_lookup", "vfs_open", "vfs_close", "vfs_mount", NULL };
+            for (int i = 0; fns[i]; i++) do_enable(fns[i]);
+            printf("Enabled trace profile: vfs\n");
+        } else if (strcmp(prof, "sched") == 0) {
+            const char *fns[] = { "sched_switch", "sched_yield", "sched_fork", "sched_wake", NULL };
+            for (int i = 0; fns[i]; i++) do_enable(fns[i]);
+            printf("Enabled trace profile: sched\n");
+        } else if (strcmp(prof, "ipc") == 0) {
+            const char *fns[] = { "ipc_send", "ipc_recv", "channel_create", "channel_write", NULL };
+            for (int i = 0; fns[i]; i++) do_enable(fns[i]);
+            printf("Enabled trace profile: ipc\n");
+        } else if (strcmp(prof, "all") == 0) {
+            do_enable("all");
+            printf("Enabled trace profile: all\n");
+        } else {
+            fprintf(stderr, "Unknown profile '%s'. Valid: syscalls, vfs, sched, ipc, all\n", prof);
+            return 1;
+        }
+        return 0;
     } else if (strcmp(cmd, "list") == 0 || strcmp(cmd, "status") == 0) {
         return do_list();
     } else if (strcmp(cmd, "clear") == 0) {
@@ -269,6 +302,9 @@ int main(int argc, char **argv)
         return do_stream();
     } else if (strcmp(cmd, "test") == 0) {
         return do_test();
+    } else if (strcmp(cmd, "-V") == 0 || strcmp(cmd, "--version") == 0) {
+        printf("ktrace 7.0.0 (AzamiOS Kernel Function Tracer)\n");
+        return 0;
     } else if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0 || strcmp(cmd, "help") == 0) {
         print_usage(argv[0]);
         return 0;

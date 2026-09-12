@@ -404,6 +404,12 @@ int main(int argc, char **argv)
 
         if (msg.type == AZ_WM_DESTROY_WINDOW) break;
 
+        if (msg.type == AZ_WM_WINDOW_RESIZED) {
+            if (!uk_handle_resize(&g_win, &msg)) break;
+            draw_minesweeper();
+            continue;
+        }
+
         if (msg.type == AZ_WM_TIMER_TICK) {
             if (g_game_started && !g_game_over) {
                 g_time_seconds++;

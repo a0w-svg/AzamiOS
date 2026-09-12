@@ -153,6 +153,12 @@ int main(int argc, char **argv)
             break;
         }
 
+        if (msg.type == AZ_WM_WINDOW_RESIZED) {
+            if (!uk_handle_resize(&g_win, &msg)) break;
+            draw_screenshot_ui();
+            continue;
+        }
+
         if (msg.type == AZ_WM_MOUSE_EVENT) {
             if (msg.mouse.buttons & AZ_MOUSE_BTN_LEFT) {
                 int mx = msg.mouse.abs_x;

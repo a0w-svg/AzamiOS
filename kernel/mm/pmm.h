@@ -53,6 +53,7 @@ void pmm_free(phys_addr_t phys, u32 order);
 /** Convenience wrappers for single-page allocation (order 0). */
 static inline phys_addr_t pmm_alloc_page(void) { return pmm_alloc(0); }
 static inline void        pmm_free_page(phys_addr_t p) { pmm_free(p, 0); }
+phys_addr_t               pmm_alloc_page_zeroed(void);
 
 /** Multi-page allocation helper (calculates required order automatically). */
 phys_addr_t pmm_alloc_pages(size_t page_count);

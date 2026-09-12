@@ -64,6 +64,8 @@ static int g_hist_count = 0;
 static int g_hist_idx = 0;
 
 static unsigned int g_tick = 0;
+static bool g_blink_on = true; /* last drawn cursor-blink phase; see the
+                                 * AZ_WM_TIMER_TICK handler below */
 
 static void update_cwd(void) {
   if (sys_getcwd(g_cwd, sizeof(g_cwd)) <= 0) {
@@ -263,30 +265,35 @@ static void do_tab_completion(void) {
     prefix[sizeof(prefix) - 1] = '\0';
     int plen = strlen(prefix);
 
-    DIR *dir = opendir("/bin");
-    if (!dir)
-      return;
-
+    const char *search_dirs[] = {"/bin", "/sbin", "/usr/bin"};
     int match_count = 0;
     char match[64];
     match[0] = '\0';
 
-    struct dirent *d;
-    while ((d = readdir(dir)) != NULL) {
-      char clean_name[64];
-      strncpy(clean_name, d->d_name, sizeof(clean_name) - 1);
-      clean_name[sizeof(clean_name) - 1] = '\0';
-      char *dot = strstr(clean_name, ".elf");
-      if (dot)
-        *dot = '\0';
+    for (size_t di = 0; di < sizeof(search_dirs) / sizeof(search_dirs[0]); di++) {
+      DIR *dir = opendir(search_dirs[di]);
+      if (!dir)
+        continue;
 
-      if (strncmp(clean_name, prefix, plen) == 0) {
-        match_count++;
-        strncpy(match, clean_name, sizeof(match) - 1);
-        match[sizeof(match) - 1] = '\0';
+      struct dirent *d;
+      while ((d = readdir(dir)) != NULL) {
+        char clean_name[64];
+        strncpy(clean_name, d->d_name, sizeof(clean_name) - 1);
+        clean_name[sizeof(clean_name) - 1] = '\0';
+        char *dot = strstr(clean_name, ".elf");
+        if (dot)
+          *dot = '\0';
+
+        if (strncmp(clean_name, prefix, plen) == 0) {
+          if (match_count == 0 || strcmp(match, clean_name) != 0) {
+            match_count++;
+            strncpy(match, clean_name, sizeof(match) - 1);
+            match[sizeof(match) - 1] = '\0';
+          }
+        }
       }
+      closedir(dir);
     }
-    closedir(dir);
 
     if (match_count == 1 && match[0] != '\0') {
       strncpy(g_input, match, MAX_CMD);
@@ -355,7 +362,7 @@ static void do_tab_completion(void) {
 static void show_help(void) {
   term_print("AzamiOS Terminal — Available System Commands & Utilities:",
              UK_MAUVE);
-  term_print("  System & Info : help, whoami, uname, fetch, date, uptime, df, "
+  term_print("  System & Info : help, whoami, uname, fetch, sysctl, date, uptime, df, "
              "free, ps, top, time",
              UK_TEXT);
   term_print("  File & Dir    : ls, find, du, cat, head, tail, grep, wc, "
@@ -371,6 +378,8 @@ static void show_help(void) {
              "settings, paint)",
              UK_SAPPHIRE);
   term_print("  Session       : exit, reboot, poweroff", UK_TEXT);
+  term_print("Shortcuts: Ctrl+Shift+C/V (Clipboard), Ctrl+L (Clear), Ctrl+C/U/W (Edit)",
+             UK_OVERLAY0);
   term_print("Tip: Use Up/Down arrows for history, Tab for auto-complete.",
              UK_OVERLAY0);
 }
@@ -631,6 +640,28 @@ static void execute_command(const char *raw_cmd) {
   }
 }
 
+/*
+ * input_line_layout() — where the input line's prompt, text, and cursor go.
+ * Factored out of draw_terminal() so draw_cursor_blink()'s fast path below
+ * computes the exact same cursor position draw_terminal() itself draws
+ * text up against, instead of keeping its own copy of this formula that
+ * could quietly drift out of sync with the real one.
+ */
+static void input_line_layout(char *prompt_buf, size_t buf_size,
+                               int *out_plen, int *out_cx, int *out_input_y) {
+  int input_y = (int)g_win.height - FONT_H - 8;
+  snprintf(prompt_buf, buf_size, "%s$ ",
+           (strcmp(g_cwd, "/") == 0)
+               ? "/"
+               : (g_cwd + strlen(g_cwd) -
+                  (strlen(g_cwd) > 12 ? 12 : strlen(g_cwd))));
+  int plen = (int)strlen(prompt_buf);
+
+  if (out_input_y) *out_input_y = input_y;
+  if (out_plen) *out_plen = plen;
+  if (out_cx) *out_cx = TERM_OX + plen * FONT_W + g_input_len * FONT_W;
+}
+
 /* ── Draw Terminal Window
  * ────────────────────────────────────────────────────── */
 static void draw_terminal(void) {
@@ -678,28 +709,45 @@ static void draw_terminal(void) {
   }
 
   /* Input prompt bar */
-  int input_y = (int)h - FONT_H - 8;
+  char prompt[32];
+  int plen, cx, input_y;
+  input_line_layout(prompt, sizeof(prompt), &plen, &cx, &input_y);
+
   uk_fill_rect(&g_win, 0, input_y - 3, (int)w, FONT_H + 11, UK_SURFACE0);
   uk_hline(&g_win, 0, input_y - 3, (int)w, UK_SURFACE1);
 
   /* Prompt indicator */
-  char prompt[32];
-  snprintf(prompt, sizeof(prompt), "%s$ ",
-           (strcmp(g_cwd, "/") == 0)
-               ? "/"
-               : (g_cwd + strlen(g_cwd) -
-                  (strlen(g_cwd) > 12 ? 12 : strlen(g_cwd))));
-  int plen = strlen(prompt);
   uk_draw_text(&g_win, TERM_OX, input_y, prompt, UK_GREEN);
   uk_draw_text(&g_win, TERM_OX + plen * FONT_W, input_y, g_input, UK_TEXT);
 
   /* Cursor blink */
   if ((g_tick / 5) % 2 == 0) {
-    int cx = TERM_OX + plen * FONT_W + g_input_len * FONT_W;
     uk_fill_rect(&g_win, cx, input_y, 2, FONT_H, UK_GREEN);
   }
 
   uk_invalidate(&g_win);
+}
+
+/*
+ * draw_cursor_blink() — the AZ_WM_TIMER_TICK fast path for the tick that
+ * only flips the cursor's blink phase (see the handler below). Nothing
+ * else in the window can have changed since the last full draw_terminal():
+ * every other event this loop handles (a key, a scroll, a resize) sets
+ * needs_redraw and goes through the real draw_terminal() above instead, so
+ * the layout input_line_layout() computes here is guaranteed to match
+ * what's already published everywhere except this one 2px-wide strip.
+ * That's what makes it safe to touch only the cursor rect and publish only
+ * that rect with uk_invalidate_rect(), instead of repainting and
+ * republishing the whole terminal buffer just to blink one cursor.
+ */
+static void draw_cursor_blink(void) {
+  char prompt[32];
+  int plen, cx, input_y;
+  input_line_layout(prompt, sizeof(prompt), &plen, &cx, &input_y);
+  (void)plen;
+
+  uk_fill_rect(&g_win, cx, input_y, 2, FONT_H, g_blink_on ? UK_GREEN : UK_SURFACE0);
+  uk_invalidate_rect(&g_win, cx, input_y, 2, FONT_H);
 }
 
 /* ── Key Event Handler
@@ -718,6 +766,43 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
     execute_command(g_input);
     g_input_len = 0;
     g_input[0] = '\0';
+    return;
+  }
+
+  /* Ctrl+Shift+C: Copy command or last output line to clipboard */
+  if (ctrl && shift && (keycode == 'c' || keycode == 'C' || scancode == 46 || scancode == 0x2E)) {
+    const char *text_to_copy = g_input[0] ? g_input : (g_line_count > 0 ? g_lines[g_line_count - 1] : "");
+    if (text_to_copy[0]) {
+      uk_clipboard_set(&g_win, text_to_copy);
+    }
+    return;
+  }
+
+  /* Ctrl+Shift+V: Paste clipboard content into command line */
+  if (ctrl && shift && (keycode == 'v' || keycode == 'V' || scancode == 47 || scancode == 0x2F)) {
+    char paste_buf[AZ_WM_CLIPBOARD_TEXT_MAX];
+    int n = uk_clipboard_get(&g_win, paste_buf, sizeof(paste_buf));
+    if (n > 0) {
+      for (int i = 0; i < n && g_input_len < MAX_CMD - 1; i++) {
+        char ch = paste_buf[i];
+        if (ch >= 32 && ch <= 126) {
+          g_input[g_input_len++] = ch;
+        }
+      }
+      g_input[g_input_len] = '\0';
+    }
+    return;
+  }
+
+  /* Ctrl+W: Delete word backward */
+  if (keycode == 23 || (ctrl && (keycode == 'w' || keycode == 'W' || scancode == 17 || scancode == 0x11))) {
+    while (g_input_len > 0 && (g_input[g_input_len - 1] == ' ' || g_input[g_input_len - 1] == '\t')) {
+      g_input_len--;
+    }
+    while (g_input_len > 0 && g_input[g_input_len - 1] != ' ' && g_input[g_input_len - 1] != '\t') {
+      g_input_len--;
+    }
+    g_input[g_input_len] = '\0';
     return;
   }
 
@@ -914,12 +999,37 @@ int main(int argc, char **argv) {
     g_tick++;
     bool needs_redraw = true;
 
-    if (msg.type == AZ_WM_KEY_EVENT) {
+    if (msg.type == AZ_WM_WINDOW_RESIZED) {
+      /* A drag-resize, edge-snap, or maximize/restore reallocated our
+       * surface — remap to it before the redraw below, which already lays
+       * out from g_win.width/height dynamically (see draw_terminal()). A
+       * failed remap leaves the window with no valid surface left to draw
+       * into or commit from, so there is nothing safer left to do than
+       * close cleanly instead of faulting on the next frame. */
+      if (!uk_handle_resize(&g_win, &msg)) {
+        break;
+      }
+    } else if (msg.type == AZ_WM_KEY_EVENT) {
       handle_key(msg.key.keycode, msg.key.scancode, msg.key.pressed,
                  msg.key.modifiers);
     } else if (msg.type == AZ_WM_TIMER_TICK) {
-      /* Blink cursor */
-      needs_redraw = true;
+      /* Cursor blink phase only flips every 5 ticks (500ms; see the
+       * (g_tick/5)%2 in draw_terminal()), but this timer itself fires every
+       * 100ms — so redrawing unconditionally here meant a full repaint of
+       * the whole terminal buffer 10 times a second, forever, for every
+       * open terminal, on 4 out of every 5 ticks where the cursor looked
+       * exactly the same as the frame before. On the 1 in 5 that does flip,
+       * draw_cursor_blink() repaints and republishes only the cursor's own
+       * 2px-wide rect instead of the whole window — nothing else on screen
+       * can have changed on a tick that carried nothing but a timer (see
+       * its comment) — so this path never falls through to the full
+       * draw_terminal() below at all. */
+      bool blink_on = ((g_tick / 5) % 2 == 0);
+      needs_redraw = false;
+      if (blink_on != g_blink_on) {
+        g_blink_on = blink_on;
+        draw_cursor_blink();
+      }
     } else if (msg.type == AZ_WM_MOUSE_EVENT) {
       /* Scrolling follows the wheel.  Pointer motion (dx/dy) deliberately
        * does not: reading that as a wheel scrolls the backlog away the

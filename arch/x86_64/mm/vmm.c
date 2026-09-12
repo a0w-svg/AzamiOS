@@ -53,7 +53,6 @@ static spinlock_t g_vmm_lock = SPINLOCK_INIT;
  */
 #define VMM_MAX_PHYS_PAGES  (32ULL * 1024 * 1024 * 1024 / 4096)
 static uint16_t g_page_refcounts[VMM_MAX_PHYS_PAGES];
-static spinlock_t g_cow_lock = SPINLOCK_INIT;
 
 static inline size_t pfn(phys_addr_t p) { return (size_t)(p >> 12); }
 
@@ -61,30 +60,21 @@ void vmm_page_ref_inc(phys_addr_t p)
 {
     size_t f = pfn(p);
     if (f >= VMM_MAX_PHYS_PAGES) return;
-    irqflags_t fl = spinlock_lock_irqsave(&g_cow_lock);
-    g_page_refcounts[f]++;
-    spinlock_unlock_irqrestore(&g_cow_lock, fl);
+    __atomic_add_fetch(&g_page_refcounts[f], 1, __ATOMIC_RELAXED);
 }
 
 uint16_t vmm_page_ref_dec(phys_addr_t p)
 {
     size_t f = pfn(p);
     if (f >= VMM_MAX_PHYS_PAGES) return 0;
-    irqflags_t fl = spinlock_lock_irqsave(&g_cow_lock);
-    if (g_page_refcounts[f] > 0) g_page_refcounts[f]--;
-    uint16_t v = g_page_refcounts[f];
-    spinlock_unlock_irqrestore(&g_cow_lock, fl);
-    return v;
+    return __atomic_sub_fetch(&g_page_refcounts[f], 1, __ATOMIC_ACQ_REL);
 }
 
 static inline uint16_t vmm_page_refcount(phys_addr_t p)
 {
     size_t f = pfn(p);
     if (f >= VMM_MAX_PHYS_PAGES) return 0;
-    irqflags_t fl = spinlock_lock_irqsave(&g_cow_lock);
-    uint16_t v = g_page_refcounts[f];
-    spinlock_unlock_irqrestore(&g_cow_lock, fl);
-    return v;
+    return __atomic_load_n(&g_page_refcounts[f], __ATOMIC_ACQUIRE);
 }
 
 /* ── Internal helpers ─────────────────────────────────────────────────────── */
@@ -305,9 +295,7 @@ size_t vmm_unmap_range(vmm_space_t space, virt_addr_t virt, size_t count, bool f
             if (free_frames && (old & VMM_F_USER) && !(old & VMM_F_SHARED)) {
                 /* COW-shared frame: only free when last reference drops. */
                 if (old & VMM_F_COW) {
-                    spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
                     uint16_t rc = vmm_page_ref_dec(phys);
-                    irqf = spinlock_lock_irqsave(&g_vmm_lock);
                     if (rc == 0)
                         batch[nbatch++] = phys;
                 } else {
@@ -524,63 +512,20 @@ vmm_space_t vmm_clone_space(vmm_space_t src)
                     if ((src_pt[pti] & VMM_F_USER) && !(src_pt[pti] & VMM_F_SHARED)) {
                         phys_addr_t fp = src_pt[pti] & VMM_PHYS_MASK;
                         if (fp) {
-                            if (src_pt[pti] & VMM_F_WRITE) {
-                                /* Strip WRITE, set COW in both parent and child. */
+                            if (src_pt[pti] & VMM_F_COW) {
+                                /* Already COW (grandchild fork): share and bump refcount. */
+                                dst_pt[pti] = src_pt[pti];
+                                vmm_page_ref_inc(fp);
+                            } else {
+                                /* First fork for this page (whether writable or read-only):
+                                 * Strip WRITE if present, mark both parent and child COW,
+                                 * and initialize refcount to 2 (parent + child).
+                                 * A write fault will verify VMA permissions before breaking COW. */
                                 u64 cow_pte = (src_pt[pti] & ~VMM_F_WRITE) | VMM_F_COW;
                                 src_pt[pti] = cow_pte;
                                 dst_pt[pti] = cow_pte;
-                                /* Bump refcount to 2 (one existing owner + new child). */
-                                spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
                                 vmm_page_ref_inc(fp);
                                 vmm_page_ref_inc(fp);
-                                irqf = spinlock_lock_irqsave(&g_vmm_lock);
-                                /* Refresh all table pointers (HHDM-stable). */
-                                src_pml4 = phys_to_table(src);
-                                dst_pml4 = phys_to_table(dst_phys);
-                                src_pdpt = phys_to_table(src_pml4[pml4i] & VMM_PHYS_MASK);
-                                dst_pdpt = phys_to_table(dst_pml4[pml4i] & VMM_PHYS_MASK);
-                                src_pd   = phys_to_table(src_pdpt[pdpti] & VMM_PHYS_MASK);
-                                dst_pd   = phys_to_table(dst_pdpt[pdpti] & VMM_PHYS_MASK);
-                                src_pt   = phys_to_table(src_pd[pdi] & VMM_PHYS_MASK);
-                                dst_pt   = phys_to_table(dst_pt_phys);
-                            } else if (src_pt[pti] & VMM_F_COW) {
-                                /* Already COW (grandchild fork): share and bump refcount. */
-                                dst_pt[pti] = src_pt[pti];
-                                spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
-                                vmm_page_ref_inc(fp);
-                                irqf = spinlock_lock_irqsave(&g_vmm_lock);
-                                src_pml4 = phys_to_table(src);
-                                dst_pml4 = phys_to_table(dst_phys);
-                                src_pdpt = phys_to_table(src_pml4[pml4i] & VMM_PHYS_MASK);
-                                dst_pdpt = phys_to_table(dst_pml4[pml4i] & VMM_PHYS_MASK);
-                                src_pd   = phys_to_table(src_pdpt[pdpti] & VMM_PHYS_MASK);
-                                dst_pd   = phys_to_table(dst_pdpt[pdpti] & VMM_PHYS_MASK);
-                                src_pt   = phys_to_table(src_pd[pdi] & VMM_PHYS_MASK);
-                                dst_pt   = phys_to_table(dst_pt_phys);
-                            } else {
-                                /* Read-only private page (e.g. code, rodata): allocate a private
-                                 * frame and deep-copy it so child has its own copy. When either
-                                 * process exits or execs, vmm_destroy_space() frees only its own
-                                 * frames and never frees the other process's live code. */
-                                spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
-                                phys_addr_t new_page = pmm_alloc_page();
-                                if (!new_page) {
-                                    irqf = spinlock_lock_irqsave(&g_vmm_lock);
-                                    goto oom;
-                                }
-                                void *src_pg = (void *)PHYS_TO_VIRT(fp);
-                                void *dst_pg = (void *)PHYS_TO_VIRT(new_page);
-                                memcpy(dst_pg, src_pg, PAGE_SIZE);
-                                irqf = spinlock_lock_irqsave(&g_vmm_lock);
-                                src_pml4 = phys_to_table(src);
-                                dst_pml4 = phys_to_table(dst_phys);
-                                src_pdpt = phys_to_table(src_pml4[pml4i] & VMM_PHYS_MASK);
-                                dst_pdpt = phys_to_table(dst_pml4[pml4i] & VMM_PHYS_MASK);
-                                src_pd   = phys_to_table(src_pdpt[pdpti] & VMM_PHYS_MASK);
-                                dst_pd   = phys_to_table(dst_pdpt[pdpti] & VMM_PHYS_MASK);
-                                src_pt   = phys_to_table(src_pd[pdi] & VMM_PHYS_MASK);
-                                dst_pt   = phys_to_table(dst_pt_phys);
-                                dst_pt[pti] = new_page | (src_pt[pti] & ~VMM_PHYS_MASK);
                             }
                         } else {
                             dst_pt[pti] = src_pt[pti];
@@ -643,17 +588,9 @@ void vmm_destroy_space(vmm_space_t space)
                             phys_addr_t fp = pt[pti] & VMM_PHYS_MASK;
                             if (fp) {
                                 if (pt[pti] & VMM_F_COW) {
-                                    /* COW-shared: release lock, decrement, reacquire */
-                                    spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
                                     uint16_t rc = vmm_page_ref_dec(fp);
-                                    irqf = spinlock_lock_irqsave(&g_vmm_lock);
                                     if (rc == 0)
                                         pmm_free_page(fp);
-                                    /* Refresh table pointers (HHDM stable) */
-                                    pml4 = phys_to_table(space);
-                                    pdpt = phys_to_table(pml4[pml4i] & VMM_PHYS_MASK);
-                                    pd   = phys_to_table(pdpt[pdpti] & VMM_PHYS_MASK);
-                                    pt   = phys_to_table(pd[pdi] & VMM_PHYS_MASK);
                                 } else {
                                     pmm_free_page(fp);
                                 }
@@ -854,7 +791,10 @@ int vmm_cow_fault(vmm_space_t space, virt_addr_t fault_va)
     uint16_t rc = vmm_page_refcount(old_phys);
 
     if (rc <= 1) {
-        /* Last owner: promote in-place — add WRITE, clear COW. */
+        /* Last owner: promote in-place — add WRITE, clear COW.
+         * Since this page is private to this address space and permissions are only
+         * being relaxed (read-only -> writable), local invlpg is sufficient.
+         * Omitting tlb_shootdown_all() avoids broadcast IPI storms on write faults. */
         irqf = spinlock_lock_irqsave(&g_vmm_lock);
         /* Re-read: another CPU might have already broken it. */
         u64 cur = pt[VMM_PT_IDX(page_va)];
@@ -865,7 +805,6 @@ int vmm_cow_fault(vmm_space_t space, virt_addr_t fault_va)
             vmm_page_ref_dec(old_phys);
         }
         spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
-        tlb_shootdown_all();
         return 0;
     }
 

@@ -10,6 +10,7 @@
 #include "../../libc/include/unistd.h"
 #include "../../libc/include/fcntl.h"
 #include "../../libc/include/sys/stat.h"
+#include "../../libc/include/sys/wait.h"
 #include "../azwm/protocol.h"
 #include "../azwm/de_protocol.h"
 #include "../../libc/include/az/ipc.h"
@@ -22,6 +23,8 @@ static const char *const s_config_files[] = {
     "/etc/terminal.conf",
     "/etc/audio.conf",
     "/etc/network.conf",
+    "/etc/power.conf",
+    "/etc/security.conf",
     "/etc/sysctl.conf"
 };
 #define NUM_CONFIG_FILES (sizeof(s_config_files) / sizeof(s_config_files[0]))
@@ -42,14 +45,16 @@ static void print_usage(void)
     printf("  \033[1;36mget\033[0m  <file> <key>           Get value of <key> in specific <file>\n");
     printf("  \033[1;36mset\033[0m  <key> <value>          Set <key>=<value> in matching config file\n");
     printf("  \033[1;36mset\033[0m  <file> <key> <value>   Set <key>=<value> in specific <file>\n");
+    printf("  \033[1;36mautoaccept\033[0m [on|off|status]  Manage unattended auto-accept execution policies\n");
     printf("  \033[1;36medit\033[0m [file]                 Open config file in graphical Text Editor\n");
     printf("  \033[1;36mreload\033[0m                      Broadcast reload to Desktop Environment & Compositor\n\n");
+    printf("Config domains: desktop, terminal, audio, network, power, security, sysctl\n\n");
     printf("Examples:\n");
     printf("  config list\n");
     printf("  config get theme_id\n");
-    printf("  config set theme_id 2\n");
-    printf("  config set terminal.theme nord\n");
-    printf("  config edit desktop\n");
+    printf("  config set power.profile performance\n");
+    printf("  config autoaccept on\n");
+    printf("  config edit security\n");
 }
 
 /* Helper to resolve alias/partial file names */
@@ -61,6 +66,8 @@ static const char *resolve_file(const char *name)
     if (strcmp(name, "terminal") == 0 || strcmp(name, "terminal.conf") == 0 || strcmp(name, "term") == 0) return "/etc/terminal.conf";
     if (strcmp(name, "audio") == 0 || strcmp(name, "audio.conf") == 0 || strcmp(name, "sound") == 0) return "/etc/audio.conf";
     if (strcmp(name, "network") == 0 || strcmp(name, "network.conf") == 0 || strcmp(name, "net") == 0) return "/etc/network.conf";
+    if (strcmp(name, "power") == 0 || strcmp(name, "power.conf") == 0) return "/etc/power.conf";
+    if (strcmp(name, "security") == 0 || strcmp(name, "security.conf") == 0 || strcmp(name, "sec") == 0) return "/etc/security.conf";
     if (strcmp(name, "sysctl") == 0 || strcmp(name, "sysctl.conf") == 0) return "/etc/sysctl.conf";
     return name;
 }
@@ -317,6 +324,29 @@ int main(int argc, char **argv)
             _exit(127);
         }
         return 0;
+    }
+
+    if (strcmp(cmd, "autoaccept") == 0) {
+        char *aa_argv[5];
+        aa_argv[0] = "/bin/autoaccept.elf";
+        if (argc >= 3) {
+            aa_argv[1] = argv[2];
+            aa_argv[2] = (argc >= 4) ? argv[3] : NULL;
+            aa_argv[3] = NULL;
+        } else {
+            aa_argv[1] = "status";
+            aa_argv[2] = NULL;
+        }
+        int pid = fork();
+        if (pid == 0) {
+            execve("/bin/autoaccept.elf", aa_argv, environ);
+            _exit(127);
+        } else if (pid > 0) {
+            int status = 0;
+            waitpid(pid, &status, 0);
+            return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        }
+        return 1;
     }
 
     if (strcmp(cmd, "reload") == 0) {

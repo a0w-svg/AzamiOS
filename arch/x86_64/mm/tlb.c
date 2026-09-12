@@ -21,8 +21,13 @@
  * is the property the caller actually needs, and it holds even when several
  * CPUs shoot down at once or a stray IPI arrives. No lock is involved, so the
  * handler can never be blocked by whoever is waiting on it. */
-static volatile u64 g_tlb_req[SMP_MAX_CPUS];
-static volatile u64 g_tlb_done[SMP_MAX_CPUS];
+typedef struct {
+    volatile u64 req;
+    volatile u64 done;
+    u8           _pad[48]; /* Pad to 64-byte cache line boundary */
+} __attribute__((aligned(64))) tlb_cpu_state_t;
+
+static tlb_cpu_state_t g_tlb_cpu[SMP_MAX_CPUS];
 
 void tlb_flush_local_global(void)
 {
@@ -62,7 +67,7 @@ void tlb_shootdown_all(void)
 
     for (u32 i = 0; i < n; i++) {
         if (i == me) continue;
-        ticket[i] = __atomic_add_fetch(&g_tlb_req[i], 1, __ATOMIC_SEQ_CST);
+        ticket[i] = __atomic_add_fetch(&g_tlb_cpu[i].req, 1, __ATOMIC_SEQ_CST);
         smp_send_ipi(i, TLB_SHOOTDOWN_VECTOR);
     }
 
@@ -72,7 +77,7 @@ void tlb_shootdown_all(void)
 
     for (u32 i = 0; i < n; i++) {
         if (i == me) continue;
-        while (__atomic_load_n(&g_tlb_done[i], __ATOMIC_SEQ_CST) < ticket[i])
+        while (__atomic_load_n(&g_tlb_cpu[i].done, __ATOMIC_SEQ_CST) < ticket[i])
             cpu_pause();
     }
 }
@@ -84,7 +89,7 @@ void tlb_shootdown_ipi(void)
 
     /* Snapshot first: anything requested after this point is not covered by the
      * flush we are about to do, and must not be reported as complete. */
-    u64 seen = __atomic_load_n(&g_tlb_req[me], __ATOMIC_SEQ_CST);
+    u64 seen = __atomic_load_n(&g_tlb_cpu[me].req, __ATOMIC_SEQ_CST);
     tlb_flush_local_global();
-    __atomic_store_n(&g_tlb_done[me], seen, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_tlb_cpu[me].done, seen, __ATOMIC_SEQ_CST);
 }

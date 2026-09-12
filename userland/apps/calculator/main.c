@@ -318,6 +318,12 @@ int main(int argc, char **argv)
 
         if (msg.type == AZ_WM_DESTROY_WINDOW) break;
 
+        if (msg.type == AZ_WM_WINDOW_RESIZED) {
+            if (!uk_handle_resize(&g_win, &msg)) break;
+            draw_calc();
+            continue;
+        }
+
         if (msg.type == AZ_WM_KEY_EVENT) {
             if (msg.key.pressed) {
                 char c = (char)msg.key.keycode;

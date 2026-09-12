@@ -135,3 +135,54 @@ int posix_madvise(void *addr, size_t len, int advice)
     if (ret < 0) return (int)-ret;
     return 0;
 }
+
+/* ── POSIX Shared Memory (POSIX.1b / IEEE Std 1003.1b) ───────────────────── */
+
+#include "include/fcntl.h"
+#include "include/unistd.h"
+#include "include/stdio.h"
+#include "include/string.h"
+#include "include/sys/stat.h"
+
+int shm_open(const char *name, int oflag, mode_t mode)
+{
+    if (!name || name[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char path[256];
+    while (*name == '/') name++;
+
+    /* Ensure /dev/shm directory exists */
+    (void)mkdir("/dev/shm", 0777);
+
+    snprintf(path, sizeof(path), "/dev/shm/%s", name);
+    int fd = open(path, oflag | O_CLOEXEC, mode);
+    if (fd < 0 && (errno == ENOENT || errno == ENOTDIR)) {
+        /* Fallback to /tmp/.shm */
+        (void)mkdir("/tmp/.shm", 0777);
+        snprintf(path, sizeof(path), "/tmp/.shm/%s", name);
+        fd = open(path, oflag | O_CLOEXEC, mode);
+    }
+    return fd;
+}
+
+int shm_unlink(const char *name)
+{
+    if (!name || name[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char path[256];
+    while (*name == '/') name++;
+
+    snprintf(path, sizeof(path), "/dev/shm/%s", name);
+    int ret = unlink(path);
+    if (ret < 0) {
+        snprintf(path, sizeof(path), "/tmp/.shm/%s", name);
+        ret = unlink(path);
+    }
+    return ret;
+}

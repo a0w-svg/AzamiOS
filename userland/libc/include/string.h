@@ -65,6 +65,8 @@ char *strchrnul(const char *s, int c);
 int   strverscmp(const char *s1, const char *s2);
 void  explicit_bzero(void *s, size_t n);
 int   timingsafe_bcmp(const void *b1, const void *b2, size_t n);
+int   timingsafe_memcmp(const void *b1, const void *b2, size_t n);
+uint32_t crc32c(uint32_t crc, const void *buf, size_t len);
 void *memrchr(const void *s, int c, size_t n);
 void *memmem(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen);
 void *memccpy(void *dest, const void *src, int c, size_t n);

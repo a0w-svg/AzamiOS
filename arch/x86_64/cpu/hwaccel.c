@@ -29,19 +29,30 @@ extern u8   g_erms_enabled;
  * exception fixup and reports whether it faulted. */
 extern int hwaccel_probe_asm(void *scratch, u32 which);
 
-/* Selector values for hwaccel_probe_asm(). They are sparse because the probe
- * stub numbers its cases and these are the two the kernel still needs. */
+/* Selector values for hwaccel_probe_asm(). Matches cases in hwprobe.asm. */
 #define PROBE_CLZERO     0
 #define PROBE_TPAUSE     3
+#define PROBE_RDPMC      4
+#define PROBE_CLFLUSHOPT 5
+#define PROBE_CLWB       6
+#define PROBE_SERIALIZE  7
+#define PROBE_RDRAND     8
+#define PROBE_RDSEED     9
 
 /* ── Chosen strategies ───────────────────────────────────────────────────── */
 static u8  s_clear_variant = HW_CLEAR_REP_STOSB;
 static u8  s_have_crc32    = 0;
 static u8  s_have_tpause   = 0;
-u8         g_popcnt_enabled = 0;
-u8         g_lzcnt_enabled  = 0;
-u8         g_bmi2_enabled   = 0;
-static u32 s_line_size     = 64;
+u8         g_popcnt_enabled     = 0;
+u8         g_lzcnt_enabled      = 0;
+u8         g_bmi1_enabled       = 0;
+u8         g_bmi2_enabled       = 0;
+u8         g_clflushopt_enabled = 0;
+u8         g_clwb_enabled       = 0;
+u8         g_serialize_enabled  = 0;
+u8         g_rdrand_enabled     = 0;
+u8         g_rdseed_enabled     = 0;
+static u32 s_line_size          = 64;
 
 /* Scratch for the boot probes. A whole line so CLZERO, whose operand is
  * rounded down to the enclosing cache line, cannot scribble past it. */
@@ -348,7 +359,29 @@ void hwaccel_init(void)
     s_have_crc32     = g_cpu_info.has_sse4_2 ? 1 : 0;
     g_popcnt_enabled = g_cpu_info.has_popcnt ? 1 : 0;
     g_lzcnt_enabled  = g_cpu_info.has_lzcnt  ? 1 : 0;
+    g_bmi1_enabled   = g_cpu_info.has_bmi1   ? 1 : 0;
     g_bmi2_enabled   = g_cpu_info.has_bmi2   ? 1 : 0;
+
+    if (g_cpu_info.has_clflushopt &&
+        hwaccel_probe_asm(s_probe_area, PROBE_CLFLUSHOPT) == 0) {
+        g_clflushopt_enabled = 1;
+    }
+    if (g_cpu_info.has_clwb &&
+        hwaccel_probe_asm(s_probe_area, PROBE_CLWB) == 0) {
+        g_clwb_enabled = 1;
+    }
+    if (g_cpu_info.has_serialize &&
+        hwaccel_probe_asm(s_probe_area, PROBE_SERIALIZE) == 0) {
+        g_serialize_enabled = 1;
+    }
+    if (g_cpu_info.has_rdrand &&
+        hwaccel_probe_asm(s_probe_area, PROBE_RDRAND) == 0) {
+        g_rdrand_enabled = 1;
+    }
+    if (g_cpu_info.has_rdseed &&
+        hwaccel_probe_asm(s_probe_area, PROBE_RDSEED) == 0) {
+        g_rdseed_enabled = 1;
+    }
 
     /* Page clear. CLZERO first (no read-for-ownership at all), then MOVNTI,
      * then ERMS. A CPU with ERMS but no CLZERO keeps `rep stosb`: on those
@@ -370,12 +403,18 @@ void hwaccel_init(void)
         s_have_tpause = 1;
     }
 
-    kprintf("[CPU] hwaccel: crc32c=%s popcnt=%s bmi=%s%s%s clear=%s spin=%s (line %u B)\n",
+    kprintf("[CPU] hwaccel: crc32c=%s popcnt=%s bmi=%s%s%s cache=%s%s%s ser=%s rng=%s%s clear=%s spin=%s (line %u B)\n",
             s_have_crc32 ? "sse4.2" : "table",
             g_popcnt_enabled ? "hw" : "swar",
             g_cpu_info.has_bmi1 ? "tzcnt" : "bsf",
             g_lzcnt_enabled ? "+lzcnt" : "",
-            g_bmi2_enabled ? "+bzhi" : "",
+            g_bmi2_enabled ? "+bmi2" : "",
+            "clflush",
+            g_clflushopt_enabled ? "+opt" : "",
+            g_clwb_enabled ? "+clwb" : "",
+            g_serialize_enabled ? "hw" : "cpuid",
+            g_rdrand_enabled ? "rdrand" : "none",
+            g_rdseed_enabled ? "+rdseed" : "",
             s_clear_variant == HW_CLEAR_CLZERO ? "clzero" :
             s_clear_variant == HW_CLEAR_MOVNTI ? "movnti" : "rep-stosb",
             s_have_tpause ? "tpause" : "pause",
@@ -384,12 +423,19 @@ void hwaccel_init(void)
 
 size_t hwaccel_format(char *buf, size_t max)
 {
-    return (size_t)scnprintf(buf, max, "crc32c=%s popcnt=%s bmi=%s%s%s clear=%s spin=%s",
+    return (size_t)scnprintf(buf, max,
+            "crc32c=%s popcnt=%s bmi=%s%s%s cache=%s%s%s ser=%s rng=%s%s clear=%s spin=%s",
             s_have_crc32 ? "sse4.2" : "table",
             g_popcnt_enabled ? "hw" : "swar",
             g_cpu_info.has_bmi1 ? "tzcnt" : "bsf",
             g_lzcnt_enabled ? "+lzcnt" : "",
-            g_bmi2_enabled ? "+bzhi" : "",
+            g_bmi2_enabled ? "+bmi2" : "",
+            "clflush",
+            g_clflushopt_enabled ? "+opt" : "",
+            g_clwb_enabled ? "+clwb" : "",
+            g_serialize_enabled ? "hw" : "cpuid",
+            g_rdrand_enabled ? "rdrand" : "none",
+            g_rdseed_enabled ? "+rdseed" : "",
             s_clear_variant == HW_CLEAR_CLZERO ? "clzero" :
             s_clear_variant == HW_CLEAR_MOVNTI ? "movnti" : "rep-stosb",
             s_have_tpause ? "tpause" : "pause");

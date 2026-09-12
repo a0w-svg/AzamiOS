@@ -13,6 +13,7 @@
 #include "../include/azami/defs.h"
 #include "../kernel/syscall/syscall.h"
 #include "../kernel/sched/sched.h"
+#include "../kernel/security/security.h"
 #include "../arch/x86_64/cpu/hwaccel.h"
 
 
@@ -43,18 +44,100 @@ dentry_t *dcache_alloc(dentry_t *parent, const char *name)
     return d;
 }
 
-#define DCACHE_HASH_SIZE 256
+#define DCACHE_HASH_SIZE 1024
 static dentry_t *g_dcache_hash[DCACHE_HASH_SIZE];
+
+/* ============================================================================
+ * Negative Dentry Cache
+ *
+ * Remembers components that failed lookup under a given parent directory.
+ * Avoids repeated disk directory reads when binaries probe PATH or libraries.
+ * ============================================================================ */
+#define NEG_DCACHE_SIZE 512
+
+typedef struct {
+    dentry_t *parent;
+    char      name[VFS_NAME_MAX];
+    u32       access_count;
+    bool      valid;
+} neg_dentry_t;
+
+static neg_dentry_t g_neg_dcache[NEG_DCACHE_SIZE];
+static spinlock_t g_neg_dcache_lock = SPINLOCK_INIT;
+static u32 g_neg_dcache_timer = 0;
+
+static inline u32 neg_dcache_hash(dentry_t *parent, const char *name)
+{
+    uintptr_t pval = (uintptr_t)parent;
+    u32 hash = crc32c(0xFFFFFFFFu, &pval, sizeof(pval));
+    size_t len = 0;
+    while (len < VFS_NAME_MAX && name[len]) len++;
+    hash = crc32c(hash, name, len) ^ 0xFFFFFFFFu;
+    return hash % NEG_DCACHE_SIZE;
+}
+
+bool neg_dcache_lookup(dentry_t *parent, const char *name)
+{
+    if (!parent || !name) return false;
+    u32 idx = neg_dcache_hash(parent, name);
+    spinlock_lock(&g_neg_dcache_lock);
+    neg_dentry_t *slot = &g_neg_dcache[idx];
+    if (slot->valid && slot->parent == parent && strncmp(slot->name, name, VFS_NAME_MAX) == 0) {
+        slot->access_count = ++g_neg_dcache_timer;
+        spinlock_unlock(&g_neg_dcache_lock);
+        return true;
+    }
+    spinlock_unlock(&g_neg_dcache_lock);
+    return false;
+}
+
+void neg_dcache_add(dentry_t *parent, const char *name)
+{
+    if (!parent || !name) return;
+    u32 idx = neg_dcache_hash(parent, name);
+    spinlock_lock(&g_neg_dcache_lock);
+    neg_dentry_t *slot = &g_neg_dcache[idx];
+    slot->parent = parent;
+    slot->valid = true;
+    slot->access_count = ++g_neg_dcache_timer;
+    size_t i = 0;
+    while (name[i] && i < VFS_NAME_MAX - 1) {
+        slot->name[i] = name[i];
+        i++;
+    }
+    slot->name[i] = '\0';
+    spinlock_unlock(&g_neg_dcache_lock);
+}
+
+void neg_dcache_invalidate(dentry_t *parent, const char *name)
+{
+    if (!parent) return;
+    if (name) {
+        u32 idx = neg_dcache_hash(parent, name);
+        spinlock_lock(&g_neg_dcache_lock);
+        neg_dentry_t *slot = &g_neg_dcache[idx];
+        if (slot->valid && slot->parent == parent && strncmp(slot->name, name, VFS_NAME_MAX) == 0) {
+            slot->valid = false;
+        }
+        spinlock_unlock(&g_neg_dcache_lock);
+    } else {
+        spinlock_lock(&g_neg_dcache_lock);
+        for (int i = 0; i < NEG_DCACHE_SIZE; i++) {
+            if (g_neg_dcache[i].valid && g_neg_dcache[i].parent == parent) {
+                g_neg_dcache[i].valid = false;
+            }
+        }
+        spinlock_unlock(&g_neg_dcache_lock);
+    }
+}
 
 /* Path lookup hashes every component of every path, so this is one of the
  * hottest loops in the kernel. crc32c() is a single CRC32 instruction per byte
- * (per 8 bytes once aligned) on any SSE4.2 part and a table lookup elsewhere,
- * and it mixes far better than the multiply-by-31 chain it replaces — dentry
- * names differ mostly in their last few characters, which is precisely the
- * case where a weak polynomial rolling hash piles collisions into one bucket. */
+ * (per 8 bytes once aligned) on any SSE4.2 part and a table lookup elsewhere. */
 static inline u32 dcache_hash_fn(dentry_t *parent, const char *name)
 {
-    u32 hash = crc32c(0xFFFFFFFFu, &parent, sizeof(parent));
+    uintptr_t pval = (uintptr_t)parent;
+    u32 hash = crc32c(0xFFFFFFFFu, &pval, sizeof(pval));
     size_t len = 0;
     while (len < VFS_NAME_MAX && name[len]) len++;
     hash = crc32c(hash, name, len) ^ 0xFFFFFFFFu;
@@ -65,6 +148,8 @@ void dcache_add(dentry_t *dentry)
 {
     if (!dentry || !dentry->d_parent || !dentry->d_inode) return;
     
+    neg_dcache_invalidate(dentry->d_parent, dentry->d_name);
+
     spinlock_lock(&g_vfs_lock);
     dentry->d_sibling = dentry->d_parent->d_subdirs;
     dentry->d_parent->d_subdirs = dentry;
@@ -78,6 +163,9 @@ void dcache_add(dentry_t *dentry)
 void dcache_remove(dentry_t *dentry)
 {
     if (!dentry || !dentry->d_parent) return;
+
+    neg_dcache_invalidate(dentry->d_parent, dentry->d_name);
+
     spinlock_lock(&g_vfs_lock);
     dentry_t **curr = &dentry->d_parent->d_subdirs;
     while (*curr) {
@@ -478,6 +566,13 @@ restart:
         dentry_t *next = dcache_lookup(curr, comp);
         bool dentry_is_ours = false;
         if (!next) {
+            /* Fast path: check negative dentry cache to avoid costly filesystem directory scans */
+            if (neg_dcache_lookup(curr, comp)) {
+                while (*p == '/') p++;
+                if (out_dentry) *out_dentry = NULL;
+                return -(s64)ENOENT;
+            }
+
             /* Try to ask the filesystem's inode->lookup */
             if (!curr->d_inode || !curr->d_inode->i_op || !curr->d_inode->i_op->lookup) {
                 return -(s64)ENOENT;
@@ -497,10 +592,13 @@ restart:
                 next = res;
                 if (next && next->d_inode) {
                     dcache_add(next);
+                } else if (next && !next->d_inode) {
+                    neg_dcache_add(curr, comp);
                 }
             } else {
                 next = new_dentry; /* Might be negative, meaning file doesn't exist */
                 dentry_is_ours = true;
+                neg_dcache_add(curr, comp);
             }
         }
         
@@ -990,6 +1088,26 @@ s64 vfs_link(const char *oldpath, const char *newpath)
     }
     /* POSIX reserves directory hard links to the filesystem itself. */
     if (S_ISDIR(old_dentry->d_inode->i_mode)) return -(s64)EPERM;
+
+    /* Linux protected_hardlinks:
+     * Disallow hardlinking to a file the current user does not own, unless:
+     * 1. The caller is root (euid == 0) or holds CAP_FOWNER, OR
+     * 2. The caller owns the file (euid == i_uid), OR
+     * 3. The caller has both read and write access to the source file. */
+    if (g_protected_hardlinks) {
+        process_t *proc = sched_current_process();
+        if (proc && proc->euid != 0 && !security_check_permission(proc, CAP_FOWNER)) {
+            inode_t *src_i = old_dentry->d_inode;
+            if (proc->euid != src_i->i_uid) {
+                u32 perm_bits = (proc->egid == src_i->i_gid)
+                                ? ((src_i->i_mode >> 3) & 7)
+                                : (src_i->i_mode & 7);
+                if ((perm_bits & 6) != 6) {
+                    return -(s64)EPERM;
+                }
+            }
+        }
+    }
 
     dentry_t *new_dentry = NULL;
     err = vfs_path_lookup_nofollow(newpath, &new_dentry);

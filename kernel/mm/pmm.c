@@ -138,7 +138,7 @@ static u64 bitmap_range_set(u64 frame, u64 count)
         if (n > count) n = count;
         u64 mask = word_mask(bit, n);
         u64 *w = &g_bitmap[frame / 64];
-        changed += hw_popcnt64(~*w & mask);
+        changed += hw_popcnt64(hw_andn64(*w, mask));
         *w |= mask;
         frame += n;
         count -= n;
@@ -195,6 +195,7 @@ typedef struct free_block {
 } free_block_t;
 
 static free_block_t *g_free_list[PMM_ORDER_COUNT];
+static u32           g_free_orders_mask = 0;
 
 /* ── Spinlock ─────────────────────────────────────────────────────────────── */
 static spinlock_t g_pmm_lock = SPINLOCK_INIT;
@@ -231,6 +232,7 @@ static void free_list_push(u32 order, phys_addr_t phys)
         g_free_list[order]->prev = blk;
     }
     g_free_list[order] = blk;
+    g_free_orders_mask |= (1U << order);
     /* Deliberately the whole block, not just the frames this call transitioned:
      * when pmm_free() coalesces, the buddy's frames are already clear here and
      * it has already subtracted them, so the two adjustments only balance if
@@ -248,6 +250,8 @@ static phys_addr_t free_list_pop(u32 order)
     g_free_list[order] = blk->next;
     if (g_free_list[order]) {
         g_free_list[order]->prev = NULL;
+    } else {
+        g_free_orders_mask &= ~(1U << order);
     }
 
     blk->magic = 0;
@@ -285,9 +289,14 @@ static bool free_list_remove(u32 order, phys_addr_t phys)
         blk->prev->next = blk->next;
     } else {
         g_free_list[order] = blk->next;
+        if (!g_free_list[order]) {
+            g_free_orders_mask &= ~(1U << order);
+        }
     }
     if (blk->next) {
         blk->next->prev = blk->prev;
+    } else if (!blk->prev && !g_free_list[order]) {
+        g_free_orders_mask &= ~(1U << order);
     }
 
     blk->magic = 0;
@@ -372,15 +381,14 @@ phys_addr_t pmm_alloc(u32 order)
 
     irqflags_t flags = spinlock_lock_irqsave(&g_pmm_lock);
 
-    /* Find the smallest order with a free block. */
-    u32 found = order;
-    while (found <= PMM_MAX_ORDER && !g_free_list[found]) found++;
-
-    if (found > PMM_MAX_ORDER) {
+    /* O(1) search for the smallest non-empty order >= order via hardware TZCNT */
+    u32 avail = g_free_orders_mask & ~((1U << order) - 1);
+    if (unlikely(!avail)) {
         spinlock_unlock_irqrestore(&g_pmm_lock, flags);
         pr_debug("[PMM] Out of memory (order=%u requested)\n", order);
         return 0;
     }
+    u32 found = hw_ctz32(avail);
 
     /* Pop the block from its free list. */
     phys_addr_t blk = free_list_pop(found);
@@ -394,6 +402,15 @@ phys_addr_t pmm_alloc(u32 order)
 
     spinlock_unlock_irqrestore(&g_pmm_lock, flags);
     return blk;
+}
+
+phys_addr_t pmm_alloc_page_zeroed(void)
+{
+    phys_addr_t p = pmm_alloc(0);
+    if (p) {
+        hw_clear_page((void *)PHYS_TO_VIRT(p));
+    }
+    return p;
 }
 
 void pmm_free(phys_addr_t phys, u32 order)

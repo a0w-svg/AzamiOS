@@ -245,9 +245,6 @@ void kernel_main(void)
     extern void memdevs_init(void);
     memdevs_init();
 
-    extern void pcspeaker_init(void);
-    pcspeaker_init();
-
     extern void procfs_init(void);
     procfs_init();
 
@@ -315,8 +312,19 @@ void kernel_main(void)
     extern void virtio_balloon_init(void);
     extern void i2c_core_init(void);
     extern void i801_init(void);
+    extern void debugcon_init(void);
+    extern void fw_cfg_init(void);
+    extern void pvpanic_init(void);
+    extern void pci_serial_init(void);
+    extern void pcspeaker_init(void);
+
+    debugcon_init();
+    fw_cfg_init();
+    pvpanic_init();
+    pcspeaker_init();
     virtio_input_init();
     virtio_console_init();
+    pci_serial_init();
     i6300esb_init();
     virtio_balloon_init();
 
@@ -332,23 +340,40 @@ void kernel_main(void)
     extern int fdc_init(void);
     fdc_init();
 
-    /* VirtIO and legacy PCI storage/network/RNG devices. */
     extern void virtio_blk_init(void);
     extern void virtio_scsi_init(void);
     extern void virtio_net_init(void);
     extern void virtio_rng_init(void);
+    extern int  virtio_9p_init(void);
     extern void pcnet_init(void);
     extern void hda_init(void);
+    extern void es1370_init(void);
+    extern int  mpu401_init(void);
+    extern int  uhci_init(void);
+    extern int  ehci_init(void);
+    extern int  pm_timer_init(void);
+    extern int  piix4_pm_init(void);
     extern void e1000_init(void);
+    extern int  e100_init(void);
     extern void rtl8139_init(void);
+    extern void rtl8169_init(void);
+    extern int  vmxnet3_init(void);
     extern void net_init(void);
+    extern void coretemp_init(void);
 
     virtio_blk_init();
     virtio_scsi_init();
     virtio_net_init();
     virtio_rng_init();
+    virtio_9p_init();
     pcnet_init();
     hda_init();
+    es1370_init();
+    mpu401_init();
+    uhci_init();
+    ehci_init();
+    pm_timer_init();
+    piix4_pm_init();
 
     extern void bga_init(void);
     bga_init();
@@ -367,9 +392,15 @@ void kernel_main(void)
     /* Initialize Network Interface Drivers & Stack. */
     extern void ne2k_pci_init(void);
     e1000_init();
+    e100_init();
     rtl8139_init();
+    rtl8169_init();
+    vmxnet3_init();
     ne2k_pci_init();
     net_init();
+
+    /* Hardware monitoring: CPU digital thermal sensor */
+    coretemp_init();
 
     /* Load initrd.ext2 module as ramdisk and mount */
     struct limine_file *initrd = az_boot_initrd();

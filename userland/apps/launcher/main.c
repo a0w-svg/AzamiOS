@@ -362,11 +362,136 @@ static void draw_launcher(void)
 }
 
 /* ============================================================================
+ * App registry: category, subtitle, and hide/show
+ *
+ * Loaded from /etc/launcher.conf ("appname=category:subtitle" or
+ * "appname=hidden" per line, '#' comments and blank lines skipped) so the
+ * launcher's per-app metadata and CLI-tool exclusions can be edited without
+ * recompiling. load_default_registry() covers a missing or unreadable file
+ * with the exact list this used to have hardcoded as two long if/else and
+ * string-array blocks. An .elf with no entry at all still shows, with a
+ * generic "Application" / Productivity label — only entries explicitly
+ * marked hidden are excluded.
+ * ============================================================================ */
+typedef struct {
+    char name[32];
+    char subtitle[48];
+    app_cat_t category;
+    int hidden;
+} registry_entry_t;
+
+#define MAX_REGISTRY 96
+static registry_entry_t g_registry[MAX_REGISTRY];
+static int g_registry_count = 0;
+
+static app_cat_t parse_category(const char *s)
+{
+    if (strcmp(s, "productivity") == 0) return CAT_PRODUCTIVITY;
+    if (strcmp(s, "games") == 0) return CAT_GAMES;
+    if (strcmp(s, "system") == 0) return CAT_SYSTEM;
+    if (strcmp(s, "media") == 0) return CAT_MEDIA;
+    return CAT_PRODUCTIVITY;
+}
+
+static void registry_add(const char *name, const char *subtitle, app_cat_t cat, int hidden)
+{
+    if (g_registry_count >= MAX_REGISTRY) return;
+    registry_entry_t *e = &g_registry[g_registry_count++];
+    strncpy(e->name, name, sizeof(e->name) - 1);
+    e->name[sizeof(e->name) - 1] = '\0';
+    if (subtitle) {
+        strncpy(e->subtitle, subtitle, sizeof(e->subtitle) - 1);
+        e->subtitle[sizeof(e->subtitle) - 1] = '\0';
+    } else {
+        e->subtitle[0] = '\0';
+    }
+    e->category = cat;
+    e->hidden = hidden;
+}
+
+static void load_default_registry(void)
+{
+    g_registry_count = 0;
+    registry_add("terminal",    "Command Terminal",   CAT_SYSTEM,       0);
+    registry_add("filemanager", "Files & Storage",     CAT_SYSTEM,       0);
+    registry_add("texteditor",  "Code & Text Editor",  CAT_PRODUCTIVITY, 0);
+    registry_add("sysmon",      "Activity Monitor",    CAT_SYSTEM,       0);
+    registry_add("calculator",  "Math & Calculations", CAT_PRODUCTIVITY, 0);
+    registry_add("clock",       "Clock & World Times", CAT_PRODUCTIVITY, 0);
+    registry_add("settings",    "System Control",      CAT_SYSTEM,       0);
+    registry_add("about",       "System Info",         CAT_SYSTEM,       0);
+    registry_add("fetch",       "System Telemetry",    CAT_SYSTEM,       0);
+    registry_add("screenshot",  "Screen Capture",      CAT_SYSTEM,       0);
+    registry_add("paint",       "Paint & Sketch",      CAT_PRODUCTIVITY, 0);
+    registry_add("audioplayer", "Music & Synthwave",   CAT_MEDIA,        0);
+    registry_add("minesweeper", "Minesweeper Puzzle",  CAT_GAMES,        0);
+    registry_add("2048",        "2048 Number Puzzle",  CAT_GAMES,        0);
+    registry_add("snake",       "Arcade Snake Game",   CAT_GAMES,        0);
+
+    static const char *hidden_defaults[] = {
+        "init", "sessiond", "azwm", "wallpaper", "taskbar", "launcher", "gui_test",
+        "sh", "play", "ls", "cat", "echo", "pwd", "uname", "head", "tail", "wc",
+        "grep", "mkdir", "rm", "touch", "cp", "mv", "date", "uptime", "df", "free",
+        "ifconfig", "ping", "lspci", "env", "which", "sleep", "kill", "chmod", "clear",
+        "hexdump", "base64", "md5sum", "cut", "sort", "uniq", "ps", "top", "dmesg",
+        "tree", "cal", "watch", "netstat", "poweroff", "reboot", "getfacl", "setfacl", NULL
+    };
+    for (int i = 0; hidden_defaults[i]; i++) registry_add(hidden_defaults[i], NULL, CAT_ALL, 1);
+}
+
+static void load_registry_config(void)
+{
+    int fd = sys_open("/etc/launcher.conf", 0, 0);
+    if (fd < 0) { load_default_registry(); return; }
+
+    static char buf[4096];
+    int n = sys_read(fd, buf, sizeof(buf) - 1);
+    sys_close(fd);
+    if (n <= 0) { load_default_registry(); return; }
+    buf[n] = '\0';
+
+    g_registry_count = 0;
+    char *saveptr = NULL;
+    char *line = strtok_r(buf, "\n", &saveptr);
+    while (line && g_registry_count < MAX_REGISTRY) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line == '\0' || *line == '#') { line = strtok_r(NULL, "\n", &saveptr); continue; }
+
+        char *fsave = NULL;
+        char *name_s  = strtok_r(line, "=", &fsave);
+        char *value_s = strtok_r(NULL, "=", &fsave);
+        if (name_s && value_s) {
+            if (strcmp(value_s, "hidden") == 0) {
+                registry_add(name_s, NULL, CAT_ALL, 1);
+            } else {
+                char *csave = NULL;
+                char *cat_s = strtok_r(value_s, ":", &csave);
+                char *sub_s = strtok_r(NULL, ":", &csave);
+                registry_add(name_s, sub_s ? sub_s : "Application",
+                             cat_s ? parse_category(cat_s) : CAT_PRODUCTIVITY, 0);
+            }
+        }
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    if (g_registry_count == 0) load_default_registry();
+}
+
+static const registry_entry_t *registry_lookup(const char *name)
+{
+    for (int i = 0; i < g_registry_count; i++)
+        if (strcmp(g_registry[i].name, name) == 0) return &g_registry[i];
+    return NULL;
+}
+
+/* ============================================================================
  * _start
  * ============================================================================ */
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
+
+    load_registry_config();
     de_log("[launcher] AzamiOS Modern App Launcher starting...");
 
     static const char *scan_dirs[] = { "/bin", "/sbin", "/", NULL };
@@ -385,23 +510,11 @@ int main(int argc, char **argv)
                         strncpy(appname, d->d_name, name_len);
                         appname[name_len] = '\0';
 
-                        /* Filter out internal system services & CLI tools */
-                        static const char *cli_list[] = {
-                            "init", "sessiond", "azwm", "wallpaper", "taskbar", "launcher", "gui_test",
-                            "sh", "play", "ls", "cat", "echo", "pwd", "uname", "head", "tail", "wc",
-                            "grep", "mkdir", "rm", "touch", "cp", "mv", "date", "uptime", "df", "free",
-                            "ifconfig", "ping", "lspci", "env", "which", "sleep", "kill", "chmod", "clear",
-                            "hexdump", "base64", "md5sum", "cut", "sort", "uniq", "ps", "top", "dmesg",
-                            "tree", "cal", "watch", "netstat", "poweroff", "reboot", "getfacl", "setfacl", NULL
-                        };
-                        int is_cli = 0;
-                        for (int k = 0; cli_list[k] != NULL; k++) {
-                            if (strcmp(appname, cli_list[k]) == 0) {
-                                is_cli = 1;
-                                break;
-                            }
-                        }
-                        if (is_cli) continue;
+                        /* Filter out internal system services & CLI tools,
+                         * and pick up this app's category/subtitle, per
+                         * /etc/launcher.conf (see load_registry_config()). */
+                        const registry_entry_t *reg = registry_lookup(appname);
+                        if (reg && reg->hidden) continue;
 
                         int already_added = 0;
                         for (int a = 0; a < g_num_apps; a++) {
@@ -417,24 +530,8 @@ int main(int argc, char **argv)
                             strncpy(app->name, appname, sizeof(app->name) - 1);
                             app->name[sizeof(app->name) - 1] = '\0';
 
-                            const char *sub = "Application";
-                            app_cat_t cat = CAT_PRODUCTIVITY;
-
-                            if (strcmp(appname, "terminal") == 0) { sub = "Command Terminal"; cat = CAT_SYSTEM; }
-                            else if (strcmp(appname, "filemanager") == 0) { sub = "Files & Storage"; cat = CAT_SYSTEM; }
-                            else if (strcmp(appname, "texteditor") == 0) { sub = "Code & Text Editor"; cat = CAT_PRODUCTIVITY; }
-                            else if (strcmp(appname, "sysmon") == 0) { sub = "Activity Monitor"; cat = CAT_SYSTEM; }
-                            else if (strcmp(appname, "calculator") == 0) { sub = "Math & Calculations"; cat = CAT_PRODUCTIVITY; }
-                            else if (strcmp(appname, "clock") == 0) { sub = "Clock & World Times"; cat = CAT_PRODUCTIVITY; }
-                            else if (strcmp(appname, "settings") == 0) { sub = "System Control"; cat = CAT_SYSTEM; }
-                            else if (strcmp(appname, "about") == 0) { sub = "System Info"; cat = CAT_SYSTEM; }
-                            else if (strcmp(appname, "fetch") == 0) { sub = "System Telemetry"; cat = CAT_SYSTEM; }
-                            else if (strcmp(appname, "screenshot") == 0) { sub = "Screen Capture"; cat = CAT_SYSTEM; }
-                            else if (strcmp(appname, "paint") == 0) { sub = "Paint & Sketch"; cat = CAT_PRODUCTIVITY; }
-                            else if (strcmp(appname, "audioplayer") == 0) { sub = "Music & Synthwave"; cat = CAT_MEDIA; }
-                            else if (strcmp(appname, "minesweeper") == 0) { sub = "Minesweeper Puzzle"; cat = CAT_GAMES; }
-                            else if (strcmp(appname, "2048") == 0) { sub = "2048 Number Puzzle"; cat = CAT_GAMES; }
-                            else if (strcmp(appname, "snake") == 0) { sub = "Arcade Snake Game"; cat = CAT_GAMES; }
+                            const char *sub = (reg && reg->subtitle[0]) ? reg->subtitle : "Application";
+                            app_cat_t cat = reg ? reg->category : CAT_PRODUCTIVITY;
 
                             strncpy(app->subtitle, sub, sizeof(app->subtitle) - 1);
                             app->subtitle[sizeof(app->subtitle) - 1] = '\0';
@@ -507,8 +604,13 @@ int main(int argc, char **argv)
     de_log("[launcher] Entering event loop.");
 
     for (;;) {
+        /* See sysmon's identical fix: `continue` here means a closed window
+         * (channel -> -EPIPE on every further call, never blocking again)
+         * never reaches sys_exit and instead retries as fast as the CPU
+         * allows, forever. `break` falls through to the same `return 0;`
+         * every sibling app in the DE already uses for this. */
         if (az_channel_recv(g_win.client_chan, &raw_msg) != 0) {
-            continue;
+            break;
         }
 
         switch (msg->type) {

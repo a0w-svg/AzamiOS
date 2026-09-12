@@ -13,6 +13,11 @@
 #include "include/errno.h"
 #include "include/sys/stat.h"
 
+int posix_openpt(int flags)
+{
+    return open("/dev/ptmx", flags);
+}
+
 int grantpt(int fd)
 {
     char buf[64];

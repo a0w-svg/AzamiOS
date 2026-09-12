@@ -24,6 +24,18 @@ typedef struct _FILE {
     int  unget_char;   /* buffered ungetc character (-1 if none) */
     int  is_pipe;      /* 1 if opened by popen */
     int  pipe_pid;     /* child PID for popen */
+    int  buf_pos;      /* read buffer position */
+    int  buf_len;      /* bytes valid in buffer */
+    char buf[BUFSIZ];  /* stream I/O buffer */
+
+    /* Memory stream support (fmemopen / open_memstream) */
+    int     is_memstream;
+    int     is_dynamic;
+    char   *mem_buf;
+    size_t  mem_size;
+    size_t  mem_pos;
+    char  **mem_bufloc;
+    size_t *mem_sizeloc;
 } FILE;
 
 #define stdin  ((FILE *)(void *)0)   /* fd = 0 read via sys_read  */
@@ -67,6 +79,8 @@ int vsscanf(const char *str, const char *fmt, va_list ap);
 FILE  *fopen(const char *path, const char *mode);
 FILE  *fdopen(int fd, const char *mode);
 FILE  *freopen(const char *path, const char *mode, FILE *stream);
+FILE  *fmemopen(void *buf, size_t size, const char *mode);
+FILE  *open_memstream(char **bufloc, size_t *sizeloc);
 FILE  *popen(const char *command, const char *type);
 int    pclose(FILE *stream);
 int    fclose(FILE *stream);

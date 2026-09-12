@@ -11,6 +11,10 @@
 #include "include/fcntl.h"
 #include "include/locale.h"
 #include "include/errno.h"
+#include "include/sys/stat.h"
+#include "include/sys/auxv.h"
+#include "include/limits.h"
+#include "include/inttypes.h"
 
 /* ── Free-List Memory Allocator ──────────────────────────────────────────── */
 
@@ -363,6 +367,20 @@ void *pvalloc(size_t size)
     return aligned_alloc(4096, rounded);
 }
 
+size_t malloc_usable_size(void *ptr)
+{
+    if (!ptr) return 0;
+    if (((size_t *)ptr)[-2] == ALIGNED_BLOCK_MAGIC) {
+        void *raw = ((void **)ptr)[-1];
+        block_header_t *hdr = ((block_header_t *)raw) - 1;
+        if (hdr->magic == BLOCK_MAGIC) return hdr->size;
+        return 0;
+    }
+    block_header_t *hdr = ((block_header_t *)ptr) - 1;
+    if (hdr->magic == BLOCK_MAGIC) return hdr->size;
+    return 0;
+}
+
 
 /* ── Numeric conversion ──────────────────────────────────────────────────── */
 
@@ -574,6 +592,29 @@ lldiv_t lldiv(long long numer, long long denom)
     return r;
 }
 
+intmax_t imaxabs(intmax_t j)
+{
+    return j < 0 ? -j : j;
+}
+
+imaxdiv_t imaxdiv(intmax_t numer, intmax_t denom)
+{
+    imaxdiv_t r;
+    r.quot = numer / denom;
+    r.rem  = numer % denom;
+    return r;
+}
+
+intmax_t strtoimax(const char *nptr, char **endptr, int base)
+{
+    return (intmax_t)strtoll(nptr, endptr, base);
+}
+
+uintmax_t strtoumax(const char *nptr, char **endptr, int base)
+{
+    return (uintmax_t)strtoull(nptr, endptr, base);
+}
+
 /* ── Pseudo-random ───────────────────────────────────────────────────────── */
 
 static unsigned int g_rand_state = 123456789;
@@ -695,6 +736,147 @@ void lcong48(unsigned short param[7])
     s_rand48_mult[1] = param[4];
     s_rand48_mult[2] = param[5];
     s_rand48_add     = param[6];
+}
+
+/* ── Reentrant Pseudo-Random (GNU Extensions) ────────────────────────────── */
+
+static void _drand48_r_step(unsigned short xsubi[3], struct drand48_data *buffer)
+{
+    if (!buffer->__init) {
+        buffer->__a = 0x5deece66dULL;
+        buffer->__c = 0xb;
+        buffer->__init = 1;
+    }
+    unsigned long long x = (unsigned long long)xsubi[0] |
+                          ((unsigned long long)xsubi[1] << 16) |
+                          ((unsigned long long)xsubi[2] << 32);
+    unsigned long long next = (x * buffer->__a + buffer->__c) & 0xFFFFFFFFFFFFULL;
+    xsubi[0] = (unsigned short)(next & 0xFFFF);
+    xsubi[1] = (unsigned short)((next >> 16) & 0xFFFF);
+    xsubi[2] = (unsigned short)((next >> 32) & 0xFFFF);
+}
+
+int drand48_r(struct drand48_data *buffer, double *result)
+{
+    if (!buffer || !result) return -1;
+    _drand48_r_step(buffer->__x, buffer);
+    unsigned long long x = (unsigned long long)buffer->__x[0] |
+                          ((unsigned long long)buffer->__x[1] << 16) |
+                          ((unsigned long long)buffer->__x[2] << 32);
+    *result = (double)x / 281474976710656.0;
+    return 0;
+}
+
+int erand48_r(unsigned short xsubi[3], struct drand48_data *buffer, double *result)
+{
+    if (!xsubi || !buffer || !result) return -1;
+    _drand48_r_step(xsubi, buffer);
+    unsigned long long x = (unsigned long long)xsubi[0] |
+                          ((unsigned long long)xsubi[1] << 16) |
+                          ((unsigned long long)xsubi[2] << 32);
+    *result = (double)x / 281474976710656.0;
+    return 0;
+}
+
+int lrand48_r(struct drand48_data *buffer, long *result)
+{
+    if (!buffer || !result) return -1;
+    _drand48_r_step(buffer->__x, buffer);
+    unsigned long high = ((unsigned long)buffer->__x[2] << 15) | ((unsigned long)buffer->__x[1] >> 1);
+    *result = (long)(high & 0x7FFFFFFFL);
+    return 0;
+}
+
+int nrand48_r(unsigned short xsubi[3], struct drand48_data *buffer, long *result)
+{
+    if (!xsubi || !buffer || !result) return -1;
+    _drand48_r_step(xsubi, buffer);
+    unsigned long high = ((unsigned long)xsubi[2] << 15) | ((unsigned long)xsubi[1] >> 1);
+    *result = (long)(high & 0x7FFFFFFFL);
+    return 0;
+}
+
+int mrand48_r(struct drand48_data *buffer, long *result)
+{
+    if (!buffer || !result) return -1;
+    _drand48_r_step(buffer->__x, buffer);
+    long high = (long)(((unsigned long)buffer->__x[2] << 16) | (unsigned long)buffer->__x[1]);
+    *result = high;
+    return 0;
+}
+
+int jrand48_r(unsigned short xsubi[3], struct drand48_data *buffer, long *result)
+{
+    if (!xsubi || !buffer || !result) return -1;
+    _drand48_r_step(xsubi, buffer);
+    long high = (long)(((unsigned long)xsubi[2] << 16) | (unsigned long)xsubi[1]);
+    *result = high;
+    return 0;
+}
+
+int srand48_r(long seedval, struct drand48_data *buffer)
+{
+    if (!buffer) return -1;
+    buffer->__x[0] = 0x330e;
+    buffer->__x[1] = (unsigned short)(seedval & 0xFFFF);
+    buffer->__x[2] = (unsigned short)((seedval >> 16) & 0xFFFF);
+    buffer->__old_x[0] = buffer->__x[0];
+    buffer->__old_x[1] = buffer->__x[1];
+    buffer->__old_x[2] = buffer->__x[2];
+    buffer->__a = 0x5deece66dULL;
+    buffer->__c = 0xb;
+    buffer->__init = 1;
+    return 0;
+}
+
+int seed48_r(unsigned short seed16v[3], struct drand48_data *buffer)
+{
+    if (!seed16v || !buffer) return -1;
+    buffer->__old_x[0] = buffer->__x[0];
+    buffer->__old_x[1] = buffer->__x[1];
+    buffer->__old_x[2] = buffer->__x[2];
+    buffer->__x[0] = seed16v[0];
+    buffer->__x[1] = seed16v[1];
+    buffer->__x[2] = seed16v[2];
+    buffer->__a = 0x5deece66dULL;
+    buffer->__c = 0xb;
+    buffer->__init = 1;
+    return 0;
+}
+
+int lcong48_r(unsigned short param[7], struct drand48_data *buffer)
+{
+    if (!param || !buffer) return -1;
+    buffer->__x[0] = param[0];
+    buffer->__x[1] = param[1];
+    buffer->__x[2] = param[2];
+    buffer->__a = (unsigned long long)param[3] |
+                 ((unsigned long long)param[4] << 16) |
+                 ((unsigned long long)param[5] << 32);
+    buffer->__c = param[6];
+    buffer->__init = 1;
+    return 0;
+}
+
+static unsigned int s_rand_default_state[32] = { 123456789 };
+static unsigned int *s_rand_state_ptr = s_rand_default_state;
+
+char *initstate(unsigned int seed, char *state, size_t n)
+{
+    if (!state || n < 8) return NULL;
+    char *old = (char *)s_rand_state_ptr;
+    s_rand_state_ptr = (unsigned int *)state;
+    srandom(seed);
+    s_rand_state_ptr[0] = seed;
+    return old;
+}
+
+char *setstate(char *state)
+{
+    if (!state) return NULL;
+    char *old = (char *)s_rand_state_ptr;
+    s_rand_state_ptr = (unsigned int *)state;
+    return old;
 }
 
 /* ── Searching & Sorting ─────────────────────────────────────────────────── */
@@ -846,6 +1028,16 @@ void qsort_r(void *base, size_t nmemb, size_t size,
 
 /* ── CSPRNG (arc4random family) — kernel-backed, no userspace state ──────── */
 
+static int user_cpu_has_rdrand(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    unsigned a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    cached = (c & (1u << 30)) ? 1 : 0;
+    return cached;
+}
+
 void arc4random_buf(void *buf, size_t nbytes)
 {
     unsigned char *p = (unsigned char *)buf;
@@ -855,6 +1047,31 @@ void arc4random_buf(void *buf, size_t nbytes)
             /* The kernel CSPRNG never fails in practice; degrade rather than
              * hand back an uninitialised buffer if it somehow does. */
             for (size_t i = 0; i < chunk; i++) p[i] = (unsigned char)rand();
+        }
+        /* Hardware entropy injection: if CPU supports RDRAND, fold it into
+         * the buffer. This provides dual-source defense-in-depth and ensures
+         * immediate divergence upon fork(). */
+        if (user_cpu_has_rdrand()) {
+            size_t qwords = chunk / 8;
+            uint64_t *q = (uint64_t *)p;
+            for (size_t i = 0; i < qwords; i++) {
+                uint64_t hw = 0;
+                unsigned char ok = 0;
+                __asm__ volatile("rdrand %0; setc %1" : "=r"(hw), "=qm"(ok));
+                if (ok) q[i] ^= hw;
+            }
+            size_t rem = chunk & 7;
+            if (rem) {
+                uint64_t hw = 0;
+                unsigned char ok = 0;
+                __asm__ volatile("rdrand %0; setc %1" : "=r"(hw), "=qm"(ok));
+                if (ok) {
+                    unsigned char *tail = p + qwords * 8;
+                    for (size_t i = 0; i < rem; i++) {
+                        tail[i] ^= (unsigned char)(hw >> (i * 8));
+                    }
+                }
+            }
         }
         p += chunk;
         nbytes -= chunk;
@@ -909,6 +1126,17 @@ char *getenv(const char *name)
     if (strcmp(name, "SHELL") == 0) return "/bin/sh.elf";
     if (strcmp(name, "TERM") == 0) return "azami";
     return NULL;
+}
+
+char *secure_getenv(const char *name)
+{
+    if (!name) return NULL;
+    if (getauxval(AT_SECURE) != 0 ||
+        getuid() != geteuid() ||
+        getgid() != getegid()) {
+        return NULL;
+    }
+    return getenv(name);
 }
 
 int setenv(const char *name, const char *value, int overwrite)
@@ -1304,35 +1532,191 @@ void freelocale(locale_t locobj)
 
 char *realpath(const char *path, char *resolved_path)
 {
-    if (!path) return NULL;
-    if (!resolved_path) {
-        resolved_path = (char *)malloc(512);
-        if (!resolved_path) return NULL;
+    if (!path || !*path) {
+        errno = ENOENT;
+        return NULL;
     }
 
+    int allocated = 0;
+    if (!resolved_path) {
+        resolved_path = (char *)malloc(PATH_MAX);
+        if (!resolved_path) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        allocated = 1;
+    }
+
+    char work[PATH_MAX];
+    char link_buf[PATH_MAX];
+    int symlink_depth = 0;
+
     if (path[0] == '/') {
-        strncpy(resolved_path, path, 511);
-        resolved_path[511] = '\0';
+        if (strlen(path) >= PATH_MAX) {
+            errno = ENAMETOOLONG;
+            goto fail;
+        }
+        strcpy(work, path);
     } else {
-        char cwd[256];
-        if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "/");
-        if (cwd[strlen(cwd) - 1] != '/') strcat(cwd, "/");
-        snprintf(resolved_path, 512, "%s%s", cwd, path);
+        if (!getcwd(work, sizeof(work))) {
+            strcpy(work, "/");
+        }
+        size_t clen = strlen(work);
+        if (clen == 0 || work[clen - 1] != '/') {
+            if (clen + 1 >= PATH_MAX) { errno = ENAMETOOLONG; goto fail; }
+            work[clen++] = '/';
+            work[clen] = '\0';
+        }
+        if (clen + strlen(path) >= PATH_MAX) {
+            errno = ENAMETOOLONG;
+            goto fail;
+        }
+        strcat(work, path);
+    }
+
+    resolved_path[0] = '/';
+    resolved_path[1] = '\0';
+    size_t out_len = 1;
+
+    char *p = work;
+    while (*p == '/') p++;
+
+    while (*p) {
+        char *end = strchr(p, '/');
+        size_t seg_len = end ? (size_t)(end - p) : strlen(p);
+        char segment[256];
+        if (seg_len >= sizeof(segment)) {
+            errno = ENAMETOOLONG;
+            goto fail;
+        }
+        memcpy(segment, p, seg_len);
+        segment[seg_len] = '\0';
+        p = end ? end : p + seg_len;
+        while (*p == '/') p++;
+
+        if (strcmp(segment, ".") == 0 || seg_len == 0) {
+            continue;
+        }
+        if (strcmp(segment, "..") == 0) {
+            if (out_len > 1) {
+                while (out_len > 1 && resolved_path[out_len - 1] != '/') {
+                    out_len--;
+                }
+                if (out_len > 1) {
+                    out_len--;
+                }
+                resolved_path[out_len] = '\0';
+            }
+            continue;
+        }
+
+        size_t prev_out_len = out_len;
+        if (out_len > 1) {
+            if (out_len + 1 >= PATH_MAX) { errno = ENAMETOOLONG; goto fail; }
+            resolved_path[out_len++] = '/';
+        }
+        if (out_len + seg_len >= PATH_MAX) {
+            errno = ENAMETOOLONG;
+            goto fail;
+        }
+        memcpy(resolved_path + out_len, segment, seg_len);
+        out_len += seg_len;
+        resolved_path[out_len] = '\0';
+
+        struct stat st;
+        if (lstat(resolved_path, &st) < 0) {
+            goto fail;
+        }
+
+        if (S_ISLNK(st.st_mode)) {
+            if (++symlink_depth > 32) {
+                errno = ELOOP;
+                goto fail;
+            }
+            ssize_t llen = readlink(resolved_path, link_buf, sizeof(link_buf) - 1);
+            if (llen < 0) goto fail;
+            link_buf[llen] = '\0';
+
+            out_len = prev_out_len;
+            resolved_path[out_len] = '\0';
+
+            if (*p) {
+                size_t rem_len = strlen(p);
+                if ((size_t)llen + 1 + rem_len >= PATH_MAX) {
+                    errno = ENAMETOOLONG;
+                    goto fail;
+                }
+                if (link_buf[llen - 1] != '/') link_buf[llen++] = '/';
+                strcpy(link_buf + llen, p);
+            }
+
+            if (link_buf[0] == '/') {
+                resolved_path[0] = '/';
+                resolved_path[1] = '\0';
+                out_len = 1;
+            }
+
+            strcpy(work, link_buf);
+            p = work;
+            while (*p == '/') p++;
+        } else if (*p != '\0' && !S_ISDIR(st.st_mode)) {
+            errno = ENOTDIR;
+            goto fail;
+        }
+    }
+
+    if (out_len == 0) {
+        resolved_path[0] = '/';
+        resolved_path[1] = '\0';
     }
     return resolved_path;
+
+fail:
+    if (allocated) free(resolved_path);
+    return NULL;
+}
+
+char *canonicalize_file_name(const char *path)
+{
+    return realpath(path, NULL);
+}
+
+int mkostemps(char *template, int suffixlen, int flags)
+{
+    if (!template || suffixlen < 0) { errno = EINVAL; return -1; }
+    size_t len = strlen(template);
+    if (len < (size_t)suffixlen + 6) { errno = EINVAL; return -1; }
+    char *x_start = template + len - suffixlen - 6;
+    if (memcmp(x_start, "XXXXXX", 6) != 0) { errno = EINVAL; return -1; }
+
+    static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (int tries = 0; tries < 100; tries++) {
+        unsigned int rnd = arc4random();
+        for (int i = 0; i < 6; i++) {
+            x_start[i] = chars[rnd % 62];
+            rnd /= 62;
+            if (i == 2) rnd = arc4random();
+        }
+        int fd = open(template, O_RDWR | O_CREAT | O_EXCL | flags, 0600);
+        if (fd >= 0) return fd;
+        if (errno != EEXIST) return -1;
+    }
+    return -1;
+}
+
+int mkostemp(char *template, int flags)
+{
+    return mkostemps(template, 0, flags);
+}
+
+int mkstemps(char *template, int suffixlen)
+{
+    return mkostemps(template, suffixlen, 0);
 }
 
 int mkstemp(char *template)
 {
-    if (!template) return -1;
-    size_t len = strlen(template);
-    if (len < 6 || strcmp(template + len - 6, "XXXXXX") != 0) return -1;
-
-    static unsigned long s_counter = 12345;
-    s_counter += (unsigned long)getpid() + 17;
-    snprintf(template + len - 6, 7, "%06lx", s_counter % 1000000);
-
-    return open(template, O_RDWR | O_CREAT | O_EXCL, 0600);
+    return mkostemps(template, 0, 0);
 }
 
 char *mktemp(char *template)
@@ -1359,6 +1743,126 @@ char *mkdtemp(char *template)
 
     if (mkdir(template, 0700) < 0) return NULL;
     return template;
+}
+
+/* ── Radix-64 Conversion (POSIX.1-2001 XSI) ──────────────────────────────── */
+
+static const char s_b64_table[] = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+char *l64a(long value)
+{
+    static char buf[7];
+    if (value == 0) {
+        buf[0] = '\0';
+        return buf;
+    }
+    uint32_t v = (uint32_t)value;
+    int idx = 0;
+    while (v != 0 && idx < 6) {
+        buf[idx++] = s_b64_table[v & 0x3F];
+        v >>= 6;
+    }
+    buf[idx] = '\0';
+    return buf;
+}
+
+long a64l(const char *s)
+{
+    if (!s || !*s) return 0L;
+    uint32_t result = 0;
+    int shift = 0;
+    for (int i = 0; s[i] && i < 6; i++) {
+        char c = s[i];
+        int val;
+        if (c == '.') val = 0;
+        else if (c == '/') val = 1;
+        else if (c >= '0' && c <= '9') val = c - '0' + 2;
+        else if (c >= 'A' && c <= 'Z') val = c - 'A' + 12;
+        else if (c >= 'a' && c <= 'z') val = c - 'a' + 38;
+        else break;
+        result |= ((uint32_t)val << shift);
+        shift += 6;
+    }
+    return (long)(int32_t)result;
+}
+
+/* ── User Interaction and Status ─────────────────────────────────────────── */
+
+int rpmatch(const char *response)
+{
+    if (!response) return -1;
+    while (*response == ' ' || *response == '\t') response++;
+    if (*response == 'y' || *response == 'Y') return 1;
+    if (*response == 'n' || *response == 'N') return 0;
+    return -1;
+}
+
+int getloadavg(double loadavg[], int nelem)
+{
+    if (!loadavg || nelem <= 0) return 0;
+    int fd = open("/proc/loadavg", O_RDONLY);
+    if (fd < 0) return -1;
+
+    char buf[128];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+
+    int count = 0;
+    char *p = buf;
+    for (int i = 0; i < nelem && i < 3; i++) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '\n') break;
+        char *end;
+        loadavg[i] = strtod(p, &end);
+        if (end == p) break;
+        p = end;
+        count++;
+    }
+    return count;
+}
+
+/* ── Multibyte Character Handling ────────────────────────────────────────── */
+
+int mblen(const char *s, size_t n)
+{
+    if (!s) return 0;
+    if (n == 0) return -1;
+    if (*s == '\0') return 0;
+
+    unsigned char c = (unsigned char)*s;
+    if (c < 0x80) return 1;
+
+    if ((c & 0xE0) == 0xC0) {
+        if (n < 2) { errno = EILSEQ; return -1; }
+        if (c < 0xC2 || ((unsigned char)s[1] & 0xC0) != 0x80) {
+            errno = EILSEQ;
+            return -1;
+        }
+        return 2;
+    }
+    if ((c & 0xF0) == 0xE0) {
+        if (n < 3) { errno = EILSEQ; return -1; }
+        if (((unsigned char)s[1] & 0xC0) != 0x80 || ((unsigned char)s[2] & 0xC0) != 0x80) {
+            errno = EILSEQ;
+            return -1;
+        }
+        return 3;
+    }
+    if ((c & 0xF8) == 0xF0) {
+        if (n < 4) { errno = EILSEQ; return -1; }
+        if (((unsigned char)s[1] & 0xC0) != 0x80 ||
+            ((unsigned char)s[2] & 0xC0) != 0x80 ||
+            ((unsigned char)s[3] & 0xC0) != 0x80) {
+            errno = EILSEQ;
+            return -1;
+        }
+        return 4;
+    }
+
+    errno = EILSEQ;
+    return -1;
 }
 
 int clearenv(void)
@@ -1398,11 +1902,6 @@ int getsubopt(char **optionp, char * const *tokens, char **valuep)
         }
     }
     return -1;
-}
-
-void exit(int status)
-{
-    _exit(status);
 }
 
 void abort(void)
@@ -1468,5 +1967,75 @@ void __cxa_finalize(void *dso)
 int atexit(void (*fn)(void))
 {
     return __cxa_atexit((void (*)(void *))fn, NULL, NULL);
+}
+
+/* ── on_exit & quick_exit / at_quick_exit / exit ─────────────────────────── */
+
+#define ON_EXIT_MAX 32
+typedef struct {
+    void (*fn)(int, void *);
+    void *arg;
+} on_exit_entry_t;
+
+static on_exit_entry_t g_on_exit_table[ON_EXIT_MAX];
+static int            g_on_exit_count = 0;
+
+int on_exit(void (*fn)(int, void *), void *arg)
+{
+    if (!fn || g_on_exit_count >= ON_EXIT_MAX) return -1;
+    g_on_exit_table[g_on_exit_count].fn  = fn;
+    g_on_exit_table[g_on_exit_count].arg = arg;
+    g_on_exit_count++;
+    return 0;
+}
+
+#define QUICK_EXIT_MAX 32
+static void (*g_quick_exit_table[QUICK_EXIT_MAX])(void);
+static int  g_quick_exit_count = 0;
+
+int at_quick_exit(void (*fn)(void))
+{
+    if (!fn || g_quick_exit_count >= QUICK_EXIT_MAX) return -1;
+    g_quick_exit_table[g_quick_exit_count++] = fn;
+    return 0;
+}
+
+void _Exit(int status)
+{
+    _exit(status);
+}
+
+void quick_exit(int status)
+{
+    for (int i = g_quick_exit_count - 1; i >= 0; i--) {
+        if (g_quick_exit_table[i]) {
+            void (*fn)(void) = g_quick_exit_table[i];
+            g_quick_exit_table[i] = NULL;
+            fn();
+        }
+    }
+    _Exit(status);
+}
+
+void exit(int status)
+{
+    /* 1. Run atexit & C++ destructors registered via __cxa_atexit */
+    __cxa_finalize(NULL);
+
+    /* 2. Run on_exit callbacks in reverse registration order */
+    for (int i = g_on_exit_count - 1; i >= 0; i--) {
+        if (g_on_exit_table[i].fn) {
+            void (*fn)(int, void *) = g_on_exit_table[i].fn;
+            void *arg               = g_on_exit_table[i].arg;
+            g_on_exit_table[i].fn = NULL;
+            fn(status, arg);
+        }
+    }
+
+    /* 3. Flush open stdio streams */
+    fflush(NULL);
+
+    /* 4. Terminate process */
+    _exit(status);
 }
 

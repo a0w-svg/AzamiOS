@@ -282,53 +282,58 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
             vma_add(proc, start_vaddr, end_vaddr, vma_prot, VMA_F_FILE);
         }
 
-        /* 1. Allocate & map all pages for this segment */
+        /* Single pass: allocate, stream file data directly into page, zero padding/bss, and map */
         for (u64 vaddr = start_vaddr; vaddr < end_vaddr; vaddr += PAGE_SIZE) {
             phys_addr_t phys = vmm_translate(user_space, vaddr);
-            if (phys) {
-                /* Page already mapped by an adjacent segment (page-unaligned
-                 * segment boundary). Merge permissions conservatively rather
-                 * than forcing RWX: writable if either segment needs it,
-                 * executable only if either segment is executable. */
+            bool already_mapped = (phys != 0);
+            void *page_buf = NULL;
+
+            if (already_mapped) {
                 phys = phys & VMM_PHYS_MASK;
                 u64 old_flags = vmm_query_flags(user_space, vaddr);
                 u64 merged = VMM_F_PRESENT | VMM_F_USER;
                 if ((old_flags & VMM_F_WRITE) || (vmm_flags & VMM_F_WRITE))
                     merged |= VMM_F_WRITE;
                 if ((old_flags & VMM_F_NX) && (vmm_flags & VMM_F_NX))
-                    merged |= VMM_F_NX;   /* NX only when neither part is code */
+                    merged |= VMM_F_NX;
                 vmm_map(user_space, vaddr, phys, merged);
+                page_buf = (void *)PHYS_TO_VIRT(phys);
             } else {
                 phys = pmm_alloc_page();
                 if (!phys) return -ENOMEM;
-
-                void *page_buf = (void *)PHYS_TO_VIRT(phys);
-                __builtin_memset(page_buf, 0, PAGE_SIZE);
+                page_buf = (void *)PHYS_TO_VIRT(phys);
                 vmm_map(user_space, vaddr, phys, vmm_flags);
             }
-        }
 
-        /* 2. Stream file data directly into mapped memory pages */
-        if (phdr.p_filesz > 0) {
-            file->f_pos = phdr.p_offset;
-            u64 bytes_loaded = 0;
-            while (bytes_loaded < phdr.p_filesz) {
-                u64 cur_vaddr = seg_vaddr + bytes_loaded;
-                phys_addr_t phys = vmm_translate(user_space, cur_vaddr) & VMM_PHYS_MASK;
-                if (!phys) return -EIO;
+            /* Overlap calculation between this page [vaddr, page_end) and file data [seg_vaddr, file_data_end) */
+            u64 page_end = vaddr + PAGE_SIZE;
+            u64 file_data_end = seg_vaddr + phdr.p_filesz;
+            u64 file_start = (vaddr < seg_vaddr) ? seg_vaddr : vaddr;
+            u64 file_end   = (page_end < file_data_end) ? page_end : file_data_end;
 
-                void *page_buf = (void *)PHYS_TO_VIRT(phys);
-                u64 page_offset = cur_vaddr & (PAGE_SIZE - 1);
-                size_t chunk = (size_t)MIN(PAGE_SIZE - page_offset, phdr.p_filesz - bytes_loaded);
+            if (file_end > file_start) {
+                u64 page_off = file_start - vaddr;
+                size_t read_bytes = (size_t)(file_end - file_start);
 
-                s64 nread = vfs_read(file, (char *)page_buf + page_offset, chunk);
-                if (nread <= 0) break;
-                bytes_loaded += (u64)nread;
-            }
-            if (bytes_loaded < phdr.p_filesz) {
-                pr_debug("[ELF] ERROR: Short read on segment %u! Loaded %llu of %llu bytes\n",
-                         (unsigned int)i, (unsigned long long)bytes_loaded, (unsigned long long)phdr.p_filesz);
-                return -EIO;
+                if (!already_mapped && page_off > 0) {
+                    __builtin_memset(page_buf, 0, (size_t)page_off);
+                }
+
+                file->f_pos = phdr.p_offset + (file_start - seg_vaddr);
+                s64 nread = vfs_read(file, (char *)page_buf + page_off, read_bytes);
+                if (nread < (s64)read_bytes) {
+                    pr_debug("[ELF] ERROR: Short read on segment %u at vaddr 0x%llx\n",
+                             (unsigned int)i, (unsigned long long)vaddr);
+                    return -EIO;
+                }
+
+                if (page_off + read_bytes < PAGE_SIZE) {
+                    __builtin_memset((char *)page_buf + page_off + read_bytes, 0,
+                                     PAGE_SIZE - (page_off + read_bytes));
+                }
+            } else {
+                /* Pure BSS page */
+                hw_clear_page(page_buf);
             }
         }
     }

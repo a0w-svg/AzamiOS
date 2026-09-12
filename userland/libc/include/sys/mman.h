@@ -59,6 +59,8 @@ int   posix_madvise(void *addr, size_t len, int advice);
 void *mremap(void *old_address, size_t old_size, size_t new_size, int flags, ...);
 int   mincore(void *addr, size_t length, unsigned char *vec);
 int   memfd_create(const char *name, unsigned int flags);
+int   shm_open(const char *name, int oflag, mode_t mode);
+int   shm_unlink(const char *name);
 /* mlockall(2)/mlock2(2) flags — canonical uapi (include/azami/uapi/syscall_nr.h,
  * staged into azami/uapi/ alongside this header — see sys/syscall.h). */
 #include "syscall.h"
