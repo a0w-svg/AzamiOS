@@ -46,12 +46,30 @@ static unix_sock_t *unix_registry_find_locked(const char *path)
     return NULL;
 }
 
+/* unix_sock_get()/unix_sock_put() — see the refcnt comment in socket.h.
+ * get() must only be called while still holding g_unix_registry_lock, on a
+ * socket unix_registry_find_locked() just found there — that's what
+ * guarantees it can't already be mid-free (unix_socket_close() removes a
+ * socket from the registry, under the same lock, before ever dropping its
+ * own reference). */
+static void unix_sock_get(unix_sock_t *u)
+{
+    __atomic_fetch_add(&u->refcnt, 1, __ATOMIC_RELAXED);
+}
+
+static void unix_sock_put(unix_sock_t *u)
+{
+    if (__atomic_sub_fetch(&u->refcnt, 1, __ATOMIC_ACQ_REL) != 0) return;
+    kfree(u);
+}
+
 unix_sock_t *unix_socket_create(int type)
 {
     unix_sock_t *u = (unix_sock_t *)kzalloc(sizeof(unix_sock_t));
     if (!u) return NULL;
     u->type = type;
     u->state = UNIX_ST_UNBOUND;
+    u->refcnt = 1; /* the reference unix_socket_close() will drop */
     spinlock_init(&u->lock);
     return u;
 }
@@ -104,7 +122,10 @@ void unix_socket_close(unix_sock_t *u)
     if (tx) pipe_close_end(tx, false);
     if (rx) pipe_close_end(rx, true);
 
-    kfree(u);
+    /* Drops the creator's reference; a concurrent connect()/sendmsg() that
+     * looked this socket up in the registry and is still holding its own
+     * (see unix_sock_get()) keeps it alive until that's done with it. */
+    unix_sock_put(u);
 }
 
 int unix_socket_bind(unix_sock_t *u, const char *path)
@@ -148,16 +169,25 @@ int unix_socket_connect(unix_sock_t *client, const char *path, bool nonblock)
 
     spinlock_lock(&g_unix_registry_lock);
     unix_sock_t *listener = unix_registry_find_locked(path);
+    /* Taken while g_unix_registry_lock is still held — see
+     * unix_sock_get()'s comment. Every exit below this point must
+     * unix_sock_put() it exactly once. */
+    if (listener) unix_sock_get(listener);
     spinlock_unlock(&g_unix_registry_lock);
-    if (!listener || listener->type != SOCK_STREAM) return -ECONNREFUSED;
+    if (!listener || listener->type != SOCK_STREAM) {
+        if (listener) unix_sock_put(listener);
+        return -ECONNREFUSED;
+    }
 
     spinlock_lock(&listener->lock);
     if (listener->state != UNIX_ST_LISTENING) {
         spinlock_unlock(&listener->lock);
+        unix_sock_put(listener);
         return -ECONNREFUSED;
     }
     if (listener->msg_count >= listener->backlog_max) {
         spinlock_unlock(&listener->lock);
+        unix_sock_put(listener);
         /* A full backlog on a real AF_UNIX listener is a connection refusal,
          * not something connect() retries — matches accept() being expected
          * to drain the backlog promptly rather than this side waiting. */
@@ -171,10 +201,11 @@ int unix_socket_connect(unix_sock_t *client, const char *path, bool nonblock)
      * pipe #1 carries client->accepted, pipe #2 carries accepted->client. */
     file_t *r1 = NULL, *w1 = NULL, *r2 = NULL, *w2 = NULL;
     int err = pipe_create(&r1, &w1);
-    if (err < 0) return err;
+    if (err < 0) { unix_sock_put(listener); return err; }
     err = pipe_create(&r2, &w2);
     if (err < 0) {
         vfs_close(r1); vfs_close(w1);
+        unix_sock_put(listener);
         return err;
     }
 
@@ -182,6 +213,7 @@ int unix_socket_connect(unix_sock_t *client, const char *path, bool nonblock)
     if (!pending) {
         vfs_close(r1); vfs_close(w1);
         vfs_close(r2); vfs_close(w2);
+        unix_sock_put(listener);
         return -ENOMEM;
     }
     pending->pending_tx = (struct pipe *)w2->private_data; /* accepted side writes here */
@@ -206,6 +238,7 @@ int unix_socket_connect(unix_sock_t *client, const char *path, bool nonblock)
     listener->recv_wait = NULL;
     spinlock_unlock(&listener->lock);
     if (need_wake) sched_unblock(waiter);
+    unix_sock_put(listener);
 
     client->state = UNIX_ST_CONNECTED;
     return 0;
@@ -266,11 +299,18 @@ s64 unix_socket_sendmsg(unix_sock_t *u, const char *dest_path, const void *buf, 
     if (!dest_path || !dest_path[0]) return -EDESTADDRREQ;
     spinlock_lock(&g_unix_registry_lock);
     unix_sock_t *target = unix_registry_find_locked(dest_path);
+    /* Taken while g_unix_registry_lock is still held — see
+     * unix_sock_get()'s comment. Every exit below this point must
+     * unix_sock_put() it exactly once. */
+    if (target) unix_sock_get(target);
     spinlock_unlock(&g_unix_registry_lock);
-    if (!target || target->type != SOCK_DGRAM) return -ECONNREFUSED;
+    if (!target || target->type != SOCK_DGRAM) {
+        if (target) unix_sock_put(target);
+        return -ECONNREFUSED;
+    }
 
     unix_msg_t *msg = (unix_msg_t *)kmalloc(sizeof(unix_msg_t) + len);
-    if (!msg) return -ENOMEM;
+    if (!msg) { unix_sock_put(target); return -ENOMEM; }
     memset(msg, 0, sizeof(unix_msg_t));
     if (len > 0) memcpy(msg->data, buf, len);
     msg->len = len;
@@ -289,6 +329,7 @@ s64 unix_socket_sendmsg(unix_sock_t *u, const char *dest_path, const void *buf, 
     target->recv_wait = NULL;
     spinlock_unlock(&target->lock);
     if (need_wake) sched_unblock(waiter);
+    unix_sock_put(target);
 
     return (s64)len;
 }

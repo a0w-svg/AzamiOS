@@ -59,6 +59,20 @@ u16 udp_checksum(const udp_hdr_t *udp, const ipv4_hdr_t *ip, const void *payload
     return res == 0 ? 0xFFFF : res;
 }
 
+/* udp_sock_get()/udp_sock_put() — see the refcnt comment in udp.h. Same
+ * contract as tcp.c's tcp_sock_get()/tcp_sock_put(): get() only while still
+ * holding g_udp_lock on a socket that lookup just found in the list. */
+static void udp_sock_get(udp_sock_t *s)
+{
+    __atomic_fetch_add(&s->refcnt, 1, __ATOMIC_RELAXED);
+}
+
+static void udp_sock_put(udp_sock_t *s)
+{
+    if (__atomic_sub_fetch(&s->refcnt, 1, __ATOMIC_ACQ_REL) != 0) return;
+    kfree(s);
+}
+
 udp_sock_t *udp_socket_create(void)
 {
     udp_sock_t *s = (udp_sock_t *)kzalloc(sizeof(udp_sock_t));
@@ -69,6 +83,7 @@ udp_sock_t *udp_socket_create(void)
     s->bound = false;
     s->connected = false;
     s->wait_thread = NULL;
+    s->refcnt = 1; /* the reference udp_socket_close() will drop */
 
     spinlock_lock(&g_udp_lock);
     s->next = g_udp_sockets;
@@ -101,7 +116,9 @@ void udp_socket_close(udp_sock_t *sock)
     }
     spinlock_unlock(&sock->lock);
 
-    kfree(sock);
+    /* Drops the creator's reference; a concurrent udp_input() holding its
+     * own (see udp_sock_get()) keeps the socket alive until it is done. */
+    udp_sock_put(sock);
 }
 
 static u16 udp_alloc_ephemeral_port(void)
@@ -356,6 +373,10 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         }
         cur = cur->next;
     }
+    /* Taken while g_udp_lock is still held — see udp_sock_get()'s comment.
+     * Dropped below once this packet is done with target_sock, whichever
+     * of the two branches that turns out to be. */
+    if (target_sock) udp_sock_get(target_sock);
     spinlock_unlock(&g_udp_lock);
 
     if (target_sock) {
@@ -378,6 +399,7 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             }
             spinlock_unlock(&target_sock->lock);
         }
+        udp_sock_put(target_sock);
     } else if (dst_port != DHCP_CLIENT_PORT) {
         /* Port Unreachable */
         icmp_send_dest_unreach(ip_hdr, buf->data, buf->len, ICMP_CODE_PORT_UNREACH);

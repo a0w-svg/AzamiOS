@@ -174,6 +174,14 @@ typedef struct unix_sock {
 
     spinlock_t        lock;
     struct unix_sock *registry_next; /* g_unix_registry link, when path[0] != 0 */
+
+    /* Reference count — same reasoning as tcp_sock_t.refcnt (kernel/net/
+     * tcp.c): unix_socket_connect() and unix_socket_sendmsg() look a peer
+     * up in g_unix_registry, release that lock, then dereference and lock
+     * the socket they found; unix_socket_close() can free it from another
+     * thread in that gap — reachable from plain local IPC, no network
+     * needed. See unix_sock_get()/unix_sock_put() in unix_socket.c. */
+    u32               refcnt;
 } unix_sock_t;
 
 typedef struct socket {

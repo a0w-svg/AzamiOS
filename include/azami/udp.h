@@ -43,6 +43,13 @@ typedef struct udp_sock {
     struct thread  *wait_thread;
     spinlock_t      lock;
     struct udp_sock *next;
+
+    /* Reference count — same reasoning as tcp_sock_t.refcnt (see tcp.h):
+     * udp_input() finds a socket by walking g_udp_sockets under the global
+     * lock, then uses it (queue push, wait_thread wakeup) after releasing
+     * that lock; udp_socket_close() can free it from another CPU in that
+     * gap. See udp_sock_get()/udp_sock_put() in udp.c. */
+    u32              refcnt;
 } udp_sock_t;
 
 /* Public UDP API */

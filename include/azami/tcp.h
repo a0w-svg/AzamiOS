@@ -110,6 +110,18 @@ typedef struct tcp_sock {
 
     spinlock_t       lock;
     struct tcp_sock *next;
+
+    /* Reference count. tcp_input() finds a socket by walking g_tcp_sockets
+     * under the global lock, then — after releasing it — locks the socket
+     * itself and uses it; tcp_socket_close() can run concurrently on
+     * another CPU in between those two steps. A count taken under the
+     * global lock while the socket is still known to be in the list, held
+     * for the duration of that use, and dropped (freeing at zero) is what
+     * stops the second CPU's free from landing while the first is still
+     * inside spinlock_lock(&sock->lock) or beyond — a spinlock alone only
+     * keeps two live users from colliding, it does not keep the object
+     * alive at all. See tcp_sock_get()/tcp_sock_put() in tcp.c. */
+    u32              refcnt;
 } tcp_sock_t;
 
 /* Public TCP API */

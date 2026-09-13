@@ -124,6 +124,30 @@ static s64 tcp_send_packet(tcp_sock_t *sock, u8 flags, const void *payload, size
     return ipv4_send(buf, sock->remote_ip, IP_PROTO_TCP);
 }
 
+/* tcp_sock_get()/tcp_sock_put() — see the refcnt comment in tcp.h.
+ *
+ * tcp_sock_get() must only be called while still holding g_tcp_lock, on a
+ * socket just found in g_tcp_sockets by that same lookup — that is what
+ * guarantees it can't already be mid-free (tcp_socket_close() removes a
+ * socket from the list, under the same lock, before ever dropping its own
+ * reference).
+ *
+ * tcp_sock_put() drops one reference and frees the socket once nothing
+ * holds another — the creator's initial reference (dropped by
+ * tcp_socket_close()) and one per concurrent tcp_input() lookup. */
+static void tcp_sock_get(tcp_sock_t *s)
+{
+    __atomic_fetch_add(&s->refcnt, 1, __ATOMIC_RELAXED);
+}
+
+static void tcp_sock_put(tcp_sock_t *s)
+{
+    if (__atomic_sub_fetch(&s->refcnt, 1, __ATOMIC_ACQ_REL) != 0) return;
+    if (s->rx_buf) kfree(s->rx_buf);
+    if (s->tx_buf) kfree(s->tx_buf);
+    kfree(s);
+}
+
 tcp_sock_t *tcp_socket_create(void)
 {
     tcp_sock_t *s = (tcp_sock_t *)kzalloc(sizeof(tcp_sock_t));
@@ -132,6 +156,7 @@ tcp_sock_t *tcp_socket_create(void)
     spinlock_init(&s->lock);
     s->state = TCP_STATE_CLOSED;
     s->bound = false;
+    s->refcnt = 1; /* the reference tcp_socket_close() will drop */
     s->rcv_wnd = TCP_DEFAULT_WINDOW;
     s->snd_wnd = TCP_DEFAULT_WINDOW;
 
@@ -171,12 +196,25 @@ void tcp_socket_close(tcp_sock_t *sock)
         sock->state = TCP_STATE_CLOSED;
     }
 
+    /* A closed listener's not-yet-accept()ed children are about to become
+     * unreachable: they stay in g_tcp_sockets (so they keep answering
+     * traffic) but the backlog array that was their only path to accept()
+     * lives inside *this* struct, one kfree() away. Snapshot and close
+     * them here instead of leaking them as connections nothing can ever
+     * accept and nothing will ever close. */
+    tcp_sock_t *orphans[TCP_MAX_BACKLOG];
+    int norphans = sock->backlog_count;
+    for (int i = 0; i < norphans; i++) orphans[i] = sock->backlog[i];
+    sock->backlog_count = 0;
+
     /* Unblock all waiting threads */
     if (sock->rx_wait_thread) { sched_unblock(sock->rx_wait_thread); sock->rx_wait_thread = NULL; }
     if (sock->tx_wait_thread) { sched_unblock(sock->tx_wait_thread); sock->tx_wait_thread = NULL; }
     if (sock->conn_wait_thread) { sched_unblock(sock->conn_wait_thread); sock->conn_wait_thread = NULL; }
     if (sock->accept_wait_thread) { sched_unblock(sock->accept_wait_thread); sock->accept_wait_thread = NULL; }
     spinlock_unlock(&sock->lock);
+
+    for (int i = 0; i < norphans; i++) tcp_socket_close(orphans[i]);
 
     spinlock_lock(&g_tcp_lock);
     tcp_sock_t **curr = &g_tcp_sockets;
@@ -189,9 +227,9 @@ void tcp_socket_close(tcp_sock_t *sock)
     }
     spinlock_unlock(&g_tcp_lock);
 
-    if (sock->rx_buf) kfree(sock->rx_buf);
-    if (sock->tx_buf) kfree(sock->tx_buf);
-    kfree(sock);
+    /* Drops the creator's reference; a concurrent tcp_input() holding its
+     * own (see tcp_sock_get()) keeps the socket alive until it is done. */
+    tcp_sock_put(sock);
 }
 
 static u16 tcp_alloc_ephemeral_port(void)
@@ -478,6 +516,10 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         cur = cur->next;
     }
     if (!sock) sock = listener;
+    /* Taken while g_tcp_lock is still held, on a socket this same lookup
+     * just confirmed is still in the list — see tcp_sock_get()'s comment.
+     * Every exit below this point must tcp_sock_put() it exactly once. */
+    if (sock) tcp_sock_get(sock);
     spinlock_unlock(&g_tcp_lock);
 
     if (!sock) {
@@ -555,6 +597,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
                 tcp_send_packet(sock, TCP_FLAG_ACK, NULL, 0);
             spinlock_unlock(&sock->lock);
             net_buf_free(buf);
+            tcp_sock_put(sock);
             return;
         }
 
@@ -567,6 +610,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             if (acked > in_flight) {
                 spinlock_unlock(&sock->lock);
                 net_buf_free(buf);
+                tcp_sock_put(sock);
                 return;
             }
         }
@@ -582,6 +626,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             if (sock->conn_wait_thread) { sched_unblock(sock->conn_wait_thread); sock->conn_wait_thread = NULL; }
             spinlock_unlock(&sock->lock);
             net_buf_free(buf);
+            tcp_sock_put(sock);
             return;
         }
     }
@@ -737,6 +782,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
 
     spinlock_unlock(&sock->lock);
     net_buf_free(buf);
+    tcp_sock_put(sock);
 }
 
 void tcp_timer_tick(void)
