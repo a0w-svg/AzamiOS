@@ -874,6 +874,11 @@ static void vfs_fill_stat(inode_t *i, struct stat *statbuf)
     statbuf->st_gid   = i->i_gid;
     statbuf->st_size  = i->i_size;
     statbuf->st_blocks = i->i_blocks;
+    /* Only a device node carries a real device number; every other inode
+     * (including one that happens to have i_rdev left as its kzalloc'd 0)
+     * must report 0 here regardless, so this doesn't depend on callers
+     * having zeroed i_rdev for non-device inodes. */
+    statbuf->st_rdev = (S_ISCHR(i->i_mode) || S_ISBLK(i->i_mode)) ? i->i_rdev : 0;
     statbuf->st_atime = i->i_atime;
     statbuf->st_mtime = i->i_mtime;
     statbuf->st_ctime = i->i_ctime;

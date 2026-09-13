@@ -139,9 +139,6 @@ To put the applets in `/bin` and `/sbin` instead, edit the `install` target in
 
 ## Known gaps
 
-- **`st_rdev` is always 0.** devfs does not assign major/minor numbers, so
-  `ls -l /dev` shows `0, 0` for every node and anything that inspects device
-  numbers sees nothing useful.
 - **Dynamic linking is untested.** `PT_INTERP` is honoured by the loader but no
   dynamic binary has been run end to end.
 - **No vDSO.** `AT_SYSINFO_EHDR` is not supplied, so `clock_gettime` and friends

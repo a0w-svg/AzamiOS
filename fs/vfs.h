@@ -48,6 +48,13 @@
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
 #define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
+/* Device numbers: old-style 8-bit-minor encoding, matching what the statx
+ * path (kernel/syscall/syscall.c) already assumes when it splits kst.st_rdev
+ * back into stx_rdev_major/stx_rdev_minor. */
+#define MKDEV(ma, mi)  ((u64)(((u32)(ma) << 8) | ((u32)(mi) & 0xFFu)))
+#define MAJOR(rdev)    ((u32)((rdev) >> 8))
+#define MINOR(rdev)    ((u32)((rdev) & 0xFFu))
+
 /* Linux x86_64 compatible struct stat */
 struct stat {
     u64 st_dev;
@@ -147,6 +154,7 @@ typedef struct inode {
     u32 i_gid;
     u64 i_size;
     u64 i_blocks;
+    u64 i_rdev;    /* Device number for S_ISCHR/S_ISBLK nodes; 0 otherwise */
     u64 i_atime;
     u64 i_mtime;
     u64 i_ctime;
