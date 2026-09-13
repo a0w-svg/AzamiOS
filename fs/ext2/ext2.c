@@ -839,6 +839,7 @@ static s64 ext2_mount(file_system_type_t *fs_type, const char *dev_name, const c
     }
 
     vfs_sb->s_magic = EXT2_SUPER_MAGIC;
+    vfs_sb->s_dev = bdev->rdev;
     vfs_sb->s_blocksize = fs->block_size;
     vfs_sb->s_fs_info = fs;
     vfs_sb->s_op = &ext2_super_ops;

@@ -119,12 +119,29 @@ typedef struct super_operations {
 typedef struct super_block {
     u32 s_magic;
     u32 s_blocksize;
+    u64 s_dev;   /* st_dev every inode on this mount reports: the backing
+                  * block device's rdev for a disk-backed filesystem, or a
+                  * vfs_alloc_anon_dev() id for a pseudo one (devfs, procfs,
+                  * sysfs, tmpfs, devpts, ...) */
     struct file_system_type *s_type;
     super_operations_t *s_op;
     struct dentry *s_root;
     void *s_fs_info; /* Filesystem specific private data */
     struct super_block *next;
 } super_block_t;
+
+/* A unique, never-reused device id for a superblock with no real backing
+ * block device — same role Linux's anonymous-device allocator plays for
+ * pseudo filesystems. Major 0 is never handed to a real device, so these
+ * can never collide with a devfs_get_rdev() result. */
+u64 vfs_alloc_anon_dev(void);
+
+/* devfs_get_rdev(name) — the MKDEV() value devfs assigned the /dev node
+ * @name at registration (0 if no such node exists yet). Lets a disk-backed
+ * filesystem's mount() give its superblock the same st_dev its block
+ * device already reports through stat("/dev/<name>"), matching what every
+ * inode on that mount is expected to report. */
+u64 devfs_get_rdev(const char *name);
 
 /* --------------------------------------------------------------------------
  * Inode Operations

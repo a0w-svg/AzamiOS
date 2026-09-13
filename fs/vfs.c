@@ -372,7 +372,8 @@ void vfs_init(void)
     super_block_t *sb = (super_block_t *)kzalloc(sizeof(super_block_t));
     inode_t *root_inode = (inode_t *)kzalloc(sizeof(inode_t));
     dentry_t *root_dentry = dcache_alloc(NULL, "/");
-    
+
+    sb->s_dev = vfs_alloc_anon_dev();
     root_inode->i_ino = 1;
     root_inode->i_mode = S_IFDIR | 0755;
     root_inode->i_sb = sb;
@@ -865,9 +866,20 @@ s64 vfs_lseek(file_t *file, s64 offset, int whence)
  * early when it reads 0, and tools that de-duplicate hard links read it on
  * files. A filesystem that does not track links reports 0, so substitute the
  * honest minimum — 1 for a file, 2 for a directory (itself and its own '.'). */
+/* See vfs.h: major 0 is never a real device, so these can't collide with a
+ * devfs_get_rdev() result. Starts at 1 — 0 stays reserved for "no
+ * superblock", the state an inode created before vfs_init() finished would
+ * otherwise show. */
+u64 vfs_alloc_anon_dev(void)
+{
+    static u64 s_next_anon_minor = 1;
+    return MKDEV(0, s_next_anon_minor++);
+}
+
 static void vfs_fill_stat(inode_t *i, struct stat *statbuf)
 {
     __builtin_memset(statbuf, 0, sizeof(struct stat));
+    statbuf->st_dev   = i->i_sb ? i->i_sb->s_dev : 0;
     statbuf->st_ino   = i->i_ino;
     statbuf->st_mode  = i->i_mode;
     statbuf->st_uid   = i->i_uid;

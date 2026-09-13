@@ -1559,6 +1559,7 @@ static s64 procfs_mount(file_system_type_t *fs_type, const char *dev_name, const
     if (!sb) return -(s64)ENOMEM;
 
     sb->s_magic = PROCFS_SUPER_MAGIC;
+    sb->s_dev = vfs_alloc_anon_dev();
     sb->s_blocksize = 4096;
 
     inode_t *root_inode = procfs_alloc_inode(sb, 1, S_IFDIR | 0555, PROCFS_TYPE_ROOT_DIR, 0);

@@ -196,6 +196,25 @@ static u64 devfs_assign_rdev(const char *name, u32 mode)
     return MKDEV(DEVFS_MISC_MAJOR, s_next_misc_minor++);
 }
 
+/* devfs_get_rdev() — the device number a /dev node was assigned at
+ * registration (see vfs.h). Used by disk-backed filesystems' mount() to
+ * give their superblock the same st_dev their block device already
+ * reports via stat("/dev/<name>"). */
+u64 devfs_get_rdev(const char *name)
+{
+    if (!name) return 0;
+    u64 rdev = 0;
+    spinlock_lock(&g_devfs_lock);
+    for (u32 i = 0; i < g_device_count; i++) {
+        if (strcmp(g_devices[i].name, name) == 0) {
+            rdev = g_devices[i].rdev;
+            break;
+        }
+    }
+    spinlock_unlock(&g_devfs_lock);
+    return rdev;
+}
+
 /* Global function exposed to drivers */
 int devfs_register_device(const char *name, file_operations_t *fops, void *private_data)
 {
@@ -527,6 +546,7 @@ static s64 devfs_mount(file_system_type_t *fs_type, const char *dev_name, const 
     }
     
     sb->s_magic = 0xDE7F5;
+    sb->s_dev = vfs_alloc_anon_dev();
     sb->s_type = fs_type;
     
     root_inode->i_ino = 1;

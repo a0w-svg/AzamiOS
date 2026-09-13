@@ -153,6 +153,7 @@ static s64 devpts_mount(file_system_type_t *fs_type, const char *dev_name, const
     if (!sb) return -(s64)ENOMEM;
 
     sb->s_magic = DEVPTS_SUPER_MAGIC;
+    sb->s_dev = vfs_alloc_anon_dev();
     sb->s_blocksize = 4096;
     sb->s_op = &g_devpts_super_ops;
 

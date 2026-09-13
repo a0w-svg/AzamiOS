@@ -151,8 +151,12 @@ s64 block_dev_register(block_dev_t *dev)
     g_block_devices = dev;
     spinlock_unlock(&g_block_lock);
 
-    /* Register with devfs */
+    /* Register with devfs, then read back the device number it assigned —
+     * a filesystem mounted from this device (fs/ext2, fs/squashfs,
+     * fs/fat32) uses it as the superblock's st_dev, matching what
+     * stat("/dev/<name>") already reports for the same device. */
     devfs_register_block_device(dev->name, &block_fops, dev);
+    dev->rdev = devfs_get_rdev(dev->name);
 
     pr_debug("[BLOCK] Registered block device '%s' (%llu sectors, %u B/sec)\n",
             dev->name, (unsigned long long)dev->sector_count, dev->sector_size);

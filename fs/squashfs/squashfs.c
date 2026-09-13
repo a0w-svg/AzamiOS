@@ -1135,6 +1135,7 @@ static s64 sqfs_mount(file_system_type_t *fs_type,
         return -(s64)ENOMEM;
     }
     vsb->s_magic    = SQFS_MAGIC;
+    vsb->s_dev      = bdev->rdev;
     vsb->s_blocksize = bsz;
     vsb->s_type     = fs_type;
     vsb->s_op       = &sqfs_sb_ops;

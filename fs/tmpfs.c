@@ -967,6 +967,7 @@ static s64 tmpfs_mount(file_system_type_t *fs_type, const char *dev,
     if (!sb) return -12;
     memset(sb, 0, sizeof(*sb));
     sb->s_magic     = (u32)TMPFS_MAGIC;
+    sb->s_dev       = vfs_alloc_anon_dev();
     sb->s_blocksize = 4096;
     sb->s_type      = fs_type;
     sb->s_op        = &s_tmpfs_super_ops;

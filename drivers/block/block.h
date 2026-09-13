@@ -34,6 +34,7 @@ typedef struct block_dev {
     char        name[32];
     u32         sector_size;   /* Typically 512 bytes */
     u64         sector_count;  /* Total sectors on device */
+    u64         rdev;          /* devfs_get_rdev(name) once registered, else 0 */
     block_ops_t *ops;
     void        *driver_data;  /* Driver-specific private data (e.g., Ramdisk base or AHCI port) */
     struct block_dev *next;

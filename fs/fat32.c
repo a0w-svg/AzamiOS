@@ -471,6 +471,7 @@ s64 fat32_mount(block_dev_t *dev, const char *mount_point)
     dentry_t *root_dentry = dcache_alloc(NULL, "/");
 
     sb->s_magic = 0x4853;
+    sb->s_dev = dev->rdev;
     sb->s_blocksize = vol->bytes_per_cluster;
     sb->s_fs_info = vol;
 
