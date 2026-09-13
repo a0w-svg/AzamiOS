@@ -186,26 +186,6 @@ static inline u32 ext2_bcache_hash(ext2_fs_info_t *fs, u32 block)
 }
 
 /*
- * Push one slot to disk. Caller holds the bucket's lock; the slot must be
- * valid and belong to a live fs.
- */
-static s64 ext2_bcache_flush_slot(ext2_bcache_slot_t *slot)
-{
-    ext2_fs_info_t *fs = slot->fs;
-    if (!fs || !fs->bdev || !fs->bdev->ops || !fs->bdev->ops->write_sectors)
-        return -(s64)ENODEV;
-    u32 ss = fs->bdev->sector_size;
-    if (ss == 0 || fs->block_size % ss) return -(s64)EINVAL;
-
-    u64 lba   = (u64)slot->block * (fs->block_size / ss);
-    u32 count = fs->block_size / ss;
-    s64 ret = fs->bdev->ops->write_sectors(fs->bdev, lba, count, slot->data);
-    if (ret < 0) return ret;
-    slot->dirty = false;
-    return 0;
-}
-
-/*
  * Choose a way in @bucket to recycle for a new block. Caller holds
  * the bucket's stripe lock. Ways already claimed by another thread's
  * in-flight ext2_bcache_claim_victim() (loading == true) are skipped
@@ -429,16 +409,54 @@ static s64 ext2_write_block(ext2_fs_info_t *fs, u32 block, void *buf)
 
 static void ext2_bcache_writeback(ext2_fs_info_t *only_fs)
 {
+    /* One scratch buffer reused across every flush below — see the comment
+     * where it's filled for why the write itself must not happen with the
+     * bucket's lock held. */
+    u8 *scratch = kzalloc(EXT2_MAX_BLOCK_SIZE);
+    if (!scratch) return;
+
     for (u32 bucket = 0; bucket < EXT2_BCACHE_BUCKETS; bucket++) {
         spinlock_t *lock = ext2_bcache_bucket_lock(bucket);
-        spinlock_lock(lock);
         for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
+            spinlock_lock(lock);
             ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
-            if (slot->valid && slot->dirty && (!only_fs || slot->fs == only_fs))
-                ext2_bcache_flush_slot(slot);
+            if (!(slot->valid && slot->dirty && (!only_fs || slot->fs == only_fs))) {
+                spinlock_unlock(lock);
+                continue;
+            }
+            /* This periodic thread used to call ext2_bcache_flush_slot()
+             * (a write_sectors() call) right here, with the bucket's lock
+             * held — same bug as ext2_read_block()/ext2_write_block() used
+             * to have (see ext2_bcache_claim_victim()'s comment): every
+             * foreground reader/writer hashing to this bucket's stripe
+             * would queue up behind however long this background flush
+             * took, on a timer that fires every ~5s for as long as the
+             * filesystem is mounted. Mark the slot loading so a concurrent
+             * claim can't also pick it, copy out what needs writing, and
+             * do the actual transfer with the lock released. */
+            ext2_fs_info_t *fs = slot->fs;
+            u32 block = slot->block;
+            __builtin_memcpy(scratch, slot->data, EXT2_MAX_BLOCK_SIZE);
+            slot->loading = true;
+            spinlock_unlock(lock);
+
+            u32 ss = fs->bdev->sector_size;
+            u64 lba   = (u64)block * (fs->block_size / ss);
+            u32 count = fs->block_size / ss;
+            s64 ret = fs->bdev->ops->write_sectors(fs->bdev, lba, count, scratch);
+
+            spinlock_lock(lock);
+            slot->loading = false;
+            /* Only clear dirty if this slot is still the same block we
+             * just wrote — a concurrent claim could have evicted it
+             * while unlocked above, in which case that claim already
+             * owns (and will flush) whatever it put here instead. */
+            if (ret >= 0 && slot->valid && slot->fs == fs && slot->block == block)
+                slot->dirty = false;
+            spinlock_unlock(lock);
         }
-        spinlock_unlock(lock);
     }
+    kfree(scratch);
 }
 
 void ext2_sync(void)
@@ -508,6 +526,8 @@ static void ext2_writeback_thread(void *arg)
  */
 static void ext2_bcache_overlay(ext2_fs_info_t *fs, u32 start, u32 count, u8 *dst)
 {
+    u8 *scratch = kzalloc(EXT2_MAX_BLOCK_SIZE);
+
     for (u32 i = 0; i < count; i++) {
         u32 blk = start + i;
         u32 bucket = ext2_bcache_hash(fs, blk);
@@ -517,12 +537,35 @@ static void ext2_bcache_overlay(ext2_fs_info_t *fs, u32 start, u32 count, u8 *ds
             ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
             if (slot->valid && slot->dirty && slot->fs == fs && slot->block == blk) {
                 __builtin_memcpy(dst + (size_t)i * fs->block_size, slot->data, fs->block_size);
-                ext2_bcache_flush_slot(slot);
+                /* Opportunistic, best-effort flush — the overlay above
+                 * already made this call's result correct regardless.
+                 * Same reasoning as ext2_bcache_writeback() for doing the
+                 * actual write with the lock released, if a scratch
+                 * buffer was available; skip the flush entirely rather
+                 * than fall back to the old lock-held-across-I/O write on
+                 * an allocation failure, since this one is opportunistic. */
+                if (scratch) {
+                    __builtin_memcpy(scratch, slot->data, fs->block_size);
+                    slot->loading = true;
+                    spinlock_unlock(lock);
+
+                    u32 ss = fs->bdev->sector_size;
+                    u64 lba   = (u64)blk * (fs->block_size / ss);
+                    u32 cnt   = fs->block_size / ss;
+                    s64 ret = fs->bdev->ops->write_sectors(fs->bdev, lba, cnt, scratch);
+
+                    spinlock_lock(lock);
+                    slot->loading = false;
+                    if (ret >= 0 && slot->valid && slot->fs == fs && slot->block == blk)
+                        slot->dirty = false;
+                }
                 break;
             }
         }
         spinlock_unlock(lock);
     }
+
+    kfree(scratch);
 }
 
 static void ext2_bcache_update_burst(ext2_fs_info_t *fs, u32 start, u32 count, const u8 *src)
@@ -1330,6 +1373,8 @@ static s64 ext2_file_read(struct file *filp, void *buf, size_t len, u64 *offset)
  * slot first. */
 static void ext2_bcache_drop(ext2_fs_info_t *fs, u32 start, u32 count)
 {
+    u8 *scratch = kzalloc(EXT2_MAX_BLOCK_SIZE);
+
     for (u32 i = 0; i < count; i++) {
         u32 blk = start + i;
         u32 bucket = ext2_bcache_hash(fs, blk);
@@ -1338,8 +1383,23 @@ static void ext2_bcache_drop(ext2_fs_info_t *fs, u32 start, u32 count)
         for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
             ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
             if (slot->valid && slot->fs == fs && slot->block == blk) {
-                if (slot->dirty && ext2_bcache_flush_slot(slot) < 0)
-                    break;   /* flush failed — keep the slot, its data is owed */
+                if (slot->dirty) {
+                    if (!scratch) break; /* keep the slot; its data is owed */
+                    __builtin_memcpy(scratch, slot->data, fs->block_size);
+                    slot->loading = true;
+                    spinlock_unlock(lock);
+
+                    u32 ss = fs->bdev->sector_size;
+                    u64 lba = (u64)blk * (fs->block_size / ss);
+                    u32 cnt = fs->block_size / ss;
+                    s64 ret = fs->bdev->ops->write_sectors(fs->bdev, lba, cnt, scratch);
+
+                    spinlock_lock(lock);
+                    slot->loading = false;
+                    if (ret < 0) break;   /* flush failed — keep the slot, its data is owed */
+                    if (!(slot->valid && slot->fs == fs && slot->block == blk))
+                        break;            /* a concurrent claim already replaced it */
+                }
                 slot->valid = false;
                 slot->dirty = false;
                 break;
@@ -1348,6 +1408,8 @@ static void ext2_bcache_drop(ext2_fs_info_t *fs, u32 start, u32 count)
         spinlock_unlock(lock);
         if (blk == 0xFFFFFFFFu) break;
     }
+
+    kfree(scratch);
 }
 
 static s64 ext2_file_fadvise(struct file *filp, u64 offset, u64 len, int advice)

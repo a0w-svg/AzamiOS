@@ -9,8 +9,17 @@
 #include "../cpu/smp.h"
 #include "../cpu/lapic.h"
 #include "../../../include/azami/defs.h"
+#include "../../../drivers/char/console.h"
 
 #define TLB_SHOOTDOWN_VECTOR  251
+
+/* Spin iterations (each one a cpu_pause()) before concluding a target's
+ * ack is late enough to be worth re-sending the IPI rather than just
+ * still in flight. Not a real-time bound — cpu_pause() cost varies a lot
+ * by host — just short enough that a genuinely dropped IPI (see the wait
+ * loop's comment) gets retried in well under a second instead of spinning
+ * unbounded. */
+#define TLB_SHOOTDOWN_RESEND_BUDGET  2000000u
 
 /* Request/completion counters, one pair per CPU.
  *
@@ -92,10 +101,41 @@ static void tlb_shootdown_mask(u64 cpu_mask)
      * else's shootdown ourselves. */
     if (!irqs_enabled()) return;
 
+    /* Bounded per-CPU wait, with the IPI re-sent if a target hasn't
+     * acknowledged within one budget — confirmed live (gdb attached to a
+     * stuck boot, see the commit this belongs to) that the plain "spin
+     * forever" version below can wait on a target that is verifiably
+     * idle, interrupts enabled, ticking normally, and simply never runs
+     * tlb_shootdown_ipi() for that request: some race between this send
+     * and the target's LAPIC (most plausible: the target still had our
+     * vector in-service from a request moments earlier when this second
+     * one arrived, and whatever should re-raise it once that finishes
+     * didn't) drops the interrupt rather than queuing it. However that
+     * happens, re-sending it is always a safe recovery: smp_send_ipi() is
+     * a fresh, independent delivery attempt, and the target's handler is
+     * idempotent (it always resolves to "flush, then publish whatever
+     * req currently reads," never "the specific request that triggered
+     * this delivery") so a resend can only ever produce the same
+     * outcome as this one arriving cleanly the first time — there is no
+     * double-flush hazard to worry about. */
     for (u32 i = 0; i < n; i++) {
         if (!((sent >> i) & 1ULL)) continue;
-        while (__atomic_load_n(&g_tlb_cpu[i].done, __ATOMIC_SEQ_CST) < ticket[i])
+        u32 spins = 0;
+        u32 resends = 0;
+        while (__atomic_load_n(&g_tlb_cpu[i].done, __ATOMIC_SEQ_CST) < ticket[i]) {
             cpu_pause();
+            if (++spins < TLB_SHOOTDOWN_RESEND_BUDGET) continue;
+            spins = 0;
+            resends++;
+            if (resends == 1 || resends % 16 == 0) {
+                kprintf("[TLB] shootdown to CPU%u stuck after %u resend(s) "
+                        "(req=%llu, done=%llu) — resending IPI\n",
+                        i, resends,
+                        (unsigned long long)ticket[i],
+                        (unsigned long long)__atomic_load_n(&g_tlb_cpu[i].done, __ATOMIC_RELAXED));
+            }
+            smp_send_ipi(i, TLB_SHOOTDOWN_VECTOR);
+        }
     }
 }
 

@@ -422,13 +422,30 @@ static int ncq_issue_and_wait(ahci_drive_t *d, u32 slot)
 
     spinlock_lock(&d->lock);
     u32 my_epoch = __atomic_load_n(&d->epoch, __ATOMIC_RELAXED);
-    /* AHCI §5.5.1: set SAct for this slot, then CI, for this slot. Both are
-     * accumulate-additional-bits registers, so two threads issuing into
-     * different slots at once must not race a read-modify-write of the
-     * same register against each other — hence the lock, even though nothing
-     * else here needs it. */
-    mw(&p->sact, mr(&p->sact) | (1u << slot));
-    mw(&p->ci,   mr(&p->ci)   | (1u << slot));
+    /* AHCI §5.5.1: set SAct for this slot, then CI, for this slot. Both
+     * registers are HBA-accumulating: a software write only ever SETS the
+     * bits present in the value written (the HBA ORs them into whatever it
+     * currently holds), and the HBA autonomously CLEARS a slot's bit when
+     * that command completes (SAct) or is dispatched (CI) — so the write
+     * here must carry *only* the new bit, nothing read back first.
+     *
+     * This used to be mw(&p->sact, mr(&p->sact) | (1u << slot)) — a
+     * software read-modify-write of a register the HBA can also modify
+     * on its own. That races the read against the HBA's autonomous clear:
+     * if some other outstanding command on this port completed between
+     * this thread's read and its write, the write's now-stale copy of
+     * that already-cleared bit got OR'd straight back in by the HBA,
+     * silently re-asserting SAct for a command that had already finished.
+     * Its waiter (this function, running on whatever thread issued it)
+     * then spun in the loop below on a bit that was never going to clear
+     * again — a real, reproducible hang under concurrent NCQ traffic, not
+     * a theoretical one; see the fs/ext2/ext2.c commit this one follows.
+     * The lock is still worth keeping: it's not protecting this bit
+     * pattern any more, but it does serialize the two register writes as
+     * one step against another thread issuing into a different slot at
+     * the same time, which the AHCI spec leaves undefined otherwise. */
+    mw(&p->sact, (1u << slot));
+    mw(&p->ci,   (1u << slot));
     spinlock_unlock(&d->lock);
 
     for (u32 i = 0; i < WAIT_LONG; i++) {
@@ -1009,8 +1026,13 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 
             build_cmd_fpdma(d, (u32)s2, ATA_CMD_READ_FPDMA_QUEUED, 280, 4, 2048, 0);
             ahci_port_t *p = d->port;
             spinlock_lock(&d->lock);
-            mw(&p->sact, mr(&p->sact) | (1u << s1) | (1u << s2));
-            mw(&p->ci,   mr(&p->ci)   | (1u << s1) | (1u << s2));
+            /* Plain write, not read-modify-write — see ncq_issue_and_wait()'s
+             * comment on why an RMW here races the HBA's own autonomous bit
+             * clearing. Both new slots are known-idle (just allocated), so
+             * writing just their two bits is exactly what the HBA needs to
+             * OR in. */
+            mw(&p->sact, (1u << s1) | (1u << s2));
+            mw(&p->ci,   (1u << s1) | (1u << s2));
             spinlock_unlock(&d->lock);
             overlapped = true;
 
