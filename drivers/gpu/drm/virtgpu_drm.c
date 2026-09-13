@@ -97,18 +97,24 @@ static int virtgpu_flush(drm_crtc_t *crtc, drm_framebuffer_t *fb,
 
 /* ── Hardware cursor ─────────────────────────────────────────────────────── */
 
+/* Guards the shared img[] staging buffer below. drm_ioctl_cursor() only ever
+ * allows this to be called by the current DRM master, and only one file can
+ * be master at a time — but a multi-monitor compositor's master fd can still
+ * legitimately have more than one thread issuing CURSOR ioctls for different
+ * CRTCs at once, and virtio-gpu's cursor queue itself is already shared
+ * across every scanout (see virtio_gpu.h). Without this, two concurrent
+ * cursor_set() calls could interleave their writes into img[] and each
+ * upload the other's half-written image. */
+static spinlock_t g_cursor_img_lock = SPINLOCK_INIT;
+
 static int virtgpu_cursor_set(drm_crtc_t *crtc, drm_gem_object_t *bo, u32 w, u32 h)
 {
     virtgpu_device_t *vg = (virtgpu_device_t *)crtc->dev->dev_private;
     virtgpu_output_t *out = virtgpu_find_output(vg, crtc);
-    /* UPDATE_CURSOR always targets scanout 0 in this driver's command
-     * wrappers (fbdev.c's cursor ioctls make the same assumption), so a
-     * second monitor gets no hardware cursor rather than a silently wrong
-     * one on the primary head. */
-    if (!out || out->scanout_id != 0) return -EINVAL;
+    if (!out) return -EINVAL;
 
     if (!bo)
-        return virtio_gpu_cursor_hide() ? -EIO : 0;
+        return virtio_gpu_cursor_hide(out->scanout_id) ? -EIO : 0;
 
     /* virtio-gpu's hardware cursor is a fixed 64x64 image; a client asking
      * for another size falls back to a software cursor by getting -EINVAL. */
@@ -116,29 +122,33 @@ static int virtgpu_cursor_set(drm_crtc_t *crtc, drm_gem_object_t *bo, u32 w, u32
         return -EINVAL;
 
     /* Gather the ARGB8888 image into a linear 64x64 buffer. drm_gem_blit_rect
-     * copes with a bo whose backing pages are not contiguous. One master, and
-     * the device lock inside the command path, keep this static buffer from
-     * being entered twice at once. */
+     * copes with a bo whose backing pages are not contiguous. */
     static u32 img[VIRTIO_GPU_CURSOR_W * VIRTIO_GPU_CURSOR_H];
     drm_rect_t all = { 0, 0, VIRTIO_GPU_CURSOR_W, VIRTIO_GPU_CURSOR_H };
+
+    spinlock_lock(&g_cursor_img_lock);
     __builtin_memset(img, 0, sizeof(img));
     drm_gem_blit_rect(bo, img, VIRTIO_GPU_CURSOR_W * 4, &all, 32);
-
-    return virtio_gpu_cursor_define(img, (u32)crtc->cursor_hot_x,
-                                    (u32)crtc->cursor_hot_y) ? -EIO : 0;
+    /* The device only ever holds one cursor image, shared across every
+     * scanout's independent position (see virtio_gpu.h) — every monitor
+     * shows the same shape, which is what a compositor actually wants. */
+    int ret = virtio_gpu_cursor_define(img, (u32)crtc->cursor_hot_x,
+                                       (u32)crtc->cursor_hot_y, out->scanout_id);
+    spinlock_unlock(&g_cursor_img_lock);
+    return ret ? -EIO : 0;
 }
 
 static int virtgpu_cursor_move(drm_crtc_t *crtc, s32 x, s32 y)
 {
     virtgpu_device_t *vg = (virtgpu_device_t *)crtc->dev->dev_private;
     virtgpu_output_t *out = virtgpu_find_output(vg, crtc);
-    if (!out || out->scanout_id != 0) return -EINVAL;
+    if (!out) return -EINVAL;
 
     /* MOVE_CURSOR places the hotspot on the scanout; a cursor dragged past
      * the top or left edge is clamped to the origin. */
     u32 ux = x < 0 ? 0u : (u32)x;
     u32 uy = y < 0 ? 0u : (u32)y;
-    return virtio_gpu_cursor_move(ux, uy) ? -EIO : 0;
+    return virtio_gpu_cursor_move(ux, uy, out->scanout_id) ? -EIO : 0;
 }
 
 static int virtgpu_mode_set(drm_crtc_t *crtc, drm_framebuffer_t *fb,
@@ -241,13 +251,13 @@ static int virtgpu_load(drm_device_t *dev)
         drm_plane_create(dev, DRM_PLANE_TYPE_PRIMARY, 1U << crtc->index,
                          formats, ARRAY_SIZE(formats));
 
-        /* A cursor plane, so universal-plane and atomic clients see the
-         * hardware cursor the legacy CURSOR ioctl drives through
-         * .cursor_set/.cursor_move — scanout 0 only, see virtgpu_cursor_set. */
-        if (out->scanout_id == 0) {
-            drm_plane_create(dev, DRM_PLANE_TYPE_CURSOR, 1U << crtc->index,
-                             cursor_formats, ARRAY_SIZE(cursor_formats));
-        }
+        /* A cursor plane on every scanout, so universal-plane and atomic
+         * clients see the hardware cursor the legacy CURSOR ioctl drives
+         * through .cursor_set/.cursor_move — virtio_gpu_cursor_define()/
+         * _move() now take the scanout id, so a second (or third, ...)
+         * monitor gets a real hardware cursor instead of none at all. */
+        drm_plane_create(dev, DRM_PLANE_TYPE_CURSOR, 1U << crtc->index,
+                         cursor_formats, ARRAY_SIZE(cursor_formats));
 
         crtc->mode       = mode;
         crtc->mode_valid = true;

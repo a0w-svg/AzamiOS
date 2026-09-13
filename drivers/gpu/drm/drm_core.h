@@ -102,6 +102,10 @@ typedef struct drm_framebuffer {
     u32                width, height, pitch, bpp, depth, pixel_format;
     drm_gem_object_t  *obj;
     int                refcount;
+    struct drm_file   *owner;      /* the file that ADDFB'd it, or NULL once
+                                     * that file has closed (see
+                                     * drm_framebuffer_release_owned()); only
+                                     * @owner or the DRM master may RMFB it. */
     struct drm_framebuffer *next;
 } drm_framebuffer_t;
 
@@ -356,8 +360,38 @@ void drm_mode_simple(drm_display_mode_t *mode, u32 w, u32 h, u32 refresh);
 drm_framebuffer_t *drm_framebuffer_create(drm_device_t *dev, drm_gem_object_t *obj,
                                           u32 width, u32 height, u32 pitch,
                                           u32 bpp, u32 depth, u32 pixel_format);
+
+/**
+ * drm_framebuffer_find(dev, id) — look up a framebuffer by its mode-object ID
+ * and hand back a reference the caller owns, dropped with
+ * drm_framebuffer_put() once done.
+ *
+ * Unlike drm_crtc_find()/drm_encoder_find()/drm_connector_find()/
+ * drm_plane_find() — which walk lists built once at driver load() and never
+ * touched again after the card is published — dev->fb_list is mutated live,
+ * from any CPU, by ADDFB/RMFB and by the vblank worker retiring a flip. A
+ * lookup that merely returned a bare pointer (as this used to) would race a
+ * concurrent RMFB two ways: the traversal itself could chase a ->next
+ * pointer into a node freed out from under it, and even a lookup that
+ * finished cleanly could still hand back a pointer that RMFB frees before
+ * the caller gets around to dereferencing it — the same shape of
+ * lookup-then-use-after-unlock bug fixed across kernel/net/ (tcp/udp/unix)
+ * in an earlier session. Taking the reference inside the same lock as the
+ * lookup is what closes both gaps at once.
+ */
 drm_framebuffer_t *drm_framebuffer_find(drm_device_t *dev, u32 id);
+
+/** drm_framebuffer_get(fb) — take an extra reference. */
+void drm_framebuffer_get(drm_framebuffer_t *fb);
 void drm_framebuffer_put(drm_device_t *dev, drm_framebuffer_t *fb);
+
+/**
+ * drm_framebuffer_release_owned(dev, file) — drop the ADDFB-time reference of
+ * every framebuffer @file still owns. Called from drm_release() so a closed
+ * fd's framebuffers don't survive it with a dangling (and, if the drm_file_t
+ * slab slot is reused, potentially misleading) ->owner pointer.
+ */
+void drm_framebuffer_release_owned(drm_device_t *dev, drm_file_t *file);
 
 /* ── GEM API (drm_gem.c) ─────────────────────────────────────────────────── */
 drm_gem_object_t *drm_gem_object_create(drm_device_t *dev, u32 width, u32 height,
@@ -365,13 +399,39 @@ drm_gem_object_t *drm_gem_object_create(drm_device_t *dev, u32 width, u32 height
 void  drm_gem_object_get(drm_gem_object_t *obj);
 void  drm_gem_object_put(drm_device_t *dev, drm_gem_object_t *obj);
 
+/**
+ * drm_gem_object_get_locked(obj) — like drm_gem_object_get(), for a caller
+ * that already holds obj->dev->lock (drm_gem_object_get() taking it too
+ * would deadlock). Used where a shared pointer field is swapped under the
+ * lock in one step, e.g. crtc->cursor_bo in drm_ioctl_cursor().
+ */
+void  drm_gem_object_get_locked(drm_gem_object_t *obj);
+
 u32   drm_gem_handle_create(drm_file_t *file, drm_gem_object_t *obj);
 drm_gem_object_t *drm_gem_handle_lookup(drm_file_t *file, u32 handle);
 int   drm_gem_handle_delete(drm_file_t *file, u32 handle);
 void  drm_gem_release_all(drm_file_t *file);
 
+/**
+ * drm_gem_object_by_mmap_offset(dev, offset) — pure lookup, no reference
+ * taken. The caller must hold dev->lock across both this call and its own
+ * use of the returned object (see drm_mmap() in drm_drv.c, the only caller):
+ * unlike drm_gem_object_lookup_by_name() below, this cannot take a reference
+ * on the caller's behalf because mmap doesn't want to hold one past the
+ * ioctl — it only ever touches obj->pages while already holding the lock.
+ */
 drm_gem_object_t *drm_gem_object_by_mmap_offset(drm_device_t *dev, u64 offset);
-drm_gem_object_t *drm_gem_object_by_name(drm_device_t *dev, u32 name);
+
+/**
+ * drm_gem_object_lookup_by_name(dev, name) — find a flink'd object and hand
+ * back a reference the caller owns (drop with drm_gem_object_put()), taken
+ * inside the same dev->lock as the lookup so a concurrent drm_gem_object_put()
+ * on another CPU (closing some other handle on the same object) cannot free
+ * it in the gap between finding it here and the caller getting its own
+ * handle on it. See drm_framebuffer_find()'s longer version of the same
+ * reasoning.
+ */
+drm_gem_object_t *drm_gem_object_lookup_by_name(drm_device_t *dev, u32 name);
 u32   drm_gem_object_flink(drm_device_t *dev, drm_gem_object_t *obj);
 
 /** drm_gem_kmap(obj) → HHDM pointer to the first page, for kernel-side blits. */

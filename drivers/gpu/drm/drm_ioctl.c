@@ -219,6 +219,12 @@ static s64 drm_ioctl_getcrtc(drm_device_t *dev, u64 arg)
     drm_crtc_t *crtc = drm_crtc_find(dev, out.crtc_id);
     if (!crtc) return -(s64)ENOENT;
 
+    /* crtc->fb is a bare pointer (see drm_framebuffer_put()'s comment), so
+     * reading crtc->fb->base.id has to happen under the same lock that
+     * RMFB/a flip retirement would need to free it — dereferencing it
+     * unlocked raced a concurrent RMFB on another CPU for nothing more than
+     * a struct id field. */
+    spinlock_lock(&dev->lock);
     out.fb_id      = crtc->fb ? crtc->fb->base.id : 0;
     out.x          = crtc->x;
     out.y          = crtc->y;
@@ -226,6 +232,7 @@ static s64 drm_ioctl_getcrtc(drm_device_t *dev, u64 arg)
     out.mode_valid = crtc->mode_valid ? 1 : 0;
     memset(&out.mode, 0, sizeof(out.mode));
     if (crtc->mode_valid) drm_mode_to_user(&out.mode, &crtc->mode);
+    spinlock_unlock(&dev->lock);
 
     DRM_COPY_OUT(arg, &out);
     return 0;
@@ -250,22 +257,32 @@ static s64 drm_ioctl_setcrtc(drm_device_t *dev, drm_file_t *file, u64 arg)
         return 0;
     }
 
+    drm_display_mode_t mode;
+    drm_mode_from_user(&mode, &req.mode);
+    if (mode.hdisplay == 0 || mode.vdisplay == 0) return -(s64)EINVAL;
+    if (mode.hdisplay > dev->max_width || mode.vdisplay > dev->max_height) return -(s64)EINVAL;
+
+    /* Take our own reference before dev->driver->mode_set() dereferences it
+     * (every driver's mode_set() blits from fb->obj via .page_flip when @fb
+     * is non-NULL) — without one, a concurrent RMFB on another CPU can free
+     * this framebuffer in the gap between finding it and using it. Every
+     * exit below drops exactly this one reference exactly once; crtc->fb and
+     * crtc->primary->fb stay the bare, non-owning pointers they always were
+     * (RMFB detaches them synchronously — see drm_framebuffer_put()). */
     drm_framebuffer_t *fb = NULL;
     if (req.fb_id) {
         fb = drm_framebuffer_find(dev, req.fb_id);
         if (!fb) return -(s64)ENOENT;
     }
 
-    drm_display_mode_t mode;
-    drm_mode_from_user(&mode, &req.mode);
-    if (mode.hdisplay == 0 || mode.vdisplay == 0) return -(s64)EINVAL;
-    if (mode.hdisplay > dev->max_width || mode.vdisplay > dev->max_height) return -(s64)EINVAL;
-
     int ret = 0;
     if (dev->driver->mode_set) {
         ret = dev->driver->mode_set(crtc, fb, &mode, req.x, req.y);
     }
-    if (ret != 0) return (s64)ret;
+    if (ret != 0) {
+        if (fb) drm_framebuffer_put(dev, fb);
+        return (s64)ret;
+    }
 
     crtc->mode       = mode;
     crtc->mode_valid = true;
@@ -283,6 +300,7 @@ static s64 drm_ioctl_setcrtc(drm_device_t *dev, drm_file_t *file, u64 arg)
 
     pr_debug("[DRM] card%d: CRTC %u set to %ux%u fb=%u\n",
              dev->index, crtc->base.id, mode.hdisplay, mode.vdisplay, req.fb_id);
+    if (fb) drm_framebuffer_put(dev, fb);
     return 0;
 }
 
@@ -383,8 +401,12 @@ static s64 drm_ioctl_getplane(drm_device_t *dev, u64 arg)
     }
     out.count_format_types = plane->nformats;
 
+    /* plane->fb is a bare pointer too — see the same note in
+     * drm_ioctl_getcrtc(). */
+    spinlock_lock(&dev->lock);
     out.crtc_id        = plane->crtc ? plane->crtc->base.id : 0;
     out.fb_id          = plane->fb ? plane->fb->base.id : 0;
+    spinlock_unlock(&dev->lock);
     out.possible_crtcs = plane->possible_crtcs;
     out.gamma_size     = 0;
 
@@ -409,12 +431,19 @@ static s64 drm_ioctl_setplane(drm_device_t *dev, drm_file_t *file, u64 arg)
         return 0;
     }
 
+    /* Transient reference for the duration of this call — see the identical
+     * note in drm_ioctl_setcrtc(). plane->fb stays a bare pointer;
+     * drm_vblank_queue_flip() below takes its own reference for as long as
+     * it needs one. */
     drm_framebuffer_t *fb = drm_framebuffer_find(dev, req.fb_id);
     if (!fb) return -(s64)ENOENT;
 
     drm_crtc_t *crtc = drm_crtc_find(dev, req.crtc_id);
-    if (!crtc) return -(s64)ENOENT;
-    if (!(plane->possible_crtcs & (1U << crtc->index))) return -(s64)EINVAL;
+    if (!crtc) { drm_framebuffer_put(dev, fb); return -(s64)ENOENT; }
+    if (!(plane->possible_crtcs & (1U << crtc->index))) {
+        drm_framebuffer_put(dev, fb);
+        return -(s64)EINVAL;
+    }
 
     plane->fb     = fb;
     plane->crtc   = crtc;
@@ -425,12 +454,14 @@ static s64 drm_ioctl_setplane(drm_device_t *dev, drm_file_t *file, u64 arg)
 
     /* The primary plane is the scanout source, so updating it is a flip and
      * lands at a frame boundary like any other. */
+    s64 result = 0;
     if (plane->plane_type == DRM_PLANE_TYPE_PRIMARY) {
         int ret = drm_vblank_queue_flip(crtc, file, fb, 0, false, false);
         if (ret == -EBUSY) ret = 0;   /* the queued flip supersedes this one */
-        if (ret != 0) return (s64)ret;
+        result = (s64)ret;
     }
-    return 0;
+    drm_framebuffer_put(dev, fb);
+    return result;
 }
 
 /* ── Framebuffers ────────────────────────────────────────────────────────── */
@@ -451,6 +482,7 @@ static s64 drm_ioctl_addfb(drm_device_t *dev, drm_file_t *file, u64 arg)
     drm_framebuffer_t *fb = drm_framebuffer_create(dev, obj, req.width, req.height,
                                                    req.pitch, req.bpp, req.depth, format);
     if (!fb) return -(s64)ENOMEM;
+    fb->owner = file;   /* only this file, or the master, may RMFB it */
 
     req.fb_id = fb->base.id;
     DRM_COPY_OUT(arg, &req);
@@ -482,6 +514,7 @@ static s64 drm_ioctl_addfb2(drm_device_t *dev, drm_file_t *file, u64 arg)
     drm_framebuffer_t *fb = drm_framebuffer_create(dev, obj, req.width, req.height,
                                                    pitch, bpp, depth, req.pixel_format);
     if (!fb) return -(s64)ENOMEM;
+    fb->owner = file;   /* only this file, or the master, may RMFB it */
 
     req.fb_id = fb->base.id;
     DRM_COPY_OUT(arg, &req);
@@ -504,6 +537,7 @@ static s64 drm_ioctl_getfb(drm_device_t *dev, u64 arg)
     /* Linux only hands back a GEM handle to the master; unprivileged callers
      * get the geometry with handle 0. */
     out.handle = 0;
+    drm_framebuffer_put(dev, fb);
 
     DRM_COPY_OUT(arg, &out);
     return 0;
@@ -516,10 +550,29 @@ static s64 drm_ioctl_rmfb(drm_device_t *dev, drm_file_t *file, u64 arg)
     u32 fb_id;
     if (copy_from_user(&fb_id, (void *)(uintptr_t)arg, sizeof(fb_id)) != 0) return -(s64)EFAULT;
 
+    /* find() hands back our own transient reference (see its doc comment in
+     * drm_core.h) — needed even for the ->owner check right below: without
+     * it, another CPU's RMFB of the same ID, or a GEM_CLOSE dropping the
+     * last reference from a flink'd/PRIME'd peer, can free this fb in the
+     * gap between the lookup and this check. */
     drm_framebuffer_t *fb = drm_framebuffer_find(dev, fb_id);
     if (!fb) return -(s64)ENOENT;
 
-    drm_framebuffer_put(dev, fb);
+    /* Only the client that ADDFB'd this framebuffer, or the master, may
+     * remove it — matching Linux (drm_mode_rmfb_ioctl() requires the fb's
+     * own filp or CAP_SYS_ADMIN). Every card fd used to be able to RMFB any
+     * ID it could guess, tearing down another client's active scanout out
+     * from under it: an unprivileged neighbour needed no race at all to hit
+     * exactly the use-after-free this whole reference-counting fix exists to
+     * survive — it could simply cause it, any time it liked, on purpose or
+     * by accident. */
+    if (fb->owner && fb->owner != file && !file->is_master) {
+        drm_framebuffer_put(dev, fb);   /* our transient reference */
+        return -(s64)EACCES;
+    }
+
+    drm_framebuffer_put(dev, fb);       /* our transient reference */
+    drm_framebuffer_put(dev, fb);       /* the reference ADDFB created */
     return 0;
 }
 
@@ -530,15 +583,20 @@ static s64 drm_ioctl_dirtyfb(drm_device_t *dev, drm_file_t *file, u64 arg)
     struct drm_mode_fb_dirty_cmd req;
     DRM_COPY_IN(&req, arg);
 
+    /* Transient reference for the duration of this call: fb->width/height are
+     * read directly below, and drm_crtc_flush_damage() at the end also
+     * dereferences whatever crtc->fb currently is (which, absent a
+     * concurrent SETCRTC/RMFB, is this same fb) — see drm_ioctl_setcrtc()'s
+     * identical note. */
     drm_framebuffer_t *fb = drm_framebuffer_find(dev, req.fb_id);
     if (!fb) return -(s64)ENOENT;
-    if (!dev->driver->dirty_fb) return 0;
+    if (!dev->driver->dirty_fb) { drm_framebuffer_put(dev, fb); return 0; }
 
     drm_crtc_t *crtc = NULL;
     for (drm_crtc_t *c = dev->crtc_list; c; c = c->next) {
         if (c->fb == fb) { crtc = c; break; }
     }
-    if (!crtc) return 0;   /* not on screen; nothing to flush */
+    if (!crtc) { drm_framebuffer_put(dev, fb); return 0; }   /* not on screen */
 
     /*
      * Record what the client says changed rather than flushing the whole
@@ -556,6 +614,7 @@ static s64 drm_ioctl_dirtyfb(drm_device_t *dev, drm_file_t *file, u64 arg)
             struct drm_clip_rect c;
             if (copy_from_user(&c, (void *)(uintptr_t)(req.clips_ptr + i * sizeof(c)),
                                sizeof(c)) != 0) {
+                drm_framebuffer_put(dev, fb);
                 return -(s64)EFAULT;
             }
             drm_rect_t r = { c.x1, c.y1, c.x2, c.y2 };
@@ -566,8 +625,10 @@ static s64 drm_ioctl_dirtyfb(drm_device_t *dev, drm_file_t *file, u64 arg)
     }
 
     /* Without a running vblank clock there is nothing to defer to. */
-    if (!drm_vblank_running()) return (s64)drm_crtc_flush_damage(crtc);
-    return 0;
+    s64 result = 0;
+    if (!drm_vblank_running()) result = (s64)drm_crtc_flush_damage(crtc);
+    drm_framebuffer_put(dev, fb);
+    return result;
 }
 
 /* ── Dumb buffers ────────────────────────────────────────────────────────── */
@@ -651,10 +712,16 @@ static s64 drm_ioctl_gem_open(drm_device_t *dev, drm_file_t *file, u64 arg)
     struct drm_gem_open req;
     DRM_COPY_IN(&req, arg);
 
-    drm_gem_object_t *obj = drm_gem_object_by_name(dev, req.name);
+    /* Transient reference for the duration of this call — without it, a
+     * concurrent GEM_CLOSE of this object's last other handle (or an RMFB
+     * dropping an fb built on it) could free it between finding it here and
+     * drm_gem_handle_create() taking the handle's own reference. See
+     * drm_gem_object_lookup_by_name()'s doc comment in drm_core.h. */
+    drm_gem_object_t *obj = drm_gem_object_lookup_by_name(dev, req.name);
     if (!obj) return -(s64)ENOENT;
 
     u32 handle = drm_gem_handle_create(file, obj);
+    drm_gem_object_put(dev, obj);
     if (!handle) return -(s64)EMFILE;
 
     req.handle = handle;
@@ -715,13 +782,17 @@ static s64 drm_ioctl_page_flip(drm_device_t *dev, drm_file_t *file, u64 arg)
     drm_crtc_t *crtc = drm_crtc_find(dev, req.crtc_id);
     if (!crtc) return -(s64)ENOENT;
 
+    /* Transient reference — drm_vblank_queue_flip() takes its own for as
+     * long as the flip itself needs one (see its doc comment), but the fb
+     * still has to survive the gap between finding it here and that call. */
     drm_framebuffer_t *fb = drm_framebuffer_find(dev, req.fb_id);
     if (!fb) return -(s64)ENOENT;
-    if (!crtc->enabled) return -(s64)EINVAL;
+    if (!crtc->enabled) { drm_framebuffer_put(dev, fb); return -(s64)EINVAL; }
 
     int ret = drm_vblank_queue_flip(crtc, file, fb, req.user_data,
                                     (req.flags & DRM_MODE_PAGE_FLIP_EVENT) != 0,
                                     (req.flags & DRM_MODE_PAGE_FLIP_ASYNC) != 0);
+    drm_framebuffer_put(dev, fb);
     return (s64)ret;
 }
 
@@ -760,9 +831,22 @@ static s64 drm_ioctl_cursor(drm_device_t *dev, drm_file_t *file, u32 cmd, u64 ar
         drm_gem_object_t *bo = req.handle ? drm_gem_handle_lookup(file, req.handle) : NULL;
         if (req.handle && !bo) return -(s64)ENOENT;
 
-        if (crtc->cursor_bo) drm_gem_object_put(dev, crtc->cursor_bo);
+        /* Capture-old / install-new / reference-new as one step under
+         * dev->lock, then drop the old reference outside it — the same
+         * shape as drm_flip_complete()'s crtc->fb swap in drm_vblank.c. As
+         * three separate *unlocked* statements (what this used to be), two
+         * threads calling CURSOR concurrently on the same master fd could
+         * both read the same old cursor_bo and both put() it (one put() too
+         * many), or one thread's get() on the new bo could land after the
+         * other thread has already swapped crtc->cursor_bo to something else
+         * and lose that reference for good. */
+        spinlock_lock(&dev->lock);
+        drm_gem_object_t *old_cursor = crtc->cursor_bo;
         crtc->cursor_bo = bo;
-        if (bo) drm_gem_object_get(bo);
+        if (bo) drm_gem_object_get_locked(bo);
+        spinlock_unlock(&dev->lock);
+        if (old_cursor) drm_gem_object_put(dev, old_cursor);
+
         crtc->cursor_visible = bo != NULL;
 
         if (dev->driver->cursor_set) {

@@ -420,7 +420,7 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
                 }
             }
 
-            int r = virtio_gpu_cursor_define(img, c.hot_x, c.hot_y);
+            int r = virtio_gpu_cursor_define(img, c.hot_x, c.hot_y, 0);
             kfree(img);
             return r ? -(s64)EIO : 0;
         }
@@ -431,12 +431,12 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
             if (copy_from_user(&p, (void *)(uintptr_t)arg, sizeof(p)) != 0) return -(s64)EFAULT;
             u32 x = p.x < 0 ? 0u : (u32)p.x;
             u32 y = p.y < 0 ? 0u : (u32)p.y;
-            return virtio_gpu_cursor_move(x, y) ? -(s64)EIO : 0;
+            return virtio_gpu_cursor_move(x, y, 0) ? -(s64)EIO : 0;
         }
 
         case FBIOAZ_HWCURSOR_HIDE:
             if (!g_fb_state.is_virtio) return -(s64)ENOTTY;
-            return virtio_gpu_cursor_hide() ? -(s64)EIO : 0;
+            return virtio_gpu_cursor_hide(0) ? -(s64)EIO : 0;
 
         case FBIOAZ_DAMAGE: {
             if (!g_fb_state.is_virtio) return 0;   /* nothing to sync; harmless */

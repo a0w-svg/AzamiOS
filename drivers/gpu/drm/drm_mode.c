@@ -31,6 +31,13 @@ u32 drm_mode_object_add(drm_device_t *dev, drm_mode_object_t *obj, u32 type)
     return obj->id;
 }
 
+/*
+ * Plain, unlocked walk — safe only for the CRTC/encoder/connector/plane
+ * lists, which are built once in a driver's load() before the card is
+ * published and never mutated again. dev->fb_list is not one of those (see
+ * drm_framebuffer_find()'s own comment); nothing currently calls this with
+ * DRM_MODE_OBJECT_FB or DRM_MODE_OBJECT_ANY, and it needs to stay that way.
+ */
 drm_mode_object_t *drm_mode_object_find(drm_device_t *dev, u32 id, u32 type)
 {
     if (!dev || id == 0) return NULL;
@@ -51,10 +58,9 @@ drm_mode_object_t *drm_mode_object_find(drm_device_t *dev, u32 id, u32 type)
         for (drm_plane_t *p = dev->plane_list; p; p = p->next)
             if (p->base.id == id) return &p->base;
     }
-    if (type == DRM_MODE_OBJECT_FB || type == DRM_MODE_OBJECT_ANY) {
-        for (drm_framebuffer_t *f = dev->fb_list; f; f = f->next)
-            if (f->base.id == id) return &f->base;
-    }
+    /* DRM_MODE_OBJECT_FB deliberately has no case here — see the comment
+     * above this function. drm_framebuffer_find() is the only sanctioned
+     * lookup for dev->fb_list. */
     return NULL;
 }
 
@@ -313,16 +319,57 @@ drm_framebuffer_t *drm_framebuffer_create(drm_device_t *dev, drm_gem_object_t *o
     return fb;
 }
 
+/*
+ * dev->fb_list, unlike the CRTC/encoder/connector/plane lists above (built
+ * once at driver load(), never touched again once the card is published),
+ * is mutated live from any CPU by ADDFB/RMFB and by the vblank worker
+ * retiring a flip. drm_mode_object_find()'s plain unlocked walk is only
+ * safe for those static lists, so this does not go through it: the lookup
+ * and the reference this hands back both happen inside the same dev->lock
+ * critical section — see the long version of why in drm_core.h.
+ */
 drm_framebuffer_t *drm_framebuffer_find(drm_device_t *dev, u32 id)
 {
-    drm_mode_object_t *o = drm_mode_object_find(dev, id, DRM_MODE_OBJECT_FB);
-    return o ? container_of(o, drm_framebuffer_t, base) : NULL;
+    if (!dev || id == 0) return NULL;
+
+    spinlock_lock(&dev->lock);
+    drm_framebuffer_t *fb = NULL;
+    for (drm_framebuffer_t *f = dev->fb_list; f; f = f->next) {
+        if (f->base.id == id) { fb = f; break; }
+    }
+    if (fb) fb->refcount++;
+    spinlock_unlock(&dev->lock);
+    return fb;
+}
+
+void drm_framebuffer_get(drm_framebuffer_t *fb)
+{
+    if (!fb) return;
+    spinlock_lock(&fb->dev->lock);
+    fb->refcount++;
+    spinlock_unlock(&fb->dev->lock);
 }
 
 void drm_framebuffer_put(drm_device_t *dev, drm_framebuffer_t *fb)
 {
     if (!dev || !fb) return;
-    if (--fb->refcount > 0) return;
+
+    /* Decrement, zero-check, detach and unlink all run under dev->lock for
+     * exactly the reason drm_gem_object_put() now does the same (see its
+     * comment in drm_gem.c): crtc->fb/plane->fb/dev->fb_list are read and
+     * written under this lock everywhere else, so the surgery that retires a
+     * framebuffer has to be too, or a concurrent RMFB and a page-flip
+     * retirement racing on the same fb (both routinely reachable — a
+     * compositor's own outstanding flip completing while its RMFB from a
+     * different thread lands, or two clients that share a flink'd/PRIME'd
+     * buffer each dropping their handle at once) can double-free it, corrupt
+     * the list, or leave a CRTC scanning out a pointer this just kfree()'d.
+     */
+    spinlock_lock(&dev->lock);
+    if (--fb->refcount > 0) {
+        spinlock_unlock(&dev->lock);
+        return;
+    }
 
     /* Detach from anything still pointing at it, so scanout never follows a
      * dangling framebuffer after RMFB. */
@@ -339,7 +386,37 @@ void drm_framebuffer_put(drm_device_t *dev, drm_framebuffer_t *fb)
         pp = &(*pp)->next;
     }
     dev->num_fb--;
+    spinlock_unlock(&dev->lock);
 
+    /* Outside the lock: drm_gem_object_put() takes dev->lock itself. */
     drm_gem_object_put(dev, fb->obj);
     kfree(fb);
+}
+
+void drm_framebuffer_release_owned(drm_device_t *dev, drm_file_t *file)
+{
+    if (!dev || !file) return;
+
+    /*
+     * Repeatedly take the first fb this file still owns and drop its
+     * ADDFB-time reference, one at a time, rather than walking dev->fb_list
+     * once and calling drm_framebuffer_put() mid-traversal — that put() can
+     * itself unlink the very node being visited, which is exactly the node a
+     * plain for-loop's own `f = f->next` would step to. Clearing ->owner
+     * before dropping the lock is what makes each pass
+     * strictly smaller: a fb that survives its put() (still referenced by an
+     * in-flight flip elsewhere) is never picked again.
+     */
+    for (;;) {
+        spinlock_lock(&dev->lock);
+        drm_framebuffer_t *fb = NULL;
+        for (drm_framebuffer_t *f = dev->fb_list; f; f = f->next) {
+            if (f->owner == file) { fb = f; break; }
+        }
+        if (fb) fb->owner = NULL;
+        spinlock_unlock(&dev->lock);
+
+        if (!fb) return;
+        drm_framebuffer_put(dev, fb);
+    }
 }

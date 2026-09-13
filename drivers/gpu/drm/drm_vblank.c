@@ -263,10 +263,18 @@ int drm_crtc_flush_damage(drm_crtc_t *crtc)
     spinlock_lock(&dev->lock);
     u32 n = drm_crtc_take_damage(crtc, rects, &full);
     drm_framebuffer_t *fb = crtc->fb;
+    /* Take our own reference before dropping the lock: drm_present() below
+     * dereferences fb through the driver's dirty_fb hook, and crtc->fb is a
+     * bare pointer a concurrent RMFB is free to put() the instant this
+     * unlocks (see drm_framebuffer_put()'s comment in drm_mode.c). */
+    if (fb) fb->refcount++;
     spinlock_unlock(&dev->lock);
 
-    if (!full && n == 0) return 0;
-    return drm_present(crtc, fb, dev->driver->dirty_fb, rects, n, full, false);
+    if (!fb) return 0;
+    int ret = 0;
+    if (full || n) ret = drm_present(crtc, fb, dev->driver->dirty_fb, rects, n, full, false);
+    drm_framebuffer_put(dev, fb);
+    return ret;
 }
 
 /* ── Page flips ──────────────────────────────────────────────────────────── */
@@ -303,6 +311,21 @@ int drm_vblank_queue_flip(drm_crtc_t *crtc, drm_file_t *file,
     if (!crtc || !fb) return -EINVAL;
     drm_device_t *dev = crtc->dev;
 
+    /*
+     * Take our own reference before this fb is dereferenced by anything
+     * below — drm_present() calls straight into the driver's page_flip hook,
+     * which blits from fb->obj — or stored into crtc->flip_fb for the vblank
+     * worker to dereference later. Taking it late (right before the old
+     * fb->refcount++ that used to sit just above drm_flip_complete()) left a
+     * window where a concurrent RMFB on another CPU could free the very
+     * buffer drm_present() was mid-blit from. Every path below drops exactly
+     * this one reference exactly once: the immediate path via
+     * drm_flip_complete()'s existing drm_framebuffer_put(), the deferred
+     * path whenever the vblank worker retires or discards the flip
+     * (drm_vblank_advance()), and the -EBUSY path right here.
+     */
+    drm_framebuffer_get(fb);
+
     /* An asynchronous flip is a request to tear on purpose (Linux's
      * DRM_MODE_PAGE_FLIP_ASYNC), and so is a flip with no worker to defer to. */
     if (async || !g_vblank_running) {
@@ -313,9 +336,8 @@ int drm_vblank_queue_flip(drm_crtc_t *crtc, drm_file_t *file,
         spinlock_unlock(&dev->lock);
 
         int ret = drm_present(crtc, fb, dev->driver->page_flip, rects, n, full, true);
-        if (ret != 0) return ret;
+        if (ret != 0) { drm_framebuffer_put(dev, fb); return ret; }
 
-        fb->refcount++;
         drm_flip_complete(dev, crtc, fb, file, user_data, want_event, drm_now_ns());
         return 0;
     }
@@ -323,10 +345,10 @@ int drm_vblank_queue_flip(drm_crtc_t *crtc, drm_file_t *file,
     spinlock_lock(&dev->lock);
     if (crtc->flip_pending) {
         spinlock_unlock(&dev->lock);
+        drm_framebuffer_put(dev, fb);
         return -EBUSY;      /* one flip in flight, as on every KMS driver */
     }
 
-    fb->refcount++;
     crtc->flip_fb        = fb;
     crtc->flip_file      = file;
     crtc->flip_user_data = user_data;
@@ -421,6 +443,12 @@ static void drm_vblank_advance(drm_device_t *dev, drm_crtc_t *crtc, u64 now)
     bool dmg_full;
     u32  dmg_n = drm_crtc_take_damage(crtc, rects, &dmg_full);
     drm_framebuffer_t *cur = crtc->fb;
+    /* fb already owns a reference of its own, taken when the flip was queued
+     * (drm_vblank_queue_flip()). cur does not — it is crtc->fb, a bare
+     * pointer — but is about to be dereferenced by dev->driver->dirty_fb
+     * below, after this lock is dropped, so it needs one taken here, same as
+     * fb's, before a concurrent RMFB on another CPU can free it. */
+    if (cur) cur->refcount++;
     spinlock_unlock(&dev->lock);
 
     if (fb) {
@@ -452,6 +480,7 @@ static void drm_vblank_advance(drm_device_t *dev, drm_crtc_t *crtc, u64 now)
         __atomic_add_fetch(&crtc->vblank_count, elapsed, __ATOMIC_RELEASE);
         dev->vblank_count += elapsed;
     }
+    if (cur) drm_framebuffer_put(dev, cur);
 
     drm_wake(crtc);
 }

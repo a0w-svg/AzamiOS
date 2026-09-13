@@ -91,22 +91,55 @@ drm_gem_object_t *drm_gem_object_create(drm_device_t *dev, u32 width, u32 height
     return obj;
 }
 
-void drm_gem_object_get(drm_gem_object_t *obj)
+void drm_gem_object_get_locked(drm_gem_object_t *obj)
 {
     if (obj) obj->refcount++;
+}
+
+void drm_gem_object_get(drm_gem_object_t *obj)
+{
+    if (!obj) return;
+    spinlock_lock(&obj->dev->lock);
+    drm_gem_object_get_locked(obj);
+    spinlock_unlock(&obj->dev->lock);
 }
 
 void drm_gem_object_put(drm_device_t *dev, drm_gem_object_t *obj)
 {
     if (!dev || !obj) return;
-    if (--obj->refcount > 0) return;
+
+    /*
+     * The whole decrement-check-unlink sequence runs under dev->lock, not
+     * just the unlink: dev->gem_list is otherwise only touched under this
+     * lock (drm_gem_object_create()'s append, drm_gem_object_by_mmap_offset()
+     * under the caller's lock, drm_gem_object_lookup_by_name()'s own lock),
+     * and a plain "if (--obj->refcount > 0) return" here used to run the
+     * decrement — and, at zero, the unlink and free — with no lock at all.
+     * Two CPUs dropping the last two references at once could both observe
+     * the post-decrement value hit zero and both free the object; a
+     * concurrent drm_gem_object_lookup_by_name() could chase obj->next into
+     * memory this was about to kfree(); and the plain, non-atomic "--" could
+     * simply lose one CPU's decrement under the other's, leaking the object
+     * forever. Locking only the unlink would have fixed the corruption but
+     * not the double-free or the lost decrement — the refcount itself has to
+     * be inside the same critical section as the list surgery it gates.
+     */
+    spinlock_lock(&dev->lock);
+    if (--obj->refcount > 0) {
+        spinlock_unlock(&dev->lock);
+        return;
+    }
 
     drm_gem_object_t **pp = &dev->gem_list;
     while (*pp) {
         if (*pp == obj) { *pp = obj->next; break; }
         pp = &(*pp)->next;
     }
+    spinlock_unlock(&dev->lock);
 
+    /* Driver callback and the actual free happen outside the lock: nothing
+     * else can reach this object once it is unlinked, and gem_release() may
+     * itself take dev->lock (a spinlock here is not reentrant). */
     if (dev->driver->gem_release) {
         dev->driver->gem_release(dev, obj);
     }
@@ -182,20 +215,34 @@ drm_gem_object_t *drm_gem_object_by_mmap_offset(drm_device_t *dev, u64 offset)
     return NULL;
 }
 
-drm_gem_object_t *drm_gem_object_by_name(drm_device_t *dev, u32 name)
+drm_gem_object_t *drm_gem_object_lookup_by_name(drm_device_t *dev, u32 name)
 {
     if (!dev || name == 0) return NULL;
+
+    spinlock_lock(&dev->lock);
+    drm_gem_object_t *obj = NULL;
     for (drm_gem_object_t *o = dev->gem_list; o; o = o->next) {
-        if (o->name == name) return o;
+        if (o->name == name) { obj = o; break; }
     }
-    return NULL;
+    if (obj) drm_gem_object_get_locked(obj);
+    spinlock_unlock(&dev->lock);
+    return obj;
 }
 
 u32 drm_gem_object_flink(drm_device_t *dev, drm_gem_object_t *obj)
 {
     if (!dev || !obj) return 0;
+
+    /* dev->next_gem_name is a shared counter handed out to any client that
+     * flinks any object, from any CPU; two concurrent flinks of two
+     * different objects used to race the unlocked "++" and could both win
+     * the same name — after which drm_gem_object_lookup_by_name() would hand
+     * either caller's GEM_OPEN the wrong one of the two objects. */
+    spinlock_lock(&dev->lock);
     if (obj->name == 0) obj->name = ++dev->next_gem_name;
-    return obj->name;
+    u32 name = obj->name;
+    spinlock_unlock(&dev->lock);
+    return name;
 }
 
 /* ── Kernel-side access ──────────────────────────────────────────────────── */

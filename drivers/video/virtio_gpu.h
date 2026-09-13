@@ -291,17 +291,30 @@ int virtio_gpu_resource_flush(u32 resource_id, u32 width, u32 height);
 /* ── Hardware cursor plane (cursor queue) ───────────────────────────────────
  * The cursor is a host-side overlay: once its 64x64 image is uploaded, the
  * compositor never has to redraw or re-flush the scanout to move it — a
- * MOVE_CURSOR is one small message on a queue of its own. */
+ * MOVE_CURSOR is one small message on a queue of its own.
+ *
+ * QEMU's virtio-gpu device tracks cursor state (image + position) per
+ * scanout, keyed by the pos.scanout_id every UPDATE_CURSOR/MOVE_CURSOR
+ * carries — a second monitor is not limited to the same on-screen position
+ * as the first just because they share one host device. The resource itself
+ * (the 64x64 image) is still one shared allocation: every scanout shows the
+ * same cursor shape, only independently positioned, which is what every
+ * caller here actually needs — a per-scanout image would mean a second
+ * cursor_res_id and backing store per head for a shape that is, in every
+ * desktop this compositor draws, identical across monitors anyway. */
 
 /**
- * virtio_gpu_cursor_define(bgra, hot_x, hot_y) — upload a new 64x64 cursor
- * image (VIRTIO_GPU_CURSOR_W * VIRTIO_GPU_CURSOR_H pixels, BGRA8888) and make
- * it the active cursor. Creates the dedicated cursor resource on first call.
+ * virtio_gpu_cursor_define(bgra, hot_x, hot_y, scanout_id) — upload a new
+ * 64x64 cursor image (VIRTIO_GPU_CURSOR_W * VIRTIO_GPU_CURSOR_H pixels,
+ * BGRA8888) and make it the active cursor on @scanout_id. Creates the shared
+ * cursor resource on first call (from any scanout).
  */
-int virtio_gpu_cursor_define(const u32 *bgra, u32 hot_x, u32 hot_y);
+int virtio_gpu_cursor_define(const u32 *bgra, u32 hot_x, u32 hot_y, u32 scanout_id);
 
-/** virtio_gpu_cursor_move(x, y) — reposition the cursor hotspot on scanout 0. */
-int virtio_gpu_cursor_move(u32 x, u32 y);
+/** virtio_gpu_cursor_move(x, y, scanout_id) — reposition the cursor hotspot
+ *  on @scanout_id. */
+int virtio_gpu_cursor_move(u32 x, u32 y, u32 scanout_id);
 
-/** virtio_gpu_cursor_hide() — remove the cursor overlay. */
-int virtio_gpu_cursor_hide(void);
+/** virtio_gpu_cursor_hide(scanout_id) — remove the cursor overlay from
+ *  @scanout_id. */
+int virtio_gpu_cursor_hide(u32 scanout_id);

@@ -210,6 +210,14 @@ static s64 drm_release(inode_t *inode, file_t *filp)
     if (dev->master == file) dev->master = NULL;
     spinlock_unlock(&dev->lock);
 
+    /* Drop this file's framebuffers before its GEM handles: a framebuffer
+     * holds its own reference on the GEM object backing it
+     * (drm_framebuffer_create()), so freeing the fb first is what lets that
+     * reference go through the ordinary drm_gem_object_put() path below
+     * rather than leaving fb->owner pointing at a drm_file_t this is about
+     * to kfree() — a dangling pointer a later, unrelated file allocated at
+     * the same address could otherwise be mistaken for. */
+    drm_framebuffer_release_owned(dev, file);
     drm_gem_release_all(file);
     kfree(file);
     filp->private_data = NULL;

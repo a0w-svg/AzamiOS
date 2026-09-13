@@ -406,7 +406,7 @@ static int virtio_gpu_cursor_alloc(void)
     return 0;
 }
 
-int virtio_gpu_cursor_define(const u32 *bgra, u32 hot_x, u32 hot_y)
+int virtio_gpu_cursor_define(const u32 *bgra, u32 hot_x, u32 hot_y, u32 scanout_id)
 {
     if (!bgra) return -1;
     if (virtio_gpu_cursor_alloc() < 0) return -1;
@@ -420,7 +420,7 @@ int virtio_gpu_cursor_define(const u32 *bgra, u32 hot_x, u32 hot_y)
     struct virtio_gpu_update_cursor cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.hdr.type       = VIRTIO_GPU_CMD_UPDATE_CURSOR;
-    cmd.pos.scanout_id = 0;
+    cmd.pos.scanout_id = scanout_id;
     cmd.resource_id    = g_gpu.cursor_res_id;
     cmd.hot_x          = hot_x;
     cmd.hot_y          = hot_y;
@@ -428,14 +428,14 @@ int virtio_gpu_cursor_define(const u32 *bgra, u32 hot_x, u32 hot_y)
     return virtio_gpu_send_cursor(&g_gpu, &cmd, sizeof(cmd), NULL, 0);
 }
 
-int virtio_gpu_cursor_move(u32 x, u32 y)
+int virtio_gpu_cursor_move(u32 x, u32 y, u32 scanout_id)
 {
     if (!g_gpu.cursor_virt) return -1;   /* no image uploaded yet */
 
     struct virtio_gpu_update_cursor cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.hdr.type       = VIRTIO_GPU_CMD_MOVE_CURSOR;
-    cmd.pos.scanout_id = 0;
+    cmd.pos.scanout_id = scanout_id;
     cmd.pos.x          = x;
     cmd.pos.y          = y;
     cmd.resource_id    = g_gpu.cursor_res_id;   /* keep the current image */
@@ -443,14 +443,14 @@ int virtio_gpu_cursor_move(u32 x, u32 y)
     return virtio_gpu_send_cursor(&g_gpu, &cmd, sizeof(cmd), NULL, 0);
 }
 
-int virtio_gpu_cursor_hide(void)
+int virtio_gpu_cursor_hide(u32 scanout_id)
 {
     if (!g_gpu.cursor_virt) return 0;
 
     struct virtio_gpu_update_cursor cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.hdr.type       = VIRTIO_GPU_CMD_UPDATE_CURSOR;
-    cmd.pos.scanout_id = 0;
+    cmd.pos.scanout_id = scanout_id;
     cmd.resource_id    = 0;   /* 0 removes the overlay */
 
     return virtio_gpu_send_cursor(&g_gpu, &cmd, sizeof(cmd), NULL, 0);
