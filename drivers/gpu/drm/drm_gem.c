@@ -155,13 +155,34 @@ void drm_gem_object_put(drm_device_t *dev, drm_gem_object_t *obj)
     kfree(obj);
 }
 
-/* ── Per-file handles ────────────────────────────────────────────────────── */
+/* ── Per-file handles ─────────────────────────────────────────────────────
+ *
+ * file->handles[]/next_handle used to be touched with no lock at all, on the
+ * theory that one open file descriptor belongs to one client thread. POSIX
+ * doesn't actually promise that — nothing stops two threads of the same
+ * compositor sharing one DRM fd and calling GEM ioctls on it concurrently —
+ * and dev->lock already protects other genuinely per-file state the same
+ * way for the same reason (drm_send_event()'s file->event_head/tail). Two
+ * threads racing drm_gem_handle_create() could both land on the same empty
+ * slot and both write it: one handle silently overwrites the other's, whose
+ * caller now believes it exclusively owns a handle number that, in truth,
+ * names nothing it can look up — the object it thought it got a reference
+ * on is leaked (a get() with no matching put() ever queued). Racing
+ * drm_gem_handle_delete()/drm_gem_release_all() against a lookup, another
+ * delete of the same handle, or file close could double-drop the handle's
+ * one reference, freeing the object while something else still holds — and
+ * intends to use — the very handle that used to name it.
+ */
 
 u32 drm_gem_handle_create(drm_file_t *file, drm_gem_object_t *obj)
 {
     if (!file || !obj) return 0;
 
+    drm_device_t *dev = file->dev;
+    spinlock_lock(&dev->lock);
+
     /* Handle 0 is reserved as "no object", matching Linux. */
+    u32 handle = 0;
     for (u32 i = 1; i < DRM_MAX_HANDLES; i++) {
         u32 h = file->next_handle + i;
         h = 1 + (h - 1) % (DRM_MAX_HANDLES - 1);
@@ -169,36 +190,57 @@ u32 drm_gem_handle_create(drm_file_t *file, drm_gem_object_t *obj)
 
         file->handles[h]  = obj;
         file->next_handle = h;
-        drm_gem_object_get(obj);
-        return h;
+        /* _locked(): dev->lock is already held here, and drm_gem_object_get()
+         * taking it again would deadlock (not reentrant). */
+        drm_gem_object_get_locked(obj);
+        handle = h;
+        break;
     }
-    return 0;
+
+    spinlock_unlock(&dev->lock);
+    return handle;
 }
 
 drm_gem_object_t *drm_gem_handle_lookup(drm_file_t *file, u32 handle)
 {
     if (!file || handle == 0 || handle >= DRM_MAX_HANDLES) return NULL;
-    return file->handles[handle];
+
+    drm_device_t *dev = file->dev;
+    spinlock_lock(&dev->lock);
+    drm_gem_object_t *obj = file->handles[handle];
+    spinlock_unlock(&dev->lock);
+    return obj;
 }
 
 int drm_gem_handle_delete(drm_file_t *file, u32 handle)
 {
-    drm_gem_object_t *obj = drm_gem_handle_lookup(file, handle);
-    if (!obj) return -EINVAL;
+    if (!file || handle == 0 || handle >= DRM_MAX_HANDLES) return -EINVAL;
 
-    file->handles[handle] = NULL;
-    drm_gem_object_put(file->dev, obj);
+    drm_device_t *dev = file->dev;
+    spinlock_lock(&dev->lock);
+    drm_gem_object_t *obj = file->handles[handle];
+    if (obj) file->handles[handle] = NULL;
+    spinlock_unlock(&dev->lock);
+
+    if (!obj) return -EINVAL;
+    /* Outside the lock: drm_gem_object_put() takes dev->lock itself, and may
+     * call into a driver's gem_release() hook. */
+    drm_gem_object_put(dev, obj);
     return 0;
 }
 
 void drm_gem_release_all(drm_file_t *file)
 {
     if (!file) return;
+    drm_device_t *dev = file->dev;
+
     for (u32 h = 1; h < DRM_MAX_HANDLES; h++) {
-        if (!file->handles[h]) continue;
+        spinlock_lock(&dev->lock);
         drm_gem_object_t *obj = file->handles[h];
-        file->handles[h] = NULL;
-        drm_gem_object_put(file->dev, obj);
+        if (obj) file->handles[h] = NULL;
+        spinlock_unlock(&dev->lock);
+
+        if (obj) drm_gem_object_put(dev, obj);
     }
 }
 
