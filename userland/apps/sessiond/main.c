@@ -211,6 +211,19 @@ static void spawn_session_section(const char *section_header)
                 snprintf(logmsg, sizeof(logmsg), "[sessiond] Warning: failed to spawn: %s", path);
             }
             de_log(logmsg);
+
+            /* Stagger DE component startup instead of firing every az_spawn()
+             * in this section back to back: each of these (wallpaper,
+             * taskbar, notifyd, ...) does its own burst of config/icon file
+             * reads within the first few milliseconds of running, and all of
+             * them landing on the disk at once is exactly the contention
+             * pattern that made the ext2 block-cache stripe-lock-across-I/O
+             * bug (see ext2_bcache_claim_victim() in fs/ext2/ext2.c) so easy
+             * to hit at boot. That bug is fixed at the source now, but this
+             * costs one boot-time 20ms delay per component either way, so
+             * there's no reason not to keep the concurrency window narrow
+             * too. */
+            usleep(20000);
         }
 
         line = strchr(line, '\n');

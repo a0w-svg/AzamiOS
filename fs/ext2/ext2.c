@@ -66,6 +66,14 @@ typedef struct {
     u32 block;
     bool valid;
     bool dirty;
+    /* Set (with valid cleared) while a reader/writer has claimed this way
+     * for a new block and dropped the bucket lock to do the actual disk
+     * transfer — see ext2_bcache_claim_victim(). Excludes the slot from
+     * both the hit-scan and victim selection until the claimer re-locks to
+     * commit it, the same way `valid == false` always has; kept as its own
+     * flag rather than overloading `valid` so a slot mid-transfer is never
+     * mistaken for simply-empty-and-free-to-take by a second claimer. */
+    bool loading;
     u32 access_count;
     u8 data[EXT2_MAX_BLOCK_SIZE];
 } ext2_bcache_slot_t;
@@ -199,15 +207,21 @@ static s64 ext2_bcache_flush_slot(ext2_bcache_slot_t *slot)
 
 /*
  * Choose a way in @bucket to recycle for a new block. Caller holds
- * the bucket's stripe lock.
+ * the bucket's stripe lock. Ways already claimed by another thread's
+ * in-flight ext2_bcache_claim_victim() (loading == true) are skipped
+ * entirely — picking one out from under its claimer would let two
+ * transfers stomp the same slot. Returns -1 only if every way is
+ * currently loading (never a flush failure any more: the caller does the
+ * flush itself, after this returns and the lock is dropped).
  */
 static int ext2_bcache_take_victim(u32 bucket)
 {
     int clean_way = -1; u32 clean_lru = 0xFFFFFFFF;
-    int any_way   = 0;  u32 any_lru   = 0xFFFFFFFF;
+    int any_way   = -1; u32 any_lru   = 0xFFFFFFFF;
 
     for (int way = 0; way < EXT2_BCACHE_WAYS; way++) {
         ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
+        if (slot->loading) continue;
         u32 age = slot->valid ? slot->access_count : 0;
         if (age <= any_lru)   { any_lru = age; any_way = way; }
         if (!slot->valid || !slot->dirty) {
@@ -215,15 +229,60 @@ static int ext2_bcache_take_victim(u32 bucket)
         }
     }
     if (clean_way >= 0) return clean_way;
-
-    if (ext2_bcache_flush_slot(&g_ext2_bcache[bucket][any_way]) < 0)
-        return -1;
     return any_way;
+}
+
+/*
+ * Claim a victim way in @bucket for a new block, evicting whatever is
+ * there. Caller holds the bucket's lock and keeps holding it across this
+ * call — it only ever touches cache bookkeeping, never the device.
+ *
+ * If the evicted slot was dirty, its old (block, data) is copied into
+ * *out_flush_block / out_flush_data so the caller can write it back to
+ * disk *after* unlocking, rather than the old design of doing that write
+ * (and the fill read that follows it) with this bucket's stripe lock —
+ * shared by 16 of the cache's 256 buckets, see EXT2_BCACHE_STRIPES — held
+ * for the entire transfer. Every other thread whose block happens to hash
+ * to the same stripe used to queue up behind however long the disk took;
+ * under concurrent multi-process access (several DE components reading
+ * config/icon files at boot, say) that turned an ordinary read into a
+ * stall for everyone else on that stripe.
+ *
+ * The claimed way is left marked loading = true, valid = false: excluded
+ * from the hit-scan and from being picked by a concurrent claim on this
+ * bucket (see ext2_bcache_take_victim() above) until the caller re-locks
+ * to commit the new contents. Returns the way index, or -1 if every way
+ * in the bucket is already claimed by someone else (caller should treat
+ * that like the old "victim selection failed" case).
+ */
+static int ext2_bcache_claim_victim(u32 bucket, bool *out_need_flush,
+                                     u32 *out_flush_block, void *out_flush_data)
+{
+    int way = ext2_bcache_take_victim(bucket);
+    if (way < 0) return -1;
+
+    ext2_bcache_slot_t *slot = &g_ext2_bcache[bucket][way];
+    *out_need_flush = slot->valid && slot->dirty;
+    if (*out_need_flush) {
+        *out_flush_block = slot->block;
+        __builtin_memcpy(out_flush_data, slot->data, EXT2_MAX_BLOCK_SIZE);
+    }
+    slot->valid   = false;
+    slot->dirty   = false;
+    slot->loading = true;
+    return way;
 }
 
 static s64 ext2_read_block(ext2_fs_info_t *fs, u32 block, void *buf)
 {
     if (!fs || !fs->bdev || !fs->bdev->ops || !fs->bdev->ops->read_sectors) return -(s64)EINVAL;
+    /* A dirty victim evicted below needs a way back to disk regardless of
+     * whether *this* call is a read or a write — the cache has always
+     * needed both directions wired up for that (see ext2_write_block()'s
+     * matching check), just implicitly, via ext2_bcache_take_victim() ⇒
+     * ext2_bcache_flush_slot() failing closed. Made explicit here since
+     * that flush is now this function's own job, not take_victim()'s. */
+    if (!fs->bdev->ops->write_sectors) return -(s64)EINVAL;
     if (!buf) return -(s64)EINVAL;
     if (fs->block_size == 0 || fs->block_size > EXT2_MAX_BLOCK_SIZE ||
         fs->bdev->sector_size == 0 || fs->block_size % fs->bdev->sector_size)
@@ -244,29 +303,62 @@ static s64 ext2_read_block(ext2_fs_info_t *fs, u32 block, void *buf)
         }
     }
 
-    int vway = ext2_bcache_take_victim(bucket);
+    bool need_flush = false;
+    u32  flush_block = 0;
+    u8  *scratch = kzalloc(EXT2_MAX_BLOCK_SIZE);
+    if (!scratch) {
+        spinlock_unlock(lock);
+        return -(s64)ENOMEM;
+    }
+
+    int vway = ext2_bcache_claim_victim(bucket, &need_flush, &flush_block, scratch);
     if (vway < 0) {
         spinlock_unlock(lock);
+        kfree(scratch);
         return -(s64)EIO;
     }
-    ext2_bcache_slot_t *victim = &g_ext2_bcache[bucket][vway];
+    spinlock_unlock(lock);
 
-    u64 lba = (u64)block * (fs->block_size / fs->bdev->sector_size);
+    /* Disk I/O below runs with the bucket lock released — see
+     * ext2_bcache_claim_victim()'s comment for why. `scratch` first carries
+     * the evicted slot's old dirty content out to be flushed, then gets
+     * reused to receive the newly-read block, so this needs only the one
+     * allocation for either or both transfers. */
+    if (need_flush) {
+        u32 ss = fs->bdev->sector_size;
+        u64 flush_lba   = (u64)flush_block * (fs->block_size / ss);
+        u32 flush_count = fs->block_size / ss;
+        /* A failed write-back here is this evicted slot's problem, not
+         * this read's: it already lost that data the same way a failed
+         * ext2_bcache_flush_slot() call always has. Keep going and fill
+         * the slot with what was actually asked for. */
+        fs->bdev->ops->write_sectors(fs->bdev, flush_lba, flush_count, scratch);
+    }
+
+    u64 lba   = (u64)block * (fs->block_size / fs->bdev->sector_size);
     u32 count = fs->block_size / fs->bdev->sector_size;
-    s64 ret = fs->bdev->ops->read_sectors(fs->bdev, lba, count, victim->data);
+    s64 ret = fs->bdev->ops->read_sectors(fs->bdev, lba, count, scratch);
+
+    spinlock_lock(lock);
+    ext2_bcache_slot_t *victim = &g_ext2_bcache[bucket][vway];
+    victim->loading = false;
     if (ret < 0) {
+        /* Leave it invalid rather than valid-with-garbage; the next
+         * accessor just refetches it. */
         spinlock_unlock(lock);
+        kfree(scratch);
         return ret;
     }
 
+    __builtin_memcpy(victim->data, scratch, fs->block_size);
     victim->fs = fs;
     victim->block = block;
     victim->valid = true;
     victim->dirty = false;
     victim->access_count = ++g_ext2_bcache_timer;
-
     __builtin_memcpy(buf, victim->data, fs->block_size);
     spinlock_unlock(lock);
+    kfree(scratch);
     return 0;
 }
 
@@ -294,18 +386,42 @@ static s64 ext2_write_block(ext2_fs_info_t *fs, u32 block, void *buf)
         }
     }
 
-    int vway = ext2_bcache_take_victim(bucket);
+    bool need_flush = false;
+    u32  flush_block = 0;
+    u8  *scratch = kzalloc(EXT2_MAX_BLOCK_SIZE);
+    if (!scratch) {
+        spinlock_unlock(lock);
+        return -(s64)ENOMEM;
+    }
+
+    int vway = ext2_bcache_claim_victim(bucket, &need_flush, &flush_block, scratch);
     if (vway < 0) {
         spinlock_unlock(lock);
+        kfree(scratch);
         return -(s64)EIO;
     }
-    ext2_bcache_slot_t *victim = &g_ext2_bcache[bucket][vway];
+    spinlock_unlock(lock);
 
+    /* New content is write-back only (no device I/O here) — the only disk
+     * transfer this path might need is flushing whatever dirty data we
+     * just evicted, done with the bucket lock released; see
+     * ext2_bcache_claim_victim()'s comment. */
+    if (need_flush) {
+        u32 ss = fs->bdev->sector_size;
+        u64 flush_lba   = (u64)flush_block * (fs->block_size / ss);
+        u32 flush_count = fs->block_size / ss;
+        fs->bdev->ops->write_sectors(fs->bdev, flush_lba, flush_count, scratch);
+    }
+    kfree(scratch);
+
+    spinlock_lock(lock);
+    ext2_bcache_slot_t *victim = &g_ext2_bcache[bucket][vway];
     __builtin_memcpy(victim->data, buf, fs->block_size);
     victim->fs = fs;
     victim->block = block;
     victim->valid = true;
     victim->dirty = true;
+    victim->loading = false;
     victim->access_count = ++g_ext2_bcache_timer;
     spinlock_unlock(lock);
     return 0;
