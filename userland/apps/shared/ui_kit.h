@@ -30,6 +30,11 @@
 #include "../../libc/include/azami/font.h"
 #endif
 #include "de_log.h"
+#if __has_include(<azami/theme.h>)
+#include <azami/theme.h>
+#elif __has_include("../../libc/include/azami/theme.h")
+#include "../../libc/include/azami/theme.h"
+#endif
 #if defined(__x86_64__)
 #include <emmintrin.h>
 #include <immintrin.h>
@@ -249,72 +254,25 @@ static inline void uk_apply_alpha(unsigned int *pixels, size_t total, unsigned i
 #define UK_FLAMINGO   0xFFF2CDCD
 #define UK_ROSEWATER  0xFFF5E0DC
 
-typedef struct {
-    const char   *name;
-    unsigned int  crust;
-    unsigned int  mantle;
-    unsigned int  base;
-    unsigned int  surface0;
-    unsigned int  surface1;
-    unsigned int  surface2;
-    unsigned int  overlay0;
-    unsigned int  overlay1;
-    unsigned int  text;
-    unsigned int  accent;
-    unsigned int  accent_sec;
-    unsigned int  red;
-    unsigned int  green;
-    unsigned int  yellow;
-    unsigned int  blue;
-} uk_theme_palette_t;
-
-static const uk_theme_palette_t g_uk_themes[AZ_THEME_COUNT] = {
-    [AZ_THEME_MOCHA] = {
-        .name       = "Catppuccin Mocha",
-        .crust      = 0xFF11111B, .mantle     = 0xFF181825, .base       = 0xFF1E1E2E,
-        .surface0   = 0xFF313244, .surface1   = 0xFF45475A, .surface2   = 0xFF585B70,
-        .overlay0   = 0xFF6C7086, .overlay1   = 0xFF7F849C, .text       = 0xFFCDD6F4,
-        .accent     = 0xFFCBA6F7, .accent_sec = 0xFFFAB387,
-        .red        = 0xFFF38BA8, .green      = 0xFFA6E3A1, .yellow     = 0xFFF9E2AF, .blue = 0xFF89B4FA,
-    },
-    [AZ_THEME_LATTE] = {
-        .name       = "Catppuccin Latte",
-        .crust      = 0xFFDCE0E8, .mantle     = 0xFFE6E9EF, .base       = 0xFFEFF1F5,
-        .surface0   = 0xFFCCD0DA, .surface1   = 0xFFBCC0CC, .surface2   = 0xFFACB0BE,
-        .overlay0   = 0xFF9CA0B0, .overlay1   = 0xFF8C8FA1, .text       = 0xFF4C4F69,
-        .accent     = 0xFF8839EF, .accent_sec = 0xFFFE640B,
-        .red        = 0xFFD20F39, .green      = 0xFF40A02B, .yellow     = 0xFFDF8E1D, .blue = 0xFF1E66F5,
-    },
-    [AZ_THEME_NORD] = {
-        .name       = "Nord Arctic",
-        .crust      = 0xFF242933, .mantle     = 0xFF2E3440, .base       = 0xFF3B4252,
-        .surface0   = 0xFF434C5E, .surface1   = 0xFF4C566A, .surface2   = 0xFF5A657D,
-        .overlay0   = 0xFF7885A0, .overlay1   = 0xFF9AA7C0, .text       = 0xFFECEFF4,
-        .accent     = 0xFF88C0D0, .accent_sec = 0xFF81A1C1,
-        .red        = 0xFFBF616A, .green      = 0xFFA3BE8C, .yellow     = 0xFFEBCB8B, .blue = 0xFF5E81AC,
-    },
-    [AZ_THEME_CYBERPUNK] = {
-        .name       = "Cyberpunk Neon",
-        .crust      = 0xFF05050A, .mantle     = 0xFF0D0D18, .base       = 0xFF141424,
-        .surface0   = 0xFF202038, .surface1   = 0xFF2E2E50, .surface2   = 0xFF424270,
-        .overlay0   = 0xFF6868A0, .overlay1   = 0xFF8F8FD0, .text       = 0xFFF0F6FC,
-        .accent     = 0xFF00FFCC, .accent_sec = 0xFFFF007F,
-        .red        = 0xFFFF2A6D, .green      = 0xFF05FFA1, .yellow     = 0xFFFFE600, .blue = 0xFF00F0FF,
-    },
-    [AZ_THEME_OLED] = {
-        .name       = "OLED Pure Dark",
-        .crust      = 0xFF000000, .mantle     = 0xFF050505, .base       = 0xFF0A0A0A,
-        .surface0   = 0xFF181818, .surface1   = 0xFF242424, .surface2   = 0xFF323232,
-        .overlay0   = 0xFF555555, .overlay1   = 0xFF777777, .text       = 0xFFFFFFFF,
-        .accent     = 0xFF3B82F6, .accent_sec = 0xFF10B981,
-        .red        = 0xFFEF4444, .green      = 0xFF22C55E, .yellow     = 0xFFEAB308, .blue = 0xFF60A5FA,
-    },
-};
+/* Theme data used to live here as a `static const` array baked into every
+ * app that includes this header — moved to theme files under /usr/share/themes, loaded
+ * at runtime by the shared az_theme_* subsystem (azami/theme.h + libc's
+ * theme.c) so palettes are single-sourced instead of duplicated per-app, and
+ * new themes can be dropped in without a rebuild. `uk_theme_palette_t` stays
+ * as an alias so existing call sites (`uk_get_theme_palette()`) don't change
+ * shape. */
+typedef az_theme_t uk_theme_palette_t;
 
 static inline const uk_theme_palette_t *uk_get_theme_palette(unsigned int theme_id)
 {
-    if (theme_id >= AZ_THEME_COUNT) theme_id = AZ_THEME_MOCHA;
-    return &g_uk_themes[theme_id];
+    return az_theme_get(theme_id);
+}
+
+/* Runtime theme count (>= 1; see az_theme_count()) for anything that used to
+ * loop `for (i = 0; i < AZ_THEME_COUNT; i++)` over the compiled-in array. */
+static inline unsigned int uk_theme_count(void)
+{
+    return (unsigned int)az_theme_count();
 }
 
 /* ============================================================================
@@ -1077,6 +1035,19 @@ static inline void uk_icon_about(uk_window_t *w, int ix, int iy)
     /* "i" letter */
     uk_fill_rect(w, cx - 1, cy -  6, 3, 3, UK_MAUVE);  /* dot */
     uk_fill_rect(w, cx - 1, cy -  1, 3, 9, UK_MAUVE);  /* stem */
+}
+
+/* ── Audio player icon: note symbol ────────────────────────────────────────── */
+static inline void uk_icon_audioplayer(uk_window_t *w, int ix, int iy)
+{
+    uk_icon_base(w, ix, iy, UK_PINK);
+    int cx = ix + 16, cy = iy + 16;
+    /* Musical note symbol */
+    uk_fill_circle(w, cx - 4, cy + 5, 4, UK_BASE);
+    uk_fill_circle(w, cx + 4, cy + 3, 4, UK_BASE);
+    uk_fill_rect(w, cx - 2, cy - 7, 2, 12, UK_BASE);
+    uk_fill_rect(w, cx + 6, cy - 9, 2, 12, UK_BASE);
+    uk_fill_rect(w, cx - 2, cy - 7, 10, 3, UK_BASE);
 }
 
 /* ============================================================================

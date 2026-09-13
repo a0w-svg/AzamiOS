@@ -484,10 +484,13 @@ static size_t format_proc_loadavg(char *buf, size_t max)
 static size_t format_proc_mounts(char *buf, size_t max)
 {
     return (size_t)scnprintf(buf, max,
-        "rootfs / ext2 rw,relatime 0 0\n"
+        "/dev/sata0p2 / ext2 rw,relatime 0 0\n"
+        "/dev/sata0p1 /boot ext2 rw,relatime 0 0\n"
         "proc /proc procfs rw,nosuid,nodev,noexec,relatime 0 0\n"
         "dev /dev devfs rw,nosuid,relatime 0 0\n"
-        "sata0 /hdd ext2 rw,relatime 0 0\n");
+        "sys /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
+        "devpts /dev/pts devpts rw,nosuid,noexec,relatime 0 0\n"
+        "tmpfs /tmp tmpfs rw,nosuid,nodev,relatime 0 0\n");
 }
 
 static size_t format_proc_filesystems(char *buf, size_t max)
@@ -495,13 +498,16 @@ static size_t format_proc_filesystems(char *buf, size_t max)
     return (size_t)scnprintf(buf, max,
         "nodev\tdevfs\n"
         "nodev\tprocfs\n"
+        "nodev\tsysfs\n"
+        "nodev\tdevpts\n"
+        "nodev\ttmpfs\n"
         "\text2\n"
         "\tfat32\n");
 }
 
 static size_t format_proc_cmdline(char *buf, size_t max)
 {
-    return (size_t)scnprintf(buf, max, "BOOT_IMAGE=/boot/kernel.elf root=/dev/ram0 rw console=ttyS0 quiet\n");
+    return (size_t)scnprintf(buf, max, "BOOT_IMAGE=/boot/kernel.elf root=/dev/sata0p2 rw console=ttyS0 quiet\n");
 }
 
 static size_t format_proc_net_tcp(char *buf, size_t max)

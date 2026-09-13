@@ -139,6 +139,15 @@ int main(int argc, char **argv)
     char disk_bar[32];
     make_bar(disk_bar, sizeof(disk_bar), disk_pct, 10);
 
+    /* Disk usage on /boot */
+    unsigned long boot_total_mb = 0, boot_used_mb = 0;
+    if (statvfs("/boot", &vfs) == 0 && vfs.f_blocks > 0) {
+        unsigned long bsize = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+        boot_total_mb = (vfs.f_blocks * bsize) / (1024 * 1024);
+        unsigned long avail_mb = (vfs.f_bavail * bsize) / (1024 * 1024);
+        boot_used_mb = boot_total_mb > avail_mb ? (boot_total_mb - avail_mb) : 0;
+    }
+
     /* Render Neofetch-style Dashboard */
     printf("\033[1;35m        /\\          \033[1;32m%s\033[0m@\033[1;34m%s\033[0m\n", user, hostname);
     printf("\033[1;35m       /  \\         \033[0;37m---------------------------------------\033[0m\n");
@@ -148,7 +157,12 @@ int main(int argc, char **argv)
     printf("\033[1;35m   / / /  \\ \\ \\     \033[1;36mCPU:\033[0m       %s (%d cores)\n", cpu_name, cpu_cores);
     printf("\033[1;35m  / / / /\\ \\ \\ \\    \033[1;36mMemory:\033[0m    %lu MB / %lu MB %s %d%%\n", used_mb, total_mb, mem_bar, mem_pct);
     if (disk_total_mb > 0) {
-        printf("\033[1;35m /_/_/_/  \\_\\_\\_\\   \033[1;36mDisk (/):\033[0m  %lu MB / %lu MB %s %d%%\n", disk_used_mb, disk_total_mb, disk_bar, disk_pct);
+        if (boot_total_mb > 0) {
+            printf("\033[1;35m /_/_/_/  \\_\\_\\_\\   \033[1;36mDisk (/):\033[0m  %lu MB / %lu MB %s %d%% (sata0p2)\n", disk_used_mb, disk_total_mb, disk_bar, disk_pct);
+            printf("                    \033[1;36mBoot:\033[0m      %lu MB / %lu MB (sata0p1)\n", boot_used_mb, boot_total_mb);
+        } else {
+            printf("\033[1;35m /_/_/_/  \\_\\_\\_\\   \033[1;36mDisk (/):\033[0m  %lu MB / %lu MB %s %d%%\n", disk_used_mb, disk_total_mb, disk_bar, disk_pct);
+        }
     } else {
         printf("\033[1;35m /_/_/_/  \\_\\_\\_\\   \033[1;36mProcesses:\033[0m %d active tasks\n", (int)si.procs);
     }

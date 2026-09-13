@@ -85,7 +85,7 @@ static const char *g_welcome[] = {
     " */",
 };
 
-static char g_file_path[256] = "/hdd/notes.txt";
+static char g_file_path[256] = "/home/azami/notes.txt";
 
 static int linelen(int row)
 {
@@ -98,8 +98,8 @@ static int linelen(int row)
 static void save_buffer(void)
 {
     int fd = sys_open(g_file_path, 0x0241, 0644);
-    if (fd < 0 && strcmp(g_file_path, "/hdd/notes.txt") == 0) {
-        fd = sys_open("/notes.txt", 0x0241, 0644);
+    if (fd < 0) {
+        fd = sys_open("/tmp/notes.txt", 0x0241, 0644);
     }
     if (fd >= 0) {
         lseek(fd, 0, 0);
@@ -122,8 +122,8 @@ static void save_buffer(void)
 static void init_buffer(void)
 {
     int fd = sys_open(g_file_path, 0, 0);
-    if (fd < 0 && strcmp(g_file_path, "/hdd/notes.txt") == 0) {
-        fd = sys_open("/notes.txt", 0, 0);
+    if (fd < 0) {
+        fd = sys_open("/tmp/notes.txt", 0, 0);
     }
     if (fd >= 0) {
         char buf[8192];
@@ -535,7 +535,12 @@ static void handle_key(unsigned char keycode, unsigned char scancode, unsigned c
         g_cursor_col = 0;
         g_scroll = 0;
         g_dirty = 0;
-        strncpy(g_file_path, "/hdd/untitled.txt", sizeof(g_file_path) - 1);
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            snprintf(g_file_path, sizeof(g_file_path), "%s/untitled.txt", home);
+        } else {
+            strncpy(g_file_path, "/root/untitled.txt", sizeof(g_file_path) - 1);
+        }
         return;
     }
 
@@ -635,6 +640,13 @@ int main(int argc, char **argv)
     if (argc > 1 && argv[1] && argv[1][0]) {
         strncpy(g_file_path, argv[1], sizeof(g_file_path) - 1);
         g_file_path[sizeof(g_file_path) - 1] = '\0';
+    } else {
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            snprintf(g_file_path, sizeof(g_file_path), "%s/notes.txt", home);
+        } else {
+            strncpy(g_file_path, "/root/notes.txt", sizeof(g_file_path) - 1);
+        }
     }
 
     az_fb_info_t fb;

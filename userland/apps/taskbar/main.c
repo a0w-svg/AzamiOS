@@ -21,6 +21,8 @@
 #include "../../libc/include/stdlib.h"
 #include "../../libc/include/stdbool.h"
 #include "../../libc/include/string.h"
+#include "../../libc/include/sys/syscall.h"
+#include "../../libc/include/sys/sysinfo.h"
 #include "../azwm/protocol.h"
 #include "../azwm/de_protocol.h"
 #include "../azwm/de_font.h"
@@ -39,9 +41,15 @@
 #define SB_W   92
 #define SB_H   40
 
-/* Tray zone width (clock + date + wifi + sound + lock icon, right-aligned) */
-#define TRAY_W  180
+/* Tray zone width (clock + date + wifi + sound + lock + sysmon icon, right-aligned) */
+#define TRAY_W  226
 #define TRAY_M    8   /* tray right margin */
+
+/* System Monitor tray widget: "C: XX%" / "M: XX%" stacked labels, click
+ * launches sysmon.elf. Sits right after the Lock icon (which ends at
+ * tray_start_x + 68) and before the clock. */
+#define SYSMON_ZONE_X0   68
+#define SYSMON_ZONE_W    46
 
 /* Window button geometry (pill-shaped) */
 #define WB_W       140
@@ -157,6 +165,15 @@ static int           g_overflow   = 0;
 static int           g_vol_level = 80; /* 0..100 */
 static int           g_vol_muted = 0;
 
+/* System Monitor tray widget: overall CPU% (averaged across the first 4
+ * cores, same az_sysstat_t delta technique sysmon.elf uses) and RAM% (from
+ * sysinfo(2)). Refreshed once a second from the 100ms timer tick — anything
+ * faster is wasted precision for a 2-line, 8px-font tray label. */
+static int           g_cpu_pct = 0;
+static int           g_mem_pct = 0;
+static az_sysstat_t   g_last_sysstat;
+static bool           g_have_last_sysstat = false;
+
 /* Toast & Tooltip overlay state */
 static char          g_toast_msg[48] = "";
 static int           g_toast_ticks = 0;   /* countdown in 100ms ticks */
@@ -193,6 +210,46 @@ static void tb_build_date(char *buf, int max)
     struct tm tm_info;
     localtime_r(&t, &tm_info);
     strftime(buf, max, "%a %b %e", &tm_info);
+}
+
+/* Refresh g_cpu_pct/g_mem_pct. CPU% is the same idle/active-tick delta
+ * technique sysmon.elf's update_telemetry() uses (aggregated over the
+ * first 4 cores rather than reported per-core — there's room for one
+ * number here, not four); RAM% comes straight from sysinfo(2). Returns
+ * true if either value actually changed, so the timer tick can skip a
+ * repaint on the (common) tick where nothing moved. */
+static bool tb_update_sysstat(void)
+{
+    az_sysstat_t cur;
+    syscall1(SYS_AZ_SYSSTAT, (long)&cur);
+
+    int new_cpu_pct = g_cpu_pct;
+    if (g_have_last_sysstat) {
+        unsigned long long d_idle = 0, d_active = 0;
+        for (int cc = 0; cc < 4; cc++) {
+            d_idle   += cur.idle_ticks[cc]   - g_last_sysstat.idle_ticks[cc];
+            d_active += cur.active_ticks[cc] - g_last_sysstat.active_ticks[cc];
+        }
+        unsigned long long total = d_idle + d_active;
+        if (total > 0) {
+            new_cpu_pct = (int)((d_active * 100ULL) / total);
+            if (new_cpu_pct > 100) new_cpu_pct = 100;
+        }
+    }
+    g_last_sysstat = cur;
+    g_have_last_sysstat = true;
+
+    struct sysinfo info;
+    int new_mem_pct = g_mem_pct;
+    if (sysinfo(&info) == 0 && info.totalram > 0) {
+        new_mem_pct = (int)(((info.totalram - info.freeram) * 100ULL) / info.totalram);
+        if (new_mem_pct > 100) new_mem_pct = 100;
+    }
+
+    bool changed = (new_cpu_pct != g_cpu_pct) || (new_mem_pct != g_mem_pct);
+    g_cpu_pct = new_cpu_pct;
+    g_mem_pct = new_mem_pct;
+    return changed;
 }
 
 /* ── Drawing primitives ──────────────────────────────────────────────────────── */
@@ -769,6 +826,18 @@ static void taskbar_draw(void)
     /* Lock icon */
     tb_draw_lock(tray_start_x + 52, SB_Y + 12, 0xFFCBA6F7);
 
+    /* System Monitor widget: "C: XX%" / "M: XX%" stacked, click → sysmon.elf */
+    {
+        char cpu_buf[8], mem_buf[8];
+        snprintf(cpu_buf, sizeof(cpu_buf), "C:%2d%%", g_cpu_pct);
+        snprintf(mem_buf, sizeof(mem_buf), "M:%2d%%", g_mem_pct);
+        int sx = tray_start_x + SYSMON_ZONE_X0 + 2;
+        unsigned int cpu_col = g_cpu_pct >= 90 ? 0xFFF38BA8 : 0xFF89B4FA;
+        unsigned int mem_col = g_mem_pct >= 90 ? 0xFFF38BA8 : 0xFFA6E3A1;
+        tb_str(sx, SB_Y + 3,  cpu_buf, cpu_col);
+        tb_str(sx, SB_Y + 21, mem_buf, mem_col);
+    }
+
     /* Clock text "HH:MM" (large, right-aligned). The ":" is drawn separately
      * so it can blink once a second like a real clock, without shifting the
      * digits around it. */
@@ -907,9 +976,12 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
         } else if (lx < tray_start_x + 68) {
             new_tooltip = "Lock Screen";
             hover_x = tray_start_x + 58;
+        } else if (lx < tray_start_x + SYSMON_ZONE_X0 + SYSMON_ZONE_W) {
+            new_tooltip = "System Monitor (CPU & RAM)";
+            hover_x = tray_start_x + SYSMON_ZONE_X0 + SYSMON_ZONE_W / 2;
         } else {
             new_tooltip = "Clock & Calendar";
-            hover_x = tray_start_x + 120;
+            hover_x = tray_start_x + SYSMON_ZONE_X0 + SYSMON_ZONE_W + 26;
         }
     }
     if (strcmp(g_hover_tooltip, new_tooltip) != 0) {
@@ -1022,8 +1094,25 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
         return;
     }
 
+    /* Left-click on System Monitor widget → launch /bin/sysmon.elf */
+    if (lclick && lx >= tray_start_x + SYSMON_ZONE_X0 &&
+        lx < tray_start_x + SYSMON_ZONE_X0 + SYSMON_ZONE_W) {
+        az_wm_msg_t lmsg;
+        memset(&lmsg, 0, sizeof(lmsg));
+        lmsg.type = AZ_WM_LAUNCH_APP;
+        az_wm_launch_payload_t *pl = AZ_WM_MSG_LAUNCH(&lmsg);
+        const char *path = "/bin/sysmon.elf";
+        unsigned int j;
+        for (j = 0; j < AZ_WM_LAUNCH_PATH_MAX - 1 && path[j]; j++)
+            pl->path[j] = path[j];
+        pl->path[j] = '\0';
+        az_channel_send(g_srv, (az_ipc_msg_t *)&lmsg);
+        taskbar_draw();
+        return;
+    }
+
     /* Left-click on Tray Clock / Calendar area → launch Clock & Calendar widget */
-    if (lclick && lx >= tray_start_x + 68 && lx < (int)g_w) {
+    if (lclick && lx >= tray_start_x + SYSMON_ZONE_X0 + SYSMON_ZONE_W && lx < (int)g_w) {
         az_wm_msg_t lmsg;
         memset(&lmsg, 0, sizeof(lmsg));
         lmsg.type = AZ_WM_LAUNCH_APP;
@@ -1160,6 +1249,7 @@ int main(int argc, char **argv)
      * localtime_r() + snprintf() over a handful of bytes. */
     az_set_timer(g_cli, 100, 0);
 
+    tb_update_sysstat(); /* prime RAM% (and the idle/active baseline for CPU%) before the first paint */
     taskbar_draw();
     de_log("[taskbar] Entering event loop.");
 
@@ -1198,6 +1288,11 @@ int main(int argc, char **argv)
             if (colon_dirty) g_colon_on = !g_colon_on;
 
             bool other_dirty = false;
+
+            /* System Monitor widget: refresh once a second, not every 100ms
+             * tick — a CPU/RAM percentage that only changes a handful of
+             * times a second doesn't need finer sampling than that. */
+            if (g_tick_count % 10 == 0 && tb_update_sysstat()) other_dirty = true;
 
             int sb_target = g_sb_hot ? 256 : 0;
             if (g_sb_hover_level != sb_target) {

@@ -34,6 +34,28 @@
 void tlb_shootdown_all(void);
 
 /**
+ * tlb_shootdown_space(space) — like tlb_shootdown_all(), but only interrupts
+ * CPUs that could actually hold a stale translation for @space, using the
+ * scheduler's per-process record of which cores have ever loaded it (see
+ * process_t::pcid_primed and vmm_switch_proc()'s doc comment in vmm.h).
+ *
+ * The common case this wins on: a process modifying its own address space
+ * (the overwhelming majority of vmm_map/unmap/set_flags/cow_fault calls
+ * system-wide) only ever needs to interrupt cores that have run *that*
+ * process — for a single-threaded process that is none, so the call costs a
+ * mask lookup and nothing else, instead of an IPI round-trip to every other
+ * core in the system regardless of what they are doing.
+ *
+ * Whenever the scheduler can't narrow the target set — @space belongs to a
+ * different process than the one running on this core right now (ptrace
+ * poking a tracee, tearing down an exited process, cloning a fresh child
+ * space), or PCID tracking has nothing recorded yet — this degrades to
+ * exactly tlb_shootdown_all()'s behavior. It is never less safe, only
+ * sometimes less targeted.
+ */
+void tlb_shootdown_space(phys_addr_t space);
+
+/**
  * tlb_shootdown_ipi() — vector-251 handler. Flushes this CPU and publishes the
  * acknowledgement. Takes no locks, so it can always make progress.
  */

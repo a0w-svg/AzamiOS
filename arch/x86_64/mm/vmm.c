@@ -157,7 +157,7 @@ int vmm_map(vmm_space_t space, virt_addr_t virt, phys_addr_t phys, u64 flags)
     invlpg(virt);
 
     spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
-    if (replaced) tlb_shootdown_all();
+    if (replaced) tlb_shootdown_space(space);
     return 0;
 }
 
@@ -222,7 +222,7 @@ int vmm_set_flags(vmm_space_t space, virt_addr_t virt, size_t count, u64 flags)
     spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
     /* mprotect(2) narrowing a range is only enforced once every CPU has
      * dropped the old, more permissive translation. */
-    if (changed) tlb_shootdown_all();
+    if (changed) tlb_shootdown_space(space);
     return 0;
 }
 
@@ -257,7 +257,7 @@ u64 vmm_unmap_get(vmm_space_t space, virt_addr_t virt)
 
     /* Callers free the frame this returns, so no other CPU may still be able to
      * reach it through a cached translation once we are back. */
-    if (old_pte & VMM_PHYS_MASK) tlb_shootdown_all();
+    if (old_pte & VMM_PHYS_MASK) tlb_shootdown_space(space);
     return old_pte;
 }
 
@@ -305,7 +305,7 @@ size_t vmm_unmap_range(vmm_space_t space, virt_addr_t virt, size_t count, bool f
         }
         spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
 
-        if (any_live) tlb_shootdown_all();
+        if (any_live) tlb_shootdown_space(space);
         for (size_t i = 0; i < nbatch; i++) {
             pmm_free_page(batch[i]);
             freed++;
@@ -541,9 +541,12 @@ vmm_space_t vmm_clone_space(vmm_space_t src)
     spinlock_unlock_irqrestore(&g_vmm_lock, irqf);
     /* Reload CR3 verbatim (PCID bits and all) to drop this core's non-global
      * entries the deep-copy above may have created through scratch mappings;
-     * the shootdown covers the others. */
+     * the shootdown covers the others. Targeted at `src`, the space actually
+     * mutated (its writable pages just got marked COW) — dst_phys is the
+     * fresh child copy, which by definition has never run anywhere yet and
+     * needs no shootdown of its own. */
     write_cr3(read_cr3());
-    tlb_shootdown_all();
+    tlb_shootdown_space(src);
     return dst_phys;
 
 oom:
@@ -556,6 +559,24 @@ void vmm_destroy_space(vmm_space_t space)
 {
     if (!space || space == g_kernel_pml4) return;
     if (space >= 0xffff800000000000ULL) space = VIRT_TO_PHYS(space);
+
+    /* CORRECTNESS FIX: this function used to free every frame in the space
+     * (below) with no shootdown at all — a stale translation on some other
+     * core that had run this address space earlier (PCID mode does not
+     * flush those just because a core later switched away; see
+     * vmm_switch_proc()'s doc comment in vmm.h) could keep pointing at a
+     * frame straight through whatever the allocator hands it out to next.
+     *
+     * Unlike every other shootdown in this file, this one does not need to
+     * happen *after* the edit: a shootdown for a whole PCID/address space
+     * invalidates by identity, not by walking current PTE content, so it is
+     * just as effective run first as last. Doing it first — before a single
+     * frame is freed — gets the property every other call site has to work
+     * for (no frame reused before the flush that must precede it) for free,
+     * with no need to restructure this whole walk into gather-then-free like
+     * vmm_unmap_range does. By the time the loop below runs, no other core
+     * can still be holding a translation into this space at all. */
+    tlb_shootdown_space(space);
 
     irqflags_t irqf = spinlock_lock_irqsave(&g_vmm_lock);
     u64 *pml4 = phys_to_table(space);
@@ -827,7 +848,7 @@ int vmm_cow_fault(vmm_space_t space, virt_addr_t fault_va)
                                   | VMM_F_WRITE;
         invlpg(page_va);
         spinlock_unlock_irqrestore(&g_vmm_lock, irqf2);
-        tlb_shootdown_all();
+        tlb_shootdown_space(space);
         /* Decrement the old frame's refcount; free if it hits zero. */
         uint16_t remaining = vmm_page_ref_dec(old_phys);
         if (remaining == 0)

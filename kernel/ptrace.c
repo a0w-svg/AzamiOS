@@ -143,7 +143,7 @@ static bool tracee_mem(process_t *tgt, u64 va, void *buf, size_t len, bool write
                 pmm_free_page(priv);
                 return false;
             }
-            tlb_shootdown_all();
+            tlb_shootdown_space(tgt->pml4_phys);
         }
 
         phys_addr_t phys = vmm_translate(tgt->pml4_phys, va);

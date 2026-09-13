@@ -223,12 +223,22 @@ BIN_APPS = \
     $(BIN_DIR)/setfont.elf
 
 
-.PHONY: all clean libc apps skeleton etc icons fonts toolchain
+.PHONY: all clean libc apps skeleton etc icons fonts music toolchain
 
-all: skeleton libc apps toolchain etc icons fonts
+all: skeleton libc apps toolchain etc icons fonts music
 
 skeleton:
-	@mkdir -p $(BUILD_DIR) $(BIN_DIR) $(SBIN_DIR) $(OBJ_DIR) $(BUILD_DIR)/etc $(BUILD_DIR)/dev $(BUILD_DIR)/proc $(BUILD_DIR)/sys $(BUILD_DIR)/root $(BUILD_DIR)/home/azami/Desktop $(BUILD_DIR)/desktop $(BUILD_DIR)/usr/bin $(BUILD_DIR)/usr/sbin $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/share/icons $(BUILD_DIR)/usr/share/wallpapers $(BUILD_DIR)/usr/share/fonts $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/var $(BUILD_DIR)/tmp
+	@mkdir -p $(BUILD_DIR) $(BIN_DIR) $(SBIN_DIR) $(OBJ_DIR) $(BUILD_DIR)/etc $(BUILD_DIR)/boot $(BUILD_DIR)/dev $(BUILD_DIR)/proc $(BUILD_DIR)/sys $(BUILD_DIR)/root $(BUILD_DIR)/root/.config $(BUILD_DIR)/home/azami/Desktop $(BUILD_DIR)/home/azami/Music $(BUILD_DIR)/home/azami/.config $(BUILD_DIR)/desktop $(BUILD_DIR)/usr/bin $(BUILD_DIR)/usr/sbin $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/share/icons $(BUILD_DIR)/usr/share/wallpapers $(BUILD_DIR)/usr/share/fonts $(BUILD_DIR)/usr/share/themes $(BUILD_DIR)/usr/share/music $(BUILD_DIR)/music $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/var $(BUILD_DIR)/tmp
+	@# ── Desktop theme files: /usr/share/themes/*.theme ──────────────────────
+	@# Data, not code — moved out of ui_kit.h so a new palette is a file drop,
+	@# not a recompile. Leading NN- keeps the historical theme_id order (see
+	@# az_theme_t / az_theme_get() in libc/theme.c) legible in `ls`, though
+	@# scan order is authoritative, not the filename.
+	@printf "# AzamiOS Theme: Catppuccin Mocha\nname=Catppuccin Mocha\ncrust=0xFF11111B\nmantle=0xFF181825\nbase=0xFF1E1E2E\nsurface0=0xFF313244\nsurface1=0xFF45475A\nsurface2=0xFF585B70\noverlay0=0xFF6C7086\noverlay1=0xFF7F849C\ntext=0xFFCDD6F4\naccent=0xFFCBA6F7\naccent_sec=0xFFFAB387\nred=0xFFF38BA8\ngreen=0xFFA6E3A1\nyellow=0xFFF9E2AF\nblue=0xFF89B4FA\n" > $(BUILD_DIR)/usr/share/themes/00-mocha.theme
+	@printf "# AzamiOS Theme: Catppuccin Latte\nname=Catppuccin Latte\ncrust=0xFFDCE0E8\nmantle=0xFFE6E9EF\nbase=0xFFEFF1F5\nsurface0=0xFFCCD0DA\nsurface1=0xFFBCC0CC\nsurface2=0xFFACB0BE\noverlay0=0xFF9CA0B0\noverlay1=0xFF8C8FA1\ntext=0xFF4C4F69\naccent=0xFF8839EF\naccent_sec=0xFFFE640B\nred=0xFFD20F39\ngreen=0xFF40A02B\nyellow=0xFFDF8E1D\nblue=0xFF1E66F5\n" > $(BUILD_DIR)/usr/share/themes/01-latte.theme
+	@printf "# AzamiOS Theme: Nord Arctic\nname=Nord Arctic\ncrust=0xFF242933\nmantle=0xFF2E3440\nbase=0xFF3B4252\nsurface0=0xFF434C5E\nsurface1=0xFF4C566A\nsurface2=0xFF5A657D\noverlay0=0xFF7885A0\noverlay1=0xFF9AA7C0\ntext=0xFFECEFF4\naccent=0xFF88C0D0\naccent_sec=0xFF81A1C1\nred=0xFFBF616A\ngreen=0xFFA3BE8C\nyellow=0xFFEBCB8B\nblue=0xFF5E81AC\n" > $(BUILD_DIR)/usr/share/themes/02-nord.theme
+	@printf "# AzamiOS Theme: Cyberpunk Neon\nname=Cyberpunk Neon\ncrust=0xFF05050A\nmantle=0xFF0D0D18\nbase=0xFF141424\nsurface0=0xFF202038\nsurface1=0xFF2E2E50\nsurface2=0xFF424270\noverlay0=0xFF6868A0\noverlay1=0xFF8F8FD0\ntext=0xFFF0F6FC\naccent=0xFF00FFCC\naccent_sec=0xFFFF007F\nred=0xFFFF2A6D\ngreen=0xFF05FFA1\nyellow=0xFFFFE600\nblue=0xFF00F0FF\n" > $(BUILD_DIR)/usr/share/themes/03-cyberpunk.theme
+	@printf "# AzamiOS Theme: OLED Pure Dark\nname=OLED Pure Dark\ncrust=0xFF000000\nmantle=0xFF050505\nbase=0xFF0A0A0A\nsurface0=0xFF181818\nsurface1=0xFF242424\nsurface2=0xFF323232\noverlay0=0xFF555555\noverlay1=0xFF777777\ntext=0xFFFFFFFF\naccent=0xFF3B82F6\naccent_sec=0xFF10B981\nred=0xFFEF4444\ngreen=0xFF22C55E\nyellow=0xFFEAB308\nblue=0xFF60A5FA\n" > $(BUILD_DIR)/usr/share/themes/04-oled.theme
 
 libc: skeleton libc/libc.a
 
@@ -390,20 +400,25 @@ etc: skeleton
 	@echo 'ID=azamios' >> $(BUILD_DIR)/etc/os-release
 	@echo 'PRETTY_NAME="AzamiOS v7.0 (x86_64)"' >> $(BUILD_DIR)/etc/os-release
 	@echo "===================================================================" > $(BUILD_DIR)/etc/motd
-	@echo "  Welcome to AzamiOS v7.0 (x86_64 Modular Microkernel)" >> $(BUILD_DIR)/etc/motd
 	@echo "===================================================================" >> $(BUILD_DIR)/etc/motd
-	@echo "/dev/ram0   /       ext2    defaults    1 1" > $(BUILD_DIR)/etc/fstab
-	@echo "proc        /proc   procfs  defaults    0 0" >> $(BUILD_DIR)/etc/fstab
-	@echo "dev         /dev    devfs   defaults    0 0" >> $(BUILD_DIR)/etc/fstab
+	@echo "/dev/sata0p2   /       ext2    defaults    1 1" > $(BUILD_DIR)/etc/fstab
+	@echo "/dev/sata0p1   /boot   ext2    defaults    1 2" >> $(BUILD_DIR)/etc/fstab
+	@echo "proc           /proc   procfs  defaults    0 0" >> $(BUILD_DIR)/etc/fstab
+	@echo "dev            /dev    devfs   defaults    0 0" >> $(BUILD_DIR)/etc/fstab
+	@echo "sys            /sys    sysfs   defaults    0 0" >> $(BUILD_DIR)/etc/fstab
+	@echo "devpts         /dev/pts devpts defaults    0 0" >> $(BUILD_DIR)/etc/fstab
+	@echo "tmpfs          /tmp    tmpfs   defaults    0 0" >> $(BUILD_DIR)/etc/fstab
 	@echo "Europe/Warsaw" > $(BUILD_DIR)/etc/timezone
 	@printf "127.0.0.1   localhost azamios\n::1         localhost ip6-localhost ip6-loopback\n" > $(BUILD_DIR)/etc/hosts
 	@printf "nameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n" > $(BUILD_DIR)/etc/resolv.conf
 	@printf "[theme]\ntheme_id=0\nname=Catppuccin Mocha\nwallpaper=/usr/share/wallpapers/default.raw\n\n[display]\nvsync=1\ncompositing=1\ncursor_aa=1\nfps=60\n\n[panel]\nposition=bottom\nheight=32\nautohide=0\nshow_clock=1\n" > $(BUILD_DIR)/etc/desktop.conf
 	@printf "[terminal]\ntheme=catppuccin\nfont_size=12\nopacity=95\nscrollback=500\ncursor_blink=1\nhistory_size=100\nprompt=root@azamios:\w$$ \n" > $(BUILD_DIR)/etc/terminal.conf
-	@printf "[audio]\nvolume=80\nmaster_mute=0\nsample_rate=44100\nchannels=2\ndefault_sink=/dev/dsp\n" > $(BUILD_DIR)/etc/audio.conf
+	@printf "[audio]\nvolume=80\nmaster_mute=0\nsample_rate=44100\nchannels=2\ndefault_sink=/dev/dsp\nmusic_dir=/music\n" > $(BUILD_DIR)/etc/audio.conf
 	@printf "[network]\ninterface=eth0\ndhcp=0\nip=10.0.2.15\nnetmask=255.255.255.0\ngateway=10.0.2.2\ndns=10.0.2.3\n" > $(BUILD_DIR)/etc/network.conf
 	@printf "[power]\nprofile=1\nscreen_timeout=15\nacpi_pm=1\n" > $(BUILD_DIR)/etc/power.conf
 	@printf "# AzamiOS Security & Auto-Accept Configuration\nipc_autoaccept=1\nadmin_autoaccept=1\ndhcp_autoaccept=1\ntrace_autoaccept=1\n" > $(BUILD_DIR)/etc/security.conf
+	@printf "# AzamiOS Desktop Session Configuration\n[services]\nwallpaper=/sbin/wallpaper.elf\ntaskbar=/sbin/taskbar.elf\nnotifyd=/sbin/notifyd.elf\n\n[autostart]\nsettings=/bin/settings.elf\nterminal=/bin/terminal.elf\n" > $(BUILD_DIR)/etc/session.conf
+	@printf "# Desktop Icons: Label|Path|Glyph|0xAARRGGBB|IsDir|FileType\nTerminal|/bin/terminal.elf|>_|0xFF89B4FA|0|0\nFiles|/bin/filemanager.elf|[_]|0xFFF9E2AF|0|0\nMusic|/music|Mus|0xFFF5C2E7|1|2\nAudio|/bin/audioplayer.elf|Snd|0xFFF5C2E7|0|0\nCalculator|/bin/calculator.elf|+-|0xFFFAB387|0|0\nText Editor|/bin/texteditor.elf|Txt|0xFF94E2D5|0|0\nPaint|/bin/paint.elf|Art|0xFFCBA6F7|0|0\nSys Monitor|/bin/sysmon.elf|CPU|0xFFF38BA8|0|0\nSettings|/bin/settings.elf|Set|0xFF74C7EC|0|0\n" > $(BUILD_DIR)/etc/desktop_icons.conf
 	@# ── Desktop app config: taskbar dock, launcher registry, filemanager
 	@# places, and MIME associations. Each app ships a compiled-in default
 	@# matching this exact content (see tb_load_default_dock(),
@@ -412,16 +427,18 @@ etc: skeleton
 	@# gracefully — but these are the real, editable source of truth.
 	@printf "# Quick Launch Dock entries: glyph|label|path|0xAARRGGBB\nT|Terminal|/bin/terminal.elf|0xFFA6E3A1\nF|Files|/bin/filemanager.elf|0xFFF9E2AF\nE|Editor|/bin/texteditor.elf|0xFF89B4FA\nC|Calc|/bin/calculator.elf|0xFFFAB387\nP|Paint|/bin/paint.elf|0xFFCBA6F7\nA|Audio|/bin/audioplayer.elf|0xFFF38BA8\nS|Settings|/bin/settings.elf|0xFF74C7EC\nM|Sysmon|/bin/sysmon.elf|0xFF94E2D5\nX|XClock|/bin/xclock.elf|0xFF89DCEB\nY|XEyes|/bin/xeyes.elf|0xFFF5C2E7\nK|XCalc|/bin/xcalc.elf|0xFFF9E2AF\nG|XDemo|/bin/xgui_demo.elf|0xFFB4BEFE\n" > $(BUILD_DIR)/etc/taskbar_dock.conf
 	@printf "# App Launcher registry: appname=category:subtitle, or appname=hidden\nterminal=system:Command Terminal\nfilemanager=system:Files & Storage\ntexteditor=productivity:Code & Text Editor\nsysmon=system:Activity Monitor\ncalculator=productivity:Math & Calculations\nclock=productivity:Clock & World Times\nsettings=system:System Control\nabout=system:System Info\nfetch=system:System Telemetry\nscreenshot=system:Screen Capture\npaint=productivity:Paint & Sketch\naudioplayer=media:Music & Synthwave\nminesweeper=games:Minesweeper Puzzle\n2048=games:2048 Number Puzzle\nsnake=games:Arcade Snake Game\n# Internal services & CLI tools: excluded from the app grid\ninit=hidden\nsessiond=hidden\nazwm=hidden\nwallpaper=hidden\ntaskbar=hidden\nlauncher=hidden\ngui_test=hidden\nsh=hidden\nplay=hidden\nls=hidden\ncat=hidden\necho=hidden\npwd=hidden\nuname=hidden\nhead=hidden\ntail=hidden\nwc=hidden\ngrep=hidden\nmkdir=hidden\nrm=hidden\ntouch=hidden\ncp=hidden\nmv=hidden\ndate=hidden\nuptime=hidden\ndf=hidden\nfree=hidden\nifconfig=hidden\nping=hidden\nlspci=hidden\nenv=hidden\nwhich=hidden\nsleep=hidden\nkill=hidden\nchmod=hidden\nclear=hidden\nhexdump=hidden\nbase64=hidden\nmd5sum=hidden\ncut=hidden\nsort=hidden\nuniq=hidden\nps=hidden\ntop=hidden\ndmesg=hidden\ntree=hidden\ncal=hidden\nwatch=hidden\nnetstat=hidden\npoweroff=hidden\nreboot=hidden\ngetfacl=hidden\nsetfacl=hidden\n" > $(BUILD_DIR)/etc/launcher.conf
-	@printf "# File manager sidebar places: label|path|icon\nRoot|/|/\nDesktop|/home/azami/Desktop|D\nHard Disk|/hdd|H\nBinaries|/bin|B\nSystem|/sbin|S\nConfig|/etc|E\nProc FS|/proc|P\nDevices|/dev|D\nTemporary|/tmp|T\n" > $(BUILD_DIR)/etc/filemanager_places.conf
+	@printf "# File manager sidebar places: label|path|icon\nRoot|/|/\nBoot|/boot|O\nMusic|/music|M\nDesktop|/home/azami/Desktop|D\nHard Disk|/hdd|H\nBinaries|/bin|B\nSystem|/sbin|S\nConfig|/etc|E\nProc FS|/proc|P\nDevices|/dev|D\nTemporary|/tmp|T\n" > $(BUILD_DIR)/etc/filemanager_places.conf
 	@printf "# AzamiOS Kernel Runtime Configuration\n# File: /etc/sysctl.conf\n\n# Security Hardening Mitigations\nkernel.dmesg_restrict = 1\nkernel.kptr_restrict = 1\nkernel.mmap_min_addr = 65536\nkernel.yama.ptrace_scope = 1\nfs.protected_hardlinks = 1\nfs.protected_symlinks = 1\n\n# System & Hostname Defaults\nkernel.hostname = azamios\nfs.file-max = 65536\n" > $(BUILD_DIR)/etc/sysctl.conf
 	@printf "# File extension -> GUI app associations: ext=/path/to/app.elf\ntxt=/bin/texteditor.elf\nmd=/bin/texteditor.elf\nc=/bin/texteditor.elf\nh=/bin/texteditor.elf\nconf=/bin/texteditor.elf\ncfg=/bin/texteditor.elf\nini=/bin/texteditor.elf\nlog=/bin/texteditor.elf\nsh=/bin/texteditor.elf\njson=/bin/texteditor.elf\nbmp=/bin/paint.elf\npng=/bin/paint.elf\nwav=/bin/audioplayer.elf\n" > $(BUILD_DIR)/etc/mime.conf
 	@printf "/bin/sh\n/bin/sh.elf\n/bin/bash\n/usr/bin/sh\n" > $(BUILD_DIR)/etc/shells
 	@printf "Welcome to AzamiOS 7.0 (x86_64) - \\\\l\n\n" > $(BUILD_DIR)/etc/issue
 	@printf "ext2\nprocfs\ndevfs\n*\n" > $(BUILD_DIR)/etc/filesystems
-	@printf "PATH=/bin:/sbin:/usr/bin:/usr/sbin\nLANG=C.UTF-8\nEDITOR=/bin/texteditor.elf\nPAGER=cat\n" > $(BUILD_DIR)/etc/environment
-	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/home/a0wsvg/opt/cross-x86_64/bin:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin:/\nexport USER=root\nexport HOME=/root\nexport TERM=azami\nexport SHELL=/bin/sh.elf\nexport TMPDIR=/tmp\nexport COMPILER_PATH=/home/a0wsvg/opt/cross-x86_64/libexec/gcc/x86_64-elf/14.2.0/:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin/:/usr/bin:/bin\nexport LIBRARY_PATH=/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/:/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib\nexport C_INCLUDE_PATH=/usr/include:/usr/local/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/sys-include\nexport CPATH=/usr/include:/usr/local/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include\nexport PS1=\"root@azamios:\w$$ \"\n" > $(BUILD_DIR)/etc/profile
+	@printf "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nLANG=C.UTF-8\nEDITOR=/bin/texteditor.elf\nPAGER=cat\n" > $(BUILD_DIR)/etc/environment
+	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nexport USER=root\nexport HOME=/root\nexport TERM=azami\nexport SHELL=/bin/sh.elf\nexport TMPDIR=/tmp\nexport COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec/:/usr/bin:/bin\nexport LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib\nexport C_INCLUDE_PATH=/usr/include:/usr/local/include\nexport CPATH=/usr/include:/usr/local/include\nexport PS1=\"root@azamios:\w\\$$ \"\n" > $(BUILD_DIR)/etc/profile
 	@cp $(BUILD_DIR)/etc/profile $(BUILD_DIR)/root/.profile
-	@cp $(BUILD_DIR)/etc/profile $(BUILD_DIR)/home/azami/.profile
+	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nexport USER=azami\nexport HOME=/home/azami\nexport TERM=azami\nexport SHELL=/bin/sh.elf\nexport TMPDIR=/tmp\nexport COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec/:/usr/bin:/bin\nexport LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib\nexport C_INCLUDE_PATH=/usr/include:/usr/local/include\nexport CPATH=/usr/include:/usr/local/include\nexport PS1=\"azami@azamios:\w\\$$ \"\n" > $(BUILD_DIR)/home/azami/.profile
+	@cp $(BUILD_DIR)/etc/terminal.conf $(BUILD_DIR)/root/.config/terminal.conf
+	@printf "[terminal]\ntheme=catppuccin\nfont_size=12\nopacity=95\nscrollback=500\ncursor_blink=1\nhistory_size=100\nprompt=azami@azamios:\w$$ \n" > $(BUILD_DIR)/home/azami/.config/terminal.conf
 	@mkdir -p $(BUILD_DIR)/tmp $(BUILD_DIR)/var/tmp $(BUILD_DIR)/var/log $(BUILD_DIR)/var/run
 	@touch $(BUILD_DIR)/var/run/utmp $(BUILD_DIR)/var/log/wtmp $(BUILD_DIR)/etc/run-userspace-test 2>/dev/null || true
 	@mkdir -p $(BUILD_DIR)/examples
@@ -437,12 +454,12 @@ etc: skeleton
 # Usage: cd /usr/src/libc && sh build.sh\n\
 set -e\n\
 LIBC_DIR=/usr/src/libc\n\
-cd "$LIBC_DIR"\n\
+cd "$$LIBC_DIR"\n\
 echo "=== Building AzamiOS libc with native GCC 14.2.0 ==="\n\
 CFLAGS="-std=c11 -ffreestanding -fno-stack-protector -fno-pie -fno-pic -m64 -O2 -I. -Iinclude"\n\
 SRCS="syscall.c stdio.c stdlib.c string.c ctype.c dirent.c time.c math.c az_ipc.c signal.c mman.c pthread.c termios.c resource.c getopt.c acl.c x11.c socket.c netdb.c pwd.c grp.c regex.c fnmatch.c glob.c spawn.c syslog.c search.c tls.c"\n\
 echo "  Compiling C sources..."\n\
-gcc $CFLAGS -c $SRCS\n\
+gcc $$CFLAGS -c $$SRCS\n\
 echo "  Assembling crt0.asm..."\n\
 nasm -f elf64 crt0.asm -o crt0.o\n\
 echo "  Archiving libc.a..."\n\
@@ -456,9 +473,9 @@ cp libc.a  /lib64/libc.a    2>/dev/null || true\n\
 cp crt0.o  /usr/lib/crt0.o  2>/dev/null || true\n\
 cp crt0.o  /lib/crt0.o      2>/dev/null || true\n\
 cp crt0.o  /lib64/crt0.o    2>/dev/null || true\n\
-GCCLIB=/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib\n\
-cp libc.a  $GCCLIB/libc.a   2>/dev/null || true\n\
-cp crt0.o  $GCCLIB/crt0.o   2>/dev/null || true\n\
+GCCLIB=/usr/lib/gcc/x86_64-elf/14.2.0\n\
+cp libc.a  $$GCCLIB/libc.a   2>/dev/null || true\n\
+cp crt0.o  $$GCCLIB/crt0.o   2>/dev/null || true\n\
 echo "=== libc.a built and installed successfully! ==="\n\
 echo "Test: gcc hello.c -o hello && ./hello"\n\
 ' > $(BUILD_DIR)/usr/src/libc/build.sh
@@ -487,6 +504,14 @@ fonts: skeleton
 	@echo "  ↓  Compiling font subsystem binary fonts..."
 	@python3 ../scripts/generate_fonts.py
 	@printf "[font]\nsystem_font=/usr/share/fonts/vga_regular.azf\nmono_font=/usr/share/fonts/terminus_regular.azf\nsmall_font=/usr/share/fonts/vga_small.azf\nsize=16\n" > $(BUILD_DIR)/etc/font.conf
+
+music: skeleton
+	@echo "  ↓  Generating audio tracks for /music..."
+	@mkdir -p $(BUILD_DIR)/music $(BUILD_DIR)/home/azami/Music $(BUILD_DIR)/usr/share/music $(BUILD_DIR)/home/azami/Desktop
+	@python3 ../scripts/generate_music.py $(BUILD_DIR)/music
+	@cp $(BUILD_DIR)/music/*.wav $(BUILD_DIR)/home/azami/Music/ 2>/dev/null || true
+	@cp $(BUILD_DIR)/music/*.wav $(BUILD_DIR)/usr/share/music/ 2>/dev/null || true
+	@ln -sf /music $(BUILD_DIR)/home/azami/Desktop/Music 2>/dev/null || true
 
 # ── System binaries (/sbin) + user utilities & applications (/bin) ──────────
 #

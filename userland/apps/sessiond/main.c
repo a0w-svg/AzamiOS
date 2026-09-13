@@ -32,6 +32,22 @@
 
 static uk_window_t g_splash_win;
 
+static void send_notification(const char *title, const char *body)
+{
+    az_wm_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = AZ_WM_NOTIFY;
+    az_wm_notify_payload_t *pl = AZ_WM_MSG_NOTIFY(&msg);
+    int i;
+    for (i = 0; title && title[i] && i < AZ_WM_NOTIFY_TITLE_MAX - 1; i++)
+        pl->title[i] = title[i];
+    pl->title[i] = '\0';
+    for (i = 0; body && body[i] && i < AZ_WM_NOTIFY_BODY_MAX - 1; i++)
+        pl->body[i] = body[i];
+    pl->body[i] = '\0';
+    az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&msg);
+}
+
 /* ── Render sleek splash screen ───────────────────────────────────────────── */
 static void render_splash(uk_window_t *win, int progress)
 {
@@ -147,6 +163,62 @@ static int probe_azwm_readiness(int max_retries)
     return -1;
 }
 
+static void spawn_session_section(const char *section_header)
+{
+    int fd = sys_open("/etc/session.conf", 0, 0);
+    if (fd < 0) return;
+
+    char buf[1024];
+    ssize_t n = sys_read(fd, buf, sizeof(buf) - 1);
+    sys_close(fd);
+    if (n <= 0) return;
+    buf[n] = '\0';
+
+    char *sec = strstr(buf, section_header);
+    if (!sec) return;
+
+    char *line = strchr(sec, '\n');
+    if (!line) return;
+    line++;
+
+    while (*line && *line != '[') {
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line == '#' || *line == '\n' || *line == '\r') {
+            line = strchr(line, '\n');
+            if (!line) break;
+            line++;
+            continue;
+        }
+
+        char *eq = strchr(line, '=');
+        if (!eq) break;
+        char *val = eq + 1;
+        while (*val == ' ' || *val == '\t') val++;
+
+        char path[128];
+        int i = 0;
+        while (*val && *val != '\n' && *val != '\r' && *val != ' ' && i < 127) {
+            path[i++] = *val++;
+        }
+        path[i] = '\0';
+
+        if (path[0]) {
+            int pid = az_spawn(path);
+            char logmsg[160];
+            if (pid >= 0) {
+                snprintf(logmsg, sizeof(logmsg), "[sessiond] Spawned: %s (PID %d)", path, pid);
+            } else {
+                snprintf(logmsg, sizeof(logmsg), "[sessiond] Warning: failed to spawn: %s", path);
+            }
+            de_log(logmsg);
+        }
+
+        line = strchr(line, '\n');
+        if (!line) break;
+        line++;
+    }
+}
+
 #include "../shared/sys_config.h"
 
 /* ============================================================================
@@ -192,34 +264,23 @@ int main(int argc, char **argv)
         splash_ok = 1;
     }
 
-    /* ── Step 4: Spawn Root Window / Animated Wallpaper ─────────────────── */
-    if (splash_ok) render_splash(&g_splash_win, 45);
-    int wp_pid = az_spawn("/sbin/wallpaper.elf");
-    if (wp_pid >= 0) {
-        de_log("[sessiond] wallpaper.elf spawned.");
-    }
+    /* ── Step 4: Spawn Desktop Components from /etc/session.conf ───────── */
+    if (splash_ok) render_splash(&g_splash_win, 50);
 
-    /* ── Step 5: Spawn Taskbar & Services ───────────────────────────────── */
-    if (splash_ok) render_splash(&g_splash_win, 75);
-    int tb_pid = az_spawn("/sbin/taskbar.elf");
-    if (tb_pid >= 0) {
-        de_log("[sessiond] taskbar.elf spawned.");
-    }
-    int notif_pid = az_spawn("/sbin/notifyd.elf");
-    if (notif_pid >= 0) {
-        de_log("[sessiond] notifyd.elf spawned.");
-    }
-
-    /* Auto-launch settings on startup */
-    int set_pid = az_spawn("/bin/settings.elf");
-    if (set_pid >= 0) {
-        de_log("[sessiond] settings.elf auto-spawned successfully.");
-    }
-
-    /* Auto-launch terminal emulator on startup */
-    int term_pid = az_spawn("/bin/terminal.elf");
-    if (term_pid >= 0) {
-        de_log("[sessiond] terminal.elf auto-spawned successfully.");
+    int conf_fd = sys_open("/etc/session.conf", 0, 0);
+    if (conf_fd >= 0) {
+        sys_close(conf_fd);
+        spawn_session_section("[services]");
+        if (splash_ok) render_splash(&g_splash_win, 80);
+        spawn_session_section("[autostart]");
+    } else {
+        /* Fallback if /etc/session.conf is missing */
+        az_spawn("/sbin/wallpaper.elf");
+        az_spawn("/sbin/taskbar.elf");
+        az_spawn("/sbin/notifyd.elf");
+        if (splash_ok) render_splash(&g_splash_win, 80);
+        az_spawn("/bin/settings.elf");
+        az_spawn("/bin/terminal.elf");
     }
 
     /* ── Step 6: Dismiss Splash Screen ───────────────────────────────────── */
@@ -237,6 +298,7 @@ int main(int argc, char **argv)
     }
 
     de_log("[sessiond] Desktop Environment initialized successfully.");
+    send_notification("AzamiOS v7.0 Ready", "Root (sata0p2) & Boot (sata0p1) mounted. Welcome!");
 
     /* ── Step 7: Session Watchdog Loop ───────────────────────────────────── */
     for (;;) {

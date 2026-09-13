@@ -54,6 +54,38 @@ static void format_size(unsigned long long sectors, char *out, size_t max_len)
     }
 }
 
+static void lookup_mountpoint(const char *devname, char *out_mnt, size_t max_len)
+{
+    out_mnt[0] = '\0';
+    int fd = open("/proc/mounts", O_RDONLY);
+    if (fd < 0) return;
+
+    char buf[2048];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = '\0';
+
+    char *line = buf;
+    while (*line) {
+        char dev[64] = {0};
+        char mnt[64] = {0};
+        char *next = strchr(line, '\n');
+        if (next) *next = '\0';
+
+        if (sscanf(line, "%63s %63s", dev, mnt) == 2) {
+            if (strstr(dev, devname) != NULL) {
+                strncpy(out_mnt, mnt, max_len - 1);
+                out_mnt[max_len - 1] = '\0';
+                return;
+            }
+        }
+
+        if (!next) break;
+        line = next + 1;
+    }
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -64,13 +96,13 @@ int main(int argc, char **argv)
         printf("%-10s %7s %2s %7s %2s %-6s %s\n",
                "NAME", "MAJ:MIN", "RM", "SIZE", "RO", "TYPE", "MOUNTPOINTS");
         printf("%-10s %7s %2d %7s %2d %-6s %s\n",
-               "sda", "8:0", 0, "2.0G", 0, "disk", "");
+               "sata0", "8:0", 0, "2.0G", 0, "disk", "");
         printf("├─%-8s %7s %2d %7s %2d %-6s %s\n",
-               "sda1", "8:1", 0, "2.0G", 0, "part", "/hdd");
+               "sata0p1", "8:1", 0, "64M", 0, "part", "/boot");
+        printf("└─%-8s %7s %2d %7s %2d %-6s %s\n",
+               "sata0p2", "8:2", 0, "1.9G", 0, "part", "/");
         printf("%-10s %7s %2d %7s %2d %-6s %s\n",
-               "loop0", "7:0", 0, "200M", 0, "loop", "");
-        printf("%-10s %7s %2d %7s %2d %-6s %s\n",
-               "ram0", "1:0", 0, "200M", 0, "ram", "/");
+               "ram0", "1:0", 0, "200M", 0, "ram", "");
         return 0;
     }
 
@@ -103,19 +135,19 @@ int main(int argc, char **argv)
         if (strstr(bi->name, "loop") != NULL) {
             strncpy(bi->type, "loop", sizeof(bi->type) - 1);
             bi->is_part = 0;
-            bi->mountpoint[0] = '\0';
+            lookup_mountpoint(bi->name, bi->mountpoint, sizeof(bi->mountpoint));
         } else if (strstr(bi->name, "ram") != NULL) {
             strncpy(bi->type, "ram", sizeof(bi->type) - 1);
             bi->is_part = 0;
-            strncpy(bi->mountpoint, "/", sizeof(bi->mountpoint) - 1);
+            lookup_mountpoint(bi->name, bi->mountpoint, sizeof(bi->mountpoint));
         } else if (bi->name[strlen(bi->name) - 1] >= '0' && bi->name[strlen(bi->name) - 1] <= '9') {
             strncpy(bi->type, "part", sizeof(bi->type) - 1);
             bi->is_part = 1;
-            strncpy(bi->mountpoint, "/hdd", sizeof(bi->mountpoint) - 1);
+            lookup_mountpoint(bi->name, bi->mountpoint, sizeof(bi->mountpoint));
         } else {
             strncpy(bi->type, "disk", sizeof(bi->type) - 1);
             bi->is_part = 0;
-            bi->mountpoint[0] = '\0';
+            lookup_mountpoint(bi->name, bi->mountpoint, sizeof(bi->mountpoint));
         }
     }
     closedir(d);

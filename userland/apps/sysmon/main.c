@@ -50,7 +50,9 @@ static unsigned int g_mem_total_kb = 0;
 
 /* Storage stats */
 static unsigned long g_root_used_mb = 0;
-static unsigned long g_root_total_mb = 32;
+static unsigned long g_root_total_mb = 512;
+static unsigned long g_boot_used_mb = 0;
+static unsigned long g_boot_total_mb = 64;
 static unsigned long g_hdd_used_mb = 0;
 static unsigned long g_hdd_total_mb = 0;
 
@@ -198,22 +200,30 @@ static void draw_sysmon(void)
     py += 32;
 
     /* Storage Section */
-    uk_draw_section_header(&g_win, 12, py, 280, "Storage Drives", UK_SAPPHIRE);
+    uk_draw_section_header(&g_win, 12, py, 280, "Storage Partitions", UK_SAPPHIRE);
     py += 22;
 
-    char root_str[48];
-    snprintf(root_str, sizeof(root_str), "/ (Initrd Ext2): %lu MB / %lu MB", g_root_used_mb, g_root_total_mb);
+    char root_str[64];
+    snprintf(root_str, sizeof(root_str), "/ (Root Ext2 - sata0p2): %lu MB / %lu MB", g_root_used_mb, g_root_total_mb);
     uk_draw_text(&g_win, 12, py, root_str, UK_SUBTEXT0);
     py += 14;
     draw_bar_rounded(12, py, 280, 8, (unsigned int)g_root_used_mb, (unsigned int)g_root_total_mb, UK_SAPPHIRE, UK_SURFACE0);
     py += 14;
 
-    if (g_hdd_total_mb > 0) {
-        char hdd_str[48];
+    if (g_boot_total_mb > 0) {
+        char boot_str[64];
+        snprintf(boot_str, sizeof(boot_str), "/boot (Boot Ext2 - sata0p1): %lu MB / %lu MB", g_boot_used_mb, g_boot_total_mb);
+        uk_draw_text(&g_win, 12, py, boot_str, UK_SUBTEXT0);
+        py += 14;
+        draw_bar_rounded(12, py, 280, 8, (unsigned int)g_boot_used_mb, (unsigned int)g_boot_total_mb, UK_TEAL, UK_SURFACE0);
+        py += 14;
+    } else if (g_hdd_total_mb > 0) {
+        char hdd_str[64];
         snprintf(hdd_str, sizeof(hdd_str), "/hdd (SATA Drive): %lu MB / %lu MB", g_hdd_used_mb, g_hdd_total_mb);
         uk_draw_text(&g_win, 12, py, hdd_str, UK_SUBTEXT0);
         py += 14;
         draw_bar_rounded(12, py, 280, 8, (unsigned int)g_hdd_used_mb, (unsigned int)g_hdd_total_mb, UK_GREEN, UK_SURFACE0);
+        py += 14;
     }
 
     /* ── Right Column: Process List (Start at x: 310) ─────────────────────── */
@@ -299,6 +309,10 @@ static void update_telemetry(void)
     if (statfs("/", &sfs) == 0 && sfs.f_blocks > 0) {
         g_root_total_mb = (unsigned long)((sfs.f_blocks * sfs.f_bsize) / (1024 * 1024));
         g_root_used_mb  = (unsigned long)(((sfs.f_blocks - sfs.f_bfree) * sfs.f_bsize) / (1024 * 1024));
+    }
+    if (statfs("/boot", &sfs) == 0 && sfs.f_blocks > 0) {
+        g_boot_total_mb = (unsigned long)((sfs.f_blocks * sfs.f_bsize) / (1024 * 1024));
+        g_boot_used_mb  = (unsigned long)(((sfs.f_blocks - sfs.f_bfree) * sfs.f_bsize) / (1024 * 1024));
     }
     if (statfs("/hdd", &sfs) == 0 && sfs.f_blocks > 0) {
         g_hdd_total_mb = (unsigned long)((sfs.f_blocks * sfs.f_bsize) / (1024 * 1024));

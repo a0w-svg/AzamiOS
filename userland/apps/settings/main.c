@@ -5,7 +5,7 @@
  * Features:
  *  • Display Configuration (Resolution, VSync, Compositing toggles)
  *  • Audio Control (Master Volume slider, Intel AC97 test chime)
- *  • Theme Switcher (5 Themes: Mocha, Latte, Nord, Cyberpunk, OLED)
+ *  • Theme Switcher (file-backed: theme files under /usr/share/themes, /hdd/themes)
  *  • Time & Date Configuration (Timezones, Live clock)
  *  • Network Configuration (eth0 live stats, IP, gateway, DNS, packets)
  *  • Security & Kernel Mitigations (Interactive sysctl toggles: dmesg_restrict,
@@ -98,27 +98,28 @@ static void play_test_chime(void)
     sys_close(fd);
 }
 
-/* ── Theme Presets (5 Themes) ─────────────────────────────────────────────── */
-typedef struct {
-    const char *name;
-    const char *desc;
-    unsigned int bg;
-    unsigned int accent;
-    unsigned int text;
-} theme_entry_t;
-
-static const theme_entry_t g_themes[AZ_THEME_COUNT] = {
-    [AZ_THEME_MOCHA]     = { "Catppuccin Mocha", "Dark Pastel",   0xFF1E1E2E, 0xFFCBA6F7, 0xFFCDD6F4 },
-    [AZ_THEME_LATTE]     = { "Catppuccin Latte", "Light Minimal", 0xFFEFF1F5, 0xFF8839EF, 0xFF4C4F69 },
-    [AZ_THEME_NORD]      = { "Nord Arctic",      "Polar Frost",   0xFF2E3440, 0xFF88C0D0, 0xFFECEFF4 },
-    [AZ_THEME_CYBERPUNK] = { "Cyberpunk Neon",   "Neon High-Con", 0xFF0D0D18, 0xFF00FFCC, 0xFFF0F6FC },
-    [AZ_THEME_OLED]      = { "OLED Pure Dark",   "True Black",    0xFF050505, 0xFF3B82F6, 0xFFFFFFFF },
-};
+/* ── Theme Presets ─────────────────────────────────────────────────────────
+ * Used to be a second, hand-maintained copy of the palette table in
+ * ui_kit.h (name/bg/accent/text only, for the card preview). Now both read
+ * the same theme files under /usr/share/themes through az_theme_get(), so this
+ * app automatically picks up any theme dropped onto disk instead of only
+ * ever offering the 5 it was compiled with. */
 static int g_theme_selected = 0;
+
+/* A *.theme file has no "short description" field — themes are arbitrary,
+ * user-droppable data now, not a fixed enum. Derive one from the base
+ * color's luma instead of hand-authoring a caption per theme. */
+static const char *theme_brightness_label(const az_theme_t *t)
+{
+    unsigned int r = (t->base >> 16) & 0xFF, g = (t->base >> 8) & 0xFF, b = t->base & 0xFF;
+    unsigned int luma = (r * 299 + g * 587 + b * 114) / 1000;
+    return luma >= 128 ? "Light Theme" : "Dark Theme";
+}
 
 static void apply_theme(int theme_id)
 {
-    if (theme_id < 0 || theme_id >= AZ_THEME_COUNT) return;
+    int count = az_theme_count();
+    if (theme_id < 0 || theme_id >= count) return;
     g_theme_selected = theme_id;
 
     /* Broadcast to Display Server */
@@ -134,7 +135,7 @@ static void apply_theme(int theme_id)
         char buf[256];
         snprintf(buf, sizeof(buf),
                  "[theme]\ntheme_id=%d\nname=%s\nwallpaper=/usr/share/wallpapers/default.raw\n\n[display]\nvsync=1\ncompositing=1\ncursor_aa=1\nfps=60\n\n[panel]\nposition=bottom\nheight=32\nautohide=0\nshow_clock=1\n",
-                 theme_id, g_themes[theme_id].name);
+                 theme_id, az_theme_get(theme_id)->name);
         sys_write(fd, buf, strlen(buf));
         sys_close(fd);
     }
@@ -158,13 +159,14 @@ static void load_desktop_config(void)
         sys_close(fd);
         if (n > 0) {
             buf[n] = '\0';
+            int count = az_theme_count();
             char *tid = strstr(buf, "theme_id=");
             if (tid) {
                 int id = atoi(tid + 9);
-                if (id >= 0 && id < AZ_THEME_COUNT) g_theme_selected = id;
+                if (id >= 0 && id < count) g_theme_selected = id;
             } else if (buf[0] >= '0' && buf[0] <= '9') {
                 int id = atoi(buf);
-                if (id >= 0 && id < AZ_THEME_COUNT) g_theme_selected = id;
+                if (id >= 0 && id < count) g_theme_selected = id;
             }
         }
     }
@@ -338,7 +340,9 @@ static void draw_theme_tab(void)
 
     uk_draw_section_header(&g_win, px, THEME_SEC_Y, (int)w - 40, "Desktop Themes & Color Palettes", UK_MAUVE);
 
-    for (int i = 0; i < AZ_THEME_COUNT; i++) {
+    int theme_count = az_theme_count();
+    for (int i = 0; i < theme_count; i++) {
+        const az_theme_t *th = az_theme_get(i);
         int col = i % 2;
         int row = i / 2;
         int card_x = px + col * (THEME_CARD_W + THEME_CARD_GAP);
@@ -347,7 +351,7 @@ static void draw_theme_tab(void)
         bool is_sel = (i == g_theme_selected);
         unsigned int border_col = is_sel ? UK_MAUVE : UK_SURFACE1;
 
-        uk_fill_rounded_rect(&g_win, card_x, card_y, THEME_CARD_W, THEME_CARD_H, 8, g_themes[i].bg);
+        uk_fill_rounded_rect(&g_win, card_x, card_y, THEME_CARD_W, THEME_CARD_H, 8, th->base);
         uk_draw_rounded_rect_outline(&g_win, card_x, card_y, THEME_CARD_W, THEME_CARD_H, 8, border_col);
 
         if (is_sel) {
@@ -355,13 +359,13 @@ static void draw_theme_tab(void)
         }
 
         /* Swatch dots */
-        uk_fill_circle(&g_win, card_x + 22, card_y + 24, 8, g_themes[i].accent);
-        uk_fill_circle(&g_win, card_x + 42, card_y + 24, 8, g_themes[i].text);
-        uk_fill_circle(&g_win, card_x + 62, card_y + 24, 8, g_themes[i].bg);
+        uk_fill_circle(&g_win, card_x + 22, card_y + 24, 8, th->accent);
+        uk_fill_circle(&g_win, card_x + 42, card_y + 24, 8, th->text);
+        uk_fill_circle(&g_win, card_x + 62, card_y + 24, 8, th->base);
 
         /* Title & Desc */
-        uk_draw_text(&g_win, card_x + 82, card_y + 14, g_themes[i].name, is_sel ? UK_TEXT : UK_SUBTEXT1);
-        uk_draw_text(&g_win, card_x + 82, card_y + 32, g_themes[i].desc, UK_OVERLAY0);
+        uk_draw_text(&g_win, card_x + 82, card_y + 14, th->name, is_sel ? UK_TEXT : UK_SUBTEXT1);
+        uk_draw_text(&g_win, card_x + 82, card_y + 32, theme_brightness_label(th), UK_OVERLAY0);
 
         if (is_sel) {
             uk_draw_badge(&g_win, card_x + THEME_CARD_W - 54, card_y + 18, "Active", UK_SURFACE1, UK_MAUVE);
@@ -964,12 +968,14 @@ static void draw_storage_card(int x, int y, int w, int h,
         pct      = total_mb ? (int)((used_mb * 100) / total_mb) : 0;
     } else {
         /* Fallback synthetic metrics */
-        if (strcmp(path, "/hdd") == 0) {
+        if (strcmp(path, "/boot") == 0) {
+            total_mb = 64; used_mb = 12; free_mb = 52; pct = 18;
+        } else if (strcmp(path, "/hdd") == 0) {
             total_mb = 1024; used_mb = 128; free_mb = 896; pct = 12;
         } else if (strcmp(path, "/tmp") == 0) {
             total_mb = 128; used_mb = 8; free_mb = 120; pct = 6;
         } else {
-            total_mb = 512; used_mb = 96; free_mb = 416; pct = 18;
+            total_mb = 512; used_mb = 211; free_mb = 301; pct = 41;
         }
     }
 
@@ -1009,8 +1015,8 @@ static void draw_disks_tab(void)
 
     uk_draw_section_header(&g_win, px, 86, (int)w - 40, "Storage Partitions & Mounted Filesystems", UK_TEAL);
 
-    draw_storage_card(px, 114, (int)w - 40, 62, "System Volume", "/", "Ext2 File System", "/");
-    draw_storage_card(px, 186, (int)w - 40, 62, "Secondary Storage", "/hdd", "SATA AHCI Ext2", "/hdd");
+    draw_storage_card(px, 114, (int)w - 40, 62, "Root Partition (sata0p2)", "/", "SATA Rootfs Ext2", "/");
+    draw_storage_card(px, 186, (int)w - 40, 62, "Boot Partition (sata0p1)", "/boot", "SATA Boot Ext2", "/boot");
     draw_storage_card(px, 258, (int)w - 40, 62, "RAM Scratchpad", "/tmp", "tmpfs Volatile RAM", "/tmp");
 
     uk_draw_section_header(&g_win, px, 330, (int)w - 40, "Storage Maintenance & Cache Flush", UK_SAPPHIRE);
@@ -1357,7 +1363,8 @@ int main(int argc, char **argv)
 
                 /* Theme tab card clicks */
                 if (g_active_tab == 2) {
-                    for (int i = 0; i < AZ_THEME_COUNT; i++) {
+                    int theme_count = az_theme_count();
+                    for (int i = 0; i < theme_count; i++) {
                         int col = i % 2;
                         int row = i / 2;
                         int card_x = 20 + col * (THEME_CARD_W + THEME_CARD_GAP);

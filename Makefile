@@ -212,6 +212,7 @@ KERNEL_C_SRCS := \
     hal/irq.c \
     hal/pci.c \
     drivers/block/block.c \
+    drivers/block/partition.c \
     drivers/block/ata.c \
     drivers/block/ahci.c \
     drivers/block/nvme.c \
@@ -410,8 +411,12 @@ QEMU_FLAGS := \
     -device ich9-usb-ehci1 \
     -device vmxnet3
 
+# Fast partitioned disk run (Partition 1: kernel, Partition 2: rootfs + music)
+run: hdd.img
+	$(QEMU) $(QEMU_FLAGS) -boot c
+
 # Limine-based ISO run (GUI window + serial terminal)
-run: iso
+run-iso: iso
 	$(QEMU) $(QEMU_FLAGS) -cdrom $(BUILD_DIR)/AzamiOS.iso
 
 # Graphical GUI window run
@@ -522,13 +527,10 @@ linux-test: $(KERNEL_ELF)
 linux-clean:
 	@$(MAKE) -C tools/linux clean
 
-hdd.img:
-	@echo "  ↓  Generating persistent storage disk (hdd.img)..."
-	@mkdir -p hdd_root/fonts
-	@python3 scripts/generate_fonts.py >/dev/null 2>&1 || true
-	@printf "Welcome to AzamiOS Persistent Storage!\n\nThis file is saved directly to the SATA drive (AHCI).\nEdit this text and press Ctrl+S to save it persistently!\n" > hdd_root/notes.txt
-	@truncate -s 4096 hdd_root/notes.txt
-	@mke2fs -F -t ext2 -d hdd_root hdd.img 32M >/dev/null 2>&1 || true
+hdd.img: $(KERNEL_ELF) | tools/limine
+	@echo "  ↓  Generating dual-partition bootable storage disk (hdd.img)..."
+	@$(MAKE) -C userland ARCH=x86_64
+	@python3 scripts/create_disk.py
 
 # ── Userspace (pass-through to original targets) ─────────────────────────────
 userland/libc/libc.a:
@@ -539,7 +541,7 @@ userspace:
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
-	rm -rf $(BUILD_DIR) kernel.log
+	rm -rf $(BUILD_DIR) kernel.log hdd.img
 	@echo "  ✓  Build directory cleaned"
 
 # ── Header dependencies (must stay last; see DEPFILES above) ─────────────────

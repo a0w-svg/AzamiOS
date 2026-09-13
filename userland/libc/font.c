@@ -383,19 +383,30 @@ az_font_t *az_font_load_default(void)
 {
     char font_path[128] = {0};
 
-    /* 1. Check persistent SATA config first */
-    if (read_conf_value(AZ_FONT_CONFIG_HDD, "system_font", font_path, sizeof(font_path)) == 0) {
-        az_font_t *f = az_font_load(font_path);
-        if (f) return f;
+    /* 1. Check user config: $HOME/.config/font.conf */
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        char user_conf[128];
+        snprintf(user_conf, sizeof(user_conf), "%s/.config/font.conf", home);
+        if (read_conf_value(user_conf, "system_font", font_path, sizeof(font_path)) == 0) {
+            az_font_t *f = az_font_load(font_path);
+            if (f) return f;
+        }
     }
 
-    /* 2. Check system rootfs config */
+    /* 2. Check system rootfs config: /etc/font.conf */
     if (read_conf_value(AZ_FONT_CONFIG_FILE, "system_font", font_path, sizeof(font_path)) == 0) {
         az_font_t *f = az_font_load(font_path);
         if (f) return f;
     }
 
-    /* 3. Try standard system default fonts on drive */
+    /* 3. Check persistent SATA config fallback */
+    if (read_conf_value(AZ_FONT_CONFIG_HDD, "system_font", font_path, sizeof(font_path)) == 0) {
+        az_font_t *f = az_font_load(font_path);
+        if (f) return f;
+    }
+
+    /* 4. Try standard system default fonts on drive */
     az_font_t *f = az_font_load(AZ_FONT_DIR_SYSTEM "/vga_regular.azf");
     if (f) return f;
 
@@ -405,7 +416,7 @@ az_font_t *az_font_load_default(void)
     f = az_font_load(AZ_FONT_DIR_SYSTEM "/terminus_regular.azf");
     if (f) return f;
 
-    /* 4. Fallback to embedded static table */
+    /* 5. Fallback to embedded static table */
     return (az_font_t *)&s_builtin_font_regular;
 }
 
@@ -461,22 +472,37 @@ int az_font_set_default_font(const char *font_path)
              "[font]\nsystem_font=%s\nmono_font=%s\nsize=16\n",
              font_path, font_path);
 
-    /* Write to /hdd/etc/font.conf if persistent drive is present */
-    struct stat st;
-    if (stat("/hdd", &st) == 0 && S_ISDIR(st.st_mode)) {
-        mkdir("/hdd/etc", 0755);
-        int fd = open(AZ_FONT_CONFIG_HDD, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd >= 0) {
-            write(fd, conf_data, strlen(conf_data));
-            close(fd);
+    /* Write to user config $HOME/.config/font.conf if HOME is set */
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        char cfg_dir[128];
+        snprintf(cfg_dir, sizeof(cfg_dir), "%s/.config", home);
+        mkdir(cfg_dir, 0755);
+        char user_conf[128];
+        snprintf(user_conf, sizeof(user_conf), "%s/.config/font.conf", home);
+        int ufd = open(user_conf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ufd >= 0) {
+            write(ufd, conf_data, strlen(conf_data));
+            close(ufd);
         }
     }
 
-    /* Write to /etc/font.conf */
+    /* Write to system /etc/font.conf */
     int fd = open(AZ_FONT_CONFIG_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         write(fd, conf_data, strlen(conf_data));
         close(fd);
+    }
+
+    /* Also write to /hdd/etc/font.conf if persistent drive is present */
+    struct stat st;
+    if (stat("/hdd", &st) == 0 && S_ISDIR(st.st_mode)) {
+        mkdir("/hdd/etc", 0755);
+        int hfd = open(AZ_FONT_CONFIG_HDD, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (hfd >= 0) {
+            write(hfd, conf_data, strlen(conf_data));
+            close(hfd);
+        }
     }
 
     return 0;

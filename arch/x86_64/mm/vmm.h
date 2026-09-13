@@ -209,6 +209,20 @@ extern u8 g_pcid_enabled;   /* cpu.c — CR4.PCIDE is live */
  * every switch after that sets CR3[63] so the entries are kept. A cross-CPU
  * TLB shootdown flushes every PCID (INVPCID all-contexts), so a stale mapping
  * can never outlive an unmap.
+ *
+ * This is also the *only* record of which cores a given address space has
+ * ever run on, and tlb_shootdown_space() (tlb.c, via sched_tlb_current_space_
+ * mask() in sched.c) reads it for exactly that: a core whose bit is clear
+ * here has never loaded this pml4 and provably cannot hold a stale
+ * translation for it, so a shootdown never needs to interrupt it. That is
+ * why the bit still has to be set below even with PCID disabled, even though
+ * nothing in *this* function reads it in that path — a plain CR3 reload does
+ * flush this core's own TLB for the space it just left, but tlb_shootdown_
+ * space() is asking about *other* cores it has no way to inspect directly,
+ * and the bit is the only channel that reaches them. It is never cleared
+ * again (switching away doesn't prove a later shootdown already reached this
+ * core), so the set of cores it names only grows — the same over-
+ * approximate-rather-than-miss-one tradeoff the PCID path already makes.
  */
 static inline void vmm_switch_proc(phys_addr_t pml4, u32 pcid, u32 cpu,
                                    u64 *primed_mask)
@@ -222,6 +236,9 @@ static inline void vmm_switch_proc(phys_addr_t pml4, u32 pcid, u32 cpu,
     }
 
     if (!g_pcid_enabled) {
+        if (cpu < 64 && primed_mask) {
+            __atomic_or_fetch(primed_mask, 1ULL << cpu, __ATOMIC_RELAXED);
+        }
         __asm__ volatile("mov %0, %%cr3" : : "r"(phys) : "memory");
         return;
     }

@@ -565,14 +565,27 @@ restart:
         
         dentry_t *next = dcache_lookup(curr, comp);
         bool dentry_is_ours = false;
-        if (!next) {
-            /* Fast path: check negative dentry cache to avoid costly filesystem directory scans */
-            if (neg_dcache_lookup(curr, comp)) {
-                while (*p == '/') p++;
-                if (out_dentry) *out_dentry = NULL;
-                return -(s64)ENOENT;
-            }
 
+        /* Fast path: a negative dentry cache hit means the filesystem has
+         * already told us this name doesn't exist under `curr`, so skip the
+         * directory scan below — but still hand back a real (negative) stub
+         * dentry with d_parent/d_name set, exactly like the slow path builds
+         * for an ext2_lookup() miss just below. This used to short-circuit
+         * straight to `return -ENOENT` with *out_dentry left NULL, which
+         * silently broke O_CREAT (and mkdir/link/symlink) for any name that
+         * had ever been negatively looked up before — including by a plain
+         * unlink() of a file that doesn't exist yet, which is exactly the
+         * "remove stale, then recreate" idiom real programs use. Every
+         * caller that needs to *create* the missing name (vfs_open_err,
+         * vfs_mkdir, ...) requires dentry->d_parent to find out what to
+         * create it under; a NULL dentry gave them nothing to work with. */
+        if (!next && neg_dcache_lookup(curr, comp)) {
+            next = dcache_alloc(curr, comp);
+            if (!next) return -(s64)ENOMEM;
+            dentry_is_ours = true;
+        }
+
+        if (!next) {
             /* Try to ask the filesystem's inode->lookup */
             if (!curr->d_inode || !curr->d_inode->i_op || !curr->d_inode->i_op->lookup) {
                 return -(s64)ENOENT;

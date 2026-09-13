@@ -543,6 +543,37 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     return proc;
 }
 
+/* Bridge for tlb_shootdown_space() (arch/x86_64/mm/tlb.c): it needs to know
+ * which CPUs might hold a stale translation for @space, and that record
+ * (process_t::pcid_primed, kept current by every vmm_switch_proc() call —
+ * see its doc comment in vmm.h) lives here, at the scheduler layer, not in
+ * arch/x86_64/mm. Declared `extern` at its one call site rather than in a
+ * shared header, matching how this codebase already crosses a couple of
+ * other module boundaries (e.g. vfs_sync_all()'s `extern void ext2_sync()`).
+ *
+ * Deliberately only ever answers for the CURRENT cpu's own running process:
+ * that covers the overwhelming majority of real calls (a process modifying
+ * its own address space) with no locking at all — proc is pinned by the fact
+ * that it is what is executing right now, so there's nothing to race with a
+ * concurrent exit()/free(). Any other case (ptrace poking a different
+ * process, tearing one down, a freshly cloned child no one has scheduled
+ * yet) would need to search g_process_list under g_sched_lock, which the
+ * caller may already hold indirectly through a lock-ordering path this
+ * function has no way to know about — so instead of risking that, those
+ * cases just get told "assume every CPU", which is always correct, just not
+ * narrowed. */
+u64 sched_tlb_current_space_mask(phys_addr_t space)
+{
+    cpu_info_t *cpu = smp_get_cpu();
+    thread_t   *t   = cpu ? cpu->current_thread : NULL;
+    process_t  *proc = t ? t->proc : NULL;
+
+    if (!proc || proc->pml4_phys != space) return ~0ULL;
+
+    u64 mask = __atomic_load_n(&proc->pcid_primed, __ATOMIC_RELAXED);
+    return mask ? mask : ~0ULL;
+}
+
 static process_t *sched_find_reaper(process_t *child)
 {
     process_t *p = child ? child->parent : NULL;

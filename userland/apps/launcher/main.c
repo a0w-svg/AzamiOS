@@ -243,6 +243,8 @@ static void draw_cell(int slot)
             uk_icon_terminal(&g_win, draw_x, draw_y);
         } else if (strstr(name, "about") || strstr(name, "info")) {
             uk_icon_about(&g_win, draw_x, draw_y);
+        } else if (strstr(name, "audio") || strstr(name, "music") || strstr(name, "sound") || strstr(name, "play")) {
+            uk_icon_audioplayer(&g_win, draw_x, draw_y);
         } else if (strstr(name, "edit") || strstr(name, "note") || strstr(name, "text")) {
             uk_icon_texteditor(&g_win, draw_x, draw_y);
         } else {
@@ -355,7 +357,7 @@ static void draw_launcher(void)
     uk_fill_rect(&g_win, 0, (int)h - 28, (int)w, 28, UK_SURFACE0);
     uk_hline(&g_win, 0, (int)h - 28, (int)w, UK_SURFACE1);
 
-    uk_draw_text(&g_win, 16, (int)h - 20, "User: azami (UID 1000) • AzamiOS v7.0", UK_SUBTEXT0);
+    uk_draw_text(&g_win, 16, (int)h - 20, "azami@azamios • AzamiOS v7.0 • SATA (/) 512M & (/boot) 64M", UK_SUBTEXT0);
     uk_draw_text(&g_win, (int)w - 240, (int)h - 20, "Enter: Launch | Esc: Dismiss", UK_OVERLAY1);
 
     uk_invalidate(&g_win);

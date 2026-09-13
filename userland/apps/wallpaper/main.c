@@ -390,18 +390,44 @@ static void wp_launch(const char *path)
     az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&lmsg);
 }
 
+static void wp_launch_arg(const char *path, const char *arg)
+{
+    az_wm_msg_t lmsg;
+    memset(&lmsg, 0, sizeof(lmsg));
+    lmsg.type = AZ_WM_LAUNCH_APP;
+    az_wm_launch_payload_t *pl = AZ_WM_MSG_LAUNCH(&lmsg);
+    int j;
+    for (j = 0; j < AZ_WM_LAUNCH_PATH_MAX - 1 && path[j]; j++)
+        pl->path[j] = path[j];
+    pl->path[j] = '\0';
+    if (arg) {
+        for (j = 0; j < AZ_WM_LAUNCH_ARG_MAX - 1 && arg[j]; j++)
+            pl->arg[j] = arg[j];
+        pl->arg[j] = '\0';
+    }
+    az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&lmsg);
+}
+
 static void wp_open_icon(int idx)
 {
     if (idx < 0 || idx >= g_num_desktop_icons) return;
     desktop_icon_t *icon = &g_desktop_icons[idx];
 
     if (icon->file_type == ICON_TYPE_DIR) {
-        wp_launch("/bin/filemanager.elf");
+        wp_launch_arg("/bin/filemanager.elf", icon->path);
     } else if (icon->file_type == ICON_TYPE_DOC) {
         /* Open text editor */
-        wp_launch("/bin/texteditor.elf");
+        wp_launch_arg("/bin/texteditor.elf", icon->path);
     } else if (icon->file_type == ICON_TYPE_MEDIA) {
-        wp_launch("/bin/audioplayer.elf");
+        if (strstr(icon->path, ".wav") || strstr(icon->path, ".mp3")) {
+            wp_launch_arg("/bin/audioplayer.elf", icon->path);
+        } else if (strstr(icon->path, ".png") || strstr(icon->path, ".bmp") || strstr(icon->path, ".icn")) {
+            wp_launch_arg("/bin/paint.elf", icon->path);
+        } else {
+            wp_launch_arg("/bin/audioplayer.elf", icon->path);
+        }
+    } else if (icon->file_type == ICON_TYPE_SCRIPT) {
+        wp_launch_arg("/bin/terminal.elf", icon->path);
     } else {
         wp_launch(icon->path);
     }
@@ -528,20 +554,74 @@ static void wp_scan_desktop_icons(unsigned int screen_w, unsigned int screen_h)
         }
     }
 
-    /* 2. Core Default Applications */
-    wp_add_icon_entry("Terminal",     "/bin/terminal.elf",    ">_",  0xFF89B4FA, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("Files",        "/bin/filemanager.elf", "[_]", 0xFFF9E2AF, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("Calculator",   "/bin/calculator.elf",  "+-",  0xFFFAB387, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("Text Editor",  "/bin/texteditor.elf",  "Txt", 0xFF94E2D5, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("Paint",        "/bin/paint.elf",       "Art", 0xFFCBA6F7, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("Audio",        "/bin/audioplayer.elf", "Snd", 0xFFF5C2E7, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("Sys Monitor",  "/bin/sysmon.elf",      "CPU", 0xFFF38BA8, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("Settings",     "/bin/settings.elf",    "Set", 0xFF74C7EC, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("Minesweeper",  "/bin/minesweeper.elf", "[*]", 0xFFA6E3A1, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("2048",         "/bin/2048.elf",        "2048",0xFFFAB387, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("Snake",        "/bin/snake.elf",       "~:>", 0xFFA6E3A1, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("Clock",        "/bin/clock.elf",       "(t)", 0xFFB4BEFE, 0, ICON_TYPE_APP, screen_w, screen_h);
-    wp_add_icon_entry("About OS",     "/bin/about.elf",       "info", 0xFFF2CDCD, 0, ICON_TYPE_APP, screen_w, screen_h);
+    /* 2. Core Default Applications from /etc/desktop_icons.conf */
+    int conf_fd = open("/etc/desktop_icons.conf", O_RDONLY, 0);
+    if (conf_fd >= 0) {
+        char cbuf[2048];
+        ssize_t cn = read(conf_fd, cbuf, sizeof(cbuf) - 1);
+        close(conf_fd);
+        if (cn > 0) {
+            cbuf[cn] = '\0';
+            char *line = cbuf;
+            while (*line) {
+                while (*line == ' ' || *line == '\t') line++;
+                if (*line == '#' || *line == '\n' || *line == '\r') {
+                    line = strchr(line, '\n');
+                    if (!line) break;
+                    line++;
+                    continue;
+                }
+                char *next = strchr(line, '\n');
+                if (next) *next = '\0';
+
+                /* Parse: Label|Path|Glyph|ColorHex|IsDir|FileType */
+                char *f_lbl = line;
+                char *p1 = strchr(f_lbl, '|');
+                if (p1) {
+                    *p1 = '\0';
+                    char *f_path = p1 + 1;
+                    char *p2 = strchr(f_path, '|');
+                    if (p2) {
+                        *p2 = '\0';
+                        char *f_glyph = p2 + 1;
+                        char *p3 = strchr(f_glyph, '|');
+                        if (p3) {
+                            *p3 = '\0';
+                            char *f_col = p3 + 1;
+                            char *p4 = strchr(f_col, '|');
+                            if (p4) {
+                                *p4 = '\0';
+                                char *f_isdir = p4 + 1;
+                                char *p5 = strchr(f_isdir, '|');
+                                if (p5) {
+                                    *p5 = '\0';
+                                    char *f_ftype = p5 + 1;
+                                    unsigned int color = (unsigned int)strtoul(f_col, NULL, 0);
+                                    int is_dir = atoi(f_isdir);
+                                    int ftype = atoi(f_ftype);
+                                    wp_add_icon_entry(f_lbl, f_path, f_glyph, color, is_dir, ftype, screen_w, screen_h);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!next) break;
+                line = next + 1;
+            }
+        }
+    } else {
+        /* Fallback if configuration missing */
+        wp_add_icon_entry("Terminal",     "/bin/terminal.elf",    ">_",  0xFF89B4FA, 0, ICON_TYPE_APP, screen_w, screen_h);
+        wp_add_icon_entry("Files",        "/bin/filemanager.elf", "[_]", 0xFFF9E2AF, 0, ICON_TYPE_APP, screen_w, screen_h);
+        wp_add_icon_entry("Music",        "/music",               "Mus", 0xFFF5C2E7, 1, ICON_TYPE_DIR, screen_w, screen_h);
+        wp_add_icon_entry("Audio",        "/bin/audioplayer.elf", "Snd", 0xFFF5C2E7, 0, ICON_TYPE_APP, screen_w, screen_h);
+        wp_add_icon_entry("Calculator",   "/bin/calculator.elf",  "+-",  0xFFFAB387, 0, ICON_TYPE_APP, screen_w, screen_h);
+        wp_add_icon_entry("Text Editor",  "/bin/texteditor.elf",  "Txt", 0xFF94E2D5, 0, ICON_TYPE_APP, screen_w, screen_h);
+        wp_add_icon_entry("Paint",        "/bin/paint.elf",       "Art", 0xFFCBA6F7, 0, ICON_TYPE_APP, screen_w, screen_h);
+        wp_add_icon_entry("Sys Monitor",  "/bin/sysmon.elf",      "CPU", 0xFFF38BA8, 0, ICON_TYPE_APP, screen_w, screen_h);
+        wp_add_icon_entry("Settings",     "/bin/settings.elf",    "Set", 0xFF74C7EC, 0, ICON_TYPE_APP, screen_w, screen_h);
+    }
 
     /* 3. Restore any previously dragged custom positions */
     for (int i = 0; i < g_num_desktop_icons; i++) {
@@ -1041,7 +1121,7 @@ int main(int argc, char **argv)
                                 wp_open_icon(g_context_menu_target_icon);
                                 break;
                             case 1: /* Edit in Text Editor */
-                                wp_launch("/bin/texteditor.elf");
+                                wp_launch_arg("/bin/texteditor.elf", g_desktop_icons[g_context_menu_target_icon].path);
                                 break;
                             case 2: /* Delete File */
                                 wp_delete_desktop_file(g_context_menu_target_icon, screen_w, screen_h);

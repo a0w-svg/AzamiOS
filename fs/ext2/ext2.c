@@ -1734,7 +1734,19 @@ static s64 ext2_mkdir(struct inode *dir, struct dentry *dentry, u32 mode) {
         kfree(inode);
         return err;
     }
-    
+
+    /* POSIX: a subdirectory's ".." names its parent, so the parent's own
+     * link count goes up by one for every subdirectory it holds — st_nlink
+     * on a directory is conventionally 2 plus its immediate subdirectory
+     * count, and tools like find(1) have historically used exactly that to
+     * know when they can stop descending without a full re-scan. This was
+     * never applied here (nor undone in ext2_rmdir below), so a directory's
+     * reported link count never moved past whatever it was given at its own
+     * creation, regardless of how many subdirectories came and went inside
+     * it. */
+    dir->i_nlink++;
+    ext2_sync_inode(fs, dir);
+
     dentry->d_inode = inode;
     return 0;
 }
@@ -1841,7 +1853,17 @@ static s64 ext2_rmdir(struct inode *dir, struct dentry *dentry) {
 
     s64 err = ext2_remove_dir_entry(dir, dentry->d_name);
     if (err < 0) return err;
-    
+
+    /* Undo the parent nlink bump ext2_mkdir gave for this subdirectory's
+     * ".." — see its comment. Guarded at 2 (never below what "." and the
+     * parent's own entry in *its* parent always account for) purely
+     * defensively: reaching rmdir at all for an existing subdirectory means
+     * this must already have been bumped past 2, but a filesystem is not a
+     * context where a bookkeeping slip should be allowed to also produce an
+     * impossible on-disk value. */
+    if (dir->i_nlink > 2) dir->i_nlink--;
+    ext2_sync_inode((ext2_fs_info_t *)dir->i_sb->s_fs_info, dir);
+
     ext2_truncate(dentry->d_inode);
     ext2_free_inode((ext2_fs_info_t *)dir->i_sb->s_fs_info, dentry->d_inode->i_ino);
     
@@ -1852,9 +1874,36 @@ static s64 ext2_rmdir(struct inode *dir, struct dentry *dentry) {
     return 0;
 }
 
+/* Rewrite a directory's ".." entry to name a new parent inode. ".." is
+ * always the second entry (offset 12) of logical block 0 — every directory
+ * on this filesystem was laid out that way by ext2_mkdir(), which is the
+ * only place that ever writes a directory's first block from scratch — so
+ * there is no need to walk the block looking for it. Used by ext2_rename()
+ * when a directory moves to a different parent: without this, `cd ..` from
+ * inside the moved directory would keep landing back in its old parent. */
+static void ext2_update_dotdot(ext2_fs_info_t *fs, struct inode *moved_dir, u32 new_parent_ino)
+{
+    ext2_inode_info_t *priv = (ext2_inode_info_t *)moved_dir->i_private;
+    u32 blk = priv ? priv->i_block[0] : 0;
+    if (!blk) return;
+
+    void *buf = kzalloc(fs->block_size);
+    if (!buf) return;
+    ext2_read_block(fs, blk, buf);
+
+    ext2_dir_entry_t *dotdot = (ext2_dir_entry_t *)((u8 *)buf + 12);
+    dotdot->inode = new_parent_ino;
+
+    ext2_write_block(fs, blk, buf);
+    kfree(buf);
+}
+
 static s64 ext2_rename(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry) {
     if (!old_dentry->d_inode) return -(s64)ENOENT;
-    
+
+    bool moving_dir  = S_ISDIR(old_dentry->d_inode->i_mode);
+    bool cross_dir   = (old_dir->i_ino != new_dir->i_ino);
+
     /* If destination entry already exists, remove/unlink it first */
     if (new_dentry->d_inode) {
         if (S_ISDIR(new_dentry->d_inode->i_mode)) {
@@ -1869,6 +1918,20 @@ static s64 ext2_rename(struct inode *old_dir, struct dentry *old_dentry, struct 
     if (err < 0) return err;
 
     ext2_remove_dir_entry(old_dir, old_dentry->d_name);
+
+    /* Moving a directory to a *different* parent: its ".." now names the
+     * wrong inode, and the link each parent gets credited for that ".."
+     * needs to move with it. A rename that keeps the same parent (just a
+     * new name in the same directory) touches neither — ".." still names
+     * the same inode either way. */
+    if (moving_dir && cross_dir) {
+        ext2_fs_info_t *fs = (ext2_fs_info_t *)old_dir->i_sb->s_fs_info;
+        ext2_update_dotdot(fs, old_dentry->d_inode, new_dir->i_ino);
+        if (old_dir->i_nlink > 2) old_dir->i_nlink--;
+        new_dir->i_nlink++;
+        ext2_sync_inode(fs, old_dir);
+        ext2_sync_inode(fs, new_dir);
+    }
 
     /* Update the dcache so the new dentry points to the moved inode */
     new_dentry->d_inode = old_dentry->d_inode;

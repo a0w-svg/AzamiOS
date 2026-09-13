@@ -161,10 +161,10 @@ void tzset(void)
     if (env_tz && env_tz[0] != '\0') {
         strncpy(tz_buf, env_tz, sizeof(tz_buf) - 1);
     } else {
-        /* Check /hdd/etc/timezone, then fallback to /etc/timezone */
-        int fd = sys_open("/hdd/etc/timezone", 0, 0);
+        /* Check standard /etc/timezone, then fallback to /hdd/etc/timezone */
+        int fd = sys_open("/etc/timezone", 0, 0);
         if (fd < 0) {
-            fd = sys_open("/etc/timezone", 0, 0);
+            fd = sys_open("/hdd/etc/timezone", 0, 0);
         }
         if (fd >= 0) {
             int n = (int)sys_read(fd, tz_buf, sizeof(tz_buf) - 1);

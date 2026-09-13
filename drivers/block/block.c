@@ -156,6 +156,11 @@ s64 block_dev_register(block_dev_t *dev)
 
     pr_debug("[BLOCK] Registered block device '%s' (%llu sectors, %u B/sec)\n",
             dev->name, (unsigned long long)dev->sector_count, dev->sector_size);
+
+    /* Automatically probe for MBR partitions on raw disks */
+    extern void block_scan_partitions(block_dev_t *parent);
+    block_scan_partitions(dev);
+
     return 0;
 }
 
@@ -163,12 +168,26 @@ block_dev_t *block_dev_get(const char *name)
 {
     if (!name) return NULL;
 
+    /* Strip optional /dev/ prefix */
+    if (name[0] == '/' && name[1] == 'd' && name[2] == 'e' && name[3] == 'v' && name[4] == '/') {
+        name += 5;
+    }
+
+    /* Translate sda / sda1 / sda2 aliases to sata0 / sata0p1 / sata0p2 */
+    const char *lookup_name = name;
+    if (name[0] == 's' && name[1] == 'd' && name[2] == 'a') {
+        if (name[3] == '\0') lookup_name = "sata0";
+        else if (name[3] == '1' && name[4] == '\0') lookup_name = "sata0p1";
+        else if (name[3] == '2' && name[4] == '\0') lookup_name = "sata0p2";
+        else if (name[3] == '3' && name[4] == '\0') lookup_name = "sata0p3";
+    }
+
     spinlock_lock(&g_block_lock);
     block_dev_t *curr = g_block_devices;
     while (curr) {
         bool match = true;
-        for (int i = 0; name[i] || curr->name[i]; i++) {
-            if (name[i] != curr->name[i]) {
+        for (int i = 0; lookup_name[i] || curr->name[i]; i++) {
+            if (lookup_name[i] != curr->name[i]) {
                 match = false;
                 break;
             }

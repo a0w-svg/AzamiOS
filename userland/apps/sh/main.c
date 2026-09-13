@@ -1013,11 +1013,11 @@ static void source_profile(const char *path)
 int main(int argc, char **argv)
 {
     /* Initialize default toolchain and library environment */
-    if (!getenv("PATH")) setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/home/a0wsvg/opt/cross-x86_64/bin:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin:/", 1);
-    if (!getenv("COMPILER_PATH")) setenv("COMPILER_PATH", "/home/a0wsvg/opt/cross-x86_64/libexec/gcc/x86_64-elf/14.2.0/:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin/:/usr/bin:/bin", 1);
-    if (!getenv("LIBRARY_PATH")) setenv("LIBRARY_PATH", "/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/:/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64", 1);
-    if (!getenv("C_INCLUDE_PATH")) setenv("C_INCLUDE_PATH", "/usr/include:/usr/local/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/sys-include", 1);
-    if (!getenv("CPATH")) setenv("CPATH", "/usr/include:/usr/local/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include", 1);
+    if (!getenv("PATH")) setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin", 1);
+    if (!getenv("COMPILER_PATH")) setenv("COMPILER_PATH", "/usr/libexec:/usr/bin", 1);
+    if (!getenv("LIBRARY_PATH")) setenv("LIBRARY_PATH", "/usr/lib:/lib:/usr/local/lib", 1);
+    if (!getenv("C_INCLUDE_PATH")) setenv("C_INCLUDE_PATH", "/usr/include:/usr/local/include", 1);
+    if (!getenv("CPATH")) setenv("CPATH", "/usr/include:/usr/local/include", 1);
 
     source_profile("/etc/profile");
     source_profile("/root/.profile");

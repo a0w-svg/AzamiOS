@@ -56,7 +56,19 @@ static inline bool irqs_enabled(void)
     return (flags & 0x200ULL) != 0;
 }
 
-void tlb_shootdown_all(void)
+/* sched.c owns the per-process record of which cores have ever loaded a given
+ * address space (process_t::pcid_primed, kept current by every vmm_switch_
+ * proc() call — see its doc comment in vmm.h); this is the one-function
+ * bridge tlb_shootdown_space() uses to read it without arch/x86_64/mm pulling
+ * in the scheduler's headers. Bit i set means "CPU i might hold a stale
+ * translation for this space"; returning ~0ULL (every bit set) is always a
+ * safe answer, just an unnecessarily broad one. */
+extern u64 sched_tlb_current_space_mask(phys_addr_t space);
+
+/* Shared core of tlb_shootdown_all()/tlb_shootdown_space(): IPI every CPU in
+ * @cpu_mask (other than this one) and, if it is safe to wait, block until
+ * each has acknowledged. */
+static void tlb_shootdown_mask(u64 cpu_mask)
 {
     u32 n = smp_cpu_count();
     if (n <= 1) return;
@@ -64,22 +76,49 @@ void tlb_shootdown_all(void)
 
     u32 me = smp_current_cpu_id();
     u64 ticket[SMP_MAX_CPUS];
+    u64 sent = 0; /* set of CPUs we actually IPI'd, for the wait loop below */
 
     for (u32 i = 0; i < n; i++) {
         if (i == me) continue;
+        if (!((cpu_mask >> i) & 1ULL)) continue;
         ticket[i] = __atomic_add_fetch(&g_tlb_cpu[i].req, 1, __ATOMIC_SEQ_CST);
         smp_send_ipi(i, TLB_SHOOTDOWN_VECTOR);
+        sent |= (1ULL << i);
     }
+
+    if (!sent) return;
 
     /* See the header: waiting is only safe while we can still service someone
      * else's shootdown ourselves. */
     if (!irqs_enabled()) return;
 
     for (u32 i = 0; i < n; i++) {
-        if (i == me) continue;
+        if (!((sent >> i) & 1ULL)) continue;
         while (__atomic_load_n(&g_tlb_cpu[i].done, __ATOMIC_SEQ_CST) < ticket[i])
             cpu_pause();
     }
+}
+
+void tlb_shootdown_all(void)
+{
+    tlb_shootdown_mask(~0ULL);
+}
+
+void tlb_shootdown_space(phys_addr_t space)
+{
+    /* Bail out *before* calling sched_tlb_current_space_mask(): with only one
+     * CPU up there is nothing to notify regardless of the mask, and this
+     * matters beyond the obvious short-circuit — vmm_set_flags()'s own NX-bit
+     * setup runs during early boot, single-CPU, before per-CPU/scheduler
+     * state exists at all, and used to reach this point through plain
+     * tlb_shootdown_all() (which has this exact same early-out) without ever
+     * touching that state. sched_tlb_current_space_mask() reads the current
+     * CPU's running thread via smp_get_cpu(), which is only meaningful once
+     * a second CPU could plausibly be up (i.e. scheduler/SMP bring-up has
+     * happened) — calling it any earlier than that is exactly what caused a
+     * boot-time double fault the first time this function existed. */
+    if (smp_cpu_count() <= 1) return;
+    tlb_shootdown_mask(sched_tlb_current_space_mask(space));
 }
 
 void tlb_shootdown_ipi(void)

@@ -402,50 +402,77 @@ void kernel_main(void)
     /* Hardware monitoring: CPU digital thermal sensor */
     coretemp_init();
 
-    /* Load initrd.ext2 module as ramdisk and mount */
-    struct limine_file *initrd = az_boot_initrd();
-    if (initrd && initrd->address) {
-        pr_debug("[INITRD] Found initrd module at 0x%016llx (%llu bytes)\n",
-                (unsigned long long)initrd->address, (unsigned long long)initrd->size);
-                
-        phys_addr_t initrd_phys = VIRT_TO_PHYS((virt_addr_t)initrd->address);
-        block_dev_t *ram0 = block_ramdisk_init(initrd_phys, initrd->size);
-        if (ram0) {
-            if (vfs_mount("ram0", "/", "ext2", NULL) == 0) {
-                pr_debug("[INITRD] Mounted ext2 initrd as root (/).\n");
-                vfs_mkdir("/dev", 0755);
-                if (vfs_mount("devfs", "/dev", "devfs", NULL) == 0) {
-                    pr_debug("[DEVFS] Mounted devfs at /dev\n");
-                }
-                vfs_mkdir("/proc", 0755);
-                if (vfs_mount("procfs", "/proc", "procfs", NULL) == 0) {
-                    pr_debug("[PROCFS] Mounted procfs at /proc\n");
-                }
-                vfs_mkdir("/sys", 0755);
-                if (vfs_mount("sysfs", "/sys", "sysfs", NULL) == 0) {
-                    pr_debug("[SYSFS] Mounted sysfs at /sys\n");
-                }
-                vfs_mkdir("/dev/pts", 0755);
-                if (vfs_mount("devpts", "/dev/pts", "devpts", NULL) == 0) {
-                    pr_debug("[DEVPTS] Mounted devpts at /dev/pts\n");
-                }
-                file_t *f = vfs_open("/sbin/init.elf", 0, 0);
-                if (!f) f = vfs_open("/init.elf", 0, 0);
-                if (f) {
-                    u8 buf[4] = {0};
-                    vfs_read(f, buf, 4);
-                    pr_debug("[TEST] init.elf ELF magic: 0x%02x %c%c%c\n",
-                             buf[0], buf[1], buf[2], buf[3]);
-                    vfs_close(f);
-                } else {
-                    pr_debug("[TEST] Failed to open /sbin/init.elf\n");
-                }
+    /* ── Mount Root Filesystem (Partitioned Disk or Initrd Fallback) ────── */
+    bool root_mounted = false;
+
+    /* 1. Try mounting from disk partition 2 (sata0p2 / sda2) */
+    if (block_dev_get("sata0p2") && vfs_mount("sata0p2", "/", "ext2", NULL) == 0) {
+        pr_debug("[BOOT] Mounted disk partition 'sata0p2' as root (/)\n");
+        root_mounted = true;
+    } else if (block_dev_get("sata0") && vfs_mount("sata0", "/", "ext2", NULL) == 0) {
+        pr_debug("[BOOT] Mounted unpartitioned 'sata0' as root (/)\n");
+        root_mounted = true;
+    } else if (block_dev_get("hda2") && vfs_mount("hda2", "/", "ext2", NULL) == 0) {
+        pr_debug("[BOOT] Mounted disk partition 'hda2' as root (/)\n");
+        root_mounted = true;
+    }
+
+    /* 2. Fallback to initrd ramdisk (ram0) if disk root was not mounted */
+    if (!root_mounted) {
+        struct limine_file *initrd = az_boot_initrd();
+        if (initrd && initrd->address) {
+            pr_debug("[INITRD] Found initrd module at 0x%016llx (%llu bytes)\n",
+                    (unsigned long long)initrd->address, (unsigned long long)initrd->size);
+            phys_addr_t initrd_phys = VIRT_TO_PHYS((virt_addr_t)initrd->address);
+            block_dev_t *ram0 = block_ramdisk_init(initrd_phys, initrd->size);
+            if (ram0 && vfs_mount("ram0", "/", "ext2", NULL) == 0) {
+                pr_debug("[INITRD] Mounted ext2 initrd as root (/)\n");
+                root_mounted = true;
             } else {
-                pr_debug("[INITRD] Failed to mount ext2 initrd.\n");
+                pr_debug("[INITRD] Failed to mount ext2 initrd\n");
             }
+        } else {
+            pr_debug("[INITRD] No initrd module passed by Limine\n");
+        }
+    }
+
+    if (root_mounted) {
+        vfs_mkdir("/dev", 0755);
+        if (vfs_mount("devfs", "/dev", "devfs", NULL) == 0) {
+            pr_debug("[DEVFS] Mounted devfs at /dev\n");
+        }
+        vfs_mkdir("/proc", 0755);
+        if (vfs_mount("procfs", "/proc", "procfs", NULL) == 0) {
+            pr_debug("[PROCFS] Mounted procfs at /proc\n");
+        }
+        vfs_mkdir("/sys", 0755);
+        if (vfs_mount("sysfs", "/sys", "sysfs", NULL) == 0) {
+            pr_debug("[SYSFS] Mounted sysfs at /sys\n");
+        }
+        vfs_mkdir("/dev/pts", 0755);
+        if (vfs_mount("devpts", "/dev/pts", "devpts", NULL) == 0) {
+            pr_debug("[DEVPTS] Mounted devpts at /dev/pts\n");
+        }
+
+        /* Mount boot partition at /boot if present */
+        vfs_mkdir("/boot", 0755);
+        if (block_dev_get("sata0p1") && vfs_mount("sata0p1", "/boot", "ext2", NULL) == 0) {
+            pr_debug("[BOOT] Mounted boot partition (sata0p1) at /boot\n");
+        }
+
+        file_t *f = vfs_open("/sbin/init.elf", 0, 0);
+        if (!f) f = vfs_open("/init.elf", 0, 0);
+        if (f) {
+            u8 buf[4] = {0};
+            vfs_read(f, buf, 4);
+            pr_debug("[TEST] init.elf ELF magic: 0x%02x %c%c%c\n",
+                     buf[0], buf[1], buf[2], buf[3]);
+            vfs_close(f);
+        } else {
+            pr_debug("[TEST] Failed to open /sbin/init.elf\n");
         }
     } else {
-        pr_debug("[INITRD] No initrd module passed by Limine.\n");
+        PANIC("VFS: Unable to mount root filesystem on any block device!");
     }
 
     /* Mount tmpfs at /tmp so processes get a writable RAM scratch area */
@@ -456,11 +483,12 @@ void kernel_main(void)
         pr_debug("[TMPFS] Warning: failed to mount tmpfs at /tmp\n");
     }
 
+    /* Mount persistent /hdd if available */
     vfs_mkdir("/hdd", 0755);
-    if (vfs_mount("sata0", "/hdd", "ext2", NULL) == 0 || vfs_mount("hda", "/hdd", "ext2", NULL) == 0) {
-        pr_debug("[STORAGE] Mounted persistent SATA drive to /hdd\n");
-    } else {
-        pr_debug("[STORAGE] Warning: Failed to mount sata0 to /hdd\n");
+    if (block_dev_get("sata0p3") && vfs_mount("sata0p3", "/hdd", "ext2", NULL) == 0) {
+        pr_debug("[STORAGE] Mounted persistent SATA partition to /hdd\n");
+    } else if (block_dev_get("sata1") && vfs_mount("sata1", "/hdd", "ext2", NULL) == 0) {
+        pr_debug("[STORAGE] Mounted secondary SATA drive to /hdd\n");
     }
 
     pr_debug("\n[BOOT] All core microkernel subsystems initialized successfully.\n");

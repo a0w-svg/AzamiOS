@@ -384,12 +384,94 @@ static void show_help(void) {
              UK_OVERLAY0);
 }
 
+/* ── Terminal Configuration & Prompt Formatting ─────────────────────── */
+static char g_cfg_prompt[64] = "\\u@\\h:\\w$ ";
+static int  g_cfg_cursor_blink = 1;
+
+static void format_prompt(char *out, size_t max_len) {
+  const char *user = getenv("USER");
+  if (!user || !user[0]) user = "root";
+
+  char host[32] = "azamios";
+  int hfd = sys_open("/etc/hostname", 0, 0);
+  if (hfd >= 0) {
+    char hbuf[32];
+    ssize_t hn = sys_read(hfd, hbuf, sizeof(hbuf) - 1);
+    sys_close(hfd);
+    if (hn > 0) {
+      hbuf[hn] = '\0';
+      char *nl = strchr(hbuf, '\n');
+      if (nl) *nl = '\0';
+      if (hbuf[0]) strncpy(host, hbuf, sizeof(host) - 1);
+    }
+  }
+
+  const char *cwd = (strcmp(g_cwd, "/") == 0) ? "/" :
+                    (g_cwd + strlen(g_cwd) - (strlen(g_cwd) > 16 ? 16 : strlen(g_cwd)));
+
+  size_t o = 0;
+  const char *fmt = g_cfg_prompt[0] ? g_cfg_prompt : "\\u@\\h:\\w$ ";
+  for (int i = 0; fmt[i] && o < max_len - 1; i++) {
+    if (fmt[i] == '\\') {
+      i++;
+      if (fmt[i] == 'u') {
+        for (int k = 0; user[k] && o < max_len - 1; k++) out[o++] = user[k];
+      } else if (fmt[i] == 'h') {
+        for (int k = 0; host[k] && o < max_len - 1; k++) out[o++] = host[k];
+      } else if (fmt[i] == 'w') {
+        for (int k = 0; cwd[k] && o < max_len - 1; k++) out[o++] = cwd[k];
+      } else if (fmt[i]) {
+        out[o++] = fmt[i];
+      }
+    } else {
+      out[o++] = fmt[i];
+    }
+  }
+  out[o] = '\0';
+}
+
+static bool is_gui_app(const char *name) {
+  int fd = sys_open("/etc/launcher.conf", 0, 0);
+  if (fd < 0) {
+    static const char *const fallback[] = {
+        "about", "calculator", "clock", "sysmon", "texteditor", "filemanager",
+        "settings", "paint", "audioplayer", "minesweeper", "2048", "snake", "xclock", "xcalc", "xeyes"
+    };
+    for (size_t i = 0; i < sizeof(fallback) / sizeof(fallback[0]); i++) {
+      if (strcmp(name, fallback[i]) == 0) return true;
+    }
+    return false;
+  }
+
+  char buf[4096];
+  ssize_t n = sys_read(fd, buf, sizeof(buf) - 1);
+  sys_close(fd);
+  if (n <= 0) return false;
+  buf[n] = '\0';
+
+  char line_prefix[48];
+  snprintf(line_prefix, sizeof(line_prefix), "\n%s=", name);
+  char *found = strstr(buf, line_prefix);
+  if (!found && strncmp(buf, line_prefix + 1, strlen(line_prefix + 1)) == 0) {
+    found = buf - 1;
+  }
+  if (found) {
+    char *eq = strchr(found + 1, '=');
+    if (eq && strncmp(eq + 1, "hidden", 6) != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /* ── Execute Command
  * ─────────────────────────────────────────────────────────── */
 static void execute_command(const char *raw_cmd) {
   /* Echo prompt + command */
+  char prompt_str[64];
+  format_prompt(prompt_str, sizeof(prompt_str));
   char echo_line[TERM_COLS + 1];
-  snprintf(echo_line, sizeof(echo_line), "%s$ %s", g_cwd, raw_cmd);
+  snprintf(echo_line, sizeof(echo_line), "%s%s", prompt_str, raw_cmd);
   term_print(echo_line, UK_GREEN);
 
   while (*raw_cmd == ' ' || *raw_cmd == '\t')
@@ -420,10 +502,29 @@ static void execute_command(const char *raw_cmd) {
   if (argc == 0)
     return;
 
-  /* Built-in: clear */
-  if (strcmp(argv[0], "clear") == 0) {
+  /* Built-in: clear / cls */
+  if (strcmp(argv[0], "clear") == 0 || strcmp(argv[0], "cls") == 0) {
     g_line_count = 0;
     g_scroll = 0;
+    return;
+  }
+
+  /* Built-in: Quick desktop app launchers */
+  if (strcmp(argv[0], "audio") == 0 || strcmp(argv[0], "music") == 0) {
+    uk_launch_app_arg(&g_win, "/bin/audioplayer.elf", (argc > 1) ? argv[1] : "");
+    term_print("Launched Audio Player in background.", UK_GREEN);
+    return;
+  }
+
+  if (strcmp(argv[0], "files") == 0) {
+    uk_launch_app_arg(&g_win, "/bin/filemanager.elf", (argc > 1) ? argv[1] : "");
+    term_print("Launched File Manager in background.", UK_GREEN);
+    return;
+  }
+
+  if (strcmp(argv[0], "monitor") == 0) {
+    uk_launch_app(&g_win, "/bin/sysmon.elf");
+    term_print("Launched System Monitor in background.", UK_GREEN);
     return;
   }
 
@@ -510,12 +611,7 @@ static void execute_command(const char *raw_cmd) {
     return;
   }
 
-  /* Automatic GUI Application launch */
-  static const char *const s_gui_apps[] = {
-      "about", "calculator", "clock", "sysmon", "texteditor", "filemanager",
-      "settings", "paint", "audioplayer", "minesweeper", "2048", "snake",
-      "gui_test", "launcher", "xorg", "xwm", "xclock", "xcalc", "xeyes", "xgui_demo"
-  };
+  /* Automatic GUI Application launch via /etc/launcher.conf */
   const char *base = argv[0];
   const char *slash = strrchr(argv[0], '/');
   if (slash) base = slash + 1;
@@ -525,21 +621,19 @@ static void execute_command(const char *raw_cmd) {
   char *dot_elf = strstr(clean_app, ".elf");
   if (dot_elf) *dot_elf = '\0';
 
-  for (size_t gi = 0; gi < sizeof(s_gui_apps) / sizeof(s_gui_apps[0]); gi++) {
-    if (strcmp(clean_app, s_gui_apps[gi]) == 0) {
-      char app_path[64];
-      if (argv[0][0] == '/') {
-        snprintf(app_path, sizeof(app_path), "%s", argv[0]);
-      } else {
-        snprintf(app_path, sizeof(app_path), "/bin/%s%s", argv[0],
-                 (strstr(argv[0], ".elf") ? "" : ".elf"));
-      }
-      char notify[80];
-      snprintf(notify, sizeof(notify), "Launching '%s'...", app_path);
-      term_print(notify, UK_SAPPHIRE);
-      uk_launch_app(&g_win, app_path);
-      return;
+  if (is_gui_app(clean_app)) {
+    char app_path[64];
+    if (argv[0][0] == '/') {
+      snprintf(app_path, sizeof(app_path), "%s", argv[0]);
+    } else {
+      snprintf(app_path, sizeof(app_path), "/bin/%s%s", argv[0],
+               (strstr(argv[0], ".elf") ? "" : ".elf"));
     }
+    char notify[80];
+    snprintf(notify, sizeof(notify), "Launching '%s'...", app_path);
+    term_print(notify, UK_SAPPHIRE);
+    uk_launch_app(&g_win, app_path);
+    return;
   }
 
   /* Execute real ELF binary via UNIX Pipe & Process Subsystem */
@@ -559,16 +653,17 @@ static void execute_command(const char *raw_cmd) {
     }
     sys_dup2(1, 2);
 
+    /* Standard Linux environment */
     char *const envp[] = {
-        "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/home/a0wsvg/opt/cross-x86_64/bin:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin:/",
+        "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin",
         "USER=root",
         "HOME=/root",
-        "TERM=azami",
+        "TERM=xterm-256color",
         "TMPDIR=/tmp",
-        "COMPILER_PATH=/home/a0wsvg/opt/cross-x86_64/libexec/gcc/x86_64-elf/14.2.0/:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin/:/usr/bin:/bin",
-        "LIBRARY_PATH=/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/:/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib",
-        "C_INCLUDE_PATH=/usr/include:/usr/local/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/sys-include",
-        "CPATH=/usr/include:/usr/local/include:/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include",
+        "COMPILER_PATH=/usr/libexec:/usr/bin",
+        "LIBRARY_PATH=/usr/lib:/lib:/usr/local/lib",
+        "C_INCLUDE_PATH=/usr/include:/usr/local/include",
+        "CPATH=/usr/include:/usr/local/include",
         NULL};
 
     /* 1. Direct binary execution */
@@ -650,11 +745,7 @@ static void execute_command(const char *raw_cmd) {
 static void input_line_layout(char *prompt_buf, size_t buf_size,
                                int *out_plen, int *out_cx, int *out_input_y) {
   int input_y = (int)g_win.height - FONT_H - 8;
-  snprintf(prompt_buf, buf_size, "%s$ ",
-           (strcmp(g_cwd, "/") == 0)
-               ? "/"
-               : (g_cwd + strlen(g_cwd) -
-                  (strlen(g_cwd) > 12 ? 12 : strlen(g_cwd))));
+  format_prompt(prompt_buf, buf_size);
   int plen = (int)strlen(prompt_buf);
 
   if (out_input_y) *out_input_y = input_y;
@@ -815,8 +906,10 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
 
   /* Ctrl+C: Cancel current line */
   if (keycode == 3 || (ctrl && (keycode == 'c' || keycode == 'C' || scancode == 46))) {
+    char pbuf[64];
+    format_prompt(pbuf, sizeof(pbuf));
     char prompt[128];
-    snprintf(prompt, sizeof(prompt), "root@azamios:%s$ %s^C", g_cwd, g_input);
+    snprintf(prompt, sizeof(prompt), "%s%s^C", pbuf, g_input);
     term_print(prompt, UK_OVERLAY0);
     g_input_len = 0;
     g_input[0] = '\0';
@@ -937,7 +1030,51 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   }
 }
 
+static void parse_terminal_conf_buf(const char *buf) {
+  const char *p = buf;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p == '#' || *p == '[') {
+      while (*p && *p != '\n') p++;
+      continue;
+    }
+    if (strncmp(p, "prompt=", 7) == 0) {
+      p += 7;
+      int i = 0;
+      while (*p && *p != '\n' && *p != '\r' && i < (int)sizeof(g_cfg_prompt) - 1) {
+        g_cfg_prompt[i++] = *p++;
+      }
+      g_cfg_prompt[i] = '\0';
+    } else if (strncmp(p, "cursor_blink=", 13) == 0) {
+      p += 13;
+      g_cfg_cursor_blink = atoi(p);
+      while (*p && *p != '\n') p++;
+    } else {
+      while (*p && *p != '\n') p++;
+    }
+  }
+}
+
 static void load_terminal_config(void) {
+  /* 1. Try $HOME/.config/terminal.conf */
+  char path[128];
+  const char *home = getenv("HOME");
+  if (home && home[0]) {
+    snprintf(path, sizeof(path), "%s/.config/terminal.conf", home);
+    int fd = sys_open(path, 0, 0);
+    if (fd >= 0) {
+      char buf[512];
+      ssize_t n = sys_read(fd, buf, sizeof(buf) - 1);
+      sys_close(fd);
+      if (n > 0) {
+        buf[n] = '\0';
+        parse_terminal_conf_buf(buf);
+        return;
+      }
+    }
+  }
+
+  /* 2. System-wide /etc/terminal.conf */
   int fd = sys_open("/etc/terminal.conf", 0, 0);
   if (fd < 0) return;
   char buf[512];
@@ -945,7 +1082,7 @@ static void load_terminal_config(void) {
   sys_close(fd);
   if (n <= 0) return;
   buf[n] = '\0';
-  /* Configuration successfully loaded from /etc/terminal.conf */
+  parse_terminal_conf_buf(buf);
 }
 
 /* ── Main
