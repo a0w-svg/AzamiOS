@@ -2,247 +2,286 @@
  * AzamiOS Userland — Linux ip (IP Route/Address/Link Configuration) Utility
  * File: userland/apps/ip/main.c
  *
- * `link`/`addr` come from /sys/class/net (already live kernel state) plus
- * SIOCGIFADDR/SIOCGIFNETMASK/SIOCGIFBRDADDR/SIOCGIFMTU on /dev/net0 (this
- * kernel models one active interface's address state globally, so any
- * /dev/netN node answers the same ioctls the same way — see net_ioctl() in
- * kernel/net/net.c); `route` comes from /proc/net/route, the same file a
- * real Linux `ip route` ultimately reads via rtnetlink-equivalent data.
+ * Queries kernel state the real way: AF_NETLINK/NETLINK_ROUTE
+ * (RTM_GETLINK/RTM_GETADDR/RTM_GETROUTE), the same protocol a genuine
+ * iproute2 `ip` uses — see kernel/net/netlink.c for what actually answers
+ * these on the other end. A single recv() gets the whole dump: that
+ * kernel builds and queues one complete reply (every RTM_NEW* message plus
+ * the NLMSG_DONE terminator) per request rather than streaming it, so
+ * there's no need to loop recv() calls waiting for more.
  * ============================================================================ */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
-#ifndef SIOCGIFADDR
-#define SIOCGIFADDR     0x8915
-#endif
-#ifndef SIOCGIFNETMASK
-#define SIOCGIFNETMASK  0x891b
-#endif
-#ifndef SIOCGIFBRDADDR
-#define SIOCGIFBRDADDR  0x8919
-#endif
-#ifndef SIOCGIFMTU
-#define SIOCGIFMTU      0x8922
-#endif
+/* Matches include/azami/net.h's IFF_* bit values — this kernel's ifi_flags
+ * carry net_device_t->flags verbatim (see kernel/net/netlink.c's
+ * nl_build_getlink()). */
+#define IFF_UP       0x0001
+#define IFF_LOOPBACK 0x0008
 
-static void read_net_attr(const char *dev, const char *attr, char *out, size_t max_len)
+#define NL_RESP_BUF_SIZE 16384
+#define MAX_IFACES 8
+
+typedef struct {
+    int used;
+    char name[32];
+    unsigned char mac[6];
+    unsigned int mtu;
+    unsigned int flags;
+    int have_addr;
+    unsigned char addr[4];
+    unsigned char brd[4];
+    int prefixlen;
+} iface_t;
+
+static ssize_t nl_do_request(int rtm_type, void *buf, size_t bufsize)
 {
-    char path[128];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/%s", dev, attr);
-    int fd = open(path, O_RDONLY);
-    if (fd >= 0) {
-        ssize_t n = read(fd, out, max_len - 1);
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (fd < 0) return -1;
+
+    struct sockaddr_nl sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nl_family = AF_NETLINK;
+    bind(fd, (struct sockaddr *)&sa, sizeof(sa));
+
+    struct {
+        struct nlmsghdr nlh;
+        unsigned char rtgen_family;
+        unsigned char pad[3];
+    } req;
+    memset(&req, 0, sizeof(req));
+    req.nlh.nlmsg_len = sizeof(req);
+    req.nlh.nlmsg_type = (unsigned short)rtm_type;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.nlh.nlmsg_seq = 1;
+
+    if (send(fd, &req, sizeof(req), 0) < 0) {
         close(fd);
-        if (n > 0) {
-            out[n] = '\0';
-            char *nl = strchr(out, '\n');
-            if (nl) *nl = '\0';
-            return;
+        return -1;
+    }
+
+    ssize_t n = recv(fd, buf, bufsize, 0);
+    close(fd);
+    return n;
+}
+
+static struct rtattr *rta_first(void *msg_payload, size_t fixed_hdr_size, int msg_len, int *rlen_out)
+{
+    *rlen_out = msg_len - (int)NLMSG_ALIGN(fixed_hdr_size);
+    return (struct rtattr *)((char *)msg_payload + NLMSG_ALIGN(fixed_hdr_size));
+}
+
+/* Collects link (name/mac/mtu/flags) and address (ip/brd/prefixlen) info
+ * for every interface into one table, indexed by ifi_index/ifa_index —
+ * what both `ip addr` and `ip route` (for RTA_OIF -> name) need. */
+static int collect_ifaces(iface_t ifaces[MAX_IFACES])
+{
+    memset(ifaces, 0, sizeof(iface_t) * MAX_IFACES);
+
+    static char linkbuf[NL_RESP_BUF_SIZE];
+    ssize_t ln = nl_do_request(RTM_GETLINK, linkbuf, sizeof(linkbuf));
+    if (ln > 0) {
+        struct nlmsghdr *nlh = (struct nlmsghdr *)linkbuf;
+        int len = (int)ln;
+        while (NLMSG_OK(nlh, len)) {
+            if (nlh->nlmsg_type == NLMSG_DONE) break;
+            if (nlh->nlmsg_type == RTM_NEWLINK) {
+                struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nlh);
+                if (ifi->ifi_index >= 0 && ifi->ifi_index < MAX_IFACES) {
+                    iface_t *f = &ifaces[ifi->ifi_index];
+                    f->used = 1;
+                    f->flags = ifi->ifi_flags;
+
+                    int rlen;
+                    struct rtattr *rta = rta_first(ifi, sizeof(*ifi),
+                                                    (int)nlh->nlmsg_len - NLMSG_HDRLEN, &rlen);
+                    for (struct rtattr *a = rta; RTA_OK(a, rlen); a = RTA_NEXT(a, rlen)) {
+                        if (a->rta_type == IFLA_IFNAME) {
+                            strncpy(f->name, (const char *)RTA_DATA(a), sizeof(f->name) - 1);
+                        } else if (a->rta_type == IFLA_ADDRESS && RTA_PAYLOAD(a) >= 6) {
+                            memcpy(f->mac, RTA_DATA(a), 6);
+                        } else if (a->rta_type == IFLA_MTU && RTA_PAYLOAD(a) >= (int)sizeof(unsigned int)) {
+                            memcpy(&f->mtu, RTA_DATA(a), sizeof(unsigned int));
+                        }
+                    }
+                }
+            }
+            nlh = NLMSG_NEXT(nlh, len);
         }
     }
-    out[0] = '\0';
-}
 
-/* Same single-shot-snapshot reasoning as userland/libc/netdb.c's
- * /etc/hosts reader and userland/apps/netstat/main.c's identical helper. */
-static char *read_whole_file(const char *path)
-{
-    int fd = open(path, O_RDONLY, 0);
-    if (fd < 0) return NULL;
-    char *buf = (char *)malloc(16384);
-    if (!buf) { close(fd); return NULL; }
-    ssize_t n = read(fd, buf, 16383);
-    close(fd);
-    if (n < 0) { free(buf); return NULL; }
-    buf[n] = '\0';
-    return buf;
-}
+    static char addrbuf[NL_RESP_BUF_SIZE];
+    ssize_t an = nl_do_request(RTM_GETADDR, addrbuf, sizeof(addrbuf));
+    if (an > 0) {
+        struct nlmsghdr *nlh = (struct nlmsghdr *)addrbuf;
+        int len = (int)an;
+        while (NLMSG_OK(nlh, len)) {
+            if (nlh->nlmsg_type == NLMSG_DONE) break;
+            if (nlh->nlmsg_type == RTM_NEWADDR) {
+                struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nlh);
+                if (ifa->ifa_index >= 0 && ifa->ifa_index < MAX_IFACES) {
+                    iface_t *f = &ifaces[ifa->ifa_index];
+                    f->used = 1;
+                    f->prefixlen = ifa->ifa_prefixlen;
 
-static int mask_to_prefix(const unsigned char mask[4])
-{
-    int bits = 0;
-    for (int i = 0; i < 4; i++) {
-        unsigned char m = mask[i];
-        while (m) { bits += (m & 1); m >>= 1; }
+                    int rlen;
+                    struct rtattr *rta = rta_first(ifa, sizeof(*ifa),
+                                                    (int)nlh->nlmsg_len - NLMSG_HDRLEN, &rlen);
+                    for (struct rtattr *a = rta; RTA_OK(a, rlen); a = RTA_NEXT(a, rlen)) {
+                        if ((a->rta_type == IFA_LOCAL || a->rta_type == IFA_ADDRESS) && RTA_PAYLOAD(a) >= 4) {
+                            memcpy(f->addr, RTA_DATA(a), 4);
+                            f->have_addr = 1;
+                        } else if (a->rta_type == IFA_BROADCAST && RTA_PAYLOAD(a) >= 4) {
+                            memcpy(f->brd, RTA_DATA(a), 4);
+                        } else if (a->rta_type == IFA_LABEL && f->name[0] == '\0') {
+                            strncpy(f->name, (const char *)RTA_DATA(a), sizeof(f->name) - 1);
+                        }
+                    }
+                }
+            }
+            nlh = NLMSG_NEXT(nlh, len);
+        }
     }
-    return bits;
-}
 
-/* The primary (non-loopback) interface's real name, as /sys/class/net
- * actually registered it (the driver's own name — "e1000", "rtl8139", ... —
- * not a fabricated "eth0"; see fs/sysfs.c's SYSFS_TYPE_CLASS_NET_DIR). This
- * kernel models exactly one such interface, so the first non-"lo" entry
- * found is *the* interface. */
-static void primary_iface_name(char *out, size_t out_len)
-{
-    strncpy(out, "eth0", out_len - 1);
-    out[out_len - 1] = '\0';
-
-    DIR *d = opendir("/sys/class/net");
-    if (!d) return;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        if (strcmp(de->d_name, "lo") == 0) continue;
-        strncpy(out, de->d_name, out_len - 1);
-        out[out_len - 1] = '\0';
-        break;
-    }
-    closedir(d);
+    return MAX_IFACES;
 }
 
 static void show_ip_link(void)
 {
-    DIR *d = opendir("/sys/class/net");
-    if (!d) {
-        printf("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN\n");
-        printf("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n");
-        return;
-    }
+    iface_t ifaces[MAX_IFACES];
+    collect_ifaces(ifaces);
 
-    struct dirent *de;
-    int idx = 1;
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue;
+    for (int i = 0; i < MAX_IFACES; i++) {
+        if (!ifaces[i].used) continue;
+        iface_t *f = &ifaces[i];
+        int is_lo = (f->flags & IFF_LOOPBACK) != 0;
 
-        char oper[32], mtu[16], mac[32];
-        read_net_attr(de->d_name, "operstate", oper, sizeof(oper));
-        read_net_attr(de->d_name, "mtu", mtu, sizeof(mtu));
-        read_net_attr(de->d_name, "address", mac, sizeof(mac));
-
-        if (oper[0] == '\0') strncpy(oper, "UP", sizeof(oper) - 1);
-        if (mtu[0] == '\0') strncpy(mtu, "1500", sizeof(mtu) - 1);
-
-        int is_lo = (strcmp(de->d_name, "lo") == 0);
-        const char *flags = is_lo ? "LOOPBACK,UP,LOWER_UP" : "BROADCAST,MULTICAST,UP,LOWER_UP";
-        const char *link_type = is_lo ? "link/loopback" : "link/ether";
-
-        printf("%d: %s: <%s> mtu %s qdisc %s state %s\n",
-               idx, de->d_name, flags, mtu, is_lo ? "noqueue" : "pfifo_fast", oper);
-        printf("    %s %s brd %s\n",
-               link_type, mac[0] ? mac : (is_lo ? "00:00:00:00:00:00" : "00:00:00:00:00:00"),
+        printf("%d: %s: <%s> mtu %u qdisc %s state %s\n",
+               i, f->name[0] ? f->name : "?",
+               is_lo ? "LOOPBACK,UP,LOWER_UP" : "BROADCAST,MULTICAST,UP,LOWER_UP",
+               f->mtu, is_lo ? "noqueue" : "pfifo_fast",
+               (f->flags & IFF_UP) ? "UP" : "DOWN");
+        printf("    link/%s %02x:%02x:%02x:%02x:%02x:%02x brd %s\n",
+               is_lo ? "loopback" : "ether",
+               f->mac[0], f->mac[1], f->mac[2], f->mac[3], f->mac[4], f->mac[5],
                is_lo ? "00:00:00:00:00:00" : "ff:ff:ff:ff:ff:ff");
-        idx++;
     }
-    closedir(d);
 }
 
 static void show_ip_addr(void)
 {
-    printf("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN\n");
-    printf("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n");
-    printf("    inet 127.0.0.1/8 scope host lo\n");
-    printf("       valid_lft forever preferred_lft forever\n");
+    iface_t ifaces[MAX_IFACES];
+    collect_ifaces(ifaces);
 
-    char iface[32];
-    primary_iface_name(iface, sizeof(iface));
+    for (int i = 0; i < MAX_IFACES; i++) {
+        if (!ifaces[i].used) continue;
+        iface_t *f = &ifaces[i];
+        int is_lo = (f->flags & IFF_LOOPBACK) != 0;
 
-    char mac[32];
-    read_net_attr(iface, "address", mac, sizeof(mac));
+        printf("%d: %s: <%s> mtu %u qdisc %s state %s\n",
+               i, f->name[0] ? f->name : "?",
+               is_lo ? "LOOPBACK,UP,LOWER_UP" : "BROADCAST,MULTICAST,UP,LOWER_UP",
+               f->mtu, is_lo ? "noqueue" : "pfifo_fast",
+               (f->flags & IFF_UP) ? "UP" : "DOWN");
+        printf("    link/%s %02x:%02x:%02x:%02x:%02x:%02x brd %s\n",
+               is_lo ? "loopback" : "ether",
+               f->mac[0], f->mac[1], f->mac[2], f->mac[3], f->mac[4], f->mac[5],
+               is_lo ? "00:00:00:00:00:00" : "ff:ff:ff:ff:ff:ff");
 
-    unsigned char ip[4] = {0}, mask[4] = {0}, brd[4] = {0};
-    unsigned mtu = 1500;
-    int fd = open("/dev/net0", O_RDWR, 0);
-    if (fd >= 0) {
-        ioctl(fd, SIOCGIFADDR, (unsigned long)ip);
-        ioctl(fd, SIOCGIFNETMASK, (unsigned long)mask);
-        ioctl(fd, SIOCGIFBRDADDR, (unsigned long)brd);
-        ioctl(fd, SIOCGIFMTU, (unsigned long)&mtu);
-        close(fd);
+        if (f->have_addr) {
+            printf("    inet %u.%u.%u.%u/%d brd %u.%u.%u.%u scope %s %s\n",
+                   f->addr[0], f->addr[1], f->addr[2], f->addr[3], f->prefixlen,
+                   f->brd[0], f->brd[1], f->brd[2], f->brd[3],
+                   is_lo ? "host" : "global", f->name);
+            printf("       valid_lft forever preferred_lft forever\n");
+        }
     }
+}
 
-    int has_ip = (ip[0] || ip[1] || ip[2] || ip[3]);
-    printf("2: %s: <BROADCAST,MULTICAST%s> mtu %u qdisc pfifo_fast state %s\n",
-           iface, has_ip ? ",UP,LOWER_UP" : "", mtu, has_ip ? "UP" : "DOWN");
-    printf("    link/ether %s brd ff:ff:ff:ff:ff:ff\n", mac[0] ? mac : "00:00:00:00:00:00");
-    if (has_ip) {
-        printf("    inet %u.%u.%u.%u/%d brd %u.%u.%u.%u scope global %s\n",
-               ip[0], ip[1], ip[2], ip[3], mask_to_prefix(mask),
-               brd[0], brd[1], brd[2], brd[3], iface);
-        printf("       valid_lft forever preferred_lft forever\n");
+static void show_ip_addr_brief(void)
+{
+    iface_t ifaces[MAX_IFACES];
+    collect_ifaces(ifaces);
+
+    for (int i = 0; i < MAX_IFACES; i++) {
+        if (!ifaces[i].used) continue;
+        iface_t *f = &ifaces[i];
+        const char *state = (f->flags & IFF_UP) ? "UP" : "DOWN";
+        if (f->flags & IFF_LOOPBACK) state = "UNKNOWN";
+
+        if (f->have_addr) {
+            printf("%-16s %-14s %u.%u.%u.%u/%d\n", f->name, state,
+                   f->addr[0], f->addr[1], f->addr[2], f->addr[3], f->prefixlen);
+        } else {
+            printf("%-16s %-14s\n", f->name, state);
+        }
     }
 }
 
 static void show_ip_route(void)
 {
-    char *content = read_whole_file("/proc/net/route");
-    if (!content) return;
+    iface_t ifaces[MAX_IFACES];
+    collect_ifaces(ifaces);
 
-    unsigned char host_ip[4] = {0};
-    int fd = open("/dev/net0", O_RDWR, 0);
-    if (fd >= 0) {
-        ioctl(fd, SIOCGIFADDR, (unsigned long)host_ip);
-        close(fd);
-    }
+    static char buf[NL_RESP_BUF_SIZE];
+    ssize_t n = nl_do_request(RTM_GETROUTE, buf, sizeof(buf));
+    if (n <= 0) return;
 
-    char *line = strtok(content, "\r\n");
-    int line_no = 0;
-    while (line) {
-        if (line_no > 0) { /* skip the "Iface Destination Gateway ..." header */
-            char rt_iface[32];
-            unsigned dest = 0, gw = 0, flags = 0, metric = 0, mask = 0;
-            int n = sscanf(line, "%31s %x %x %x %*u %*u %u %x",
-                           rt_iface, &dest, &gw, &flags, &metric, &mask);
-            if (n == 6) {
-                unsigned char d[4] = { (unsigned char)dest, (unsigned char)(dest >> 8),
-                                        (unsigned char)(dest >> 16), (unsigned char)(dest >> 24) };
-                unsigned char g[4] = { (unsigned char)gw, (unsigned char)(gw >> 8),
-                                        (unsigned char)(gw >> 16), (unsigned char)(gw >> 24) };
-                unsigned char m[4] = { (unsigned char)mask, (unsigned char)(mask >> 8),
-                                        (unsigned char)(mask >> 16), (unsigned char)(mask >> 24) };
-                int prefix = mask_to_prefix(m);
-                int is_gw_route = (flags & 0x0002) != 0; /* RTF_GATEWAY */
-                int is_default = (d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 0);
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    int len = (int)n;
+    while (NLMSG_OK(nlh, len)) {
+        if (nlh->nlmsg_type == NLMSG_DONE) break;
+        if (nlh->nlmsg_type == RTM_NEWROUTE) {
+            struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+            unsigned char *dst = NULL, *gw = NULL;
+            unsigned int oif = 0, have_oif = 0, metric = 0;
 
-                if (is_default && is_gw_route) {
-                    printf("default via %u.%u.%u.%u dev %s proto dhcp metric %u\n",
-                           g[0], g[1], g[2], g[3], rt_iface, metric);
-                } else if (d[0] == 127) {
+            int rlen;
+            struct rtattr *rta = rta_first(rtm, sizeof(*rtm),
+                                            (int)nlh->nlmsg_len - NLMSG_HDRLEN, &rlen);
+            for (struct rtattr *a = rta; RTA_OK(a, rlen); a = RTA_NEXT(a, rlen)) {
+                if (a->rta_type == RTA_DST && RTA_PAYLOAD(a) >= 4) dst = (unsigned char *)RTA_DATA(a);
+                else if (a->rta_type == RTA_GATEWAY && RTA_PAYLOAD(a) >= 4) gw = (unsigned char *)RTA_DATA(a);
+                else if (a->rta_type == RTA_OIF && RTA_PAYLOAD(a) >= (int)sizeof(unsigned int)) {
+                    memcpy(&oif, RTA_DATA(a), sizeof(oif));
+                    have_oif = 1;
+                } else if (a->rta_type == RTA_PRIORITY && RTA_PAYLOAD(a) >= (int)sizeof(unsigned int)) {
+                    memcpy(&metric, RTA_DATA(a), sizeof(metric));
+                }
+            }
+
+            const char *devname = (have_oif && oif < MAX_IFACES && ifaces[oif].used)
+                                       ? ifaces[oif].name : "?";
+
+            if (!dst && gw) {
+                printf("default via %u.%u.%u.%u dev %s proto dhcp metric %u\n",
+                       gw[0], gw[1], gw[2], gw[3], devname, metric);
+            } else if (dst) {
+                if (dst[0] == 127) {
                     printf("%u.%u.%u.%u/%d dev %s scope link\n",
-                           d[0], d[1], d[2], d[3], prefix, rt_iface);
+                           dst[0], dst[1], dst[2], dst[3], rtm->rtm_dst_len, devname);
                 } else {
-                    printf("%u.%u.%u.%u/%d dev %s proto kernel scope link src %u.%u.%u.%u\n",
-                           d[0], d[1], d[2], d[3], prefix, rt_iface,
-                           host_ip[0], host_ip[1], host_ip[2], host_ip[3]);
+                    unsigned char *src = (have_oif && oif < MAX_IFACES) ? ifaces[oif].addr : NULL;
+                    if (src) {
+                        printf("%u.%u.%u.%u/%d dev %s proto kernel scope link src %u.%u.%u.%u\n",
+                               dst[0], dst[1], dst[2], dst[3], rtm->rtm_dst_len, devname,
+                               src[0], src[1], src[2], src[3]);
+                    } else {
+                        printf("%u.%u.%u.%u/%d dev %s proto kernel scope link\n",
+                               dst[0], dst[1], dst[2], dst[3], rtm->rtm_dst_len, devname);
+                    }
                 }
             }
         }
-        line_no++;
-        line = strtok(NULL, "\r\n");
-    }
-    free(content);
-}
-
-static void show_ip_addr_brief(void)
-{
-    char iface[32];
-    primary_iface_name(iface, sizeof(iface));
-
-    unsigned char ip[4] = {0}, mask[4] = {0};
-    int fd = open("/dev/net0", O_RDWR, 0);
-    if (fd >= 0) {
-        ioctl(fd, SIOCGIFADDR, (unsigned long)ip);
-        ioctl(fd, SIOCGIFNETMASK, (unsigned long)mask);
-        close(fd);
-    }
-    int has_ip = (ip[0] || ip[1] || ip[2] || ip[3]);
-
-    printf("%-16s %-14s %s\n", "lo", "UNKNOWN", "127.0.0.1/8");
-    if (has_ip) {
-        char cidr[32];
-        snprintf(cidr, sizeof(cidr), "%u.%u.%u.%u/%d", ip[0], ip[1], ip[2], ip[3], mask_to_prefix(mask));
-        printf("%-16s %-14s %s\n", iface, "UP", cidr);
-    } else {
-        printf("%-16s %-14s\n", iface, "DOWN");
+        nlh = NLMSG_NEXT(nlh, len);
     }
 }
 

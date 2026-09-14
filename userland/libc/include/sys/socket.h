@@ -15,6 +15,8 @@ typedef unsigned short sa_family_t;
 #define AF_LOCAL    1
 #define AF_INET     2
 #define AF_INET6    10
+#define AF_NETLINK  16
+#define AF_PACKET   17
 
 /* Socket Types */
 #define SOCK_STREAM     1
