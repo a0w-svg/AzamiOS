@@ -3421,8 +3421,13 @@ static s64 sys_socket_impl(pt_regs_t *r)
      * `type` — packet_socket_create() (kernel/net/packet.c) doesn't offer a
      * narrower, unprivileged variant the way AF_INET's SOCK_DGRAM/SOCK_STREAM
      * do, so requesting it with SOCK_DGRAM instead of SOCK_RAW must not be a
-     * way to dodge this check. */
-    if (base_type == SOCK_RAW || domain == AF_PACKET) {
+     * way to dodge this check. AF_NETLINK is explicitly excluded even though
+     * it also uses SOCK_RAW: real netlink route queries are unprivileged on
+     * Linux (an ordinary `ip addr show` doesn't need root), and
+     * netlink_socket_send() (kernel/net/netlink.c) only ever answers
+     * read-only GETLINK/GETADDR/GETROUTE dumps — nothing it does needs
+     * CAP_NET_RAW to justify. */
+    if ((base_type == SOCK_RAW && domain != AF_NETLINK) || domain == AF_PACKET) {
         if (!security_check_permission(proc, CAP_NET_RAW)) {
             return -(s64)EPERM;
         }
@@ -3506,6 +3511,17 @@ static s64 sys_bind_impl(pt_regs_t *r)
         if (err < 0) return err;
         if (!is_unix) return -(s64)EINVAL;
         return unix_socket_bind(sock->uds, path);
+    }
+
+    /* AF_NETLINK: struct sockaddr_nl (12 bytes) is smaller than
+     * sockaddr_in, so it must be accepted before the generic size check
+     * below rejects it outright. Binding is a no-op — this stack's
+     * netlink_sock_t (kernel/net/netlink.c) doesn't track a bound pid or
+     * multicast groups; every socket already gets exactly the reply its own
+     * request asked for, which is all real callers (nl_pid left 0 for the
+     * kernel to autoassign) actually need. */
+    if (sock->domain == AF_NETLINK) {
+        return 0;
     }
 
     if (addrlen < sizeof(struct sockaddr_in)) return -(s64)EINVAL;
@@ -4063,6 +4079,14 @@ static s64 sys_sendto_impl(pt_regs_t *r)
         return res;
     }
 
+    /* AF_NETLINK, same reasoning as AF_PACKET just above — sock->nl aliases
+     * the same union storage sock->raw would read as a raw_sock_t. */
+    if (sock->domain == AF_NETLINK && sock->nl) {
+        res = netlink_socket_send(sock->nl, kbuf, len);
+        kfree(kbuf);
+        return res;
+    }
+
     if (sock->type == SOCK_STREAM && sock->tcp) {
         res = tcp_send(sock->tcp, kbuf, len, flags);
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
@@ -4210,6 +4234,43 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
                 }
             } else {
                 spinlock_unlock_irqrestore(&sock->pkt->lock, pflags);
+            }
+        }
+    }
+
+    /* AF_NETLINK, same union-aliasing reasoning as its sys_sendto_impl
+     * check. `uaddr` is left unfilled the same way AF_PACKET's is above —
+     * nothing here builds a struct sockaddr_nl, and a real netlink client
+     * doesn't need one to make sense of the reply (it's just the kernel's
+     * well-known nl_pid 0, always). */
+    if (sock->domain == AF_NETLINK && sock->nl) {
+        for (;;) {
+            net_buf_t *msg = net_buf_queue_pop(&sock->nl->rx_queue);
+            if (msg) {
+                size_t clen = (msg->len < len) ? msg->len : len;
+                if (copy_to_user(ubuf, msg->data, clen) != 0) {
+                    net_buf_free(msg);
+                    return -(s64)EFAULT;
+                }
+                net_buf_free(msg);
+                return (s64)clen;
+            }
+            if (nonblock) return -(s64)EAGAIN;
+            irqflags_t nflags = spinlock_lock_irqsave(&sock->nl->lock);
+            if (net_buf_queue_len(&sock->nl->rx_queue) == 0) {
+                sock->nl->wait_thread = sched_current_thread();
+                spinlock_unlock_irqrestore(&sock->nl->lock, nflags);
+                sched_block(THREAD_BLOCKED_PENDING);
+
+                if (proc && (proc->sig_pending & ~proc->sig_blocked)) {
+                    nflags = spinlock_lock_irqsave(&sock->nl->lock);
+                    if (sock->nl->wait_thread == sched_current_thread())
+                        sock->nl->wait_thread = NULL;
+                    spinlock_unlock_irqrestore(&sock->nl->lock, nflags);
+                    return -(s64)EINTR;
+                }
+            } else {
+                spinlock_unlock_irqrestore(&sock->nl->lock, nflags);
             }
         }
     }

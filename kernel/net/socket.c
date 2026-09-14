@@ -147,6 +147,34 @@ static s64 sock_fop_read(struct file *filp, void *buf, size_t len, u64 *offset)
                 spinlock_unlock_irqrestore(&sock->pkt->lock, flags);
             }
         }
+    } else if (sock->domain == AF_NETLINK && sock->nl) {
+        for (;;) {
+            net_buf_t *msg = net_buf_queue_pop(&sock->nl->rx_queue);
+            if (msg) {
+                size_t clen = (msg->len < len) ? msg->len : len;
+                memcpy(buf, msg->data, clen);
+                net_buf_free(msg);
+                return (s64)clen;
+            }
+            if (nonblock) return -(s64)EAGAIN;
+            irqflags_t flags = spinlock_lock_irqsave(&sock->nl->lock);
+            if (net_buf_queue_len(&sock->nl->rx_queue) == 0) {
+                sock->nl->wait_thread = sched_current_thread();
+                spinlock_unlock_irqrestore(&sock->nl->lock, flags);
+                sched_block(THREAD_BLOCKED_PENDING);
+
+                process_t *p = sched_current_process();
+                if (p && (p->sig_pending & ~p->sig_blocked)) {
+                    flags = spinlock_lock_irqsave(&sock->nl->lock);
+                    if (sock->nl->wait_thread == sched_current_thread())
+                        sock->nl->wait_thread = NULL;
+                    spinlock_unlock_irqrestore(&sock->nl->lock, flags);
+                    return -(s64)EINTR;
+                }
+            } else {
+                spinlock_unlock_irqrestore(&sock->nl->lock, flags);
+            }
+        }
     } else if (sock->type == SOCK_STREAM && sock->tcp) {
         return tcp_recv(sock->tcp, buf, len, nonblock);
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
@@ -197,6 +225,8 @@ static s64 sock_fop_write(struct file *filp, const void *buf, size_t len, u64 *o
         return unix_socket_sendmsg(sock->uds, NULL, buf, len, NULL, 0, nonblock);
     } else if (sock->domain == AF_PACKET && sock->pkt) {
         return packet_send(buf, len);
+    } else if (sock->domain == AF_NETLINK && sock->nl) {
+        return netlink_socket_send(sock->nl, buf, len);
     } else if (sock->type == SOCK_STREAM && sock->tcp) {
         return tcp_send(sock->tcp, buf, len, 0);
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
@@ -215,6 +245,9 @@ static int sock_fop_poll(struct file *filp)
         mask = unix_socket_poll(sock->uds);
     } else if (sock->domain == AF_PACKET && sock->pkt) {
         if (net_buf_queue_len(&sock->pkt->rx_queue) > 0) mask |= (POLLIN | POLLPRI);
+        mask |= POLLOUT;
+    } else if (sock->domain == AF_NETLINK && sock->nl) {
+        if (net_buf_queue_len(&sock->nl->rx_queue) > 0) mask |= (POLLIN | POLLPRI);
         mask |= POLLOUT;
     } else if (sock->type == SOCK_STREAM && sock->tcp) {
         if (tcp_poll_in(sock->tcp)) mask |= (POLLIN | POLLPRI);
@@ -483,6 +516,8 @@ static s64 sock_fop_ioctl(struct file *filp, u32 cmd, u64 arg)
             bytes = (int)net_buf_queue_len(&sock->udp->rx_queue);
         } else if (sock->domain == AF_PACKET && sock->pkt) {
             bytes = (int)net_buf_queue_len(&sock->pkt->rx_queue);
+        } else if (sock->domain == AF_NETLINK && sock->nl) {
+            bytes = (int)net_buf_queue_len(&sock->nl->rx_queue);
         } else if (sock->type == SOCK_RAW && sock->raw) {
             bytes = (int)net_buf_queue_len(&sock->raw->rx_queue);
         }
@@ -551,6 +586,18 @@ socket_t *sock_alloc(int domain, int type, int protocol)
         return sock;
     }
 
+    /* AF_NETLINK, same reasoning as AF_PACKET just above: real netlink
+     * sockets use SOCK_RAW too, which would otherwise collide with
+     * AF_INET's raw_sock_t on this same union storage. */
+    if (domain == AF_NETLINK) {
+        sock->nl = netlink_socket_create();
+        if (!sock->nl) {
+            kfree(sock);
+            return NULL;
+        }
+        return sock;
+    }
+
     if (type == SOCK_STREAM || protocol == IPPROTO_TCP) {
         sock->tcp = tcp_socket_create();
         if (!sock->tcp) {
@@ -584,6 +631,9 @@ void sock_free(socket_t *sock)
     } else if (sock->domain == AF_PACKET && sock->pkt) {
         packet_socket_close(sock->pkt);
         sock->pkt = NULL;
+    } else if (sock->domain == AF_NETLINK && sock->nl) {
+        netlink_socket_close(sock->nl);
+        sock->nl = NULL;
     } else if (sock->type == SOCK_STREAM && sock->tcp) {
         tcp_socket_close(sock->tcp);
         sock->tcp = NULL;

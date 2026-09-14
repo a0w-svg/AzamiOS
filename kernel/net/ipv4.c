@@ -238,6 +238,21 @@ void route_print_table(void)
     spinlock_unlock_irqrestore(&g_route_lock, flags);
 }
 
+int route_get_all(route_entry_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+
+    irqflags_t flags = spinlock_lock_irqsave(&g_route_lock);
+    int n = 0;
+    for (int i = 0; i < MAX_ROUTES && n < max; i++) {
+        if (g_routes[i].flags & RT_FLAG_UP) {
+            out[n++] = g_routes[i];
+        }
+    }
+    spinlock_unlock_irqrestore(&g_route_lock, flags);
+    return n;
+}
+
 /* Same address encoding as tcp_format_proc_net()'s comment (kernel/net/
  * tcp.c) — the raw in_addr bytes read as a little-endian u32. */
 static u32 route_proc_net_field(const u8 ip[4])

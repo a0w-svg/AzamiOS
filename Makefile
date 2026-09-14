@@ -273,6 +273,7 @@ KERNEL_C_SRCS := \
     kernel/net/tcp.c \
     kernel/net/socket.c \
     kernel/net/packet.c \
+    kernel/net/netlink.c \
     kernel/net/unix_socket.c \
     kernel/net/dhcp.c \
     fs/pipe.c \

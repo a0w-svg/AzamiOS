@@ -10,6 +10,7 @@
 #include "types.h"
 #include "tcp.h"
 #include "udp.h"
+#include "netlink.h"
 #include "../../fs/vfs.h"
 
 static inline u16 htons(u16 v) { return (u16)((v << 8) | (v >> 8)); }
@@ -24,6 +25,7 @@ static inline u32 ntohl(u32 v) { return htonl(v); }
 #define AF_INET     2
 #define AF_INET6    10
 #define AF_PACKET   17
+#define AF_NETLINK  16
 
 /* Socket Types */
 #define SOCK_STREAM 1
@@ -228,6 +230,7 @@ typedef struct socket {
         raw_sock_t  *raw;
         unix_sock_t *uds;
         pkt_sock_t  *pkt;
+        netlink_sock_t *nl;
     };
     int         so_reuseaddr;
     int         so_reuseport;

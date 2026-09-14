@@ -39,6 +39,11 @@ int  route_add(const u8 dst[4], const u8 mask[4], const u8 gw[4], struct net_dev
 int  route_del(const u8 dst[4], const u8 mask[4]);
 int  route_lookup(const u8 dst_ip[4], u8 next_hop_out[4], struct net_device **dev_out);
 void route_print_table(void);
+/* Copies up to `max` active routes into `out` (dst/mask/gateway/dev/flags/
+ * metric — route_entry_t as declared above) and returns how many. For
+ * kernel/net/netlink.c's RTM_GETROUTE, which needs the raw fields rather
+ * than route_format_proc_net()'s text rendering. */
+int route_get_all(route_entry_t *out, int max);
 /* Renders the routing table in Linux's /proc/net/route column layout —
  * fs/procfs.c's PROCFS_TYPE_NET_ROUTE serves this verbatim, which is what
  * lets a real "ip route"/"route -n" show actual kernel state instead of a
