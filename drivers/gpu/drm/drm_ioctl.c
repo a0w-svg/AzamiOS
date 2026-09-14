@@ -45,7 +45,7 @@ static void drm_copy_string(char *user_ptr, size_t cap, const char *str)
 }
 
 /* KMS requests are refused on render nodes and on non-master file handles. */
-static bool drm_can_modeset(drm_file_t *file)
+bool drm_can_modeset(drm_file_t *file)
 {
     return !file->is_render_node && file->is_master;
 }
@@ -1000,6 +1000,20 @@ s64 drm_ioctl_dispatch(drm_device_t *dev, drm_file_t *file, u32 cmd, u64 arg)
     case DRM_IOCTL_MODE_DESTROY_DUMB:  return drm_ioctl_destroy_dumb(file, arg);
     }
 
+    /* Driver-private range (Linux's DRM_COMMAND_BASE..DRM_COMMAND_END) —
+     * virtio-gpu's 3D family lives here. Checked before the render-node gate
+     * below: rendering, unlike modesetting, is exactly what render nodes are
+     * for. The two ranges never overlap in nr (0x40-0x9F here, 0xA0+ for
+     * every DRM_IOCTL_MODE_* above and below), so there is no ambiguity in
+     * trying this first. */
+    {
+        u32 nr = cmd & 0xFF;
+        if (nr >= DRM_COMMAND_BASE && nr < 0xA0) {
+            if (!dev->driver->ioctl) return -(s64)EINVAL;
+            return dev->driver->ioctl(dev, file, cmd, arg);
+        }
+    }
+
     /* Everything below is modesetting, which render nodes never get. */
     if (file->is_render_node) return -(s64)EACCES;
 
@@ -1020,6 +1034,13 @@ s64 drm_ioctl_dispatch(drm_device_t *dev, drm_file_t *file, u32 cmd, u64 arg)
     case DRM_IOCTL_MODE_PAGE_FLIP:         return drm_ioctl_page_flip(dev, file, arg);
     case DRM_IOCTL_MODE_CURSOR:
     case DRM_IOCTL_MODE_CURSOR2:           return drm_ioctl_cursor(dev, file, cmd, arg);
+    case DRM_IOCTL_MODE_GETPROPERTY:       return drm_ioctl_getproperty(dev, arg);
+    case DRM_IOCTL_MODE_GETPROPBLOB:       return drm_ioctl_getpropblob(dev, arg);
+    case DRM_IOCTL_MODE_OBJ_GETPROPERTIES: return drm_ioctl_obj_getproperties(dev, arg);
+    case DRM_IOCTL_MODE_OBJ_SETPROPERTY:   return drm_ioctl_obj_setproperty(dev, file, arg);
+    case DRM_IOCTL_MODE_ATOMIC:            return drm_ioctl_atomic(dev, file, arg);
+    case DRM_IOCTL_MODE_CREATEPROPBLOB:    return drm_ioctl_createpropblob(dev, arg);
+    case DRM_IOCTL_MODE_DESTROYPROPBLOB:   return drm_ioctl_destroypropblob(dev, arg);
     default:                               return -(s64)EINVAL;
     }
 }

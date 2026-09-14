@@ -42,6 +42,7 @@ typedef enum {
     PROCFS_TYPE_CPUINFO,
     PROCFS_TYPE_STAT,
     PROCFS_TYPE_DMESG,
+    PROCFS_TYPE_NET_DIR,
     PROCFS_TYPE_NET_DEV,
     PROCFS_TYPE_LOADAVG,
     PROCFS_TYPE_MOUNTS,
@@ -778,7 +779,10 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
         } else if (strcmp(name, "dmesg") == 0 || strcmp(name, "kmsg") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 105, S_IFREG | 0444, PROCFS_TYPE_DMESG, 0);
         } else if (strcmp(name, "net") == 0) {
-            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 106, S_IFREG | 0444, PROCFS_TYPE_NET_DEV, 0);
+            /* A real directory (dev/tcp/udp inside), not a flat file — matches
+             * Linux, and is what lets a stock binary's "/proc/net/dev" open
+             * resolve instead of failing ENOTDIR on the "net" component. */
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 106, S_IFDIR | 0555, PROCFS_TYPE_NET_DIR, 0);
         } else if (strcmp(name, "loadavg") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 107, S_IFREG | 0444, PROCFS_TYPE_LOADAVG, 0);
         } else if (strcmp(name, "mounts") == 0) {
@@ -787,10 +791,6 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 109, S_IFREG | 0444, PROCFS_TYPE_FILESYSTEMS, 0);
         } else if (strcmp(name, "cmdline") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 110, S_IFREG | 0444, PROCFS_TYPE_CMDLINE, 0);
-        } else if (strcmp(name, "tcp") == 0) {
-            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 111, S_IFREG | 0444, PROCFS_TYPE_NET_TCP, 0);
-        } else if (strcmp(name, "udp") == 0) {
-            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 112, S_IFREG | 0444, PROCFS_TYPE_NET_UDP, 0);
         } else if (strcmp(name, "devices") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 113, S_IFREG | 0444, PROCFS_TYPE_DEVICES, 0);
         } else if (strcmp(name, "interrupts") == 0) {
@@ -829,6 +829,14 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             if (is_num && pid > 0 && proc_exists) {
                 dentry->d_inode = procfs_alloc_inode(dir->i_sb, 1000 + pid, S_IFDIR | 0555, PROCFS_TYPE_PID_DIR, pid);
             }
+        }
+    } else if (dir_priv->type == PROCFS_TYPE_NET_DIR) {
+        if (strcmp(name, "dev") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 106 * 10 + 1, S_IFREG | 0444, PROCFS_TYPE_NET_DEV, 0);
+        } else if (strcmp(name, "tcp") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 111, S_IFREG | 0444, PROCFS_TYPE_NET_TCP, 0);
+        } else if (strcmp(name, "udp") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 112, S_IFREG | 0444, PROCFS_TYPE_NET_UDP, 0);
         }
     } else if (dir_priv->type == PROCFS_TYPE_SYSVIPC_DIR) {
         if (strcmp(name, "shm") == 0) {
@@ -1203,7 +1211,7 @@ static s64 procfs_file_write(struct file *filp, const void *buf, size_t len, u64
 
 static const char *g_static_root_entries[] = {
     "version", "uptime", "meminfo", "cpuinfo", "stat", "dmesg", "net",
-    "loadavg", "mounts", "filesystems", "cmdline", "tcp", "udp",
+    "loadavg", "mounts", "filesystems", "cmdline",
     "devices", "interrupts", "partitions", "swaps", "self", "sys", "sysvipc",
     "mqueues", "vulnerabilities", "security", "mcelog", "slabinfo"
 };
@@ -1244,7 +1252,7 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
                 name = ".."; dtype = DT_DIR;
             } else if (idx - 2 < NUM_ROOT_ENTRIES) {
                 name = g_static_root_entries[idx - 2];
-                if (strcmp(name, "sys") == 0) dtype = DT_DIR;
+                if (strcmp(name, "sys") == 0 || strcmp(name, "net") == 0) dtype = DT_DIR;
                 else if (strcmp(name, "self") == 0) dtype = DT_LNK;
                 else dtype = DT_REG;
             } else {
@@ -1268,6 +1276,27 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
             d->d_type = dtype;
             memcpy(d->d_name, name, nlen + 1);
 
+            written += reclen;
+            idx++;
+        }
+    } else if (priv->type == PROCFS_TYPE_NET_DIR) {
+        const char *net_entries[] = { ".", "..", "dev", "tcp", "udp" };
+        u64 total_entries = 5;
+        while (idx < total_entries) {
+            const char *name = net_entries[idx];
+            u8 dtype = (idx < 2) ? DT_DIR : DT_REG;
+            size_t nlen = strlen(name);
+            size_t reclen = ALIGN_UP(sizeof(struct linux_dirent64) + nlen + 1, 8);
+            if (written + reclen > len) {
+                if (written == 0) return -(s64)EINVAL;
+                break;
+            }
+            struct linux_dirent64 *d = (struct linux_dirent64 *)(out_ptr + written);
+            d->d_ino = idx + 1;
+            d->d_off = idx + 1;
+            d->d_reclen = (unsigned short)reclen;
+            d->d_type = dtype;
+            memcpy(d->d_name, name, nlen + 1);
             written += reclen;
             idx++;
         }

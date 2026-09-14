@@ -23,6 +23,16 @@
 #define TCP_DEFAULT_MSS          1460
 #define TCP_DEFAULT_WINDOW       65535
 
+/* Retransmission of the connection's control segments (SYN, SYN-ACK, FIN) —
+ * see tcp_timer_tick()'s comment in tcp.c for what this does and does not
+ * cover. Fixed RTO with a doubling backoff, same shape as ARP's retry
+ * timer (arp.h's ARP_RETRY_TIMEOUT/ARP_MAX_RETRIES) rather than a real
+ * RTT-sampled RTO — good enough to recover from one lost packet instead of
+ * hanging forever, not a claim of RFC 6298 compliance. */
+#define TCP_RTX_BASE_TIMEOUT     3   /* seconds before the first retransmit */
+#define TCP_RTX_MAX_BACKOFF      24  /* seconds: cap on the doubling delay  */
+#define TCP_RTX_MAX_RETRIES      5   /* give up and reset after this many   */
+
 /* TCP Header Flags */
 #define TCP_FLAG_FIN 0x01
 #define TCP_FLAG_SYN 0x02
@@ -84,6 +94,12 @@ typedef struct tcp_sock {
     u32              rcv_wnd;    /* Receive window advertisement               */
     u32              iss;        /* Initial send sequence number               */
     u32              irs;        /* Initial receive sequence number            */
+
+    /* Retransmission of the outstanding control segment (SYN/SYN-ACK/FIN).
+     * rtx_deadline is an absolute g_tcp_ticks value, 0 meaning "nothing
+     * outstanding to retransmit"; see tcp_timer_tick() in tcp.c. */
+    u32              rtx_deadline;
+    u8               rtx_count;
 
     /* Stream reception circular ring buffer */
     u8              *rx_buf;

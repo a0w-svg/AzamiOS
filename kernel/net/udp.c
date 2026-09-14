@@ -24,15 +24,28 @@ static udp_sock_t *g_udp_sockets = NULL;
 static spinlock_t  g_udp_lock = SPINLOCK_INIT;
 static u16         g_next_ephemeral_port = UDP_PORT_EPHEMERAL_START;
 
+/* Every lock in this file uses spinlock_lock_irqsave()/_irqrestore(), for the
+ * same reason as tcp.c's identical note: udp_input() is reachable from a
+ * timer interrupt on any CPU (sched_tick() -> net_poll() ->
+ * e1000_poll_rx() -> net_process_incoming() -> ipv4_input() -> udp_input()),
+ * and it takes both g_udp_lock and a socket's own sock->lock. A plain
+ * spinlock_lock() in udp_bind()/udp_connect()/udp_socket_close()/
+ * udp_recvfrom() leaves interrupts enabled, so that timer can land on the
+ * very CPU already holding one of those locks in ordinary process context;
+ * udp_input()'s attempt to take the same (non-reentrant, ticket) lock then
+ * spins forever, and so does the process-context holder once the interrupt
+ * never returns. See kernel/net/tcp.c for the full writeup — this is the
+ * same bug in the sibling transport. */
+
 static inline u16 htons(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 static inline u16 ntohs(u16 v) { return htons(v); }
 
 void udp_init(void)
 {
-    spinlock_lock(&g_udp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_udp_lock);
     g_udp_sockets = NULL;
     g_next_ephemeral_port = UDP_PORT_EPHEMERAL_START;
-    spinlock_unlock(&g_udp_lock);
+    spinlock_unlock_irqrestore(&g_udp_lock, flags);
     pr_debug("[UDP] User Datagram Protocol engine initialized.\n");
 }
 
@@ -85,10 +98,10 @@ udp_sock_t *udp_socket_create(void)
     s->wait_thread = NULL;
     s->refcnt = 1; /* the reference udp_socket_close() will drop */
 
-    spinlock_lock(&g_udp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_udp_lock);
     s->next = g_udp_sockets;
     g_udp_sockets = s;
-    spinlock_unlock(&g_udp_lock);
+    spinlock_unlock_irqrestore(&g_udp_lock, flags);
 
     return s;
 }
@@ -97,7 +110,7 @@ void udp_socket_close(udp_sock_t *sock)
 {
     if (!sock) return;
 
-    spinlock_lock(&g_udp_lock);
+    irqflags_t list_flags = spinlock_lock_irqsave(&g_udp_lock);
     udp_sock_t **curr = &g_udp_sockets;
     while (*curr) {
         if (*curr == sock) {
@@ -106,15 +119,15 @@ void udp_socket_close(udp_sock_t *sock)
         }
         curr = &(*curr)->next;
     }
-    spinlock_unlock(&g_udp_lock);
+    spinlock_unlock_irqrestore(&g_udp_lock, list_flags);
 
-    spinlock_lock(&sock->lock);
+    irqflags_t sock_flags = spinlock_lock_irqsave(&sock->lock);
     net_buf_queue_purge(&sock->rx_queue);
     if (sock->wait_thread) {
         sched_unblock(sock->wait_thread);
         sock->wait_thread = NULL;
     }
-    spinlock_unlock(&sock->lock);
+    spinlock_unlock_irqrestore(&sock->lock, sock_flags);
 
     /* Drops the creator's reference; a concurrent udp_input() holding its
      * own (see udp_sock_get()) keeps the socket alive until it is done. */
@@ -150,14 +163,14 @@ int udp_bind(udp_sock_t *sock, const u8 ip[4], u16 port)
 {
     if (!sock) return -EINVAL;
 
-    spinlock_lock(&g_udp_lock);
-    spinlock_lock(&sock->lock);
+    irqflags_t list_flags = spinlock_lock_irqsave(&g_udp_lock);
+    irqflags_t sock_flags = spinlock_lock_irqsave(&sock->lock);
 
     if (port == 0) {
         port = udp_alloc_ephemeral_port();
         if (port == 0) {
-            spinlock_unlock(&sock->lock);
-            spinlock_unlock(&g_udp_lock);
+            spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+            spinlock_unlock_irqrestore(&g_udp_lock, list_flags);
             return -EADDRINUSE;
         }
     } else {
@@ -165,8 +178,8 @@ int udp_bind(udp_sock_t *sock, const u8 ip[4], u16 port)
         udp_sock_t *cur = g_udp_sockets;
         while (cur) {
             if (cur != sock && cur->bound && cur->local_port == port) {
-                spinlock_unlock(&sock->lock);
-                spinlock_unlock(&g_udp_lock);
+                spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+                spinlock_unlock_irqrestore(&g_udp_lock, list_flags);
                 return -EADDRINUSE;
             }
             cur = cur->next;
@@ -178,8 +191,8 @@ int udp_bind(udp_sock_t *sock, const u8 ip[4], u16 port)
     else memset(sock->local_ip, 0, 4);
     sock->bound = true;
 
-    spinlock_unlock(&sock->lock);
-    spinlock_unlock(&g_udp_lock);
+    spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+    spinlock_unlock_irqrestore(&g_udp_lock, list_flags);
 
     return 0;
 }
@@ -193,11 +206,11 @@ int udp_connect(udp_sock_t *sock, const u8 ip[4], u16 port)
         if (res < 0) return res;
     }
 
-    spinlock_lock(&sock->lock);
+    irqflags_t flags = spinlock_lock_irqsave(&sock->lock);
     memcpy(sock->remote_ip, ip, 4);
     sock->remote_port = port;
     sock->connected = true;
-    spinlock_unlock(&sock->lock);
+    spinlock_unlock_irqrestore(&sock->lock, flags);
 
     return 0;
 }
@@ -297,13 +310,25 @@ s64 udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], 
         }
 
         /* Sleep waiting for datagram */
-        spinlock_lock(&sock->lock);
+        irqflags_t flags = spinlock_lock_irqsave(&sock->lock);
         if (net_buf_queue_len(&sock->rx_queue) == 0) {
             sock->wait_thread = sched_current_thread();
-            spinlock_unlock(&sock->lock);
+            spinlock_unlock_irqrestore(&sock->lock, flags);
             sched_block(THREAD_BLOCKED_PENDING);
+
+            /* A pending, unblocked signal (SIGALRM from an alarm()-based
+             * timeout, most often — see the matching TCP fix) must break the
+             * wait with -EINTR rather than looping back to sleep forever. */
+            process_t *p = sched_current_process();
+            if (p && (p->sig_pending & ~p->sig_blocked)) {
+                flags = spinlock_lock_irqsave(&sock->lock);
+                if (sock->wait_thread == sched_current_thread())
+                    sock->wait_thread = NULL;
+                spinlock_unlock_irqrestore(&sock->lock, flags);
+                return -(s64)EINTR;
+            }
         } else {
-            spinlock_unlock(&sock->lock);
+            spinlock_unlock_irqrestore(&sock->lock, flags);
         }
     }
 }
@@ -363,7 +388,7 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     }
 
     /* Find matching socket */
-    spinlock_lock(&g_udp_lock);
+    irqflags_t list_flags = spinlock_lock_irqsave(&g_udp_lock);
     udp_sock_t *target_sock = NULL;
     udp_sock_t *cur = g_udp_sockets;
     while (cur) {
@@ -377,7 +402,7 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
      * Dropped below once this packet is done with target_sock, whichever
      * of the two branches that turns out to be. */
     if (target_sock) udp_sock_get(target_sock);
-    spinlock_unlock(&g_udp_lock);
+    spinlock_unlock_irqrestore(&g_udp_lock, list_flags);
 
     if (target_sock) {
         /* Allocate a packet buffer containing [src_ip 4B][src_port 2B][payload] */
@@ -392,12 +417,12 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             net_buf_queue_push(&target_sock->rx_queue, rx_buf);
 
             /* Wakeup sleeping thread if waiting */
-            spinlock_lock(&target_sock->lock);
+            irqflags_t sock_flags = spinlock_lock_irqsave(&target_sock->lock);
             if (target_sock->wait_thread) {
                 sched_unblock(target_sock->wait_thread);
                 target_sock->wait_thread = NULL;
             }
-            spinlock_unlock(&target_sock->lock);
+            spinlock_unlock_irqrestore(&target_sock->lock, sock_flags);
         }
         udp_sock_put(target_sock);
     } else if (dst_port != DHCP_CLIENT_PORT) {

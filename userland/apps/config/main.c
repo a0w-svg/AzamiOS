@@ -25,7 +25,10 @@ static const char *const s_config_files[] = {
     "/etc/network.conf",
     "/etc/power.conf",
     "/etc/security.conf",
-    "/etc/sysctl.conf"
+    "/etc/sysctl.conf",
+    "/etc/session.conf",
+    "/etc/font.conf",
+    "/etc/mime.conf"
 };
 #define NUM_CONFIG_FILES (sizeof(s_config_files) / sizeof(s_config_files[0]))
 
@@ -45,14 +48,19 @@ static void print_usage(void)
     printf("  \033[1;36mget\033[0m  <file> <key>           Get value of <key> in specific <file>\n");
     printf("  \033[1;36mset\033[0m  <key> <value>          Set <key>=<value> in matching config file\n");
     printf("  \033[1;36mset\033[0m  <file> <key> <value>   Set <key>=<value> in specific <file>\n");
+    printf("  \033[1;36msession\033[0m [list|add|del]      Manage autostart and background services\n");
+    printf("  \033[1;36mfont\033[0m [show|set]             Manage system typography and font sizing\n");
+    printf("  \033[1;36mmime\033[0m [list|set]             Manage default GUI file associations\n");
     printf("  \033[1;36mautoaccept\033[0m [on|off|status]  Manage unattended auto-accept execution policies\n");
     printf("  \033[1;36medit\033[0m [file]                 Open config file in graphical Text Editor\n");
     printf("  \033[1;36mreload\033[0m                      Broadcast reload to Desktop Environment & Compositor\n\n");
-    printf("Config domains: desktop, terminal, audio, network, power, security, sysctl\n\n");
+    printf("Config domains: desktop, terminal, audio, network, power, security, sysctl, session, font, mime\n\n");
     printf("Examples:\n");
     printf("  config list\n");
     printf("  config get theme_id\n");
-    printf("  config set power.profile performance\n");
+    printf("  config session list\n");
+    printf("  config font set /usr/share/fonts/vga_regular.azf 16\n");
+    printf("  config mime set ppm /bin/imageviewer.elf\n");
     printf("  config autoaccept on\n");
     printf("  config edit security\n");
 }
@@ -69,6 +77,9 @@ static const char *resolve_file(const char *name)
     if (strcmp(name, "power") == 0 || strcmp(name, "power.conf") == 0) return "/etc/power.conf";
     if (strcmp(name, "security") == 0 || strcmp(name, "security.conf") == 0 || strcmp(name, "sec") == 0) return "/etc/security.conf";
     if (strcmp(name, "sysctl") == 0 || strcmp(name, "sysctl.conf") == 0) return "/etc/sysctl.conf";
+    if (strcmp(name, "session") == 0 || strcmp(name, "session.conf") == 0) return "/etc/session.conf";
+    if (strcmp(name, "font") == 0 || strcmp(name, "font.conf") == 0) return "/etc/font.conf";
+    if (strcmp(name, "mime") == 0 || strcmp(name, "mime.conf") == 0) return "/etc/mime.conf";
     return name;
 }
 
@@ -347,6 +358,110 @@ int main(int argc, char **argv)
             return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
         }
         return 1;
+    }
+
+    if (strcmp(cmd, "session") == 0) {
+        if (argc >= 3 && strcmp(argv[2], "add") == 0 && argc >= 6) {
+            const char *sec = argv[3];  /* services or autostart */
+            const char *name = argv[4];
+            const char *path = argv[5];
+            int fd = open("/etc/session.conf", O_RDWR, 0644);
+            if (fd >= 0) {
+                char buf[MAX_FILE_SIZE];
+                ssize_t n = read(fd, buf, sizeof(buf) - 256);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    char target_sec[64];
+                    snprintf(target_sec, sizeof(target_sec), "[%s]", sec);
+                    char *p = strstr(buf, target_sec);
+                    if (p) {
+                        char *nl = strchr(p, '\n');
+                        if (nl) {
+                            char new_buf[MAX_FILE_SIZE];
+                            size_t pre_len = (size_t)(nl - buf + 1);
+                            memcpy(new_buf, buf, pre_len);
+                            int added = snprintf(new_buf + pre_len, sizeof(new_buf) - pre_len, "%s=%s\n", name, path);
+                            strcpy(new_buf + pre_len + added, nl + 1);
+                            lseek(fd, 0, SEEK_SET);
+                            write(fd, new_buf, strlen(new_buf));
+                            ftruncate(fd, strlen(new_buf));
+                            printf("\033[1;32m✓\033[0m Added [%s] \033[1;36m%s\033[0m = \033[1;33m%s\033[0m to /etc/session.conf\n", sec, name, path);
+                            close(fd);
+                            return 0;
+                        }
+                    }
+                }
+                close(fd);
+            }
+            printf("\033[1;31mError:\033[0m Failed to add session entry.\n");
+            return 1;
+        } else if (argc >= 4 && (strcmp(argv[2], "del") == 0 || strcmp(argv[2], "remove") == 0)) {
+            const char *name = argv[3];
+            int fd = open("/etc/session.conf", O_RDWR, 0644);
+            if (fd >= 0) {
+                char buf[MAX_FILE_SIZE];
+                ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    char new_buf[MAX_FILE_SIZE];
+                    new_buf[0] = '\0';
+                    char *line = buf;
+                    while (line && *line) {
+                        char *eol = strchr(line, '\n');
+                        if (eol) *eol = '\0';
+                        char *eq = strchr(line, '=');
+                        bool skip = false;
+                        if (eq) {
+                            *eq = '\0';
+                            char *k = line;
+                            while (*k == ' ' || *k == '\t') k++;
+                            if (strcmp(k, name) == 0) skip = true;
+                            *eq = '=';
+                        }
+                        if (!skip) {
+                            strncat(new_buf, line, sizeof(new_buf) - strlen(new_buf) - 1);
+                            strncat(new_buf, "\n", sizeof(new_buf) - strlen(new_buf) - 1);
+                        }
+                        line = eol ? eol + 1 : NULL;
+                    }
+                    lseek(fd, 0, SEEK_SET);
+                    write(fd, new_buf, strlen(new_buf));
+                    ftruncate(fd, strlen(new_buf));
+                    printf("\033[1;32m✓\033[0m Removed entry '%s' from /etc/session.conf\n", name);
+                    close(fd);
+                    return 0;
+                }
+                close(fd);
+            }
+            return 1;
+        } else {
+            cmd_list_file("/etc/session.conf");
+            return 0;
+        }
+    }
+
+    if (strcmp(cmd, "font") == 0) {
+        if (argc >= 4 && strcmp(argv[2], "set") == 0) {
+            set_key_in_file("/etc/font.conf", "system_font", argv[3]);
+            if (argc >= 5) {
+                set_key_in_file("/etc/font.conf", "size", argv[4]);
+            }
+            printf("\033[1;32m✓\033[0m Updated /etc/font.conf font settings.\n");
+            broadcast_reload();
+            return 0;
+        }
+        cmd_list_file("/etc/font.conf");
+        return 0;
+    }
+
+    if (strcmp(cmd, "mime") == 0) {
+        if (argc >= 5 && strcmp(argv[2], "set") == 0) {
+            set_key_in_file("/etc/mime.conf", argv[3], argv[4]);
+            printf("\033[1;32m✓\033[0m Associated extension '%s' -> '%s' in /etc/mime.conf\n", argv[3], argv[4]);
+            return 0;
+        }
+        cmd_list_file("/etc/mime.conf");
+        return 0;
     }
 
     if (strcmp(cmd, "reload") == 0) {

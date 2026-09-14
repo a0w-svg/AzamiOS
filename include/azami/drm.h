@@ -33,6 +33,8 @@
 #define DRM_IOCTL_MODE_CURSOR            0xC01C64A3
 #define DRM_IOCTL_MODE_GETENCODER        0xC01464A6
 #define DRM_IOCTL_MODE_GETCONNECTOR      0xC05064A7
+#define DRM_IOCTL_MODE_GETPROPERTY       0xC04064AA
+#define DRM_IOCTL_MODE_GETPROPBLOB       0xC01064AC
 #define DRM_IOCTL_MODE_GETFB             0xC01C64AD
 #define DRM_IOCTL_MODE_ADDFB             0xC01C64AE
 #define DRM_IOCTL_MODE_RMFB              0xC00464AF
@@ -45,7 +47,26 @@
 #define DRM_IOCTL_MODE_GETPLANE          0xC02064B6
 #define DRM_IOCTL_MODE_SETPLANE          0xC03064B7
 #define DRM_IOCTL_MODE_ADDFB2            0xC06064B8
+#define DRM_IOCTL_MODE_OBJ_GETPROPERTIES 0xC02064B9
+#define DRM_IOCTL_MODE_OBJ_SETPROPERTY   0xC01864BA
 #define DRM_IOCTL_MODE_CURSOR2           0xC02464BB
+#define DRM_IOCTL_MODE_ATOMIC            0xC03864BC
+#define DRM_IOCTL_MODE_CREATEPROPBLOB    0xC01064BD
+#define DRM_IOCTL_MODE_DESTROYPROPBLOB   0xC00464BE
+
+/* ── Driver-private ioctls (Linux's DRM_COMMAND_BASE range) ─────────────────
+ * virtio-gpu's 3D command family, numbered the same way real Linux does:
+ * DRM_COMMAND_BASE + a small per-driver subcommand. */
+#define DRM_COMMAND_BASE                 0x40
+#define DRM_IOCTL_VIRTGPU_MAP             0xC0106441
+#define DRM_IOCTL_VIRTGPU_EXECBUFFER      0xC0206442
+#define DRM_IOCTL_VIRTGPU_GETPARAM        0xC0106443
+#define DRM_IOCTL_VIRTGPU_RESOURCE_CREATE 0xC0386444
+#define DRM_IOCTL_VIRTGPU_RESOURCE_INFO   0xC0106445
+#define DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST 0xC0306446
+#define DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST   0xC0306447
+#define DRM_IOCTL_VIRTGPU_WAIT            0xC0086448
+#define DRM_IOCTL_VIRTGPU_GET_CAPS        0xC0186449
 
 /* ── Capabilities ────────────────────────────────────────────────────────── */
 #define DRM_CAP_DUMB_BUFFER              0x1
@@ -63,6 +84,35 @@
 #define DRM_CLIENT_CAP_STEREO_3D         1
 #define DRM_CLIENT_CAP_UNIVERSAL_PLANES  2
 #define DRM_CLIENT_CAP_ATOMIC            3
+
+/* ── Atomic modesetting: property types and well-known flags ────────────────
+ * Just enough of Linux's property model to describe the handful of
+ * properties drm_atomic.c actually backs with real state (see its own
+ * comment): a property is a (name, type, range-or-enum) description shared
+ * by every object it applies to; each object stores its own current value.
+ */
+#define DRM_MODE_PROP_RANGE              (1 << 0)   /* value in [min, max] */
+#define DRM_MODE_PROP_OBJECT             (1 << 6)   /* value names another object, 0 = none */
+#define DRM_MODE_PROP_BLOB               (1 << 4)   /* value names a blob (CREATEPROPBLOB) */
+
+#define DRM_MODE_ATOMIC_TEST_ONLY        0x0100     /* validate, never apply */
+#define DRM_MODE_ATOMIC_NONBLOCK         0x0200      /* don't wait for the flip */
+#define DRM_MODE_ATOMIC_ALLOW_MODESET    0x0400      /* permit a mode/CRTC change, not just a flip */
+
+struct drm_mode_property_enum {
+    u64  value;
+    char name[32];
+};
+
+struct drm_mode_get_property {
+    u64  values_ptr;      /* range: [min, max]; enum: unused here */
+    u64  enum_blob_ptr;   /* unused — no enum-valued properties yet */
+    u32  prop_id;
+    u32  flags;
+    char name[32];
+    u32  count_values;
+    u32  count_enum_blobs;
+};
 
 #define DRM_PRIME_CAP_IMPORT             0x1
 #define DRM_PRIME_CAP_EXPORT             0x2
@@ -374,4 +424,123 @@ struct drm_mode_set_plane {
     u32 crtc_w, crtc_h;
     u32 src_x, src_y;
     u32 src_h, src_w;
+};
+
+/* ── Atomic modesetting structures ───────────────────────────────────────── */
+
+struct drm_mode_obj_get_properties {
+    u64 props_ptr;
+    u64 prop_values_ptr;
+    u32 count_props;
+    u32 obj_id;
+    u32 obj_type;
+};
+
+struct drm_mode_obj_set_property {
+    u64 value;
+    u32 prop_id;
+    u32 obj_id;
+    u32 obj_type;
+};
+
+struct drm_mode_atomic {
+    u32 flags;
+    u32 count_objs;
+    u64 objs_ptr;          /* u32[count_objs]: object ids                  */
+    u64 count_props_ptr;   /* u32[count_objs]: property count per object   */
+    u64 props_ptr;         /* u32[[sum count_props]]: property ids, flat   */
+    u64 prop_values_ptr;   /* u64[[sum count_props]]: values, flat         */
+    u64 reserved;
+    u64 user_data;
+};
+
+struct drm_mode_create_blob {
+    u64 data;
+    u32 length;
+    u32 blob_id;           /* out */
+};
+
+struct drm_mode_destroy_blob {
+    u32 blob_id;
+};
+
+struct drm_mode_get_blob {
+    u32 blob_id;
+    u32 length;
+    u64 data;
+};
+
+/* ── virtio-gpu 3D (driver-private ioctls) ───────────────────────────────────
+ * Structure layouts mirror Linux's <drm/virtgpu_drm.h> closely enough that
+ * they describe the same wire shape a real virglrenderer/Mesa virgl driver
+ * expects — target/format/bind are opaque Gallium enum values the kernel
+ * never interprets, just forwards to the host's virtio-gpu device. */
+
+struct drm_virtgpu_map {
+    u64 offset;             /* out: mmap() offset, like MODE_MAP_DUMB       */
+    u32 handle;
+    u32 pad;
+};
+
+struct drm_virtgpu_execbuffer {
+    u32 flags;
+    u32 size;               /* bytes at @command                            */
+    u64 command;            /* raw virgl/TGSI command stream, opaque here   */
+    u64 bo_handles;         /* u32[num_bo_handles]: GEM handles referenced  */
+    u32 num_bo_handles;
+    u32 pad;
+};
+
+#define VIRTGPU_PARAM_3D_FEATURES 1   /* value: 1 if 3D contexts may be created */
+
+struct drm_virtgpu_getparam {
+    u64 param;
+    u64 value;              /* out */
+};
+
+struct drm_virtgpu_resource_create {
+    u32 target, format, bind;
+    u32 width, height, depth;
+    u32 array_size;
+    u32 last_level;
+    u32 nr_samples;
+    u32 flags;
+    u32 bo_handle;          /* out: GEM handle                              */
+    u32 res_handle;         /* out: host resource id                        */
+    u32 size;               /* out: backing store size in bytes             */
+    u32 stride;             /* out                                          */
+};
+
+struct drm_virtgpu_resource_info {
+    u32 bo_handle;
+    u32 res_handle;         /* out */
+    u32 size;               /* out */
+    u32 stride;             /* out */
+};
+
+struct drm_virtgpu_3d_box {
+    u32 x, y, z;
+    u32 w, h, d;
+};
+
+struct drm_virtgpu_3d_transfer {
+    u64 offset;
+    struct drm_virtgpu_3d_box box;
+    u32 bo_handle;
+    u32 level;
+    u32 stride;
+    u32 layer_stride;
+};
+
+struct drm_virtgpu_wait {
+    u32 handle;
+    u32 flags;
+};
+
+struct drm_virtgpu_get_caps {
+    u32 cap_set_id;
+    u32 cap_set_ver;
+    u64 addr;               /* out buffer                                   */
+    u32 size;               /* in: capacity of @addr; out: bytes written    */
+    u32 pad;
 };

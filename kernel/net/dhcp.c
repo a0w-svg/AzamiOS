@@ -22,6 +22,17 @@
 static dhcp_lease_t g_dhcp_lease;
 static spinlock_t   g_dhcp_lock = SPINLOCK_INIT;
 
+/* g_dhcp_lock uses spinlock_lock_irqsave()/_irqrestore() throughout this
+ * file, for the same reason as tcp.c's and udp.c's identical note:
+ * dhcp_input() is reachable from a timer interrupt on any CPU (via
+ * net_poll() -> ... -> udp_input() -> dhcp_input()) and takes this same
+ * lock. A plain spinlock_lock() in dhcp_start_discovery()/dhcp_get_lease()
+ * leaves interrupts enabled, so that timer can land on the CPU already
+ * holding the lock in ordinary process context, and dhcp_input()'s own
+ * acquire then spins forever. See kernel/net/tcp.c for the full writeup.
+ * (dhcp_start_discovery()'s net_poll() call in its retry loop is not part
+ * of this hazard — it happens with the lock already released.) */
+
 static inline u16 htons(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 static inline u16 ntohs(u16 v) { return htons(v); }
 static inline u32 htonl(u32 v) { return (((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v & 0xFF0000) >> 8) | ((v >> 24) & 0xFF)); }
@@ -63,18 +74,18 @@ static u32 generate_dhcp_xid(void)
 
 void dhcp_init(void)
 {
-    spinlock_lock(&g_dhcp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_dhcp_lock);
     memset(&g_dhcp_lease, 0, sizeof(g_dhcp_lease));
     g_dhcp_lease.state = DHCP_STATE_INIT;
     g_dhcp_lease.xid = generate_dhcp_xid();
-    spinlock_unlock(&g_dhcp_lock);
+    spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
 
     pr_debug("[DHCP] RFC 2131 DHCP client subsystem initialized.\n");
 }
 
 int dhcp_start_discovery(void)
 {
-    spinlock_lock(&g_dhcp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_dhcp_lock);
 
     u8 host_mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
     net_device_t *dev = net_get_default_device();
@@ -125,7 +136,7 @@ int dhcp_start_discovery(void)
     size_t opt_len = (size_t)(opt - pkt.options);
     size_t total_len = sizeof(dhcp_packet_t) - sizeof(pkt.options) + opt_len;
     u32 current_xid = g_dhcp_lease.xid;
-    spinlock_unlock(&g_dhcp_lock);
+    spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
 
     pr_debug("[DHCP] Broadcasting DHCPDISCOVER (xid: 0x%08x)...\n", current_xid);
 
@@ -137,12 +148,12 @@ int dhcp_start_discovery(void)
             extern void net_poll(void);
             net_poll();
 
-            spinlock_lock(&g_dhcp_lock);
+            flags = spinlock_lock_irqsave(&g_dhcp_lock);
             if (g_dhcp_lease.state == DHCP_STATE_BOUND) {
-                spinlock_unlock(&g_dhcp_lock);
+                spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
                 return 0; /* Lease successfully acquired */
             }
-            spinlock_unlock(&g_dhcp_lock);
+            spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
 
             for (volatile int d = 0; d < 2000; d++) {
                 cpu_pause();
@@ -150,7 +161,7 @@ int dhcp_start_discovery(void)
         }
     }
 
-    spinlock_lock(&g_dhcp_lock);
+    flags = spinlock_lock_irqsave(&g_dhcp_lock);
     if (g_dhcp_lease.state != DHCP_STATE_BOUND) {
         static const u8 def_ip[4] = { 10, 0, 2, 15 };
         static const u8 def_mask[4] = { 255, 255, 255, 0 };
@@ -162,7 +173,7 @@ int dhcp_start_discovery(void)
         net_set_gateway(def_gw);
         net_set_dns(def_dns);
     }
-    spinlock_unlock(&g_dhcp_lock);
+    spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
 
     return 0;
 }
@@ -256,9 +267,9 @@ void dhcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     }
 
     /* Verify Transaction ID */
-    spinlock_lock(&g_dhcp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_dhcp_lock);
     if (ntohl(pkt->xid) != g_dhcp_lease.xid) {
-        spinlock_unlock(&g_dhcp_lock);
+        spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
         net_buf_free(buf);
         return;
     }
@@ -326,7 +337,7 @@ void dhcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
 
         dhcp_lease_t req_lease;
         memcpy(&req_lease, &g_dhcp_lease, sizeof(dhcp_lease_t));
-        spinlock_unlock(&g_dhcp_lock);
+        spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
 
         dhcp_send_request(&req_lease);
         net_buf_free(buf);
@@ -364,14 +375,14 @@ void dhcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         pr_debug("       Lease Time:  %u seconds\n", g_dhcp_lease.lease_time);
     }
 
-    spinlock_unlock(&g_dhcp_lock);
+    spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
     net_buf_free(buf);
 }
 
 void dhcp_get_lease(dhcp_lease_t *out_lease)
 {
     if (!out_lease) return;
-    spinlock_lock(&g_dhcp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_dhcp_lock);
     memcpy(out_lease, &g_dhcp_lease, sizeof(dhcp_lease_t));
-    spinlock_unlock(&g_dhcp_lock);
+    spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
 }

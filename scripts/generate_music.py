@@ -308,7 +308,20 @@ def main():
     make_track_cyber_city_rain(os.path.join(dest_dir, "03_Cyber_City_Rain.wav"))
     make_track_azami_anthem(os.path.join(dest_dir, "04_Azami_Anthem.wav"))
 
-    print("All audio tracks generated successfully.")
+    # Install in-tree MP3 tracks
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+    src_music = os.path.join(repo_root, "userland", "music")
+    if os.path.isdir(src_music):
+        for f in os.listdir(src_music):
+            if f.lower().endswith(".mp3"):
+                src_file = os.path.join(src_music, f)
+                dst_file = os.path.join(dest_dir, f)
+                import shutil
+                shutil.copy2(src_file, dst_file)
+                print(f"  ✓  Installed {f} ({os.path.getsize(dst_file)} bytes) [MP3]")
+
+    print("All audio tracks generated and installed successfully.")
 
 if __name__ == "__main__":
     main()

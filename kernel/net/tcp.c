@@ -23,6 +23,44 @@ static tcp_sock_t *g_tcp_sockets = NULL;
 static spinlock_t  g_tcp_lock = SPINLOCK_INIT;
 static u16         g_tcp_ephemeral_port = TCP_PORT_EPHEMERAL_START;
 static u32         g_isn_seed = 0x12345678;
+static u32         g_tcp_ticks = 0;   /* seconds, advanced once per tcp_timer_tick() */
+
+/*
+ * Every lock in this file — g_tcp_lock and each socket's own sock->lock — is
+ * taken with spinlock_lock_irqsave()/spinlock_unlock_irqrestore(), never the
+ * plain spinlock_lock()/spinlock_unlock(). This is not defensive style: it is
+ * the fix for a real, silent whole-CPU hang.
+ *
+ * tcp_input() — which takes both locks — is not only called from a socket
+ * syscall's thread; sched_tick() calls net_poll() on every timer interrupt,
+ * which walks straight down through e1000_poll_rx()/net_process_incoming()
+ * into tcp_input() from *interrupt* context, on whichever CPU the timer
+ * landed on. A plain spinlock_lock() leaves IF set, so nothing stops that
+ * timer interrupt from landing on the very CPU that is, at that instant,
+ * inside tcp_connect()/tcp_bind()/tcp_accept()/tcp_recv()/tcp_socket_close()
+ * holding sock->lock (or g_tcp_lock) in ordinary process context. The
+ * interrupt handler it vectors to then calls tcp_input(), which tries to
+ * take that same lock — a ticket spinlock, so the acquire is unconditional,
+ * not a try-lock. The thread that already holds it cannot run again until
+ * this interrupt returns, and this interrupt cannot return until that thread
+ * releases the lock: the CPU spins in the timer ISR forever. Nothing crashes
+ * and nothing times out; the affected CPU just goes silent mid-syscall.
+ *
+ * A single fast connect()/close() pair rarely loses this race — by the time
+ * a reply can arrive, the caller has already reached its sched_block() and
+ * dropped the lock. A *second* connect() right after DHCP has already
+ * finished (no lease wait to soak up the gap) sends its SYN and can have the
+ * SYN-ACK already sitting in the RX ring by the very next timer tick, while
+ * tcp_connect() is still between tcp_send_packet() and the unlock a few
+ * instructions later — exactly the window this lock exists to protect.
+ * spinlock_lock_irqsave() closes it by disabling interrupts for the
+ * duration: the timer simply cannot land on this CPU while the lock is held,
+ * so tcp_input() can never observe it taken from anywhere but its own,
+ * already-non-reentrant call sites. This mirrors the e1000 driver's own
+ * tx/rx locks (arch/x86_64 spinlock.h's whole reason for offering the
+ * _irqsave form), which face the identical process-context-vs-poll-from-IRQ
+ * hazard one layer down.
+ */
 
 static inline u16 htons(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 static inline u16 ntohs(u16 v) { return htons(v); }
@@ -36,10 +74,10 @@ static u32 generate_isn(void)
 
 void tcp_init(void)
 {
-    spinlock_lock(&g_tcp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_tcp_lock);
     g_tcp_sockets = NULL;
     g_tcp_ephemeral_port = TCP_PORT_EPHEMERAL_START;
-    spinlock_unlock(&g_tcp_lock);
+    spinlock_unlock_irqrestore(&g_tcp_lock, flags);
     pr_debug("[TCP] Full TCP 11-state protocol engine initialized.\n");
 }
 
@@ -124,6 +162,40 @@ static s64 tcp_send_packet(tcp_sock_t *sock, u8 flags, const void *payload, size
     return ipv4_send(buf, sock->remote_ip, IP_PROTO_TCP);
 }
 
+/*
+ * Resend the connection's still-unacknowledged SYN (SYN_SENT) or SYN-ACK
+ * (SYN_RECEIVED) exactly as first sent — same sequence number, no sequence
+ * space consumed a second time. tcp_send_packet() cannot be reused for
+ * this: it always advances snd_nxt on the assumption that every call is a
+ * new segment, which is exactly wrong for one being sent again — a second
+ * call after the first already moved snd_nxt from iss to iss+1 would put
+ * iss+1 on the wire as if the peer's first SYN-ACK had already arrived,
+ * desynchronising the handshake instead of repeating it. In SYN_SENT and
+ * SYN_RECEIVED there is always exactly one unacknowledged control byte, at
+ * sequence number iss, so that is what goes back out — snd_una/snd_nxt are
+ * untouched. See tcp_timer_tick() for the caller.
+ */
+static s64 tcp_retransmit_syn(tcp_sock_t *sock, u8 flags)
+{
+    net_buf_t *buf = net_buf_alloc(NET_BUF_HEADROOM + sizeof(tcp_hdr_t));
+    if (!buf) return -ENOMEM;
+
+    net_buf_reserve(buf, NET_BUF_HEADROOM);
+
+    tcp_hdr_t *tcp = (tcp_hdr_t *)net_buf_put(buf, sizeof(tcp_hdr_t));
+    tcp->src_port = htons(sock->local_port);
+    tcp->dst_port = htons(sock->remote_port);
+    tcp->seq_num = htonl(sock->iss);
+    tcp->ack_num = (flags & TCP_FLAG_ACK) ? htonl(sock->rcv_nxt) : 0;
+    tcp->data_offset = (sizeof(tcp_hdr_t) / 4) << 4;
+    tcp->flags = flags;
+    tcp->window_size = htons((u16)sock->rcv_wnd);
+    tcp->checksum = 0;
+    tcp->urgent_pointer = 0;
+
+    return ipv4_send(buf, sock->remote_ip, IP_PROTO_TCP);
+}
+
 /* tcp_sock_get()/tcp_sock_put() — see the refcnt comment in tcp.h.
  *
  * tcp_sock_get() must only be called while still holding g_tcp_lock, on a
@@ -175,10 +247,10 @@ tcp_sock_t *tcp_socket_create(void)
     s->backlog_count = 0;
     s->backlog_max = 0;
 
-    spinlock_lock(&g_tcp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_tcp_lock);
     s->next = g_tcp_sockets;
     g_tcp_sockets = s;
-    spinlock_unlock(&g_tcp_lock);
+    spinlock_unlock_irqrestore(&g_tcp_lock, flags);
 
     return s;
 }
@@ -187,7 +259,7 @@ void tcp_socket_close(tcp_sock_t *sock)
 {
     if (!sock) return;
 
-    spinlock_lock(&sock->lock);
+    irqflags_t sock_flags = spinlock_lock_irqsave(&sock->lock);
     if (sock->state == TCP_STATE_ESTABLISHED || sock->state == TCP_STATE_CLOSE_WAIT) {
         /* Initiate graceful teardown (FIN) */
         tcp_send_packet(sock, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
@@ -212,11 +284,11 @@ void tcp_socket_close(tcp_sock_t *sock)
     if (sock->tx_wait_thread) { sched_unblock(sock->tx_wait_thread); sock->tx_wait_thread = NULL; }
     if (sock->conn_wait_thread) { sched_unblock(sock->conn_wait_thread); sock->conn_wait_thread = NULL; }
     if (sock->accept_wait_thread) { sched_unblock(sock->accept_wait_thread); sock->accept_wait_thread = NULL; }
-    spinlock_unlock(&sock->lock);
+    spinlock_unlock_irqrestore(&sock->lock, sock_flags);
 
     for (int i = 0; i < norphans; i++) tcp_socket_close(orphans[i]);
 
-    spinlock_lock(&g_tcp_lock);
+    irqflags_t list_flags = spinlock_lock_irqsave(&g_tcp_lock);
     tcp_sock_t **curr = &g_tcp_sockets;
     while (*curr) {
         if (*curr == sock) {
@@ -225,7 +297,7 @@ void tcp_socket_close(tcp_sock_t *sock)
         }
         curr = &(*curr)->next;
     }
-    spinlock_unlock(&g_tcp_lock);
+    spinlock_unlock_irqrestore(&g_tcp_lock, list_flags);
 
     /* Drops the creator's reference; a concurrent tcp_input() holding its
      * own (see tcp_sock_get()) keeps the socket alive until it is done. */
@@ -260,22 +332,22 @@ int tcp_bind(tcp_sock_t *sock, const u8 ip[4], u16 port)
 {
     if (!sock) return -EINVAL;
 
-    spinlock_lock(&g_tcp_lock);
-    spinlock_lock(&sock->lock);
+    irqflags_t list_flags = spinlock_lock_irqsave(&g_tcp_lock);
+    irqflags_t sock_flags = spinlock_lock_irqsave(&sock->lock);
 
     if (port == 0) {
         port = tcp_alloc_ephemeral_port();
         if (port == 0) {
-            spinlock_unlock(&sock->lock);
-            spinlock_unlock(&g_tcp_lock);
+            spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+            spinlock_unlock_irqrestore(&g_tcp_lock, list_flags);
             return -EADDRINUSE;
         }
     } else {
         tcp_sock_t *cur = g_tcp_sockets;
         while (cur) {
             if (cur != sock && cur->bound && cur->local_port == port) {
-                spinlock_unlock(&sock->lock);
-                spinlock_unlock(&g_tcp_lock);
+                spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+                spinlock_unlock_irqrestore(&g_tcp_lock, list_flags);
                 return -EADDRINUSE;
             }
             cur = cur->next;
@@ -287,8 +359,8 @@ int tcp_bind(tcp_sock_t *sock, const u8 ip[4], u16 port)
     else memset(sock->local_ip, 0, 4);
     sock->bound = true;
 
-    spinlock_unlock(&sock->lock);
-    spinlock_unlock(&g_tcp_lock);
+    spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+    spinlock_unlock_irqrestore(&g_tcp_lock, list_flags);
 
     return 0;
 }
@@ -301,11 +373,11 @@ int tcp_listen(tcp_sock_t *sock, int backlog)
         if (res < 0) return res;
     }
 
-    spinlock_lock(&sock->lock);
+    irqflags_t flags = spinlock_lock_irqsave(&sock->lock);
     sock->state = TCP_STATE_LISTEN;
     sock->backlog_max = (backlog > TCP_MAX_BACKLOG) ? TCP_MAX_BACKLOG : (backlog <= 0 ? 5 : backlog);
     sock->backlog_count = 0;
-    spinlock_unlock(&sock->lock);
+    spinlock_unlock_irqrestore(&sock->lock, flags);
 
     return 0;
 }
@@ -315,7 +387,7 @@ tcp_sock_t *tcp_accept(tcp_sock_t *listener, u8 client_ip_out[4], u16 *client_po
     if (!listener || listener->state != TCP_STATE_LISTEN) return NULL;
 
     for (;;) {
-        spinlock_lock(&listener->lock);
+        irqflags_t flags = spinlock_lock_irqsave(&listener->lock);
         if (listener->backlog_count > 0) {
             int ready_idx = -1;
             for (int i = 0; i < listener->backlog_count; i++) {
@@ -334,18 +406,18 @@ tcp_sock_t *tcp_accept(tcp_sock_t *listener, u8 client_ip_out[4], u16 *client_po
                 if (client_ip_out) memcpy(client_ip_out, client->remote_ip, 4);
                 if (client_port_out) *client_port_out = client->remote_port;
 
-                spinlock_unlock(&listener->lock);
+                spinlock_unlock_irqrestore(&listener->lock, flags);
                 return client;
             }
         }
 
         if (nonblock) {
-            spinlock_unlock(&listener->lock);
+            spinlock_unlock_irqrestore(&listener->lock, flags);
             return NULL;
         }
 
         listener->accept_wait_thread = sched_current_thread();
-        spinlock_unlock(&listener->lock);
+        spinlock_unlock_irqrestore(&listener->lock, flags);
         sched_block(THREAD_BLOCKED_PENDING);
     }
 }
@@ -359,7 +431,7 @@ int tcp_connect(tcp_sock_t *sock, const u8 dst_ip[4], u16 dst_port, bool nonbloc
         if (res < 0) return res;
     }
 
-    spinlock_lock(&sock->lock);
+    irqflags_t flags = spinlock_lock_irqsave(&sock->lock);
     memcpy(sock->remote_ip, dst_ip, 4);
     sock->remote_port = dst_port;
 
@@ -370,22 +442,39 @@ int tcp_connect(tcp_sock_t *sock, const u8 dst_ip[4], u16 dst_port, bool nonbloc
 
     /* Transmit initial SYN packet */
     tcp_send_packet(sock, TCP_FLAG_SYN, NULL, 0);
+    sock->rtx_count = 0;
+    sock->rtx_deadline = g_tcp_ticks + TCP_RTX_BASE_TIMEOUT;
 
     if (nonblock) {
-        spinlock_unlock(&sock->lock);
+        spinlock_unlock_irqrestore(&sock->lock, flags);
         return -EINPROGRESS;
     }
 
-    /* Block waiting for 3-way handshake completion */
+    /* Block waiting for 3-way handshake completion. A pending, unblocked
+     * signal (SIGALRM from an alarm()-based timeout being the common case —
+     * wget, curl and friends all use one) must break this out with -EINTR
+     * instead of spinning back to sleep forever: sched_block() only returns
+     * when *something* woke the thread, which includes a signal arriving
+     * with no state change at all. */
     while (sock->state == TCP_STATE_SYN_SENT) {
         sock->conn_wait_thread = sched_current_thread();
-        spinlock_unlock(&sock->lock);
+        spinlock_unlock_irqrestore(&sock->lock, flags);
         sched_block(THREAD_BLOCKED_PENDING);
-        spinlock_lock(&sock->lock);
+
+        process_t *p = sched_current_process();
+        if (p && (p->sig_pending & ~p->sig_blocked)) {
+            flags = spinlock_lock_irqsave(&sock->lock);
+            if (sock->conn_wait_thread == sched_current_thread())
+                sock->conn_wait_thread = NULL;
+            spinlock_unlock_irqrestore(&sock->lock, flags);
+            return -EINTR;
+        }
+
+        flags = spinlock_lock_irqsave(&sock->lock);
     }
 
     int result = (sock->state == TCP_STATE_ESTABLISHED) ? 0 : -ECONNREFUSED;
-    spinlock_unlock(&sock->lock);
+    spinlock_unlock_irqrestore(&sock->lock, flags);
     return result;
 }
 
@@ -414,7 +503,7 @@ s64 tcp_recv(tcp_sock_t *sock, void *buf, size_t max_len, bool nonblock)
     if (!sock || !buf || max_len == 0) return -EINVAL;
 
     for (;;) {
-        spinlock_lock(&sock->lock);
+        irqflags_t flags = spinlock_lock_irqsave(&sock->lock);
 
         if (sock->rx_len > 0) {
             size_t copy_len = (sock->rx_len < max_len) ? sock->rx_len : max_len;
@@ -423,24 +512,33 @@ s64 tcp_recv(tcp_sock_t *sock, void *buf, size_t max_len, bool nonblock)
             }
             sock->rx_head = (sock->rx_head + copy_len) % TCP_RX_BUF_SIZE;
             sock->rx_len -= copy_len;
-            spinlock_unlock(&sock->lock);
+            spinlock_unlock_irqrestore(&sock->lock, flags);
             return (s64)copy_len;
         }
 
         /* If connection was closed by peer and buffer is drained, return EOF */
         if (sock->state == TCP_STATE_CLOSE_WAIT || sock->state == TCP_STATE_CLOSED || sock->state == TCP_STATE_TIME_WAIT) {
-            spinlock_unlock(&sock->lock);
+            spinlock_unlock_irqrestore(&sock->lock, flags);
             return 0; /* EOF */
         }
 
         if (nonblock) {
-            spinlock_unlock(&sock->lock);
+            spinlock_unlock_irqrestore(&sock->lock, flags);
             return -(s64)EAGAIN;
         }
 
         sock->rx_wait_thread = sched_current_thread();
-        spinlock_unlock(&sock->lock);
+        spinlock_unlock_irqrestore(&sock->lock, flags);
         sched_block(THREAD_BLOCKED_PENDING);
+
+        process_t *p = sched_current_process();
+        if (p && (p->sig_pending & ~p->sig_blocked)) {
+            flags = spinlock_lock_irqsave(&sock->lock);
+            if (sock->rx_wait_thread == sched_current_thread())
+                sock->rx_wait_thread = NULL;
+            spinlock_unlock_irqrestore(&sock->lock, flags);
+            return -(s64)EINTR;
+        }
     }
 }
 
@@ -499,7 +597,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     }
 
     /* Find matching socket: 1. Exact 4-tuple match */
-    spinlock_lock(&g_tcp_lock);
+    irqflags_t list_flags = spinlock_lock_irqsave(&g_tcp_lock);
     tcp_sock_t *sock = NULL;
     tcp_sock_t *listener = NULL;
     tcp_sock_t *cur = g_tcp_sockets;
@@ -520,7 +618,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
      * just confirmed is still in the list — see tcp_sock_get()'s comment.
      * Every exit below this point must tcp_sock_put() it exactly once. */
     if (sock) tcp_sock_get(sock);
-    spinlock_unlock(&g_tcp_lock);
+    spinlock_unlock_irqrestore(&g_tcp_lock, list_flags);
 
     if (!sock) {
         /* No listener or connection: reply with RST if not incoming RST */
@@ -553,7 +651,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         return;
     }
 
-    spinlock_lock(&sock->lock);
+    irqflags_t sock_flags = spinlock_lock_irqsave(&sock->lock);
 
     /*
      * ── Sequence validation (RFC 793 §3.9, "SEGMENT ARRIVES") ─────────────
@@ -595,7 +693,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
                                 (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN));
             if (consumes_seq && !(flags & TCP_FLAG_RST))
                 tcp_send_packet(sock, TCP_FLAG_ACK, NULL, 0);
-            spinlock_unlock(&sock->lock);
+            spinlock_unlock_irqrestore(&sock->lock, sock_flags);
             net_buf_free(buf);
             tcp_sock_put(sock);
             return;
@@ -608,7 +706,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             u32 acked = ack_num - sock->snd_una;          /* modulo 2^32 */
             u32 in_flight = sock->snd_nxt - sock->snd_una;
             if (acked > in_flight) {
-                spinlock_unlock(&sock->lock);
+                spinlock_unlock_irqrestore(&sock->lock, sock_flags);
                 net_buf_free(buf);
                 tcp_sock_put(sock);
                 return;
@@ -624,7 +722,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             if (sock->rx_wait_thread) { sched_unblock(sock->rx_wait_thread); sock->rx_wait_thread = NULL; }
             if (sock->tx_wait_thread) { sched_unblock(sock->tx_wait_thread); sock->tx_wait_thread = NULL; }
             if (sock->conn_wait_thread) { sched_unblock(sock->conn_wait_thread); sock->conn_wait_thread = NULL; }
-            spinlock_unlock(&sock->lock);
+            spinlock_unlock_irqrestore(&sock->lock, sock_flags);
             net_buf_free(buf);
             tcp_sock_put(sock);
             return;
@@ -653,6 +751,8 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
 
                     /* Send SYN-ACK */
                     tcp_send_packet(child, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
+                    child->rtx_count = 0;
+                    child->rtx_deadline = g_tcp_ticks + TCP_RTX_BASE_TIMEOUT;
 
                     sock->backlog[sock->backlog_count++] = child;
                 }
@@ -671,6 +771,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             sock->rcv_nxt = seq_num + 1;
             sock->snd_una = ack_num;
             sock->state = TCP_STATE_ESTABLISHED;
+            sock->rtx_deadline = 0;  /* our SYN is acked; nothing left to retransmit */
 
             /* Send final ACK of 3-way handshake */
             tcp_send_packet(sock, TCP_FLAG_ACK, NULL, 0);
@@ -687,31 +788,32 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             seq_num == sock->rcv_nxt) {
             sock->snd_una = ack_num;
             sock->state = TCP_STATE_ESTABLISHED;
+            sock->rtx_deadline = 0;  /* our SYN-ACK is acked; nothing left to retransmit */
 
             /* Notify listener's accept thread.
              * BUG fix: must hold g_tcp_lock before walking g_tcp_sockets;
              * release sock->lock first to preserve ordering (g_tcp_lock -> sock->lock). */
             u16 my_local_port = sock->local_port;
-            spinlock_unlock(&sock->lock);
+            spinlock_unlock_irqrestore(&sock->lock, sock_flags);
 
-            spinlock_lock(&g_tcp_lock);
+            irqflags_t l_list_flags = spinlock_lock_irqsave(&g_tcp_lock);
             tcp_sock_t *l = g_tcp_sockets;
             while (l) {
                 if (l->state == TCP_STATE_LISTEN && l->local_port == my_local_port) {
-                    spinlock_lock(&l->lock);
+                    irqflags_t l_flags = spinlock_lock_irqsave(&l->lock);
                     if (l->accept_wait_thread) {
                         sched_unblock(l->accept_wait_thread);
                         l->accept_wait_thread = NULL;
                     }
-                    spinlock_unlock(&l->lock);
+                    spinlock_unlock_irqrestore(&l->lock, l_flags);
                     break;
                 }
                 l = l->next;
             }
-            spinlock_unlock(&g_tcp_lock);
+            spinlock_unlock_irqrestore(&g_tcp_lock, l_list_flags);
 
-            /* Re-acquire sock->lock so the outer spinlock_unlock() at line 623 is balanced */
-            spinlock_lock(&sock->lock);
+            /* Re-acquire sock->lock so the outer unlock below is balanced */
+            sock_flags = spinlock_lock_irqsave(&sock->lock);
         }
         break;
 
@@ -780,12 +882,139 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         break;
     }
 
-    spinlock_unlock(&sock->lock);
+    spinlock_unlock_irqrestore(&sock->lock, sock_flags);
     net_buf_free(buf);
     tcp_sock_put(sock);
 }
 
+/*
+ * Retransmit the handshake — and give up on it.
+ *
+ * Scope: this recovers a lost SYN (connecting out) or a lost SYN-ACK
+ * (accepting in) — the two failure modes that previously hung forever with
+ * nothing ever resending anything, no matter how long the caller waited.
+ * That was true even though the retry logic on the wire format (SYN,
+ * SYN-ACK) is trivial to redo idempotently: tcp_connect()/tcp_accept()
+ * simply never got a second chance, because nothing ever called this
+ * function — it existed as an empty stub with every socket it should have
+ * been driving already carrying the state (rtx_deadline/rtx_count in
+ * tcp.h) to do it.
+ *
+ * Deliberately out of scope: retransmitting lost *data* (TCP_STATE_
+ * ESTABLISHED) or a lost FIN. Data retransmission needs an actual unacked-
+ * data queue — tx_buf/tx_head/tx_tail/tx_len are declared in tcp_sock_t and
+ * allocated in tcp_socket_create(), but nothing anywhere writes to them;
+ * tcp_send() hands its caller's buffer straight to tcp_send_packet() and
+ * forgets it, so by the time a retransmit could fire there is nothing left
+ * to resend but the bytes themselves, which this function does not have.
+ * FIN retransmission has a sharper problem: tcp_socket_close() unlinks the
+ * socket from g_tcp_sockets and drops its own reference unconditionally,
+ * the moment it sends the FIN — a lost FIN's socket is usually already
+ * freed by the time this function next runs, so there is nothing here left
+ * to find. Both are real gaps, but closing either means changing what
+ * tcp_send()/tcp_socket_close() do, not just this function — a bigger,
+ * riskier change than a timer that was never wired up at all.
+ */
 void tcp_timer_tick(void)
 {
-    /* Maintenance timer tick for TCP state transitions / TIME_WAIT cleanup */
+    g_tcp_ticks++;
+
+    /* Snapshot every socket with a retransmit outstanding, taking a
+     * reference on each under g_tcp_lock — same discipline as tcp_input()'s
+     * lookup (see tcp_sock_get()'s comment) — so the per-socket work below
+     * can run without holding g_tcp_lock across it. */
+    tcp_sock_t *pending[MAX_TCP_SOCKETS];
+    int n = 0;
+
+    irqflags_t list_flags = spinlock_lock_irqsave(&g_tcp_lock);
+    for (tcp_sock_t *cur = g_tcp_sockets; cur && n < MAX_TCP_SOCKETS; cur = cur->next) {
+        if (cur->rtx_deadline != 0) {
+            tcp_sock_get(cur);
+            pending[n++] = cur;
+        }
+    }
+    spinlock_unlock_irqrestore(&g_tcp_lock, list_flags);
+
+    for (int i = 0; i < n; i++) {
+        tcp_sock_t *sock = pending[i];
+        irqflags_t sock_flags = spinlock_lock_irqsave(&sock->lock);
+
+        /* Rechecked under the lock: the handshake may have completed (or
+         * the socket moved on some other way) between the snapshot above
+         * and getting here. */
+        if (sock->rtx_deadline == 0 || g_tcp_ticks < sock->rtx_deadline) {
+            spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+            tcp_sock_put(sock);
+            continue;
+        }
+
+        if (sock->rtx_count >= TCP_RTX_MAX_RETRIES) {
+            /* Gave up. Only SYN_SENT and SYN_RECEIVED ever set
+             * rtx_deadline (see tcp_connect() and tcp_input()'s LISTEN
+             * case), so this is always one of those two. */
+            bool was_syn_received = (sock->state == TCP_STATE_SYN_RECEIVED);
+            u16 my_local_port = sock->local_port;
+
+            sock->state = TCP_STATE_CLOSED;
+            sock->rtx_deadline = 0;
+            if (sock->conn_wait_thread) {
+                sched_unblock(sock->conn_wait_thread);
+                sock->conn_wait_thread = NULL;
+            }
+            spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+
+            /* A dead half-open child otherwise sits in its listener's
+             * backlog forever — tcp_accept() only ever picks an
+             * ESTABLISHED/CLOSE_WAIT entry out of it, never a CLOSED one —
+             * quietly eating one backlog slot for the rest of the
+             * listener's life. Splice it out, the same way tcp_socket_
+             * close() already does for a listener's own orphans. */
+            if (was_syn_received) {
+                irqflags_t l_list_flags = spinlock_lock_irqsave(&g_tcp_lock);
+                tcp_sock_t *l = g_tcp_sockets;
+                while (l) {
+                    if (l->state == TCP_STATE_LISTEN && l->local_port == my_local_port) {
+                        irqflags_t l_flags = spinlock_lock_irqsave(&l->lock);
+                        for (int j = 0; j < l->backlog_count; j++) {
+                            if (l->backlog[j] == sock) {
+                                for (int k = j; k < l->backlog_count - 1; k++)
+                                    l->backlog[k] = l->backlog[k + 1];
+                                l->backlog_count--;
+                                break;
+                            }
+                        }
+                        spinlock_unlock_irqrestore(&l->lock, l_flags);
+                        break;
+                    }
+                    l = l->next;
+                }
+                spinlock_unlock_irqrestore(&g_tcp_lock, l_list_flags);
+            }
+        } else {
+            sock->rtx_count++;
+            switch (sock->state) {
+            case TCP_STATE_SYN_SENT:
+                tcp_retransmit_syn(sock, TCP_FLAG_SYN);
+                break;
+            case TCP_STATE_SYN_RECEIVED:
+                tcp_retransmit_syn(sock, TCP_FLAG_SYN | TCP_FLAG_ACK);
+                break;
+            default:
+                /* State moved on since rtx_deadline was set (e.g. straight
+                 * to CLOSED some other way) without clearing it — nothing
+                 * to resend. */
+                sock->rtx_deadline = 0;
+                break;
+            }
+
+            if (sock->rtx_deadline != 0) {
+                u32 backoff = TCP_RTX_BASE_TIMEOUT << sock->rtx_count;
+                if (backoff > TCP_RTX_MAX_BACKOFF) backoff = TCP_RTX_MAX_BACKOFF;
+                sock->rtx_deadline = g_tcp_ticks + backoff;
+            }
+            spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+        }
+
+        tcp_sock_put(sock);
+    }
 }

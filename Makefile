@@ -248,6 +248,7 @@ KERNEL_C_SRCS := \
     drivers/gpu/drm/drm_ioctl.c \
     drivers/gpu/drm/drm_drv.c \
     drivers/gpu/drm/drm_vblank.c \
+    drivers/gpu/drm/drm_atomic.c \
     drivers/gpu/drm/bochs_drv.c \
     drivers/gpu/drm/vmwgfx_drv.c \
     drivers/gpu/drm/simpledrm.c \

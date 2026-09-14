@@ -26,6 +26,9 @@
 #include "../azwm/de_font.h"
 #include "../shared/ui_kit.h"
 
+#define MINIMP3_IMPLEMENTATION
+#include "../shared/minimp3.h"
+
 #define SERVER_CHAN  1
 #define WIN_W        620
 #define WIN_H        460
@@ -42,7 +45,8 @@
 
 typedef enum {
     TRACK_TYPE_SYNTH,
-    TRACK_TYPE_WAV
+    TRACK_TYPE_WAV,
+    TRACK_TYPE_MP3
 } track_type_t;
 
 typedef struct {
@@ -54,12 +58,13 @@ typedef struct {
     unsigned int total_seconds;
     unsigned int total_frames;
 
-    /* WAV playback metadata */
+    /* WAV / MP3 playback metadata */
     int channels;
     int sample_rate;
     int bits_per_sample;
     size_t data_offset;
     size_t data_size;
+    int bitrate_kbps;
 
     /* Synth playback metadata */
     int bpm;
@@ -110,12 +115,25 @@ static int g_playlist_scroll = 0;
 static unsigned int g_frames_played = 0;
 static int g_dsp_fd = -1;
 static int g_wav_fd = -1;
+static int g_mp3_fd = -1;
 static unsigned int g_tick = 0;
 
 /* Resampling and streaming state for WAV files */
 static unsigned int g_wav_sample_accum = 0; /* fractional sample accumulator (Q16) */
 static short g_last_wav_l = 0, g_last_wav_r = 0;
 static short g_next_wav_l = 0, g_next_wav_r = 0;
+
+/* Resampling and streaming state for MP3 files (SIMD-accelerated via SSE/SSE2) */
+static mp3dec_t g_mp3_dec;
+static uint8_t g_mp3_inbuf[8192];
+static int g_mp3_inbytes = 0;
+static int g_mp3_inoff = 0;
+static short g_mp3_pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+static int g_mp3_pcm_count = 0;
+static int g_mp3_pcm_pos = 0;
+static unsigned int g_mp3_sample_accum = 0;
+static short g_last_mp3_l = 0, g_last_mp3_r = 0;
+static short g_next_mp3_l = 0, g_next_mp3_r = 0;
 
 /* Synth generator state */
 static int g_note_idx = 0;
@@ -295,6 +313,165 @@ static int parse_wav_file(const char *path, track_t *t)
     return 0;
 }
 
+/* ── MP3 File Parsing (ID3v1/ID3v2 & Header Extraction) ──────────────────── */
+static int parse_mp3_file(const char *path, track_t *t)
+{
+    int fd = open(path, O_RDONLY, 0);
+    if (fd < 0) return -1;
+
+    off_t file_size = lseek(fd, 0, SEEK_END);
+    if (file_size <= 64) { close(fd); return -1; }
+    lseek(fd, 0, SEEK_SET);
+
+    unsigned char header[10];
+    int rd = (int)read(fd, header, 10);
+    if (rd < 10) { close(fd); return -1; }
+
+    size_t data_offset = 0;
+    char title[64] = {0};
+    char artist[64] = {0};
+
+    /* Check ID3v2 tag at file start */
+    if (header[0] == 'I' && header[1] == 'D' && header[2] == '3') {
+        int tag_size = ((header[6] & 0x7f) << 21) |
+                       ((header[7] & 0x7f) << 14) |
+                       ((header[8] & 0x7f) << 7)  |
+                       (header[9] & 0x7f);
+        data_offset = 10 + (size_t)tag_size;
+
+        /* Scan ID3v2 frames for TIT2 / TPE1 */
+        if (tag_size > 0 && tag_size < 32768) {
+            unsigned char *tag_data = (unsigned char *)malloc((size_t)tag_size);
+            if (tag_data) {
+                lseek(fd, 10, SEEK_SET);
+                int tag_rd = (int)read(fd, tag_data, (size_t)tag_size);
+                int pos = 0;
+                while (pos + 10 < tag_rd) {
+                    if (tag_data[pos] == 0) break;
+                    char fid[5];
+                    fid[0] = (char)tag_data[pos];
+                    fid[1] = (char)tag_data[pos+1];
+                    fid[2] = (char)tag_data[pos+2];
+                    fid[3] = (char)tag_data[pos+3];
+                    fid[4] = '\0';
+                    int fsize = ((int)tag_data[pos+4] << 24) | ((int)tag_data[pos+5] << 16) |
+                                ((int)tag_data[pos+6] << 8)  | (int)tag_data[pos+7];
+                    if (header[3] == 4) {
+                        fsize = ((tag_data[pos+4] & 0x7f) << 21) | ((tag_data[pos+5] & 0x7f) << 14) |
+                                ((tag_data[pos+6] & 0x7f) << 7)  | (tag_data[pos+7] & 0x7f);
+                    }
+                    pos += 10;
+                    if (pos + fsize > tag_rd || fsize <= 1) break;
+
+                    int enc = tag_data[pos];
+                    const char *txt = (const char *)&tag_data[pos + 1];
+                    int tlen = fsize - 1;
+                    if (strcmp(fid, "TIT2") == 0 && !title[0]) {
+                        if (enc == 0 || enc == 3) {
+                            int cp = (tlen < (int)sizeof(title) - 1) ? tlen : (int)sizeof(title) - 1;
+                            memcpy(title, txt, (size_t)cp);
+                            title[cp] = '\0';
+                        }
+                    } else if (strcmp(fid, "TPE1") == 0 && !artist[0]) {
+                        if (enc == 0 || enc == 3) {
+                            int cp = (tlen < (int)sizeof(artist) - 1) ? tlen : (int)sizeof(artist) - 1;
+                            memcpy(artist, txt, (size_t)cp);
+                            artist[cp] = '\0';
+                        }
+                    }
+                    pos += fsize;
+                }
+                free(tag_data);
+            }
+        }
+    }
+
+    /* Check ID3v1 trailer at file end if tags missing */
+    if (file_size >= 128 && (!title[0] || !artist[0])) {
+        lseek(fd, file_size - 128, SEEK_SET);
+        unsigned char id3v1[128];
+        if (read(fd, id3v1, 128) == 128 && id3v1[0] == 'T' && id3v1[1] == 'A' && id3v1[2] == 'G') {
+            char t1[31] = {0}, a1[31] = {0};
+            memcpy(t1, id3v1 + 3, 30);
+            memcpy(a1, id3v1 + 33, 30);
+            for (int k = 29; k >= 0 && t1[k] == ' '; k--) t1[k] = '\0';
+            for (int k = 29; k >= 0 && a1[k] == ' '; k--) a1[k] = '\0';
+            if (!title[0] && t1[0]) strncpy(title, t1, sizeof(title)-1);
+            if (!artist[0] && a1[0]) strncpy(artist, a1, sizeof(artist)-1);
+        }
+    }
+
+    /* Read first audio chunk to detect frame info */
+    lseek(fd, (off_t)data_offset, SEEK_SET);
+    unsigned char first_chunk[8192];
+    int fc_len = (int)read(fd, first_chunk, sizeof(first_chunk));
+    close(fd);
+
+    if (fc_len <= 0) return -1;
+
+    mp3dec_t dec;
+    mp3dec_init(&dec);
+    mp3dec_frame_info_t info;
+    short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+    int samples = mp3dec_decode_frame(&dec, first_chunk, fc_len, pcm, &info);
+    if (samples <= 0 || info.hz <= 0 || info.channels <= 0 || info.bitrate_kbps <= 0) {
+        int off = 0;
+        while (off + 4 < fc_len) {
+            if (first_chunk[off] == 0xFF && (first_chunk[off + 1] & 0xE0) == 0xE0) {
+                samples = mp3dec_decode_frame(&dec, first_chunk + off, fc_len - off, pcm, &info);
+                if (samples > 0 && info.hz > 0 && info.channels > 0 && info.bitrate_kbps > 0) {
+                    data_offset += (size_t)off;
+                    break;
+                }
+            }
+            off++;
+        }
+        if (samples <= 0 || info.hz <= 0) return -1;
+    }
+
+    t->type = TRACK_TYPE_MP3;
+    strncpy(t->filepath, path, sizeof(t->filepath) - 1);
+    t->channels = info.channels;
+    t->sample_rate = info.hz;
+    t->bits_per_sample = 16;
+    t->data_offset = data_offset;
+    size_t audio_bytes = (file_size > (off_t)data_offset) ? (size_t)(file_size - (off_t)data_offset) : 0;
+    t->data_size = audio_bytes;
+    t->bitrate_kbps = info.bitrate_kbps;
+
+    if (!title[0]) {
+        const char *base = strrchr(path, '/');
+        base = base ? (base + 1) : path;
+        strncpy(t->title, base, sizeof(t->title) - 1);
+        char *dot = strrchr(t->title, '.');
+        if (dot) *dot = '\0';
+        for (int i = 0; t->title[i]; i++) {
+            if (t->title[i] == '_') t->title[i] = ' ';
+        }
+    } else {
+        strncpy(t->title, title, sizeof(t->title) - 1);
+    }
+
+    if (!artist[0]) {
+        strncpy(t->artist, "Azami MP3 Audio", sizeof(t->artist) - 1);
+    } else {
+        strncpy(t->artist, artist, sizeof(t->artist) - 1);
+    }
+
+    unsigned int dur_sec = 0;
+    if (info.bitrate_kbps > 0) {
+        dur_sec = (unsigned int)(((unsigned long long)audio_bytes * 8) / ((unsigned long long)info.bitrate_kbps * 1000));
+    }
+    t->total_seconds = dur_sec;
+    t->total_frames = dur_sec * SAMPLE_RATE;
+
+    snprintf(t->format_info, sizeof(t->format_info), "%d.%dkHz %dk %s",
+             info.hz / 1000, (info.hz % 1000) / 100, info.bitrate_kbps,
+             (info.channels == 1) ? "Mono" : "Stereo");
+
+    return 0;
+}
+
 /* ── Playlist & Directory Scanner ─────────────────────────────────────────── */
 static void scan_directory(const char *dirpath)
 {
@@ -324,6 +501,24 @@ static void scan_directory(const char *dirpath)
             track_t trk;
             memset(&trk, 0, sizeof(trk));
             if (parse_wav_file(full_path, &trk) == 0) {
+                g_tracks[g_num_tracks++] = trk;
+            }
+        } else if (strcasecmp(de->d_name + len - 4, ".mp3") == 0) {
+            char full_path[512];
+            snprintf(full_path, sizeof(full_path), "%s/%s", dirpath, de->d_name);
+
+            int exists = 0;
+            for (int i = 0; i < g_num_tracks; i++) {
+                if (strcmp(g_tracks[i].filepath, full_path) == 0) {
+                    exists = 1;
+                    break;
+                }
+            }
+            if (exists) continue;
+
+            track_t trk;
+            memset(&trk, 0, sizeof(trk));
+            if (parse_mp3_file(full_path, &trk) == 0) {
                 g_tracks[g_num_tracks++] = trk;
             }
         }
@@ -378,8 +573,15 @@ static void populate_playlist(const char *arg_file)
     if (arg_file && arg_file[0]) {
         track_t trk;
         memset(&trk, 0, sizeof(trk));
-        if (parse_wav_file(arg_file, &trk) == 0) {
-            g_tracks[g_num_tracks++] = trk;
+        size_t alen = strlen(arg_file);
+        if (alen >= 4 && strcasecmp(arg_file + alen - 4, ".mp3") == 0) {
+            if (parse_mp3_file(arg_file, &trk) == 0) {
+                g_tracks[g_num_tracks++] = trk;
+            }
+        } else {
+            if (parse_wav_file(arg_file, &trk) == 0) {
+                g_tracks[g_num_tracks++] = trk;
+            }
         }
     }
 
@@ -631,6 +833,120 @@ static void wav_chunk(short *out, int nframes)
     }
 }
 
+/* Read one raw sample frame from MP3 stream with SIMD decoding */
+static int read_mp3_raw_sample(short *l_out, short *r_out)
+{
+    const track_t *trk = &g_tracks[g_current_track];
+
+    while (g_mp3_pcm_pos >= g_mp3_pcm_count) {
+        if (g_mp3_fd < 0) return -1;
+
+        if (g_mp3_inbytes - g_mp3_inoff < 2048) {
+            int rem = g_mp3_inbytes - g_mp3_inoff;
+            if (rem > 0 && g_mp3_inoff > 0) {
+                memmove(g_mp3_inbuf, g_mp3_inbuf + g_mp3_inoff, (size_t)rem);
+            }
+            g_mp3_inoff = 0;
+            g_mp3_inbytes = rem;
+            int n = (int)read(g_mp3_fd, g_mp3_inbuf + g_mp3_inbytes, sizeof(g_mp3_inbuf) - (size_t)g_mp3_inbytes);
+            if (n > 0) {
+                g_mp3_inbytes += n;
+            }
+        }
+
+        if (g_mp3_inbytes - g_mp3_inoff <= 0) {
+            return -1;
+        }
+
+        mp3dec_frame_info_t info;
+        int samples = mp3dec_decode_frame(&g_mp3_dec,
+                                          g_mp3_inbuf + g_mp3_inoff,
+                                          g_mp3_inbytes - g_mp3_inoff,
+                                          g_mp3_pcm,
+                                          &info);
+        g_mp3_inoff += info.frame_bytes;
+        if (samples > 0) {
+            g_mp3_pcm_count = samples * info.channels;
+            g_mp3_pcm_pos = 0;
+            break;
+        } else if (info.frame_bytes == 0) {
+            g_mp3_inoff++;
+        }
+    }
+
+    if (g_mp3_pcm_pos + (trk->channels > 1 ? 2 : 1) > g_mp3_pcm_count) {
+        return -1;
+    }
+
+    *l_out = g_mp3_pcm[g_mp3_pcm_pos++];
+    *r_out = (trk->channels > 1) ? g_mp3_pcm[g_mp3_pcm_pos++] : *l_out;
+    return 0;
+}
+
+static void mp3_chunk(short *out, int nframes)
+{
+    track_t *trk = &g_tracks[g_current_track];
+
+    if (g_mp3_fd < 0) {
+        g_mp3_fd = open(trk->filepath, O_RDONLY, 0);
+        if (g_mp3_fd < 0) {
+            g_is_playing = 0;
+            return;
+        }
+        lseek(g_mp3_fd, (off_t)trk->data_offset, SEEK_SET);
+        mp3dec_init(&g_mp3_dec);
+        g_mp3_inbytes = 0;
+        g_mp3_inoff = 0;
+        g_mp3_pcm_count = 0;
+        g_mp3_pcm_pos = 0;
+        read_mp3_raw_sample(&g_last_mp3_l, &g_last_mp3_r);
+        read_mp3_raw_sample(&g_next_mp3_l, &g_next_mp3_r);
+        g_mp3_sample_accum = 0;
+    }
+
+    unsigned int ratio = (unsigned int)(((unsigned long long)trk->sample_rate << 16) / SAMPLE_RATE);
+
+    for (int i = 0; i < nframes; i++) {
+        while (g_mp3_sample_accum >= 0x10000) {
+            g_mp3_sample_accum -= 0x10000;
+            g_last_mp3_l = g_next_mp3_l;
+            g_last_mp3_r = g_next_mp3_r;
+            if (read_mp3_raw_sample(&g_next_mp3_l, &g_next_mp3_r) < 0) {
+                close(g_mp3_fd);
+                g_mp3_fd = -1;
+
+                if (g_loop_mode == 1) {
+                    g_frames_played = 0;
+                } else if (g_loop_mode == 0) {
+                    g_current_track = (g_current_track + 1) % g_num_tracks;
+                    g_frames_played = 0;
+                } else {
+                    g_is_playing = 0;
+                }
+                g_ui_dirty = 1;
+                return;
+            }
+        }
+
+        int frac = g_mp3_sample_accum & 0xFFFF;
+        int l = g_last_mp3_l + (((g_next_mp3_l - g_last_mp3_l) * frac) >> 16);
+        int r = g_last_mp3_r + (((g_next_mp3_r - g_last_mp3_r) * frac) >> 16);
+
+        l = (l * g_volume) / 100;
+        r = (r * g_volume) / 100;
+
+        if (l > 32767) l = 32767;
+        if (l < -32768) l = -32768;
+        if (r > 32767) r = 32767;
+        if (r < -32768) r = -32768;
+
+        out[i * CHANNELS]     = (short)l;
+        out[i * CHANNELS + 1] = (short)r;
+
+        g_mp3_sample_accum += ratio;
+    }
+}
+
 static void audio_step(void)
 {
     if (!g_is_playing || g_num_tracks == 0) return;
@@ -648,6 +964,8 @@ static void audio_step(void)
         track_t *cur = &g_tracks[g_current_track];
         if (cur->type == TRACK_TYPE_WAV) {
             wav_chunk(g_pending, CHUNK_FRAMES);
+        } else if (cur->type == TRACK_TYPE_MP3) {
+            mp3_chunk(g_pending, CHUNK_FRAMES);
         } else {
             synth_chunk(g_pending, CHUNK_FRAMES);
         }
@@ -685,12 +1003,29 @@ static void seek_to_frame(unsigned int frame)
         if (g_wav_fd >= 0) {
             unsigned int bytes_per_frame = (unsigned int)(trk->channels * (trk->bits_per_sample / 8));
             double pct = (double)frame / (double)(trk->total_frames ? trk->total_frames : 1);
-            off_t byte_off = trk->data_offset + (off_t)(pct * trk->data_size);
+            off_t byte_off = (off_t)trk->data_offset + (off_t)(pct * trk->data_size);
             byte_off -= (byte_off % bytes_per_frame);
             lseek(g_wav_fd, byte_off, SEEK_SET);
             read_wav_raw_sample(g_wav_fd, trk->channels, trk->bits_per_sample, &g_last_wav_l, &g_last_wav_r);
             read_wav_raw_sample(g_wav_fd, trk->channels, trk->bits_per_sample, &g_next_wav_l, &g_next_wav_r);
             g_wav_sample_accum = 0;
+        }
+    } else if (trk->type == TRACK_TYPE_MP3) {
+        if (g_mp3_fd < 0) {
+            g_mp3_fd = open(trk->filepath, O_RDONLY, 0);
+        }
+        if (g_mp3_fd >= 0) {
+            double pct = (double)frame / (double)(trk->total_frames ? trk->total_frames : 1);
+            off_t byte_off = (off_t)trk->data_offset + (off_t)(pct * trk->data_size);
+            lseek(g_mp3_fd, byte_off, SEEK_SET);
+            mp3dec_init(&g_mp3_dec);
+            g_mp3_inbytes = 0;
+            g_mp3_inoff = 0;
+            g_mp3_pcm_count = 0;
+            g_mp3_pcm_pos = 0;
+            read_mp3_raw_sample(&g_last_mp3_l, &g_last_mp3_r);
+            read_mp3_raw_sample(&g_next_mp3_l, &g_next_mp3_r);
+            g_mp3_sample_accum = 0;
         }
     } else {
         int spb = (SAMPLE_RATE * 60) / (trk->bpm * 4);
@@ -713,6 +1048,10 @@ static void select_track(int idx)
     if (g_wav_fd >= 0) {
         close(g_wav_fd);
         g_wav_fd = -1;
+    }
+    if (g_mp3_fd >= 0) {
+        close(g_mp3_fd);
+        g_mp3_fd = -1;
     }
     g_current_track = ((idx % g_num_tracks) + g_num_tracks) % g_num_tracks;
     seek_to_frame(0);
@@ -875,8 +1214,10 @@ static void draw_player(void)
         snprintf(num_str, sizeof(num_str), "%2d.", t + 1);
         uk_draw_text(&g_win, 24, row_y + 7, num_str, active ? UK_MAUVE : UK_OVERLAY0);
 
-        const char *type_tag = (g_tracks[t].type == TRACK_TYPE_WAV) ? "[WAV]" : "[SYNTH]";
-        unsigned int tag_col = (g_tracks[t].type == TRACK_TYPE_WAV) ? UK_TEAL : UK_PEACH;
+        const char *type_tag = (g_tracks[t].type == TRACK_TYPE_WAV) ? "[WAV]" :
+                               ((g_tracks[t].type == TRACK_TYPE_MP3) ? "[MP3]" : "[SYNTH]");
+        unsigned int tag_col = (g_tracks[t].type == TRACK_TYPE_WAV) ? UK_TEAL :
+                               ((g_tracks[t].type == TRACK_TYPE_MP3) ? UK_SAPPHIRE : UK_PEACH);
         uk_draw_text(&g_win, 54, row_y + 7, type_tag, tag_col);
 
         uk_draw_text(&g_win, 114, row_y + 7, g_tracks[t].title, active ? UK_TEXT : UK_SUBTEXT1);
@@ -1046,6 +1387,7 @@ int main(int argc, char **argv)
     }
 
     if (g_wav_fd >= 0) close(g_wav_fd);
+    if (g_mp3_fd >= 0) close(g_mp3_fd);
     if (g_dsp_fd >= 0) close(g_dsp_fd);
     return 0;
 }

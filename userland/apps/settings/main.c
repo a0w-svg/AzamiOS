@@ -679,7 +679,7 @@ static void draw_network_tab(void)
     /* Telemetry strings */
     char rx_info[64] = "RX: 128 packets (14.2 KB)";
     char tx_info[64] = "TX: 64 packets (8.4 KB)";
-    int nfd = open("/proc/net", O_RDONLY, 0);
+    int nfd = open("/proc/net/dev", O_RDONLY, 0);
     if (nfd >= 0) {
         char nbuf[512];
         ssize_t n = read(nfd, nbuf, sizeof(nbuf) - 1);

@@ -18,18 +18,30 @@ static arp_entry_t g_arp_table[ARP_TABLE_SIZE];
 static spinlock_t  g_arp_lock = SPINLOCK_INIT;
 static u32         g_arp_ticks = 0;
 
+/* g_arp_lock uses spinlock_lock_irqsave()/_irqrestore() throughout this
+ * file, for the same reason as tcp.c's/udp.c's/dhcp.c's/ipv4.c's identical
+ * note: arp_input() runs from a timer interrupt on any CPU (net_poll() ->
+ * e1000_poll_rx() -> net_process_incoming()), and arp_resolve() — which
+ * takes this same lock — is reached both from ordinary process context
+ * (ipv4_send() from a socket syscall) and from that very interrupt path
+ * (ipv4_send() from tcp_input()/udp_input() sending a reply). A plain
+ * spinlock_lock() left interrupts enabled across arp_resolve()'s critical
+ * section, so the timer interrupt could land on the CPU already holding
+ * this lock and spin forever inside arp_input()'s own acquire. See
+ * kernel/net/tcp.c for the full writeup. */
+
 static inline u16 htons(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 static inline u16 ntohs(u16 v) { return htons(v); }
 
 void arp_init(void)
 {
-    spinlock_lock(&g_arp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_arp_lock);
     for (int i = 0; i < ARP_TABLE_SIZE; i++) {
         memset(&g_arp_table[i], 0, sizeof(arp_entry_t));
         g_arp_table[i].state = ARP_STATE_FREE;
         net_buf_queue_init(&g_arp_table[i].pending_queue);
     }
-    spinlock_unlock(&g_arp_lock);
+    spinlock_unlock_irqrestore(&g_arp_lock, flags);
     pr_debug("[ARP] Dynamic ARP cache subsystem initialized (%d entries).\n", ARP_TABLE_SIZE);
 }
 
@@ -118,7 +130,7 @@ int arp_resolve(const u8 ip[4], u8 mac_out[6], net_buf_t *pending_buf)
         return 0;
     }
 
-    spinlock_lock(&g_arp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_arp_lock);
 
     /* 1. Search existing entries */
     int free_slot = -1;
@@ -127,13 +139,13 @@ int arp_resolve(const u8 ip[4], u8 mac_out[6], net_buf_t *pending_buf)
             if (memcmp(g_arp_table[i].ip, ip, 4) == 0) {
                 if (g_arp_table[i].state == ARP_STATE_RESOLVED) {
                     memcpy(mac_out, g_arp_table[i].mac, 6);
-                    spinlock_unlock(&g_arp_lock);
+                    spinlock_unlock_irqrestore(&g_arp_lock, flags);
                     return 0;
                 } else if (g_arp_table[i].state == ARP_STATE_PENDING) {
                     if (pending_buf) {
                         net_buf_queue_push(&g_arp_table[i].pending_queue, pending_buf);
                     }
-                    spinlock_unlock(&g_arp_lock);
+                    spinlock_unlock_irqrestore(&g_arp_lock, flags);
                     return -1;
                 }
             }
@@ -158,7 +170,7 @@ int arp_resolve(const u8 ip[4], u8 mac_out[6], net_buf_t *pending_buf)
         net_buf_queue_push(&entry->pending_queue, pending_buf);
     }
 
-    spinlock_unlock(&g_arp_lock);
+    spinlock_unlock_irqrestore(&g_arp_lock, flags);
 
     /* Transmit initial ARP request broadcast */
     arp_send_request(ip);
@@ -178,7 +190,7 @@ void arp_input(const u8 *pkt, size_t len)
     u8 host_ip[4];
     net_get_ip(host_ip);
 
-    spinlock_lock(&g_arp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_arp_lock);
 
     /* Update or insert sender IP into ARP cache */
     arp_entry_t *match = NULL;
@@ -220,7 +232,7 @@ void arp_input(const u8 *pkt, size_t len)
         }
     }
 
-    spinlock_unlock(&g_arp_lock);
+    spinlock_unlock_irqrestore(&g_arp_lock, flags);
 
     /* If this is an ARP request asking for our IP address, send an ARP reply */
     if (oper == ARP_OP_REQUEST) {
@@ -232,7 +244,7 @@ void arp_input(const u8 *pkt, size_t len)
 
 void arp_timer_tick(void)
 {
-    spinlock_lock(&g_arp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_arp_lock);
     g_arp_ticks++;
 
     for (int i = 0; i < ARP_TABLE_SIZE; i++) {
@@ -258,12 +270,12 @@ void arp_timer_tick(void)
         }
     }
 
-    spinlock_unlock(&g_arp_lock);
+    spinlock_unlock_irqrestore(&g_arp_lock, flags);
 }
 
 void arp_print_table(void)
 {
-    spinlock_lock(&g_arp_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_arp_lock);
     pr_debug("=== ARP Cache Table ===\n");
     for (int i = 0; i < ARP_TABLE_SIZE; i++) {
         if (g_arp_table[i].state == ARP_STATE_RESOLVED) {
@@ -276,5 +288,5 @@ void arp_print_table(void)
                      g_arp_ticks - g_arp_table[i].timestamp);
         }
     }
-    spinlock_unlock(&g_arp_lock);
+    spinlock_unlock_irqrestore(&g_arp_lock, flags);
 }

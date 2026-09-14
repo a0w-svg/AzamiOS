@@ -156,6 +156,8 @@ BIN_APPS = \
     $(BIN_DIR)/xgui_demo.elf \
     $(BIN_DIR)/nc.elf \
     $(BIN_DIR)/curl.elf \
+    $(BIN_DIR)/pkg.elf \
+    $(BIN_DIR)/cowsay.elf \
     $(BIN_DIR)/httpd.elf \
     $(BIN_DIR)/config.elf \
     $(BIN_DIR)/test.elf \
@@ -220,15 +222,22 @@ BIN_APPS = \
     $(BIN_DIR)/getfattr.elf \
     $(BIN_DIR)/setfattr.elf \
     $(BIN_DIR)/autoaccept.elf \
-    $(BIN_DIR)/setfont.elf
+    $(BIN_DIR)/setfont.elf \
+    $(BIN_DIR)/imageviewer.elf \
+    $(BIN_DIR)/notes.elf \
+    $(BIN_DIR)/less.elf \
+    $(BIN_DIR)/bc.elf \
+    $(BIN_DIR)/hexedit.elf \
+    $(BIN_DIR)/fontviewer.elf \
+    $(BIN_DIR)/ide.elf
 
 
-.PHONY: all clean libc apps skeleton etc icons fonts music toolchain
+.PHONY: all clean libc apps skeleton etc icons fonts music images templates toolchain
 
-all: skeleton libc apps toolchain etc icons fonts music
+all: skeleton libc apps toolchain etc icons fonts music images templates pkgrepo
 
 skeleton:
-	@mkdir -p $(BUILD_DIR) $(BIN_DIR) $(SBIN_DIR) $(OBJ_DIR) $(BUILD_DIR)/etc $(BUILD_DIR)/boot $(BUILD_DIR)/dev $(BUILD_DIR)/proc $(BUILD_DIR)/sys $(BUILD_DIR)/root $(BUILD_DIR)/root/.config $(BUILD_DIR)/home/azami/Desktop $(BUILD_DIR)/home/azami/Music $(BUILD_DIR)/home/azami/.config $(BUILD_DIR)/desktop $(BUILD_DIR)/usr/bin $(BUILD_DIR)/usr/sbin $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/share/icons $(BUILD_DIR)/usr/share/wallpapers $(BUILD_DIR)/usr/share/fonts $(BUILD_DIR)/usr/share/themes $(BUILD_DIR)/usr/share/music $(BUILD_DIR)/music $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/var $(BUILD_DIR)/tmp
+	@mkdir -p $(BUILD_DIR) $(BIN_DIR) $(SBIN_DIR) $(OBJ_DIR) $(BUILD_DIR)/etc $(BUILD_DIR)/boot $(BUILD_DIR)/dev $(BUILD_DIR)/proc $(BUILD_DIR)/sys $(BUILD_DIR)/root $(BUILD_DIR)/root/.config $(BUILD_DIR)/home/azami/Desktop $(BUILD_DIR)/home/azami/Music $(BUILD_DIR)/home/azami/Pictures $(BUILD_DIR)/home/azami/Templates $(BUILD_DIR)/home/azami/.notes $(BUILD_DIR)/home/azami/.config $(BUILD_DIR)/desktop $(BUILD_DIR)/usr/bin $(BUILD_DIR)/usr/sbin $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/share/icons $(BUILD_DIR)/usr/share/wallpapers $(BUILD_DIR)/usr/share/fonts $(BUILD_DIR)/usr/share/themes $(BUILD_DIR)/usr/share/music $(BUILD_DIR)/usr/share/templates $(BUILD_DIR)/music $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/var $(BUILD_DIR)/tmp
 	@# ── Desktop theme files: /usr/share/themes/*.theme ──────────────────────
 	@# Data, not code — moved out of ui_kit.h so a new palette is a file drop,
 	@# not a recompile. Leading NN- keeps the historical theme_id order (see
@@ -297,14 +306,29 @@ toolchain: skeleton libc
 	done
 	@ln -sf /usr/bin/gcc $(BUILD_DIR)/bin/cc 2>/dev/null || cp $(BUILD_DIR)/usr/bin/gcc $(BUILD_DIR)/bin/cc
 	@ln -sf /usr/bin/gcc $(BUILD_DIR)/usr/bin/cc 2>/dev/null || true
+	@ln -sf /usr/bin/gcc $(BUILD_DIR)/usr/bin/x86_64-elf-gcc 2>/dev/null || true
+	@ln -sf /usr/bin/gcc $(BUILD_DIR)/bin/x86_64-elf-gcc 2>/dev/null || true
+	@ln -sf /usr/bin/as $(BUILD_DIR)/usr/bin/x86_64-elf-as 2>/dev/null || true
+	@ln -sf /usr/bin/as $(BUILD_DIR)/bin/x86_64-elf-as 2>/dev/null || true
 	@ln -sf /usr/bin/ld $(BUILD_DIR)/bin/ld.bfd 2>/dev/null || true
 	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/bin/ld.bfd 2>/dev/null || true
+	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/bin/x86_64-elf-ld 2>/dev/null || true
+	@ln -sf /usr/bin/ld $(BUILD_DIR)/bin/x86_64-elf-ld 2>/dev/null || true
 	@for pass in cc1 collect2 lto-wrapper liblto_plugin.so; do \
 		src="/home/a0wsvg/opt/cross-x86_64/libexec/gcc/x86_64-elf/14.2.0/$$pass"; \
 		if [ -f "$$src" ]; then \
 			strip --strip-debug "$$src" -o $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/$$pass 2>/dev/null || cp "$$src" $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/$$pass; \
 		fi; \
 	done
+	@ln -sf /usr/bin/as $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/as 2>/dev/null || true
+	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/ld 2>/dev/null || true
+	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/real-ld 2>/dev/null || true
+	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/cc1 $(BUILD_DIR)/usr/libexec/cc1 2>/dev/null || true
+	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/collect2 $(BUILD_DIR)/usr/libexec/collect2 2>/dev/null || true
+	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/lto-wrapper $(BUILD_DIR)/usr/libexec/lto-wrapper 2>/dev/null || true
+	@ln -sf /usr/bin/as $(BUILD_DIR)/usr/libexec/as 2>/dev/null || true
+	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/libexec/ld 2>/dev/null || true
+	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/libexec/real-ld 2>/dev/null || true
 
 
 	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/liblto_plugin.so $(BUILD_DIR)/usr/lib/bfd-plugins/liblto_plugin.so 2>/dev/null || true
@@ -313,12 +337,20 @@ toolchain: skeleton libc
 	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/lto-wrapper $(BUILD_DIR)/usr/bin/lto-wrapper 2>/dev/null || true
 	@cp -r /home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/ldscripts/* $(BUILD_DIR)/usr/lib/ldscripts/ 2>/dev/null || true
 	@cp -r /home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/ldscripts/* $(BUILD_DIR)/lib/ldscripts/ 2>/dev/null || true
+	@mkdir -p $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0/include $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0/include-fixed
+	@cp -r /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include/* $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0/include/ 2>/dev/null || true
+	@cp -r /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include-fixed/* $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0/include-fixed/ 2>/dev/null || true
 	@cp -r /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include/* $(BUILD_DIR)/usr/include/ 2>/dev/null || true
 	@cp -r libc/include/* $(BUILD_DIR)/usr/include/ 2>/dev/null || true
 	@cp -r libc/include/* $(BUILD_DIR)/usr/local/include/ 2>/dev/null || true
 	@mkdir -p $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf
 	@mkdir -p $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0
-	@mkdir -p $(BUILD_DIR)/x86_64-elf $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0
+	@mkdir -p $(BUILD_DIR)/lib/gcc/x86_64-elf/14.2.0
+	@mkdir -p $(BUILD_DIR)/usr/x86_64-elf $(BUILD_DIR)/x86_64-elf $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0
+	@ln -sf /usr/lib/gcc/x86_64-elf/14.2.0/include $(BUILD_DIR)/lib/gcc/x86_64-elf/14.2.0/include 2>/dev/null || true
+	@ln -sf /usr/lib/gcc/x86_64-elf/14.2.0/include-fixed $(BUILD_DIR)/lib/gcc/x86_64-elf/14.2.0/include-fixed 2>/dev/null || true
+	@ln -sf /usr/lib/gcc/x86_64-elf/14.2.0/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include 2>/dev/null || true
+	@ln -sf /usr/lib/gcc/x86_64-elf/14.2.0/include-fixed $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include-fixed 2>/dev/null || true
 	@ln -sf /usr/bin $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/bin 2>/dev/null || true
 	@ln -sf /usr/libexec $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/libexec 2>/dev/null || true
 	@ln -sf /usr/lib $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib 2>/dev/null || true
@@ -326,11 +358,15 @@ toolchain: skeleton libc
 	@ln -sf /usr/bin $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin 2>/dev/null || true
 	@ln -sf /usr/lib $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib 2>/dev/null || true
 	@ln -sf /usr/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include 2>/dev/null || true
-	@ln -sf /usr/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/sys-include 2>/dev/null || true
+	@ln -sf /usr/local/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/sys-include 2>/dev/null || true
+	@ln -sf /usr/bin $(BUILD_DIR)/usr/x86_64-elf/bin 2>/dev/null || true
+	@ln -sf /usr/lib $(BUILD_DIR)/usr/x86_64-elf/lib 2>/dev/null || true
+	@ln -sf /usr/include $(BUILD_DIR)/usr/x86_64-elf/include 2>/dev/null || true
+	@ln -sf /usr/local/include $(BUILD_DIR)/usr/x86_64-elf/sys-include 2>/dev/null || true
 	@ln -sf /usr/bin $(BUILD_DIR)/x86_64-elf/bin 2>/dev/null || true
 	@ln -sf /usr/lib $(BUILD_DIR)/x86_64-elf/lib 2>/dev/null || true
 	@ln -sf /usr/include $(BUILD_DIR)/x86_64-elf/include 2>/dev/null || true
-	@ln -sf /usr/include $(BUILD_DIR)/x86_64-elf/sys-include 2>/dev/null || true
+	@ln -sf /usr/local/include $(BUILD_DIR)/x86_64-elf/sys-include 2>/dev/null || true
 	@ln -sf /usr/libexec $(BUILD_DIR)/x86_64-elf/libexec 2>/dev/null || true
 	@for d in $(BUILD_DIR)/usr/lib $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/usr/local/lib $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0 $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0 $(BUILD_DIR)/x86_64-elf/lib; do \
 		mkdir -p "$$d" 2>/dev/null || true; \
@@ -418,29 +454,29 @@ etc: skeleton
 	@printf "[power]\nprofile=1\nscreen_timeout=15\nacpi_pm=1\n" > $(BUILD_DIR)/etc/power.conf
 	@printf "# AzamiOS Security & Auto-Accept Configuration\nipc_autoaccept=1\nadmin_autoaccept=1\ndhcp_autoaccept=1\ntrace_autoaccept=1\n" > $(BUILD_DIR)/etc/security.conf
 	@printf "# AzamiOS Desktop Session Configuration\n[services]\nwallpaper=/sbin/wallpaper.elf\ntaskbar=/sbin/taskbar.elf\nnotifyd=/sbin/notifyd.elf\n\n[autostart]\nsettings=/bin/settings.elf\nterminal=/bin/terminal.elf\n" > $(BUILD_DIR)/etc/session.conf
-	@printf "# Desktop Icons: Label|Path|Glyph|0xAARRGGBB|IsDir|FileType\nTerminal|/bin/terminal.elf|>_|0xFF89B4FA|0|0\nFiles|/bin/filemanager.elf|[_]|0xFFF9E2AF|0|0\nMusic|/music|Mus|0xFFF5C2E7|1|2\nAudio|/bin/audioplayer.elf|Snd|0xFFF5C2E7|0|0\nCalculator|/bin/calculator.elf|+-|0xFFFAB387|0|0\nText Editor|/bin/texteditor.elf|Txt|0xFF94E2D5|0|0\nPaint|/bin/paint.elf|Art|0xFFCBA6F7|0|0\nSys Monitor|/bin/sysmon.elf|CPU|0xFFF38BA8|0|0\nSettings|/bin/settings.elf|Set|0xFF74C7EC|0|0\n" > $(BUILD_DIR)/etc/desktop_icons.conf
+	@printf "# Desktop Icons: Label|Path|Glyph|0xAARRGGBB|IsDir|FileType\nTerminal|/bin/terminal.elf|>_|0xFF89B4FA|0|0\nFiles|/bin/filemanager.elf|[_]|0xFFF9E2AF|0|0\nPhotos|/bin/imageviewer.elf|Pic|0xFF89DCEB|0|0\nNotes|/bin/notes.elf|Not|0xFFFFF275|0|0\nMusic|/music|Mus|0xFFF5C2E7|1|2\nAudio|/bin/audioplayer.elf|Snd|0xFFF5C2E7|0|0\nCalculator|/bin/calculator.elf|+-|0xFFFAB387|0|0\nText Editor|/bin/texteditor.elf|Txt|0xFF94E2D5|0|0\nCode Studio|/bin/ide.elf|IDE|0xFFCBA6F7|0|0\nFont Viewer|/bin/fontviewer.elf|Aa|0xFFFAB387|0|0\nTemplates|/home/azami/Templates|Tpl|0xFFA6E3A1|1|1\nPaint|/bin/paint.elf|Art|0xFFCBA6F7|0|0\nSys Monitor|/bin/sysmon.elf|CPU|0xFFF38BA8|0|0\nSettings|/bin/settings.elf|Set|0xFF74C7EC|0|0\n" > $(BUILD_DIR)/etc/desktop_icons.conf
 	@# ── Desktop app config: taskbar dock, launcher registry, filemanager
 	@# places, and MIME associations. Each app ships a compiled-in default
 	@# matching this exact content (see tb_load_default_dock(),
 	@# load_default_registry(), load_default_places(),
 	@# load_default_file_assoc()) so a missing/corrupt file degrades
 	@# gracefully — but these are the real, editable source of truth.
-	@printf "# Quick Launch Dock entries: glyph|label|path|0xAARRGGBB\nT|Terminal|/bin/terminal.elf|0xFFA6E3A1\nF|Files|/bin/filemanager.elf|0xFFF9E2AF\nE|Editor|/bin/texteditor.elf|0xFF89B4FA\nC|Calc|/bin/calculator.elf|0xFFFAB387\nP|Paint|/bin/paint.elf|0xFFCBA6F7\nA|Audio|/bin/audioplayer.elf|0xFFF38BA8\nS|Settings|/bin/settings.elf|0xFF74C7EC\nM|Sysmon|/bin/sysmon.elf|0xFF94E2D5\nX|XClock|/bin/xclock.elf|0xFF89DCEB\nY|XEyes|/bin/xeyes.elf|0xFFF5C2E7\nK|XCalc|/bin/xcalc.elf|0xFFF9E2AF\nG|XDemo|/bin/xgui_demo.elf|0xFFB4BEFE\n" > $(BUILD_DIR)/etc/taskbar_dock.conf
-	@printf "# App Launcher registry: appname=category:subtitle, or appname=hidden\nterminal=system:Command Terminal\nfilemanager=system:Files & Storage\ntexteditor=productivity:Code & Text Editor\nsysmon=system:Activity Monitor\ncalculator=productivity:Math & Calculations\nclock=productivity:Clock & World Times\nsettings=system:System Control\nabout=system:System Info\nfetch=system:System Telemetry\nscreenshot=system:Screen Capture\npaint=productivity:Paint & Sketch\naudioplayer=media:Music & Synthwave\nminesweeper=games:Minesweeper Puzzle\n2048=games:2048 Number Puzzle\nsnake=games:Arcade Snake Game\n# Internal services & CLI tools: excluded from the app grid\ninit=hidden\nsessiond=hidden\nazwm=hidden\nwallpaper=hidden\ntaskbar=hidden\nlauncher=hidden\ngui_test=hidden\nsh=hidden\nplay=hidden\nls=hidden\ncat=hidden\necho=hidden\npwd=hidden\nuname=hidden\nhead=hidden\ntail=hidden\nwc=hidden\ngrep=hidden\nmkdir=hidden\nrm=hidden\ntouch=hidden\ncp=hidden\nmv=hidden\ndate=hidden\nuptime=hidden\ndf=hidden\nfree=hidden\nifconfig=hidden\nping=hidden\nlspci=hidden\nenv=hidden\nwhich=hidden\nsleep=hidden\nkill=hidden\nchmod=hidden\nclear=hidden\nhexdump=hidden\nbase64=hidden\nmd5sum=hidden\ncut=hidden\nsort=hidden\nuniq=hidden\nps=hidden\ntop=hidden\ndmesg=hidden\ntree=hidden\ncal=hidden\nwatch=hidden\nnetstat=hidden\npoweroff=hidden\nreboot=hidden\ngetfacl=hidden\nsetfacl=hidden\n" > $(BUILD_DIR)/etc/launcher.conf
+	@printf "# Quick Launch Dock entries: glyph|label|path|0xAARRGGBB\nT|Terminal|/bin/terminal.elf|0xFFA6E3A1\nF|Files|/bin/filemanager.elf|0xFFF9E2AF\nI|Images|/bin/imageviewer.elf|0xFF89DCEB\nN|Notes|/bin/notes.elf|0xFFF9E2AF\nD|Studio|/bin/ide.elf|0xFFCBA6F7\nV|Fonts|/bin/fontviewer.elf|0xFFFAB387\nE|Editor|/bin/texteditor.elf|0xFF89B4FA\nC|Calc|/bin/calculator.elf|0xFFFAB387\nP|Paint|/bin/paint.elf|0xFFCBA6F7\nA|Audio|/bin/audioplayer.elf|0xFFF38BA8\nS|Settings|/bin/settings.elf|0xFF74C7EC\nM|Sysmon|/bin/sysmon.elf|0xFF94E2D5\nX|XClock|/bin/xclock.elf|0xFF89DCEB\nY|XEyes|/bin/xeyes.elf|0xFFF5C2E7\nK|XCalc|/bin/xcalc.elf|0xFFF9E2AF\nG|XDemo|/bin/xgui_demo.elf|0xFFB4BEFE\n" > $(BUILD_DIR)/etc/taskbar_dock.conf
+	@printf "# App Launcher registry: appname=category:subtitle, or appname=hidden\nterminal=system:Command Terminal\nfilemanager=system:Files & Storage\nimageviewer=media:Image & Photo Viewer\nnotes=productivity:Sticky Notes\ntexteditor=productivity:Code & Text Editor\nide=productivity:Code Studio & IDE\nfontviewer=system:Font & Typography Inspector\nsysmon=system:Activity Monitor\ncalculator=productivity:Math & Calculations\nclock=productivity:Clock & World Times\nsettings=system:System Control\nabout=system:System Info\nfetch=system:System Telemetry\nscreenshot=system:Screen Capture\npaint=productivity:Paint & Sketch\naudioplayer=media:Music & Synthwave\nminesweeper=games:Minesweeper Puzzle\n2048=games:2048 Number Puzzle\nsnake=games:Arcade Snake Game\n# Internal services & CLI tools: excluded from the app grid\ninit=hidden\nsessiond=hidden\nazwm=hidden\nwallpaper=hidden\ntaskbar=hidden\nlauncher=hidden\ngui_test=hidden\nsh=hidden\nplay=hidden\nls=hidden\ncat=hidden\necho=hidden\npwd=hidden\nuname=hidden\nhead=hidden\ntail=hidden\nwc=hidden\ngrep=hidden\nmkdir=hidden\nrm=hidden\ntouch=hidden\ncp=hidden\nmv=hidden\ndate=hidden\nuptime=hidden\ndf=hidden\nfree=hidden\nifconfig=hidden\nping=hidden\nlspci=hidden\nenv=hidden\nwhich=hidden\nsleep=hidden\nkill=hidden\nchmod=hidden\nclear=hidden\nhexdump=hidden\nbase64=hidden\nmd5sum=hidden\ncut=hidden\nsort=hidden\nuniq=hidden\nps=hidden\ntop=hidden\ndmesg=hidden\ntree=hidden\ncal=hidden\nwatch=hidden\nnetstat=hidden\npoweroff=hidden\nreboot=hidden\ngetfacl=hidden\nsetfacl=hidden\nless=hidden\nbc=hidden\nhexedit=hidden\n" > $(BUILD_DIR)/etc/launcher.conf
 	@printf "# File manager sidebar places: label|path|icon\nRoot|/|/\nBoot|/boot|O\nMusic|/music|M\nDesktop|/home/azami/Desktop|D\nHard Disk|/hdd|H\nBinaries|/bin|B\nSystem|/sbin|S\nConfig|/etc|E\nProc FS|/proc|P\nDevices|/dev|D\nTemporary|/tmp|T\n" > $(BUILD_DIR)/etc/filemanager_places.conf
 	@printf "# AzamiOS Kernel Runtime Configuration\n# File: /etc/sysctl.conf\n\n# Security Hardening Mitigations\nkernel.dmesg_restrict = 1\nkernel.kptr_restrict = 1\nkernel.mmap_min_addr = 65536\nkernel.yama.ptrace_scope = 1\nfs.protected_hardlinks = 1\nfs.protected_symlinks = 1\n\n# System & Hostname Defaults\nkernel.hostname = azamios\nfs.file-max = 65536\n" > $(BUILD_DIR)/etc/sysctl.conf
-	@printf "# File extension -> GUI app associations: ext=/path/to/app.elf\ntxt=/bin/texteditor.elf\nmd=/bin/texteditor.elf\nc=/bin/texteditor.elf\nh=/bin/texteditor.elf\nconf=/bin/texteditor.elf\ncfg=/bin/texteditor.elf\nini=/bin/texteditor.elf\nlog=/bin/texteditor.elf\nsh=/bin/texteditor.elf\njson=/bin/texteditor.elf\nbmp=/bin/paint.elf\npng=/bin/paint.elf\nwav=/bin/audioplayer.elf\n" > $(BUILD_DIR)/etc/mime.conf
+	@printf "# File extension -> GUI app associations: ext=/path/to/app.elf\ntxt=/bin/texteditor.elf\nmd=/bin/texteditor.elf\nc=/bin/texteditor.elf\nh=/bin/texteditor.elf\nconf=/bin/texteditor.elf\ncfg=/bin/texteditor.elf\nini=/bin/texteditor.elf\nlog=/bin/texteditor.elf\nsh=/bin/texteditor.elf\njson=/bin/texteditor.elf\nppm=/bin/imageviewer.elf\nbmp=/bin/imageviewer.elf\ntga=/bin/imageviewer.elf\nqoi=/bin/imageviewer.elf\nicn=/bin/imageviewer.elf\npng=/bin/imageviewer.elf\nazf=/bin/fontviewer.elf\nwav=/bin/audioplayer.elf\nmp3=/bin/audioplayer.elf\n" > $(BUILD_DIR)/etc/mime.conf
 	@printf "/bin/sh\n/bin/sh.elf\n/bin/bash\n/usr/bin/sh\n" > $(BUILD_DIR)/etc/shells
 	@printf "Welcome to AzamiOS 7.0 (x86_64) - \\\\l\n\n" > $(BUILD_DIR)/etc/issue
 	@printf "ext2\nprocfs\ndevfs\n*\n" > $(BUILD_DIR)/etc/filesystems
-	@printf "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nLANG=C.UTF-8\nEDITOR=/bin/texteditor.elf\nPAGER=cat\n" > $(BUILD_DIR)/etc/environment
-	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nexport USER=root\nexport HOME=/root\nexport TERM=azami\nexport SHELL=/bin/sh.elf\nexport TMPDIR=/tmp\nexport COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec/:/usr/bin:/bin\nexport LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib\nexport C_INCLUDE_PATH=/usr/include:/usr/local/include\nexport CPATH=/usr/include:/usr/local/include\nexport PS1=\"root@azamios:\w\\$$ \"\n" > $(BUILD_DIR)/etc/profile
+	@printf "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nLANG=C.UTF-8\nEDITOR=/bin/texteditor.elf\nPAGER=/bin/less.elf\n" > $(BUILD_DIR)/etc/environment
+	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nexport USER=root\nexport HOME=/root\nexport TERM=azami\nexport SHELL=/bin/sh.elf\nexport TMPDIR=/tmp\nexport COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec/:/usr/bin:/bin\nexport LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib\nexport PS1=\"root@azamios:\w\\$$ \"\n" > $(BUILD_DIR)/etc/profile
 	@cp $(BUILD_DIR)/etc/profile $(BUILD_DIR)/root/.profile
-	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nexport USER=azami\nexport HOME=/home/azami\nexport TERM=azami\nexport SHELL=/bin/sh.elf\nexport TMPDIR=/tmp\nexport COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec/:/usr/bin:/bin\nexport LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib\nexport C_INCLUDE_PATH=/usr/include:/usr/local/include\nexport CPATH=/usr/include:/usr/local/include\nexport PS1=\"azami@azamios:\w\\$$ \"\n" > $(BUILD_DIR)/home/azami/.profile
+	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nexport USER=azami\nexport HOME=/home/azami\nexport TERM=azami\nexport SHELL=/bin/sh.elf\nexport TMPDIR=/tmp\nexport COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec/:/usr/bin:/bin\nexport LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib\nexport PS1=\"azami@azamios:\w\\$$ \"\n" > $(BUILD_DIR)/home/azami/.profile
 	@cp $(BUILD_DIR)/etc/terminal.conf $(BUILD_DIR)/root/.config/terminal.conf
 	@printf "[terminal]\ntheme=catppuccin\nfont_size=12\nopacity=95\nscrollback=500\ncursor_blink=1\nhistory_size=100\nprompt=azami@azamios:\w$$ \n" > $(BUILD_DIR)/home/azami/.config/terminal.conf
 	@mkdir -p $(BUILD_DIR)/tmp $(BUILD_DIR)/var/tmp $(BUILD_DIR)/var/log $(BUILD_DIR)/var/run
-	@touch $(BUILD_DIR)/var/run/utmp $(BUILD_DIR)/var/log/wtmp $(BUILD_DIR)/etc/run-userspace-test 2>/dev/null || true
+	@touch $(BUILD_DIR)/var/run/utmp $(BUILD_DIR)/var/log/wtmp $(BUILD_DIR)/etc/run-userspace-test $(BUILD_DIR)/etc/run-toolchain-selftest 2>/dev/null || true
 	@mkdir -p $(BUILD_DIR)/examples
 	@mkdir -p $(BUILD_DIR)/usr/src/examples
 	@mkdir -p $(BUILD_DIR)/usr/src/libc
@@ -509,9 +545,31 @@ music: skeleton
 	@echo "  ↓  Generating audio tracks for /music..."
 	@mkdir -p $(BUILD_DIR)/music $(BUILD_DIR)/home/azami/Music $(BUILD_DIR)/usr/share/music $(BUILD_DIR)/home/azami/Desktop
 	@python3 ../scripts/generate_music.py $(BUILD_DIR)/music
-	@cp $(BUILD_DIR)/music/*.wav $(BUILD_DIR)/home/azami/Music/ 2>/dev/null || true
-	@cp $(BUILD_DIR)/music/*.wav $(BUILD_DIR)/usr/share/music/ 2>/dev/null || true
+	@cp -f music/*.mp3 $(BUILD_DIR)/music/ 2>/dev/null || true
+	@cp $(BUILD_DIR)/music/* $(BUILD_DIR)/home/azami/Music/ 2>/dev/null || true
+	@cp $(BUILD_DIR)/music/* $(BUILD_DIR)/usr/share/music/ 2>/dev/null || true
 	@ln -sf /music $(BUILD_DIR)/home/azami/Desktop/Music 2>/dev/null || true
+
+images: skeleton
+	@echo "  ↓  Generating sample images for /home/azami/Pictures..."
+	@mkdir -p $(BUILD_DIR)/home/azami/Pictures $(BUILD_DIR)/usr/share/wallpapers $(BUILD_DIR)/examples
+	@python3 ../scripts/generate_sample_images.py $(BUILD_DIR)/home/azami/Pictures
+	@cp $(BUILD_DIR)/home/azami/Pictures/* $(BUILD_DIR)/examples/ 2>/dev/null || true
+	@ln -sf /home/azami/Pictures $(BUILD_DIR)/home/azami/Desktop/Pictures 2>/dev/null || true
+
+templates: skeleton
+	@echo "  ↓  Installing application templates..."
+	@mkdir -p $(BUILD_DIR)/usr/share/templates $(BUILD_DIR)/home/azami/Templates
+	@cp templates/* $(BUILD_DIR)/usr/share/templates/ 2>/dev/null || true
+	@cp templates/* $(BUILD_DIR)/home/azami/Templates/ 2>/dev/null || true
+
+# Sample package repository (/repo on the image) + default /etc/pkg/repos.conf,
+# so `pkg install cowsay` (a native app) and `pkg install busybox` (a stock
+# Linux binary, when `make linux` has been run) work out of the box with no
+# network. See docs/PACKAGES.md.
+pkgrepo: apps
+	@echo "  ↓  Building sample package repository..."
+	@python3 ../scripts/generate_pkg_repo.py $(BUILD_DIR) ../tools/linux/out/bin
 
 # ── System binaries (/sbin) + user utilities & applications (/bin) ──────────
 #

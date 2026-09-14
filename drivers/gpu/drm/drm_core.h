@@ -45,6 +45,8 @@ struct drm_crtc;
 #define DRIVER_RENDER           (1U << 2)
 #define DRIVER_ATOMIC           (1U << 3)
 
+#define DRM_MAX_BLOBS           16     /* live property blobs (modes) per card */
+
 /* ── Mode object types (Linux ABI values) ────────────────────────────────── */
 #define DRM_MODE_OBJECT_CRTC       0xCCCCCCCCU
 #define DRM_MODE_OBJECT_CONNECTOR  0xC0C0C0C0U
@@ -173,6 +175,27 @@ typedef struct drm_crtc {
     struct drm_crtc   *next;
 } drm_crtc_t;
 
+/* ── Atomic modesetting: property value blobs ────────────────────────────────
+ * The only property type here that needs storage of its own rather than
+ * reading straight through to a native struct field (drm_atomic.c) — a
+ * CRTC's MODE_ID property names one of these, holding the drm_mode_modeinfo
+ * bytes a client uploaded with CREATEPROPBLOB. Applying MODE_ID copies the
+ * mode out into crtc->mode (already a plain value, not a reference) rather
+ * than having the CRTC hold onto the blob itself, so a blob's lifetime is
+ * governed purely by CREATEPROPBLOB (refcount 1) and DESTROYPROPBLOB
+ * (drops it) — libdrm's atomic helpers destroy the blob right after the
+ * commit that installed it anyway, exactly as if nothing kept it around
+ * longer. Refcounted (not just freed on DESTROYPROPBLOB outright) only so a
+ * commit reading it concurrently with another thread's DESTROYPROPBLOB
+ * holds a reference for the duration of that read — see drm_atomic.c. */
+typedef struct drm_blob {
+    u32              id;
+    u32              length;
+    int              refcount;
+    struct drm_blob *next;
+    u8               data[];
+} drm_blob_t;
+
 typedef struct drm_encoder {
     drm_mode_object_t  base;
     struct drm_device *dev;
@@ -262,6 +285,18 @@ typedef struct drm_driver {
 
     int  (*cursor_set)(drm_crtc_t *crtc, drm_gem_object_t *bo, u32 w, u32 h);
     int  (*cursor_move)(drm_crtc_t *crtc, s32 x, s32 y);
+
+    /**
+     * Driver-private ioctl range (Linux's DRM_COMMAND_BASE..DRM_COMMAND_END,
+     * see include/azami/drm.h). drm_ioctl_dispatch() calls this for any
+     * command it does not recognize as a core one, instead of failing it
+     * outright — virtio-gpu's DRM_IOCTL_VIRTGPU_* 3D family
+     * (virtgpu_drm.c) is the only user so far. The hook does its own
+     * DRM_COPY_IN()/DRM_COPY_OUT() (copy_from_user()/copy_to_user()
+     * directly — those macros are private to drm_ioctl.c) and returns a
+     * negative errno or 0/positive the same way every core handler does.
+     */
+    s64  (*ioctl)(struct drm_device *dev, drm_file_t *file, u32 cmd, u64 arg);
 } drm_driver_t;
 
 /* ── The card ────────────────────────────────────────────────────────────── */
@@ -284,6 +319,12 @@ typedef struct drm_device {
     drm_framebuffer_t *fb_list;
     drm_gem_object_t  *gem_list;
     u32 num_crtc, num_encoder, num_connector, num_plane, num_fb;
+
+    /* Atomic modesetting property blobs (drm_atomic.c), e.g. a CRTC's
+     * MODE_ID. Same list-plus-refcount shape as fb_list/gem_list above, and
+     * protected by the same dev->lock for the same reason. */
+    drm_blob_t        *blob_list;
+    u32                next_blob_id;
 
     u32                next_object_id;
     u32                next_gem_name;
@@ -456,6 +497,11 @@ drm_gem_object_t *drm_prime_import_fd(drm_device_t *dev, int fd);
 /* ── ioctl dispatch (drm_ioctl.c) ────────────────────────────────────────── */
 s64 drm_ioctl_dispatch(drm_device_t *dev, drm_file_t *file, u32 cmd, u64 arg);
 
+/** drm_can_modeset(file) — true for a non-render, DRM-master file. Shared
+ *  with drm_atomic.c, which applies the same rule to OBJ_SETPROPERTY/ATOMIC
+ *  that drm_ioctl.c already applies to SETCRTC/SETPLANE/CURSOR. */
+bool drm_can_modeset(drm_file_t *file);
+
 /* ── Vblank engine (drm_vblank.c) ────────────────────────────────────────── */
 
 /** drm_vblank_init() — start the vblank worker.  Call once, after the cards. */
@@ -512,6 +558,27 @@ void drm_vblank_file_closed(drm_device_t *dev, drm_file_t *file);
  */
 void drm_wait_on(const void *chan);
 void drm_wake(const void *chan);
+
+/* ── Atomic modesetting (drm_atomic.c) ───────────────────────────────────────
+ * A software layer over the same driver hooks legacy SETCRTC/SETPLANE/CURSOR
+ * already use, so it works identically for every driver above without any
+ * driver-specific code — "autodetection" here is simply that DRIVER_ATOMIC
+ * is unconditionally true for all of them (see each driver's .features).
+ * g_drm_atomic_enabled is the administrative override: flip it off (e.g.
+ * `sysctl -w kernel.drm_atomic=0`, /proc/sys/kernel/drm_atomic) to refuse
+ * DRM_CLIENT_CAP_ATOMIC and DRM_IOCTL_MODE_ATOMIC outright without touching
+ * any driver — for a client that mishandles atomic, or just to compare
+ * against the legacy ioctl path. Defaults on, since nothing here needs
+ * hardware support to work. */
+extern bool g_drm_atomic_enabled;
+
+s64 drm_ioctl_obj_getproperties(drm_device_t *dev, u64 arg);
+s64 drm_ioctl_obj_setproperty(drm_device_t *dev, drm_file_t *file, u64 arg);
+s64 drm_ioctl_getproperty(drm_device_t *dev, u64 arg);
+s64 drm_ioctl_atomic(drm_device_t *dev, drm_file_t *file, u64 arg);
+s64 drm_ioctl_createpropblob(drm_device_t *dev, u64 arg);
+s64 drm_ioctl_destroypropblob(drm_device_t *dev, u64 arg);
+s64 drm_ioctl_getpropblob(drm_device_t *dev, u64 arg);
 
 /* ── Built-in drivers ────────────────────────────────────────────────────── */
 void drm_subsystem_init(void);   /* registers the class and every KMS driver */

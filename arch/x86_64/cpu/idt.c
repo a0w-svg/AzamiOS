@@ -200,8 +200,22 @@ static bool handle_user_page_fault(pt_regs_t *r, uintptr_t fault_addr)
         if (pte_fl & (1ULL << 10) /* VMM_F_COW */) {
             u32 vma_prot = 0;
             bool vma_ok = vma_probe(proc, fault_addr, &vma_prot);
-            /* Only resolve COW if the region actually has PROT_WRITE permission */
+            bool is_writable = false;
             if (vma_ok && (vma_prot & VMA_PROT_WRITE)) {
+                is_writable = true;
+            } else if (proc->heap_start > 0 && fault_addr >= proc->heap_start &&
+                       fault_addr < ALIGN_UP(proc->heap_end, PAGE_SIZE)) {
+                is_writable = true;
+            } else if (proc->stack_low > 0 && fault_addr >= proc->stack_low &&
+                       fault_addr < proc->stack_high) {
+                is_writable = true;
+            } else if (!vma_ok && proc->mmap_current > 0x0000600000000000ULL &&
+                       fault_addr >= 0x0000600000000000ULL && fault_addr < proc->mmap_current) {
+                is_writable = true;
+            }
+
+            /* Only resolve COW if the region actually has PROT_WRITE permission */
+            if (is_writable) {
                 if (vmm_cow_fault(proc->pml4_phys, fault_addr) == 0) {
                     proc->nr_minor_faults++;
                     return true; /* COW resolved; resume instruction */

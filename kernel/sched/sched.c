@@ -1246,6 +1246,19 @@ void sched_tick(pt_regs_t *regs)
         current_ticks = __atomic_add_fetch(&g_system_ticks, 1, __ATOMIC_RELAXED);
         extern void net_poll(void);
         net_poll();
+
+        /* ARP cache expiry/retry and TCP handshake retransmission both work
+         * in whole seconds (see ARP_RETRY_TIMEOUT and TCP_RTX_BASE_TIMEOUT),
+         * not in LAPIC ticks — calling them on every tick would fire them
+         * ~100x too fast at the 100 Hz lapic_timer_start(100) in
+         * kernel/main.c. Gating on that same 100 recovers "once a second"
+         * without either function needing to know the tick rate itself. */
+        if (current_ticks % 100 == 0) {
+            extern void arp_timer_tick(void);
+            arp_timer_tick();
+            extern void tcp_timer_tick(void);
+            tcp_timer_tick();
+        }
     } else {
         current_ticks = __atomic_load_n(&g_system_ticks, __ATOMIC_RELAXED);
     }

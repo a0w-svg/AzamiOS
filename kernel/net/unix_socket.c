@@ -264,9 +264,19 @@ int unix_socket_accept(unix_sock_t *listener, unix_sock_t *child, bool nonblock)
         listener->recv_wait = sched_current_thread();
         spinlock_unlock(&listener->lock);
         sched_block(THREAD_BLOCKED_PENDING);
-        /* Woken by a new connection (unix_socket_connect) or by
-         * unix_socket_close() tearing the listener down; loop and recheck
-         * either way rather than assuming what woke us. */
+        /* Woken by a new connection (unix_socket_connect), by
+         * unix_socket_close() tearing the listener down, or by a pending
+         * signal (e.g. SIGALRM from an alarm()-based accept timeout); loop
+         * and recheck rather than assuming what woke us, but a signal still
+         * has to end the wait with -EINTR instead of going back to sleep. */
+        process_t *p = sched_current_process();
+        if (p && (p->sig_pending & ~p->sig_blocked)) {
+            spinlock_lock(&listener->lock);
+            if (listener->recv_wait == sched_current_thread())
+                listener->recv_wait = NULL;
+            spinlock_unlock(&listener->lock);
+            return -EINTR;
+        }
     }
 
     unix_msg_t *pending = listener->msg_head;
@@ -357,6 +367,15 @@ s64 unix_socket_recvmsg(unix_sock_t *u, void *buf, size_t len, char *src_path_ou
         u->recv_wait = sched_current_thread();
         spinlock_unlock(&u->lock);
         sched_block(THREAD_BLOCKED_PENDING);
+
+        process_t *p = sched_current_process();
+        if (p && (p->sig_pending & ~p->sig_blocked)) {
+            spinlock_lock(&u->lock);
+            if (u->recv_wait == sched_current_thread())
+                u->recv_wait = NULL;
+            spinlock_unlock(&u->lock);
+            return -EINTR;
+        }
     }
 
     unix_msg_t *msg = u->msg_head;

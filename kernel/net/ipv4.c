@@ -22,6 +22,18 @@ static route_entry_t g_routes[MAX_ROUTES];
 static spinlock_t    g_route_lock = SPINLOCK_INIT;
 static u16        g_ip_id_counter = 1;
 
+/* g_route_lock uses spinlock_lock_irqsave()/_irqrestore() throughout this
+ * section, for the same reason as tcp.c's/udp.c's/dhcp.c's identical note:
+ * route_add() is called directly from dhcp_input(), which — like the rest
+ * of the input path — runs from a timer interrupt on any CPU, while
+ * route_lookup() and route_add()/route_del() are also reached in ordinary
+ * process context (ipv4_send() from a socket syscall; the SIOCSIFADDR/
+ * SIOCSIFGW ioctls via net_set_ip()/net_set_gateway()). A plain
+ * spinlock_lock() left interrupts enabled across those process-context
+ * critical sections, so the same timer interrupt could land on the CPU
+ * already holding this lock and spin forever inside dhcp_input()'s own
+ * acquire. See kernel/net/tcp.c for the full writeup. */
+
 static inline u16 htons(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 static inline u16 ntohs(u16 v) { return htons(v); }
 
@@ -29,7 +41,7 @@ static inline u16 ntohs(u16 v) { return htons(v); }
 
 void route_init(void)
 {
-    spinlock_lock(&g_route_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_route_lock);
     for (int i = 0; i < MAX_ROUTES; i++) {
         memset(&g_routes[i], 0, sizeof(route_entry_t));
     }
@@ -47,14 +59,14 @@ void route_init(void)
     g_routes[0].flags = RT_FLAG_UP | RT_FLAG_HOST;
     g_routes[0].metric = 0;
 
-    spinlock_unlock(&g_route_lock);
+    spinlock_unlock_irqrestore(&g_route_lock, flags);
     pr_debug("[IPv4] Routing table initialized with local loopback.\n");
 }
 
-int route_add(const u8 dst[4], const u8 mask[4], const u8 gw[4], struct net_device *dev, u32 flags, u32 metric)
+int route_add(const u8 dst[4], const u8 mask[4], const u8 gw[4], struct net_device *dev, u32 flags_in, u32 metric)
 {
     if (!dst || !mask) return -1;
-    spinlock_lock(&g_route_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_route_lock);
 
     int target_slot = -1;
     int free_slot = -1;
@@ -72,7 +84,7 @@ int route_add(const u8 dst[4], const u8 mask[4], const u8 gw[4], struct net_devi
 
     int slot = (target_slot >= 0) ? target_slot : free_slot;
     if (slot < 0) {
-        spinlock_unlock(&g_route_lock);
+        spinlock_unlock_irqrestore(&g_route_lock, flags);
         return -1; /* Table full */
     }
 
@@ -81,30 +93,30 @@ int route_add(const u8 dst[4], const u8 mask[4], const u8 gw[4], struct net_devi
     if (gw) memcpy(g_routes[slot].gateway, gw, 4);
     else memset(g_routes[slot].gateway, 0, 4);
     g_routes[slot].dev = dev ? dev : net_get_default_device();
-    g_routes[slot].flags = flags | RT_FLAG_UP;
+    g_routes[slot].flags = flags_in | RT_FLAG_UP;
     g_routes[slot].metric = metric;
 
-    spinlock_unlock(&g_route_lock);
+    spinlock_unlock_irqrestore(&g_route_lock, flags);
     return 0;
 }
 
 int route_del(const u8 dst[4], const u8 mask[4])
 {
     if (!dst || !mask) return -1;
-    spinlock_lock(&g_route_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_route_lock);
 
     for (int i = 0; i < MAX_ROUTES; i++) {
         if (g_routes[i].flags & RT_FLAG_UP) {
             if (memcmp(g_routes[i].dst, dst, 4) == 0 &&
                 memcmp(g_routes[i].mask, mask, 4) == 0) {
                 g_routes[i].flags = 0;
-                spinlock_unlock(&g_route_lock);
+                spinlock_unlock_irqrestore(&g_route_lock, flags);
                 return 0;
             }
         }
     }
 
-    spinlock_unlock(&g_route_lock);
+    spinlock_unlock_irqrestore(&g_route_lock, flags);
     return -1;
 }
 
@@ -112,7 +124,7 @@ int route_lookup(const u8 dst_ip[4], u8 next_hop_out[4], struct net_device **dev
 {
     if (!dst_ip || !next_hop_out || !dev_out) return -1;
 
-    spinlock_lock(&g_route_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_route_lock);
 
     int best_match = -1;
     int best_prefix_len = -1;
@@ -148,7 +160,7 @@ int route_lookup(const u8 dst_ip[4], u8 next_hop_out[4], struct net_device **dev
     }
 
     if (best_match < 0) {
-        spinlock_unlock(&g_route_lock);
+        spinlock_unlock_irqrestore(&g_route_lock, flags);
         return -1; /* No route to host */
     }
 
@@ -160,14 +172,14 @@ int route_lookup(const u8 dst_ip[4], u8 next_hop_out[4], struct net_device **dev
     }
 
     *dev_out = r->dev ? r->dev : net_get_default_device();
-    spinlock_unlock(&g_route_lock);
+    spinlock_unlock_irqrestore(&g_route_lock, flags);
 
     return 0;
 }
 
 void route_print_table(void)
 {
-    spinlock_lock(&g_route_lock);
+    irqflags_t flags = spinlock_lock_irqsave(&g_route_lock);
     pr_debug("=== IPv4 Routing Table ===\n");
     pr_debug("Destination     Gateway         Genmask         Flags Metric Iface\n");
     for (int i = 0; i < MAX_ROUTES; i++) {
@@ -182,7 +194,7 @@ void route_print_table(void)
                      g_routes[i].dev ? g_routes[i].dev->name : "net0");
         }
     }
-    spinlock_unlock(&g_route_lock);
+    spinlock_unlock_irqrestore(&g_route_lock, flags);
 }
 
 /* ── IPv4 Transmission & Ingestion ────────────────────────────────────────── */

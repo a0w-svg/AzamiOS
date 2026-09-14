@@ -660,10 +660,8 @@ static void execute_command(const char *raw_cmd) {
         "HOME=/root",
         "TERM=xterm-256color",
         "TMPDIR=/tmp",
-        "COMPILER_PATH=/usr/libexec:/usr/bin",
-        "LIBRARY_PATH=/usr/lib:/lib:/usr/local/lib",
-        "C_INCLUDE_PATH=/usr/include:/usr/local/include",
-        "CPATH=/usr/include:/usr/local/include",
+        "COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin",
+        "LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib",
         NULL};
 
     /* 1. Direct binary execution */

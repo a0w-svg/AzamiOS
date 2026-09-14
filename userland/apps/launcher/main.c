@@ -429,6 +429,10 @@ static void load_default_registry(void)
     registry_add("minesweeper", "Minesweeper Puzzle",  CAT_GAMES,        0);
     registry_add("2048",        "2048 Number Puzzle",  CAT_GAMES,        0);
     registry_add("snake",       "Arcade Snake Game",   CAT_GAMES,        0);
+    registry_add("ide",         "Azami Code Studio",   CAT_PRODUCTIVITY, 0);
+    registry_add("fontviewer",  "Typography Inspector",CAT_SYSTEM,       0);
+    registry_add("imageviewer", "Image & Photo Viewer",CAT_MEDIA,        0);
+    registry_add("notes",       "Sticky Notes",        CAT_PRODUCTIVITY, 0);
 
     static const char *hidden_defaults[] = {
         "init", "sessiond", "azwm", "wallpaper", "taskbar", "launcher", "gui_test",
@@ -436,7 +440,8 @@ static void load_default_registry(void)
         "grep", "mkdir", "rm", "touch", "cp", "mv", "date", "uptime", "df", "free",
         "ifconfig", "ping", "lspci", "env", "which", "sleep", "kill", "chmod", "clear",
         "hexdump", "base64", "md5sum", "cut", "sort", "uniq", "ps", "top", "dmesg",
-        "tree", "cal", "watch", "netstat", "poweroff", "reboot", "getfacl", "setfacl", NULL
+        "tree", "cal", "watch", "netstat", "poweroff", "reboot", "getfacl", "setfacl",
+        "hexedit", "less", "bc", NULL
     };
     for (int i = 0; hidden_defaults[i]; i++) registry_add(hidden_defaults[i], NULL, CAT_ALL, 1);
 }

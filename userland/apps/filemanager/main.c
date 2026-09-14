@@ -271,9 +271,15 @@ static void load_default_file_assoc(void)
         { "log",  "/bin/texteditor.elf" },
         { "sh",   "/bin/texteditor.elf" },
         { "json", "/bin/texteditor.elf" },
-        { "bmp",  "/bin/paint.elf" },
-        { "png",  "/bin/paint.elf" },
+        { "ppm",  "/bin/imageviewer.elf" },
+        { "bmp",  "/bin/imageviewer.elf" },
+        { "tga",  "/bin/imageviewer.elf" },
+        { "qoi",  "/bin/imageviewer.elf" },
+        { "icn",  "/bin/imageviewer.elf" },
+        { "png",  "/bin/imageviewer.elf" },
+        { "azf",  "/bin/fontviewer.elf" },
         { "wav",  "/bin/audioplayer.elf" },
+        { "mp3",  "/bin/audioplayer.elf" },
     };
     g_num_file_assoc = 0;
     for (unsigned int i = 0; i < sizeof(defaults) / sizeof(defaults[0]) && g_num_file_assoc < MAX_FILE_ASSOC; i++) {

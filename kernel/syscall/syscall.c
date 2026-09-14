@@ -1726,15 +1726,23 @@ static s64 sys_brk_impl(pt_regs_t *r)
     virt_addr_t target_page = ALIGN_UP(new_brk, PAGE_SIZE);
 
     if (target_page > cur_page) {
-        for (virt_addr_t va = cur_page; va < target_page; va += PAGE_SIZE) {
+        virt_addr_t va = cur_page;
+        for (; va < target_page; va += PAGE_SIZE) {
             phys_addr_t phys = vmm_translate(proc->pml4_phys, va);
             if (!phys) {
                 phys = pmm_alloc_page();
-                if (!phys) return (s64)proc->heap_end;
+                if (!phys) {
+                    if (va > cur_page) {
+                        vma_add(proc, cur_page, va, VMA_PROT_READ | VMA_PROT_WRITE, VMA_F_ANON);
+                        proc->heap_end = va;
+                    }
+                    return (s64)proc->heap_end;
+                }
                 hw_clear_page((void *)PHYS_TO_VIRT(phys));
                 vmm_map(proc->pml4_phys, va, phys, VMM_USER_RW);
             }
         }
+        vma_add(proc, cur_page, target_page, VMA_PROT_READ | VMA_PROT_WRITE, VMA_F_ANON);
     } else if (target_page < cur_page) {
         /* One batched teardown: vmm_unmap_range() applies the same ownership
          * rule (skip VMM_F_SHARED frames, which the shmem object or a peer
@@ -1742,6 +1750,7 @@ static s64 sys_brk_impl(pt_regs_t *r)
          * than one per page. */
         vmm_unmap_range(proc->pml4_phys, target_page,
                         (size_t)((cur_page - target_page) / PAGE_SIZE), true);
+        vma_remove(proc, target_page, cur_page);
     }
 
     proc->heap_end = new_brk;

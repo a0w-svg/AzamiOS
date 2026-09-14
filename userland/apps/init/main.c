@@ -78,6 +78,8 @@ static void sig_fp_handler(int signo)
     } \
 } while (0)
 
+static void run_toolchain_selftest(void);
+
 static void run_posix_verification_suite(void)
 {
     puts("-------------------------------------------------------------------------------");
@@ -605,114 +607,9 @@ static void run_posix_verification_suite(void)
         }
     }
 
-    /* 12. Native GCC Toolchain Verification — real gcc/as/ld invocations
-     * (cc1 does actual compilation, ld does a real link), unlike the ~200
-     * syscall-probe tests above that each cost microseconds. Under QEMU TCG
-     * emulation this one step is ~2s of an ~8s boot — the single largest
-     * cost in the whole sequence. Still worth having (it is the only thing
-     * that actually proves the self-hosted toolchain staged into the image
-     * works), just not worth paying on every boot by default.
-     * `touch /etc/run-toolchain-selftest` before repacking the initrd
-     * re-enables it. */
-    if (access("/etc/run-toolchain-selftest", F_OK) != 0) {
-        printf("[INIT] Skipping native GCC/binutils smoke test "
-               "(touch /etc/run-toolchain-selftest to re-enable)\n");
-    } else {
-    int as_pid = fork();
-    if (as_pid == 0) {
-        int lfd = open("/tmp/as_log.txt", O_CREAT | O_WRONLY | O_TRUNC, 0666);
-        if (lfd >= 0) {
-            dup2(lfd, 1);
-            dup2(lfd, 2);
-            close(lfd);
-        }
-        char *const as_argv[] = {"/usr/bin/as", "--version", NULL};
-        char *const as_envp[] = {"PATH=/bin:/usr/bin", "LC_ALL=C", NULL};
-        execve("/usr/bin/as", as_argv, as_envp);
-        exit(127);
-    }
-    int as_status = 0;
-    waitpid(as_pid, &as_status, 0);
-    printf("[INIT-AS] as --version returned status=0x%x (exit_code=%d)\n", as_status, (as_status >> 8) & 0xFF);
-    int afd = open("/tmp/as_log.txt", O_RDONLY);
-    if (afd >= 0) {
-        printf("[AS-LOG-START]\n");
-        char abuf[512];
-        ssize_t n;
-        while ((n = read(afd, abuf, sizeof(abuf) - 1)) > 0) {
-            abuf[n] = '\0';
-            printf("%s", abuf);
-        }
-        printf("\n[AS-LOG-END]\n");
-        close(afd);
-    }
-    TEST_ASSERT(as_status == 0, "GNU Assembler (as) native execution");
-
-    int gcc_pid = fork();
-    if (gcc_pid == 0) {
-        int lfd = open("/tmp/gcc_log.txt", O_CREAT | O_WRONLY | O_TRUNC, 0666);
-        if (lfd >= 0) {
-            dup2(lfd, 1);
-            dup2(lfd, 2);
-            close(lfd);
-        }
-
-        char *const gcc_argv[] = {"/usr/bin/gcc", "-v", "-c", "/examples/hello.c", "-o", "/tmp/hello.o", NULL};
-
-        char *const gcc_envp[] = {
-            "PATH=/usr/bin:/bin:/usr/libexec/gcc/x86_64-elf/14.2.0",
-            "TMPDIR=/tmp",
-            "C_INCLUDE_PATH=/usr/include",
-            NULL
-        };
-        execve("/usr/bin/gcc", gcc_argv, gcc_envp);
-        exit(127);
-    }
-    int gcc_status = 0;
-    waitpid(gcc_pid, &gcc_status, 0);
-    printf("[INIT-GCC] gcc -c /examples/hello.c -> /tmp/hello.o returned status=0x%x (exit_code=%d)\n", gcc_status, (gcc_status >> 8) & 0xFF);
-
-    int rfd = open("/tmp/gcc_log.txt", O_RDONLY);
-    if (rfd >= 0) {
-        printf("[GCC-LOG-START]\n");
-        char lbuf[512];
-        ssize_t n;
-        while ((n = read(rfd, lbuf, sizeof(lbuf) - 1)) > 0) {
-            lbuf[n] = '\0';
-            printf("%s", lbuf);
-        }
-        printf("\n[GCC-LOG-END]\n");
-        close(rfd);
-    }
-    TEST_ASSERT(gcc_status == 0, "GNU GCC 14.2.0 native C compilation (cc1 + as)");
-
-    int ld_status = -1;
-    if (gcc_status == 0) {
-        int ld_pid = fork();
-        if (ld_pid == 0) {
-            char *const ld_argv[] = {"/usr/bin/ld", "-nostdlib", "/usr/lib/crt0.o", "/tmp/hello.o", "/usr/lib/libc.a", "-o", "/tmp/hello", NULL};
-            char *const ld_envp[] = {"PATH=/bin:/usr/bin", NULL};
-            execve("/usr/bin/ld", ld_argv, ld_envp);
-            exit(127);
-        }
-        waitpid(ld_pid, &ld_status, 0);
-        printf("[INIT-LD] ld /tmp/hello.o -> /tmp/hello returned status=0x%x (exit_code=%d)\n", ld_status, (ld_status >> 8) & 0xFF);
-        TEST_ASSERT(ld_status == 0, "GNU Binutils (ld) native ELF linking");
-    }
-
-    if (ld_status == 0) {
-        int run_pid = fork();
-        if (run_pid == 0) {
-            char *const hello_argv[] = {"/tmp/hello", "native_test", NULL};
-            char *const hello_envp[] = {NULL};
-            execve("/tmp/hello", hello_argv, hello_envp);
-            exit(127);
-        }
-        int run_status = 0;
-        waitpid(run_pid, &run_status, 0);
-        printf("[INIT-HELLO] /tmp/hello execution returned status=0x%x (exit_code=%d)\n", run_status, (run_status >> 8) & 0xFF);
-        TEST_ASSERT(run_status == 0, "Native compiled binary execution (/tmp/hello)");
-    }
+    /* 12. Native GCC Toolchain Verification */
+    if (access("/etc/run-toolchain-selftest", F_OK) == 0) {
+        run_toolchain_selftest();
     }
 
 
@@ -1457,6 +1354,160 @@ static void run_posix_verification_suite(void)
     printf("-------------------------------------------------------------------------------\n");
 }
 
+static void run_toolchain_selftest(void)
+{
+    int as_pid = fork();
+    if (as_pid == 0) {
+        int lfd = open("/tmp/as_log.txt", O_CREAT | O_WRONLY | O_TRUNC, 0666);
+        if (lfd >= 0) {
+            dup2(lfd, 1);
+            dup2(lfd, 2);
+            close(lfd);
+        }
+        char *const as_argv[] = {"/usr/bin/as", "--version", NULL};
+        char *const as_envp[] = {"PATH=/bin:/usr/bin", "LC_ALL=C", NULL};
+        execve("/usr/bin/as", as_argv, as_envp);
+        exit(127);
+    }
+    int as_status = 0;
+    waitpid(as_pid, &as_status, 0);
+    printf("[INIT-AS] as --version returned status=0x%x (exit_code=%d)\n", as_status, (as_status >> 8) & 0xFF);
+    int afd = open("/tmp/as_log.txt", O_RDONLY);
+    if (afd >= 0) {
+        printf("[AS-LOG-START]\n");
+        char abuf[512];
+        ssize_t n;
+        while ((n = read(afd, abuf, sizeof(abuf) - 1)) > 0) {
+            abuf[n] = '\0';
+            printf("%s", abuf);
+        }
+        printf("\n[AS-LOG-END]\n");
+        close(afd);
+    }
+    TEST_ASSERT(as_status == 0, "GNU Assembler (as) native execution");
+
+    int gcc_pid = fork();
+    if (gcc_pid == 0) {
+        int lfd = open("/tmp/gcc_log.txt", O_CREAT | O_WRONLY | O_TRUNC, 0666);
+        if (lfd >= 0) {
+            dup2(lfd, 1);
+            dup2(lfd, 2);
+            close(lfd);
+        }
+
+        char *const gcc_argv[] = {"/usr/bin/gcc", "-v", "-c", "/examples/hello.c", "-o", "/tmp/hello.o", NULL};
+
+        char *const gcc_envp[] = {
+            "PATH=/usr/bin:/bin:/usr/libexec/gcc/x86_64-elf/14.2.0",
+            "TMPDIR=/tmp",
+            "COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin",
+            "LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib",
+            NULL
+        };
+        execve("/usr/bin/gcc", gcc_argv, gcc_envp);
+        exit(127);
+    }
+    int gcc_status = 0;
+    waitpid(gcc_pid, &gcc_status, 0);
+    printf("[INIT-GCC] gcc -c /examples/hello.c -> /tmp/hello.o returned status=0x%x (exit_code=%d)\n", gcc_status, (gcc_status >> 8) & 0xFF);
+
+    int rfd = open("/tmp/gcc_log.txt", O_RDONLY);
+    if (rfd >= 0) {
+        printf("[GCC-LOG-START]\n");
+        char lbuf[512];
+        ssize_t n;
+        while ((n = read(rfd, lbuf, sizeof(lbuf) - 1)) > 0) {
+            lbuf[n] = '\0';
+            printf("%s", lbuf);
+        }
+        printf("\n[GCC-LOG-END]\n");
+        close(rfd);
+    }
+    TEST_ASSERT(gcc_status == 0, "GNU GCC 14.2.0 native C compilation (cc1 + as)");
+
+    int ld_status = -1;
+    if (gcc_status == 0) {
+        int ld_pid = fork();
+        if (ld_pid == 0) {
+            char *const ld_argv[] = {"/usr/bin/ld", "-nostdlib", "/usr/lib/crt0.o", "/tmp/hello.o", "/usr/lib/libc.a", "-o", "/tmp/hello", NULL};
+            char *const ld_envp[] = {"PATH=/bin:/usr/bin", NULL};
+            execve("/usr/bin/ld", ld_argv, ld_envp);
+            exit(127);
+        }
+        waitpid(ld_pid, &ld_status, 0);
+        printf("[INIT-LD] ld /tmp/hello.o -> /tmp/hello returned status=0x%x (exit_code=%d)\n", ld_status, (ld_status >> 8) & 0xFF);
+        TEST_ASSERT(ld_status == 0, "GNU Binutils (ld) native ELF linking");
+    }
+
+    if (ld_status == 0) {
+        int run_pid = fork();
+        if (run_pid == 0) {
+            char *const hello_argv[] = {"/tmp/hello", "native_test", NULL};
+            char *const hello_envp[] = {NULL};
+            execve("/tmp/hello", hello_argv, hello_envp);
+            exit(127);
+        }
+        int run_status = 0;
+        waitpid(run_pid, &run_status, 0);
+        printf("[INIT-HELLO] /tmp/hello execution returned status=0x%x (exit_code=%d)\n", run_status, (run_status >> 8) & 0xFF);
+        TEST_ASSERT(run_status == 0, "Native compiled binary execution (/tmp/hello)");
+    }
+
+    /* Test full direct gcc compilation (compile + link in one step) */
+    int direct_gcc_pid = fork();
+    if (direct_gcc_pid == 0) {
+        int lfd = open("/tmp/gcc_direct_log.txt", O_CREAT | O_WRONLY | O_TRUNC, 0666);
+        if (lfd >= 0) {
+            dup2(lfd, 1);
+            dup2(lfd, 2);
+            close(lfd);
+        }
+        char *const dgcc_argv[] = {"/usr/bin/gcc", "-O2", "-std=c11", "/examples/hello.c", "-o", "/tmp/hello_native.elf", NULL};
+        char *const dgcc_envp[] = {
+            "PATH=/usr/bin:/bin:/usr/libexec/gcc/x86_64-elf/14.2.0",
+            "TMPDIR=/tmp",
+            "COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin",
+            "LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib",
+            NULL
+        };
+        execve("/usr/bin/gcc", dgcc_argv, dgcc_envp);
+        exit(127);
+    }
+    int dgcc_status = 0;
+    waitpid(direct_gcc_pid, &dgcc_status, 0);
+    printf("[INIT-GCC-DIRECT] gcc /examples/hello.c -o /tmp/hello_native.elf returned status=0x%x (exit_code=%d)\n",
+           dgcc_status, (dgcc_status >> 8) & 0xFF);
+
+    int dfd = open("/tmp/gcc_direct_log.txt", O_RDONLY);
+    if (dfd >= 0) {
+        printf("[GCC-DIRECT-LOG-START]\n");
+        char lbuf[512];
+        ssize_t n;
+        while ((n = read(dfd, lbuf, sizeof(lbuf) - 1)) > 0) {
+            lbuf[n] = '\0';
+            printf("%s", lbuf);
+        }
+        printf("\n[GCC-DIRECT-LOG-END]\n");
+        close(dfd);
+    }
+    TEST_ASSERT(dgcc_status == 0, "Full GCC end-to-end compile & link (/tmp/hello_native.elf)");
+
+    if (dgcc_status == 0) {
+        int run_pid2 = fork();
+        if (run_pid2 == 0) {
+            char *const hello_argv[] = {"/tmp/hello_native.elf", "full_gcc_test", NULL};
+            char *const hello_envp[] = {NULL};
+            execve("/tmp/hello_native.elf", hello_argv, hello_envp);
+            exit(127);
+        }
+        int run_status2 = 0;
+        waitpid(run_pid2, &run_status2, 0);
+        printf("[INIT-HELLO-DIRECT] /tmp/hello_native.elf execution returned status=0x%x (exit_code=%d)\n",
+               run_status2, (run_status2 >> 8) & 0xFF);
+        TEST_ASSERT(run_status2 == 0, "Native direct binary execution (/tmp/hello_native.elf)");
+    }
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -1473,6 +1524,16 @@ int main(int argc, char **argv)
     } else {
         puts("[INIT] Skipping POSIX & Network verification suite "
              "(touch /etc/run-posix-selftest to re-enable)");
+    }
+
+    if (access("/etc/run-toolchain-selftest", F_OK) == 0) {
+        puts("-------------------------------------------------------------------------------");
+        puts("      Running Native GCC Toolchain Smoke Test Suite (/usr/bin/gcc)");
+        puts("-------------------------------------------------------------------------------");
+        run_toolchain_selftest();
+    } else {
+        puts("[INIT] Skipping native GCC/binutils smoke test "
+             "(touch /etc/run-toolchain-selftest to re-enable)");
     }
 
     if (access("/etc/run-hwtest", F_OK) == 0) {
@@ -1578,6 +1639,16 @@ int main(int argc, char **argv)
         if (p == 0) {
             char *const args[] = { "/bin/which.elf", "-a", "sh", NULL };
             execve("/bin/which.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/play.elf", "/music/01_Neon_Viper.mp3", "1", NULL };
+            execve("/bin/play.elf", args, NULL);
             _exit(1);
         } else if (p > 0) {
             int status = 0;

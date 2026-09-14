@@ -143,6 +143,22 @@ void net_buf_trim(net_buf_t *buf, size_t len)
 
 /* ── Queue Operations ─────────────────────────────────────────────────────── */
 
+/*
+ * Every one of these takes q->lock with spinlock_lock_irqsave()/
+ * _irqrestore() rather than the plain form, for the same reason as
+ * kernel/net/tcp.c's identical note (see there for the full writeup): a
+ * net_buf_queue_t is shared between process context and the timer-interrupt-
+ * driven receive path on plenty of these queues (ARP's per-entry
+ * pending_queue, a raw socket's rx_queue, ...) — push happens from
+ * arp_input()/raw_input() etc. on whatever CPU the timer interrupt lands
+ * on, pop/purge/len from an ordinary syscall in process context. A plain
+ * spinlock_lock() left interrupts enabled across those process-context
+ * critical sections, so that timer interrupt could land on the CPU already
+ * holding a queue's lock and spin forever inside the interrupt-context
+ * push's own acquire. Each critical section here is self-contained (lock
+ * and unlock in the same call), so this needs no change to any caller.
+ */
+
 void net_buf_queue_init(net_buf_queue_t *q)
 {
     if (!q) return;
@@ -156,7 +172,7 @@ void net_buf_queue_push(net_buf_queue_t *q, net_buf_t *buf)
 {
     if (!q || !buf) return;
 
-    spinlock_lock(&q->lock);
+    irqflags_t flags = spinlock_lock_irqsave(&q->lock);
     buf->next = NULL;
 
     if (!q->tail) {
@@ -167,16 +183,16 @@ void net_buf_queue_push(net_buf_queue_t *q, net_buf_t *buf)
         q->tail = buf;
     }
     q->count++;
-    spinlock_unlock(&q->lock);
+    spinlock_unlock_irqrestore(&q->lock, flags);
 }
 
 net_buf_t *net_buf_queue_pop(net_buf_queue_t *q)
 {
     if (!q) return NULL;
 
-    spinlock_lock(&q->lock);
+    irqflags_t flags = spinlock_lock_irqsave(&q->lock);
     if (!q->head) {
-        spinlock_unlock(&q->lock);
+        spinlock_unlock_irqrestore(&q->lock, flags);
         return NULL;
     }
 
@@ -187,7 +203,7 @@ net_buf_t *net_buf_queue_pop(net_buf_queue_t *q)
     }
     buf->next = NULL;
     q->count--;
-    spinlock_unlock(&q->lock);
+    spinlock_unlock_irqrestore(&q->lock, flags);
 
     return buf;
 }
@@ -196,7 +212,7 @@ void net_buf_queue_purge(net_buf_queue_t *q)
 {
     if (!q) return;
 
-    spinlock_lock(&q->lock);
+    irqflags_t flags = spinlock_lock_irqsave(&q->lock);
     net_buf_t *cur = q->head;
     while (cur) {
         net_buf_t *next = cur->next;
@@ -206,14 +222,14 @@ void net_buf_queue_purge(net_buf_queue_t *q)
     q->head = NULL;
     q->tail = NULL;
     q->count = 0;
-    spinlock_unlock(&q->lock);
+    spinlock_unlock_irqrestore(&q->lock, flags);
 }
 
 size_t net_buf_queue_len(net_buf_queue_t *q)
 {
     if (!q) return 0;
-    spinlock_lock(&q->lock);
+    irqflags_t flags = spinlock_lock_irqsave(&q->lock);
     size_t c = q->count;
-    spinlock_unlock(&q->lock);
+    spinlock_unlock_irqrestore(&q->lock, flags);
     return c;
 }

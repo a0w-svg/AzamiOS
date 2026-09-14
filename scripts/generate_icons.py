@@ -21,13 +21,34 @@ SKY         = 0xFF89DCEB
 PINK        = 0xFFF5C2E7
 FLAMINGO    = 0xFFF38BA8
 ORANGE      = 0xFFFAB387  # alias of PEACH, used where "orange tile" reads clearer
+MANTLE      = 0xFF181825
 
 def create_blank(bg=TRANSPARENT):
     return [bg] * (32 * 32)
 
+new_icon = create_blank
+
 def set_pixel(buf, x, y, color):
     if 0 <= x < 32 and 0 <= y < 32:
         buf[y * 32 + x] = color
+
+def draw_line(buf, x0, y0, x1, y1, color):
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    while True:
+        set_pixel(buf, x0, y0, color)
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
 
 def fill_circle(buf, cx, cy, r, color):
     for y in range(cy - r, cy + r + 1):
@@ -256,6 +277,114 @@ def gen_xgui_demo():
     fill_rect(buf, 5, 16, 10, 2, BASE)
     return buf
 
+def gen_imageviewer():
+    buf = create_blank()
+    # Outer picture frame
+    fill_rounded_rect(buf, 3, 3, 26, 26, 4, BASE)
+    fill_rounded_rect(buf, 5, 5, 22, 22, 2, SURFACE0)
+    # Sky
+    fill_rect(buf, 6, 6, 20, 12, SAPPHIRE)
+    # Sun
+    fill_circle(buf, 21, 10, 3, YELLOW)
+    # Mountains / Hills
+    for y in range(14, 25):
+        for x in range(6, 26):
+            if y >= 25 - (x - 6): # Left slope
+                set_pixel(buf, x, y, TEAL)
+            if y >= 25 - (25 - x) * 0.8: # Right slope
+                set_pixel(buf, x, y, GREEN)
+    # Frame accent border
+    fill_rect(buf, 3, 3, 26, 2, MAUVE)
+    return buf
+
+def gen_notes():
+    buf = create_blank()
+    # Sticky note pad (Yellow pastel)
+    fill_rounded_rect(buf, 4, 3, 24, 26, 3, YELLOW)
+    # Top adhesive strip
+    fill_rect(buf, 4, 3, 24, 5, PEACH)
+    # Horizontal ruled lines representing notes
+    fill_rect(buf, 8, 12, 16, 2, SURFACE1)
+    fill_rect(buf, 8, 16, 14, 2, SURFACE1)
+    fill_rect(buf, 8, 20, 10, 2, SURFACE1)
+    # Folded bottom-right dog-ear corner
+    for dy in range(6):
+        for dx in range(6 - dy):
+            set_pixel(buf, 27 - dx, 28 - dy, BASE)
+    for dy in range(6):
+        set_pixel(buf, 22 + dy, 28 - dy, PEACH)
+    return buf
+
+def gen_ide():
+    """Azami Code Studio (IDE) icon: window frame with code brackets and run badge."""
+    buf = new_icon()
+    # Dark window canvas
+    fill_rect(buf, 2, 2, 28, 28, MANTLE)
+    # Header bar
+    fill_rect(buf, 2, 2, 28, 6, SURFACE0)
+    # Window dots
+    set_pixel(buf, 5, 5, RED)
+    set_pixel(buf, 8, 5, YELLOW)
+    set_pixel(buf, 11, 5, GREEN)
+    # Left sidebar divider
+    draw_line(buf, 9, 8, 9, 29, SURFACE1)
+    # Code brackets: '<'
+    draw_line(buf, 14, 13, 11, 17, SAPPHIRE)
+    draw_line(buf, 11, 17, 14, 21, SAPPHIRE)
+    # '/'
+    draw_line(buf, 16, 21, 19, 13, MAUVE)
+    # '>'
+    draw_line(buf, 21, 13, 24, 17, SAPPHIRE)
+    draw_line(buf, 24, 17, 21, 21, SAPPHIRE)
+    # Green run triangle badge at bottom right
+    for r in range(5):
+        draw_line(buf, 24, 23 + r, 24 + (4 - abs(2 - r)), 23 + r, GREEN)
+    return buf
+
+def gen_fontviewer():
+    """Font Viewer icon: large stylized 'A' with typography grid marks."""
+    buf = new_icon()
+    fill_rect(buf, 2, 2, 28, 28, SURFACE0)
+    # Baseline & cap-height guideline marks
+    draw_line(buf, 4, 8, 27, 8, SURFACE1)
+    draw_line(buf, 4, 25, 27, 25, SURFACE1)
+    # Big capital 'A' in Mauve & Text
+    # Left stem
+    draw_line(buf, 15, 9, 9, 24, TEXT)
+    draw_line(buf, 16, 9, 10, 24, MAUVE)
+    # Right stem
+    draw_line(buf, 16, 9, 22, 24, TEXT)
+    draw_line(buf, 17, 9, 23, 24, MAUVE)
+    # Crossbar
+    draw_line(buf, 11, 19, 21, 19, PEACH)
+    draw_line(buf, 11, 20, 21, 20, PEACH)
+    # Serifs at base
+    draw_line(buf, 7, 24, 12, 24, MAUVE)
+    draw_line(buf, 20, 24, 25, 24, MAUVE)
+    return buf
+
+def gen_hexedit():
+    """Terminal Hex Editor icon: 0x prefix badge with hex grid."""
+    buf = new_icon()
+    fill_rect(buf, 2, 2, 28, 28, BASE)
+    fill_rect(buf, 2, 2, 28, 6, SURFACE0)
+    # '0x' in Yellow
+    # '0'
+    draw_line(buf, 5, 11, 5, 17, YELLOW)
+    draw_line(buf, 9, 11, 9, 17, YELLOW)
+    draw_line(buf, 5, 11, 9, 11, YELLOW)
+    draw_line(buf, 5, 17, 9, 17, YELLOW)
+    # 'x'
+    draw_line(buf, 12, 13, 16, 17, YELLOW)
+    draw_line(buf, 12, 17, 16, 13, YELLOW)
+    # Hex byte dots in Sapphire and Mauve
+    for y in (20, 23, 26):
+        fill_rect(buf, 5, y, 4, 2, SAPPHIRE)
+        fill_rect(buf, 11, y, 4, 2, MAUVE)
+        fill_rect(buf, 18, y, 4, 2, TEAL)
+        fill_rect(buf, 24, y, 4, 2, TEXT)
+    return buf
+
 def main():
     generators = {
         'userland/apps/texteditor/texteditor.icn': gen_texteditor,
@@ -277,6 +406,11 @@ def main():
         'userland/apps/xeyes/xeyes.icn': gen_xeyes,
         'userland/apps/xcalc/xcalc.icn': gen_xcalc,
         'userland/apps/xgui_demo/xgui_demo.icn': gen_xgui_demo,
+        'userland/apps/imageviewer/imageviewer.icn': gen_imageviewer,
+        'userland/apps/notes/notes.icn': gen_notes,
+        'userland/apps/ide/ide.icn': gen_ide,
+        'userland/apps/fontviewer/fontviewer.icn': gen_fontviewer,
+        'userland/apps/hexedit/hexedit.icn': gen_hexedit,
     }
     for path, gen_fn in generators.items():
         buf = gen_fn()

@@ -644,13 +644,33 @@ process_t *sched_spawn_user_args(const char *path, const char *const argv[], con
 process_t *sched_spawn_user(const char *path)
 {
     const char *default_argv[] = { path, NULL };
-    const char *default_envp[] = { "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/", "TERM=azami", "USER=root", "HOME=/root", "SHELL=/bin/sh.elf", NULL };
+    const char *default_envp[] = {
+        "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/",
+        "TERM=azami",
+        "USER=root",
+        "HOME=/root",
+        "SHELL=/bin/sh.elf",
+        "TMPDIR=/tmp",
+        "COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin",
+        "LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib",
+        NULL
+    };
     return sched_spawn_user_args(path, default_argv, default_envp);
 }
 
 process_t *sched_spawn_user_arg(const char *path, const char *arg)
 {
-    const char *default_envp[] = { "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/", "TERM=azami", "USER=root", "HOME=/root", "SHELL=/bin/sh.elf", NULL };
+    const char *default_envp[] = {
+        "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/",
+        "TERM=azami",
+        "USER=root",
+        "HOME=/root",
+        "SHELL=/bin/sh.elf",
+        "TMPDIR=/tmp",
+        "COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin",
+        "LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib",
+        NULL
+    };
     if (arg && arg[0]) {
         const char *argv[] = { path, arg, NULL };
         return sched_spawn_user_args(path, argv, default_envp);

@@ -86,28 +86,57 @@ u32 net_checksum_partial(const void *data, size_t len, u32 sum)
      * exactly the same total as adding them one at a time; the widening in
      * net_checksum_fold() (32-bit sum → 16 bits) and here (64-bit → 32-bit
      * return) is the same fold at a different width, not a new idea.
+     *
+     * That tolerance has a limit the plain `sum64 += word` below used to
+     * miss: it holds only for carries that land *inside* the 64-bit
+     * accumulator. A carry out of bit 63 — sum64 itself wrapping — is
+     * silently discarded by ordinary unsigned addition, and unlike a 16-bit
+     * or 32-bit lane crossing, nothing downstream ever folds it back in:
+     * net_checksum_fold() only ever sees the wrapped (too-small) value. This
+     * is not a corner case; a TCP or UDP checksum is a handful of 8-byte
+     * reads (pseudo-header plus a short header) seeded with whatever the
+     * caller already had, so the running total sits close to 2^64 often
+     * enough to wrap in ordinary traffic — that carry silently dropping was
+     * the actual reason a real peer's checksum validator (and this file's
+     * own on the receive side) saw a wrong TCP checksum on outgoing SYNs
+     * and occasionally flagged a perfectly good incoming ICMP or UDP
+     * datagram as corrupt: sum64 happened to cross 2^64 partway through and
+     * the carry bit that should have wrapped around to bit 0 (exactly what
+     * "end-around carry" means for a ones'-complement checksum) just
+     * vanished instead. Capturing it explicitly — add, then check whether
+     * the result went backwards, and if so add the 1 that fell out the top —
+     * is the same end-around-carry rule the final 32-to-16-bit fold already
+     * applies, just at the accumulator's own width.
      */
     while (len >= 8) {
         u64 word;
         memcpy(&word, p, 8);
-        sum64 += word;
+        u64 next = sum64 + word;
+        if (next < sum64) next++;   /* carry out of bit 63: wrap it around */
+        sum64 = next;
         p   += 8;
         len -= 8;
     }
     if (len >= 4) {
         u32 word;
         memcpy(&word, p, 4);
-        sum64 += word;
+        u64 next = sum64 + word;
+        if (next < sum64) next++;
+        sum64 = next;
         p   += 4;
         len -= 4;
     }
     while (len > 1) {
-        sum64 += (u32)p[0] | ((u32)p[1] << 8);
+        u64 next = sum64 + ((u32)p[0] | ((u32)p[1] << 8));
+        if (next < sum64) next++;
+        sum64 = next;
         p   += 2;
         len -= 2;
     }
     if (len > 0) {
-        sum64 += (u32)p[0];
+        u64 next = sum64 + (u32)p[0];
+        if (next < sum64) next++;
+        sum64 = next;
     }
 
     while (sum64 >> 32) {

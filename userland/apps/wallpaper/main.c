@@ -659,6 +659,7 @@ static void wp_create_desktop_note(unsigned int screen_w, unsigned int screen_h)
     }
 
     wp_scan_desktop_icons(screen_w, screen_h);
+    wp_launch_arg("/bin/notes.elf", filepath);
 }
 
 static void wp_create_desktop_folder(unsigned int screen_w, unsigned int screen_h)

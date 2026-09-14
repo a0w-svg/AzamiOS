@@ -1014,10 +1014,8 @@ int main(int argc, char **argv)
 {
     /* Initialize default toolchain and library environment */
     if (!getenv("PATH")) setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin", 1);
-    if (!getenv("COMPILER_PATH")) setenv("COMPILER_PATH", "/usr/libexec:/usr/bin", 1);
-    if (!getenv("LIBRARY_PATH")) setenv("LIBRARY_PATH", "/usr/lib:/lib:/usr/local/lib", 1);
-    if (!getenv("C_INCLUDE_PATH")) setenv("C_INCLUDE_PATH", "/usr/include:/usr/local/include", 1);
-    if (!getenv("CPATH")) setenv("CPATH", "/usr/include:/usr/local/include", 1);
+    if (!getenv("COMPILER_PATH")) setenv("COMPILER_PATH", "/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin", 1);
+    if (!getenv("LIBRARY_PATH")) setenv("LIBRARY_PATH", "/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib", 1);
 
     source_profile("/etc/profile");
     source_profile("/root/.profile");
