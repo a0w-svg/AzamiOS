@@ -33,6 +33,17 @@
 #define TCP_RTX_MAX_BACKOFF      24  /* seconds: cap on the doubling delay  */
 #define TCP_RTX_MAX_RETRIES      5   /* give up and reset after this many   */
 
+/* TCP Options (RFC 793 §3.1, RFC 879) — this stack only ever sends/parses
+ * MSS; NOP/END are recognised so a peer's option list can still be walked
+ * past whatever else it puts in there (window scale, SACK-permitted,
+ * timestamps — all silently skipped, not negotiated). */
+#define TCP_OPT_END  0
+#define TCP_OPT_NOP  1
+#define TCP_OPT_MSS  2
+
+/* RFC 879's fallback MSS when a peer's SYN carries no MSS option at all. */
+#define TCP_DEFAULT_MSS_FALLBACK 536
+
 /* TCP Header Flags */
 #define TCP_FLAG_FIN 0x01
 #define TCP_FLAG_SYN 0x02
@@ -94,6 +105,12 @@ typedef struct tcp_sock {
     u32              rcv_wnd;    /* Receive window advertisement               */
     u32              iss;        /* Initial send sequence number               */
     u32              irs;        /* Initial receive sequence number            */
+
+    /* Peer's advertised MSS from the SYN/SYN-ACK that opened this connection
+     * (TCP_DEFAULT_MSS_FALLBACK if it sent no MSS option at all) — the cap
+     * tcp_send() chunks outgoing data to, alongside our own device-MTU-based
+     * limit. See tcp_local_mss()/tcp_parse_mss_option() in tcp.c. */
+    u16              peer_mss;
 
     /* Retransmission of the outstanding control segment (SYN/SYN-ACK/FIN).
      * rtx_deadline is an absolute g_tcp_ticks value, 0 meaning "nothing

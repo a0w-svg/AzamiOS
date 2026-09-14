@@ -268,6 +268,7 @@ KERNEL_C_SRCS := \
     kernel/net/arp.c \
     kernel/net/ipv4.c \
     kernel/net/icmp.c \
+    kernel/net/igmp.c \
     kernel/net/udp.c \
     kernel/net/tcp.c \
     kernel/net/socket.c \

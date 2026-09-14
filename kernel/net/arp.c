@@ -109,6 +109,36 @@ void arp_send_reply(const u8 target_ip[4], const u8 target_mac[6])
     dev->send(pkt, sizeof(pkt));
 }
 
+void arp_send_gratuitous(const u8 ip[4])
+{
+    if (!ip || (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0)) return;
+
+    net_device_t *dev = net_get_default_device();
+    if (!dev) return;
+    u8 host_mac[6];
+    memcpy(host_mac, dev->mac, 6);
+
+    u8 pkt[sizeof(eth_hdr_t) + sizeof(arp_pkt_t)];
+    eth_hdr_t *eth = (eth_hdr_t *)pkt;
+    arp_pkt_t *arp = (arp_pkt_t *)(pkt + sizeof(eth_hdr_t));
+
+    memset(eth->dst, 0xFF, 6);
+    memcpy(eth->src, host_mac, 6);
+    eth->ethertype = htons(ETH_P_ARP);
+
+    arp->htype = htons(1);
+    arp->ptype = htons(ETH_P_IP);
+    arp->hlen = 6;
+    arp->plen = 4;
+    arp->oper = htons(ARP_OP_REQUEST);
+    memcpy(arp->sha, host_mac, 6);
+    memcpy(arp->spa, ip, 4);
+    memset(arp->tha, 0x00, 6);
+    memcpy(arp->tpa, ip, 4);
+
+    dev->send(pkt, sizeof(pkt));
+}
+
 int arp_resolve(const u8 ip[4], u8 mac_out[6], net_buf_t *pending_buf)
 {
     if (!ip || !mac_out) return -1;

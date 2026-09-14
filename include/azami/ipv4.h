@@ -42,4 +42,16 @@ void route_print_table(void);
 
 void ipv4_init(void);
 int  ipv4_send(net_buf_t *buf, const u8 dst_ip[4], u8 protocol);
+/* For a raw socket with IP_HDRINCL set: `buf` is a complete datagram the
+ * caller already built — IPv4 header (with a valid dst_ip; checksum may be
+ * left zero and this fills it in) followed by whatever payload — routed and
+ * handed to Ethernet/ARP exactly like an ordinary ipv4_send() output packet,
+ * but without prepending a second header or touching any L4 checksum. Does
+ * not fragment: a caller asking to build its own IP header is assumed to
+ * also be responsible for keeping it under the path MTU. */
+int  ipv4_send_prebuilt(net_buf_t *buf);
 void ipv4_input(net_buf_t *buf);
+/* Ages out abandoned fragment reassemblies. Call once a second, the same
+ * cadence as arp_timer_tick()/tcp_timer_tick() (see sched_tick() in
+ * kernel/sched/sched.c). */
+void ipv4_timer_tick(void);

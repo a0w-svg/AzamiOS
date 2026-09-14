@@ -35,6 +35,17 @@ static inline u32 ntohl(u32 v) { return htonl(v); }
 #define IPPROTO_ICMP 1
 #define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
+#define IPPROTO_IGMP 2
+
+/* IPPROTO_IP-level Socket Options — numeric values match Linux, the same
+ * convention this header already follows for SOL_SOCKET/SIOC* elsewhere, so
+ * a stock binary's raw-socket or multicast setsockopt() calls land on the
+ * option this kernel actually means. */
+#define IP_TOS              1
+#define IP_TTL              2
+#define IP_HDRINCL          3
+#define IP_ADD_MEMBERSHIP   35
+#define IP_DROP_MEMBERSHIP  36
 
 /* Socket Options */
 #define SO_DEBUG        1
@@ -82,6 +93,13 @@ struct sockaddr_in {
     u16            sin_port;
     struct in_addr sin_addr;
     u8             sin_zero[8];
+};
+
+/* Must stay field-for-field identical to Linux's struct ip_mreq — this is
+ * the layout copy_from_user() moves for IP_ADD_MEMBERSHIP/IP_DROP_MEMBERSHIP. */
+struct ip_mreq {
+    struct in_addr imr_multiaddr;
+    struct in_addr imr_interface;
 };
 
 /* Must stay field-for-field identical to userland/libc/include/sys/un.h's
@@ -200,6 +218,11 @@ typedef struct socket {
     int         so_error;
     u32         so_rcvtimeo;
     u32         so_sndtimeo;
+    /* IP_HDRINCL (SOL_IP): a SOCK_RAW sender builds its own complete IPv4
+     * header instead of this stack building one — see ipv4_send_prebuilt()
+     * in ipv4.c and its use in sys_sendto_impl(). Meaningless outside
+     * SOCK_RAW. */
+    int         ip_hdrincl;
     file_t     *file;
 } socket_t;
 

@@ -72,6 +72,55 @@ static u32 generate_isn(void)
     return __atomic_fetch_add(&g_isn_seed, 0x10000U, __ATOMIC_RELAXED);
 }
 
+/*
+ * Our own advertised MSS: device MTU minus the IPv4 and TCP fixed headers,
+ * clamped to TCP_DEFAULT_MSS (the value this file has always chunked
+ * tcp_send() to) so a device reporting an unusually large MTU — the
+ * loopback's 65536, say — doesn't announce a segment size nothing on this
+ * side is actually prepared to emit as one packet.
+ */
+static u16 tcp_local_mss(void)
+{
+    net_device_t *dev = net_get_default_device();
+    u32 mtu = (dev && dev->mtu > 128) ? dev->mtu : 1500;
+    u32 mss = mtu - sizeof(ipv4_hdr_t) - sizeof(tcp_hdr_t);
+    if (mss > TCP_DEFAULT_MSS) mss = TCP_DEFAULT_MSS;
+    return (u16)mss;
+}
+
+/*
+ * Walk a received SYN/SYN-ACK's option list looking for MSS (kind 2, a
+ * fixed 4-byte option). NOP (kind 1) is a single byte with no length field;
+ * every other option carries an explicit length at opts[i+1] and is skipped
+ * whole rather than assumed to be any particular size — this stack does not
+ * negotiate window scaling, SACK-permitted or timestamps, but a peer is
+ * free to send them and the MSS this is looking for can follow any of them.
+ * Returns 0 if no MSS option was present (caller falls back to
+ * TCP_DEFAULT_MSS_FALLBACK, per RFC 879) or if the option list is malformed.
+ */
+static u16 tcp_parse_mss_option(const tcp_hdr_t *tcp, size_t header_len)
+{
+    if (header_len <= sizeof(tcp_hdr_t)) return 0;
+
+    const u8 *opts = (const u8 *)tcp + sizeof(tcp_hdr_t);
+    size_t opt_total = header_len - sizeof(tcp_hdr_t);
+    size_t i = 0;
+
+    while (i < opt_total) {
+        u8 kind = opts[i];
+        if (kind == TCP_OPT_END) break;
+        if (kind == TCP_OPT_NOP) { i++; continue; }
+        if (i + 1 >= opt_total) break;
+        u8 olen = opts[i + 1];
+        if (olen < 2 || i + olen > opt_total) break;
+        if (kind == TCP_OPT_MSS && olen == 4) {
+            return (u16)(((u16)opts[i + 2] << 8) | opts[i + 3]);
+        }
+        i += olen;
+    }
+    return 0;
+}
+
 void tcp_init(void)
 {
     irqflags_t flags = spinlock_lock_irqsave(&g_tcp_lock);
@@ -124,7 +173,14 @@ u16 tcp_checksum(const tcp_hdr_t *tcp, const ipv4_hdr_t *ip, size_t header_len,
 
 static s64 tcp_send_packet(tcp_sock_t *sock, u8 flags, const void *payload, size_t payload_len)
 {
-    net_buf_t *buf = net_buf_alloc(NET_BUF_HEADROOM + sizeof(tcp_hdr_t) + payload_len);
+    /* Every SYN and SYN-ACK carries our MSS announcement — see
+     * tcp_local_mss()/tcp_parse_mss_option(). Nothing else this file sends
+     * (ACK, PSH|ACK, FIN|ACK, RST) carries options. */
+    bool with_mss = (flags & TCP_FLAG_SYN) != 0;
+    size_t opt_len = with_mss ? 4 : 0;
+    size_t hdr_len = sizeof(tcp_hdr_t) + opt_len;
+
+    net_buf_t *buf = net_buf_alloc(NET_BUF_HEADROOM + hdr_len + payload_len);
     if (!buf) return -ENOMEM;
 
     net_buf_reserve(buf, NET_BUF_HEADROOM);
@@ -135,11 +191,20 @@ static s64 tcp_send_packet(tcp_sock_t *sock, u8 flags, const void *payload, size
     tcp->dst_port = htons(sock->remote_port);
     tcp->seq_num = htonl(sock->snd_nxt);
     tcp->ack_num = (flags & TCP_FLAG_ACK) ? htonl(sock->rcv_nxt) : 0;
-    tcp->data_offset = (sizeof(tcp_hdr_t) / 4) << 4; /* 20 bytes (0x50) */
+    tcp->data_offset = (u8)((hdr_len / 4) << 4);
     tcp->flags = flags;
     tcp->window_size = htons((u16)sock->rcv_wnd);
     tcp->checksum = 0;
     tcp->urgent_pointer = 0;
+
+    if (with_mss) {
+        u8 *opt = (u8 *)net_buf_put(buf, 4);
+        u16 mss = tcp_local_mss();
+        opt[0] = TCP_OPT_MSS;
+        opt[1] = 4;
+        opt[2] = (u8)(mss >> 8);
+        opt[3] = (u8)(mss & 0xFF);
+    }
 
     /* 2. Put Payload Data */
     if (payload && payload_len > 0) {
@@ -177,7 +242,12 @@ static s64 tcp_send_packet(tcp_sock_t *sock, u8 flags, const void *payload, size
  */
 static s64 tcp_retransmit_syn(tcp_sock_t *sock, u8 flags)
 {
-    net_buf_t *buf = net_buf_alloc(NET_BUF_HEADROOM + sizeof(tcp_hdr_t));
+    /* Always a SYN or SYN-ACK (see tcp_timer_tick()'s callers) — carries the
+     * same MSS option the original did, for the same reason tcp_send_packet()
+     * does. */
+    size_t hdr_len = sizeof(tcp_hdr_t) + 4;
+
+    net_buf_t *buf = net_buf_alloc(NET_BUF_HEADROOM + hdr_len);
     if (!buf) return -ENOMEM;
 
     net_buf_reserve(buf, NET_BUF_HEADROOM);
@@ -187,11 +257,18 @@ static s64 tcp_retransmit_syn(tcp_sock_t *sock, u8 flags)
     tcp->dst_port = htons(sock->remote_port);
     tcp->seq_num = htonl(sock->iss);
     tcp->ack_num = (flags & TCP_FLAG_ACK) ? htonl(sock->rcv_nxt) : 0;
-    tcp->data_offset = (sizeof(tcp_hdr_t) / 4) << 4;
+    tcp->data_offset = (u8)((hdr_len / 4) << 4);
     tcp->flags = flags;
     tcp->window_size = htons((u16)sock->rcv_wnd);
     tcp->checksum = 0;
     tcp->urgent_pointer = 0;
+
+    u8 *opt = (u8 *)net_buf_put(buf, 4);
+    u16 mss = tcp_local_mss();
+    opt[0] = TCP_OPT_MSS;
+    opt[1] = 4;
+    opt[2] = (u8)(mss >> 8);
+    opt[3] = (u8)(mss & 0xFF);
 
     return ipv4_send(buf, sock->remote_ip, IP_PROTO_TCP);
 }
@@ -231,6 +308,7 @@ tcp_sock_t *tcp_socket_create(void)
     s->refcnt = 1; /* the reference tcp_socket_close() will drop */
     s->rcv_wnd = TCP_DEFAULT_WINDOW;
     s->snd_wnd = TCP_DEFAULT_WINDOW;
+    s->peer_mss = TCP_DEFAULT_MSS_FALLBACK; /* until a SYN/SYN-ACK says otherwise */
 
     s->rx_buf = (u8 *)kmalloc(TCP_RX_BUF_SIZE);
     s->tx_buf = (u8 *)kmalloc(TCP_TX_BUF_SIZE);
@@ -484,11 +562,19 @@ s64 tcp_send(tcp_sock_t *sock, const void *data, size_t len, int flags)
     if (!sock || !data) return -EINVAL;
     if (sock->state != TCP_STATE_ESTABLISHED) return -ENOTCONN;
 
+    /* Cap each segment at whatever is smaller: what the peer's SYN/SYN-ACK
+     * asked for, or what this side's own device MTU can carry — sending
+     * more than the peer's advertised MSS is what window scaling's absence
+     * doesn't excuse; a peer is entitled to assume nothing bigger arrives. */
+    u16 local_mss = tcp_local_mss();
+    u16 mss = sock->peer_mss;
+    if (mss == 0 || mss > local_mss) mss = local_mss;
+
     const u8 *ptr = (const u8 *)data;
     size_t remaining = len;
 
     while (remaining > 0) {
-        size_t chunk = (remaining > TCP_DEFAULT_MSS) ? TCP_DEFAULT_MSS : remaining;
+        size_t chunk = (remaining > mss) ? mss : remaining;
         s64 res = tcp_send_packet(sock, TCP_FLAG_ACK | TCP_FLAG_PSH, ptr, chunk);
         if (res < 0) return (len - remaining > 0) ? (s64)(len - remaining) : res;
         ptr += chunk;
@@ -749,6 +835,9 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
                     child->snd_nxt = child->iss;
                     child->state = TCP_STATE_SYN_RECEIVED;
 
+                    u16 pm = tcp_parse_mss_option(tcp, header_len);
+                    child->peer_mss = pm ? pm : TCP_DEFAULT_MSS_FALLBACK;
+
                     /* Send SYN-ACK */
                     tcp_send_packet(child, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
                     child->rtx_count = 0;
@@ -772,6 +861,9 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             sock->snd_una = ack_num;
             sock->state = TCP_STATE_ESTABLISHED;
             sock->rtx_deadline = 0;  /* our SYN is acked; nothing left to retransmit */
+
+            u16 pm = tcp_parse_mss_option(tcp, header_len);
+            sock->peer_mss = pm ? pm : TCP_DEFAULT_MSS_FALLBACK;
 
             /* Send final ACK of 3-way handshake */
             tcp_send_packet(sock, TCP_FLAG_ACK, NULL, 0);

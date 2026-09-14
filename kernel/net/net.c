@@ -264,6 +264,10 @@ void net_set_ip(const u8 ip_in[4])
     if (!ip_in) return;
     memcpy(g_host_ip, ip_in, 4);
 
+    /* Announce the new address — see arp_send_gratuitous()'s comment. Covers
+     * both a DHCP lease (dhcp_input() -> here) and a manual SIOCSIFADDR. */
+    arp_send_gratuitous(ip_in);
+
     /* Update subnet route if netmask is non-zero */
     if (g_host_netmask[0] != 0) {
         u8 net_addr[4] = {

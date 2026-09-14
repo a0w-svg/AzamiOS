@@ -40,6 +40,7 @@
 #include "../../drivers/misc/hpet.h"
 #include "../../include/azami/net.h"
 #include "../../include/azami/socket.h"
+#include "../../include/azami/igmp.h"
 #include "../security/acl.h"
 #include "../../arch/x86_64/cpu/cpu.h"   /* g_pku_enabled */
 #include "../../arch/x86_64/cpu/msr.h"   /* rdpkru / wrpkru */
@@ -3899,8 +3900,21 @@ static s64 sys_setsockopt_impl(pt_regs_t *r)
             return 0;
         }
     } else if (level == IPPROTO_IP) {
-        if (optname == 1 /* IP_TOS */ || optname == 2 /* IP_TTL */) {
+        if (optname == IP_TOS || optname == IP_TTL) {
             return 0;
+        } else if (optname == IP_HDRINCL && optlen >= sizeof(int)) {
+            int val = 0;
+            copy_from_user(&val, optval, sizeof(int));
+            sock->ip_hdrincl = val;
+            return 0;
+        } else if ((optname == IP_ADD_MEMBERSHIP || optname == IP_DROP_MEMBERSHIP) &&
+                   optlen >= sizeof(struct ip_mreq)) {
+            struct ip_mreq mreq;
+            if (copy_from_user(&mreq, optval, sizeof(mreq)) != 0) return -(s64)EFAULT;
+            const u8 *group = (const u8 *)&mreq.imr_multiaddr.s_addr;
+            int rc = (optname == IP_ADD_MEMBERSHIP) ? ip_multicast_join(group)
+                                                      : ip_multicast_leave(group);
+            return rc == 0 ? 0 : -(s64)EADDRNOTAVAIL;
         }
     }
     return 0;
@@ -3955,6 +3969,14 @@ static s64 sys_getsockopt_impl(pt_regs_t *r)
             return 0;
         } else if (optname == SO_RCVBUF || optname == SO_SNDBUF) {
             int val = 65536;
+            copy_to_user(optval, &val, sizeof(int));
+            socklen_t l = sizeof(int);
+            copy_to_user(optlen, &l, sizeof(socklen_t));
+            return 0;
+        }
+    } else if (level == IPPROTO_IP) {
+        if (optname == IP_HDRINCL) {
+            int val = sock->ip_hdrincl;
             copy_to_user(optval, &val, sizeof(int));
             socklen_t l = sizeof(int);
             copy_to_user(optlen, &l, sizeof(socklen_t));
@@ -4041,7 +4063,23 @@ static s64 sys_sendto_impl(pt_regs_t *r)
             res = udp_sendto(sock->udp, kbuf, len, NULL, 0);
         }
     } else if (sock->type == SOCK_RAW && sock->raw) {
-        if (uaddr) {
+        if (sock->ip_hdrincl) {
+            /* IP_HDRINCL: `kbuf` is the complete datagram the caller built —
+             * IPv4 header and all. No destination address needed from
+             * sendto() at all (a real ping(8)/traceroute(8) sets one anyway,
+             * but the header's own dst_ip is what actually gets used, the
+             * same as Linux). See ipv4_send_prebuilt(). */
+            net_buf_t *buf = net_buf_alloc(NET_BUF_HEADROOM + len);
+            if (!buf) {
+                kfree(kbuf);
+                return -(s64)ENOMEM;
+            }
+            net_buf_reserve(buf, NET_BUF_HEADROOM);
+            void *p = net_buf_put(buf, len);
+            memcpy(p, kbuf, len);
+            int err = ipv4_send_prebuilt(buf);
+            res = (err < 0) ? (s64)err : (s64)len;
+        } else if (uaddr) {
             struct sockaddr_in sin;
             if (copy_from_user(&sin, uaddr, sizeof(sin)) != 0) {
                 kfree(kbuf);

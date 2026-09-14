@@ -34,5 +34,11 @@ int  arp_resolve(const u8 ip[4], u8 mac_out[6], net_buf_t *pending_buf);
 void arp_input(const u8 *pkt, size_t len);
 void arp_send_request(const u8 target_ip[4]);
 void arp_send_reply(const u8 target_ip[4], const u8 target_mac[6]);
+/* Unsolicited "ARP Announcement" (RFC 5227 §3): broadcasts a request for our
+ * own new IP, sha/spa/tpa all pointing at ourselves. Every host on the
+ * segment updates its cached mapping for this address to our MAC without
+ * waiting to be asked, and any host already holding it sees the conflict.
+ * Call once whenever the host's IP changes — see net_set_ip() in net.c. */
+void arp_send_gratuitous(const u8 ip[4]);
 void arp_timer_tick(void);
 void arp_print_table(void);
