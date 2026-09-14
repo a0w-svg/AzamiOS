@@ -1007,6 +1007,56 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
  * tcp_send()/tcp_socket_close() do, not just this function — a bigger,
  * riskier change than a timer that was never wired up at all.
  */
+/*
+ * Linux's /proc/net/tcp encodes each address as the raw 4-byte struct
+ * in_addr — already network byte order in memory — reinterpreted as a
+ * little-endian u32 and printed in hex; on an x86 (little-endian) host that
+ * is just "%08X of the bytes in ip[0..3] order", not a byte-order swap of
+ * the dotted-decimal value. Ports are printed in host byte order (Linux's
+ * tcp4_seq_show ntohs()es inet_sport/inet_dport first), which is exactly
+ * how local_port/remote_port are already stored here.
+ */
+static u32 proc_net_ip_field(const u8 ip[4])
+{
+    return (u32)ip[0] | ((u32)ip[1] << 8) | ((u32)ip[2] << 16) | ((u32)ip[3] << 24);
+}
+
+size_t tcp_format_proc_net(char *buf, size_t max)
+{
+    /* Index by tcp_state_t; value is the matching Linux enum tcp_state
+     * (include/net/tcp_states.h) so a real tool's state-name table lines up. */
+    static const u8 lx_state[TCP_STATE_TIME_WAIT + 1] = {
+        [TCP_STATE_CLOSED]       = 7,  /* TCP_CLOSE       */
+        [TCP_STATE_LISTEN]       = 10, /* TCP_LISTEN      */
+        [TCP_STATE_SYN_SENT]     = 2,  /* TCP_SYN_SENT    */
+        [TCP_STATE_SYN_RECEIVED] = 3,  /* TCP_SYN_RECV    */
+        [TCP_STATE_ESTABLISHED]  = 1,  /* TCP_ESTABLISHED */
+        [TCP_STATE_FIN_WAIT_1]   = 4,  /* TCP_FIN_WAIT1   */
+        [TCP_STATE_FIN_WAIT_2]   = 5,  /* TCP_FIN_WAIT2   */
+        [TCP_STATE_CLOSE_WAIT]   = 8,  /* TCP_CLOSE_WAIT  */
+        [TCP_STATE_CLOSING]      = 11, /* TCP_CLOSING     */
+        [TCP_STATE_LAST_ACK]     = 9,  /* TCP_LAST_ACK    */
+        [TCP_STATE_TIME_WAIT]    = 6,  /* TCP_TIME_WAIT   */
+    };
+
+    size_t off = (size_t)scnprintf(buf, max,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
+
+    irqflags_t flags = spinlock_lock_irqsave(&g_tcp_lock);
+    int sl = 0;
+    for (tcp_sock_t *s = g_tcp_sockets; s; s = s->next) {
+        u8 lstate = (s->state <= TCP_STATE_TIME_WAIT) ? lx_state[s->state] : 7;
+        off += (size_t)scnprintf(buf + off, max > off ? max - off : 0,
+            "%4d: %08X:%04X %08X:%04X %02X %08zX:%08zX 00:00000000 00000000     0        0 0 0 0 0 0\n",
+            sl, proc_net_ip_field(s->local_ip), s->local_port,
+            proc_net_ip_field(s->remote_ip), s->remote_port,
+            lstate, s->tx_len, s->rx_len);
+        sl++;
+    }
+    spinlock_unlock_irqrestore(&g_tcp_lock, flags);
+    return off;
+}
+
 void tcp_timer_tick(void)
 {
     g_tcp_ticks++;

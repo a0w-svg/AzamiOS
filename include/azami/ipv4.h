@@ -39,6 +39,11 @@ int  route_add(const u8 dst[4], const u8 mask[4], const u8 gw[4], struct net_dev
 int  route_del(const u8 dst[4], const u8 mask[4]);
 int  route_lookup(const u8 dst_ip[4], u8 next_hop_out[4], struct net_device **dev_out);
 void route_print_table(void);
+/* Renders the routing table in Linux's /proc/net/route column layout —
+ * fs/procfs.c's PROCFS_TYPE_NET_ROUTE serves this verbatim, which is what
+ * lets a real "ip route"/"route -n" show actual kernel state instead of a
+ * hardcoded guess. Returns the number of bytes written. */
+size_t route_format_proc_net(char *buf, size_t max);
 
 void ipv4_init(void);
 int  ipv4_send(net_buf_t *buf, const u8 dst_ip[4], u8 protocol);

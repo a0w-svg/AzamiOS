@@ -170,6 +170,11 @@ s64         tcp_recv(tcp_sock_t *sock, void *buf, size_t max_len, bool nonblock)
 int         tcp_shutdown(tcp_sock_t *sock, int how);
 void        tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr);
 void        tcp_timer_tick(void);
+/* Renders every live TCP socket in the exact column layout Linux's
+ * /proc/net/tcp uses (fs/procfs.c's PROCFS_TYPE_NET_TCP serves this
+ * verbatim) — real tools (netstat, this OS's own) parse that format rather
+ * than an azami-specific one. Returns the number of bytes written. */
+size_t      tcp_format_proc_net(char *buf, size_t max);
 bool        tcp_poll_in(tcp_sock_t *sock);
 bool        tcp_poll_out(tcp_sock_t *sock);
 u16         tcp_checksum(const tcp_hdr_t *tcp, const ipv4_hdr_t *ip, size_t header_len,

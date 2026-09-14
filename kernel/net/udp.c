@@ -339,6 +339,32 @@ bool udp_poll(udp_sock_t *sock)
     return net_buf_queue_len(&sock->rx_queue) > 0;
 }
 
+/* See tcp_format_proc_net()'s comment on the address/port encoding — UDP
+ * has no state machine, so Linux's "st" column is always 07 (TCP_CLOSE,
+ * reused verbatim by udp4_seq_show — a UDP socket that exists at all is
+ * simply "open"). rx_queue counts queued, not-yet-recvfrom()'d datagrams. */
+size_t udp_format_proc_net(char *buf, size_t max)
+{
+    size_t off = (size_t)scnprintf(buf, max,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n");
+
+    irqflags_t flags = spinlock_lock_irqsave(&g_udp_lock);
+    int sl = 0;
+    for (udp_sock_t *s = g_udp_sockets; s; s = s->next) {
+        u32 local_be = (u32)s->local_ip[0] | ((u32)s->local_ip[1] << 8) |
+                       ((u32)s->local_ip[2] << 16) | ((u32)s->local_ip[3] << 24);
+        u32 rem_be = (u32)s->remote_ip[0] | ((u32)s->remote_ip[1] << 8) |
+                     ((u32)s->remote_ip[2] << 16) | ((u32)s->remote_ip[3] << 24);
+        off += (size_t)scnprintf(buf + off, max > off ? max - off : 0,
+            "%4d: %08X:%04X %08X:%04X 07 00000000:%08zX 00:00000000 00000000     0        0 0 0 0 0\n",
+            sl, local_be, s->local_port, rem_be, s->remote_port,
+            net_buf_queue_len(&s->rx_queue));
+        sl++;
+    }
+    spinlock_unlock_irqrestore(&g_udp_lock, flags);
+    return off;
+}
+
 void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
 {
     if (!buf || !ip_hdr || buf->len < sizeof(udp_hdr_t)) {

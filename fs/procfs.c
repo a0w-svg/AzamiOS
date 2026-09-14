@@ -21,6 +21,9 @@
 #include "../drivers/char/console.h"
 #include "../include/azami/defs.h"
 #include "../include/azami/net.h"
+#include "../include/azami/ipv4.h"
+#include "../include/azami/tcp.h"
+#include "../include/azami/udp.h"
 #include "../arch/x86_64/cpu/smp.h"
 #include "../arch/x86_64/cpu/cpu.h"
 #include "../userland/libc/include/sys/dirent.h"
@@ -50,6 +53,7 @@ typedef enum {
     PROCFS_TYPE_CMDLINE,
     PROCFS_TYPE_NET_TCP,
     PROCFS_TYPE_NET_UDP,
+    PROCFS_TYPE_NET_ROUTE,
     PROCFS_TYPE_DEVICES,
     PROCFS_TYPE_INTERRUPTS,
     PROCFS_TYPE_PARTITIONS,
@@ -456,12 +460,20 @@ static size_t format_proc_net_dev(char *buf, size_t max)
 {
     net_device_t *ndev = net_get_default_device();
     const char *dname = ndev ? ndev->name : "net0";
+    const net_stats_t *st = ndev ? &ndev->stats : NULL;
+    net_stats_t zero;
+    if (!st) { memset(&zero, 0, sizeof(zero)); st = &zero; }
+
     return (size_t)scnprintf(buf, max,
         "Inter-|   Receive                                                |  Transmit\n"
         " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
         "    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n"
-        "  %4s:   14200     128    0    0    0     0          0         0     8400      64    0    0    0     0       0          0\n",
-        dname);
+        "  %4s: %7llu %7llu %4llu %4llu    0     0          0         0 %8llu %7llu %4llu %4llu    0     0       0          0\n",
+        dname,
+        (unsigned long long)st->rx_bytes, (unsigned long long)st->rx_packets,
+        (unsigned long long)st->rx_errors, (unsigned long long)st->rx_dropped,
+        (unsigned long long)st->tx_bytes, (unsigned long long)st->tx_packets,
+        (unsigned long long)st->tx_errors, (unsigned long long)st->tx_dropped);
 }
 
 static size_t format_proc_loadavg(char *buf, size_t max)
@@ -513,16 +525,17 @@ static size_t format_proc_cmdline(char *buf, size_t max)
 
 static size_t format_proc_net_tcp(char *buf, size_t max)
 {
-    return (size_t)scnprintf(buf, max,
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
-        "   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1000 1 0000000000000000 100 0 0 10 0\n");
+    return tcp_format_proc_net(buf, max);
 }
 
 static size_t format_proc_net_udp(char *buf, size_t max)
 {
-    return (size_t)scnprintf(buf, max,
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"
-        "   0: 00000000:0044 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1001 2 0000000000000000 0\n");
+    return udp_format_proc_net(buf, max);
+}
+
+static size_t format_proc_net_route(char *buf, size_t max)
+{
+    return route_format_proc_net(buf, max);
 }
 
 static size_t format_proc_devices(char *buf, size_t max)
@@ -837,6 +850,8 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 111, S_IFREG | 0444, PROCFS_TYPE_NET_TCP, 0);
         } else if (strcmp(name, "udp") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 112, S_IFREG | 0444, PROCFS_TYPE_NET_UDP, 0);
+        } else if (strcmp(name, "route") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 106 * 10 + 3, S_IFREG | 0444, PROCFS_TYPE_NET_ROUTE, 0);
         }
     } else if (dir_priv->type == PROCFS_TYPE_SYSVIPC_DIR) {
         if (strcmp(name, "shm") == 0) {
@@ -1045,6 +1060,9 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
         break;
     case PROCFS_TYPE_NET_UDP:
         total_len = format_proc_net_udp(tmp, PROCFS_TMP_SIZE);
+        break;
+    case PROCFS_TYPE_NET_ROUTE:
+        total_len = format_proc_net_route(tmp, PROCFS_TMP_SIZE);
         break;
     case PROCFS_TYPE_DEVICES:
         total_len = format_proc_devices(tmp, PROCFS_TMP_SIZE);
@@ -1280,8 +1298,8 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
             idx++;
         }
     } else if (priv->type == PROCFS_TYPE_NET_DIR) {
-        const char *net_entries[] = { ".", "..", "dev", "tcp", "udp" };
-        u64 total_entries = 5;
+        const char *net_entries[] = { ".", "..", "dev", "tcp", "udp", "route" };
+        u64 total_entries = 6;
         while (idx < total_entries) {
             const char *name = net_entries[idx];
             u8 dtype = (idx < 2) ? DT_DIR : DT_REG;

@@ -238,6 +238,34 @@ void route_print_table(void)
     spinlock_unlock_irqrestore(&g_route_lock, flags);
 }
 
+/* Same address encoding as tcp_format_proc_net()'s comment (kernel/net/
+ * tcp.c) — the raw in_addr bytes read as a little-endian u32. */
+static u32 route_proc_net_field(const u8 ip[4])
+{
+    return (u32)ip[0] | ((u32)ip[1] << 8) | ((u32)ip[2] << 16) | ((u32)ip[3] << 24);
+}
+
+size_t route_format_proc_net(char *buf, size_t max)
+{
+    size_t off = (size_t)scnprintf(buf, max,
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
+
+    irqflags_t flags = spinlock_lock_irqsave(&g_route_lock);
+    for (int i = 0; i < MAX_ROUTES; i++) {
+        if (!(g_routes[i].flags & RT_FLAG_UP)) continue;
+        route_entry_t *r = &g_routes[i];
+        u16 rflags = 0x0001; /* RTF_UP */
+        if (r->flags & RT_FLAG_GATEWAY) rflags |= 0x0002; /* RTF_GATEWAY */
+        off += (size_t)scnprintf(buf + off, max > off ? max - off : 0,
+            "%s\t%08X\t%08X\t%04X\t0\t0\t%u\t%08X\t0\t0\t0\n",
+            r->dev ? r->dev->name : "net0",
+            route_proc_net_field(r->dst), route_proc_net_field(r->gateway),
+            rflags, r->metric, route_proc_net_field(r->mask));
+    }
+    spinlock_unlock_irqrestore(&g_route_lock, flags);
+    return off;
+}
+
 /* ── Fragment Reassembly Helpers ──────────────────────────────────────────── */
 
 static void reasm_ctx_release(ip_reasm_ctx_t *ctx)

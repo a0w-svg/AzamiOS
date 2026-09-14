@@ -62,4 +62,6 @@ s64         udp_sendto(udp_sock_t *sock, const void *data, size_t len, const u8 
 s64         udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], u16 *src_port_out, bool nonblock);
 void        udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr);
 bool        udp_poll(udp_sock_t *sock);
+/* Same idea as tcp_format_proc_net() — Linux /proc/net/udp column layout. */
+size_t      udp_format_proc_net(char *buf, size_t max);
 u16         udp_checksum(const udp_hdr_t *udp, const ipv4_hdr_t *ip, const void *payload, size_t payload_len);
