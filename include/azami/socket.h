@@ -23,6 +23,7 @@ static inline u32 ntohl(u32 v) { return htonl(v); }
 #define AF_LOCAL    1
 #define AF_INET     2
 #define AF_INET6    10
+#define AF_PACKET   17
 
 /* Socket Types */
 #define SOCK_STREAM 1
@@ -130,6 +131,21 @@ typedef struct raw_sock {
     struct raw_sock *next;
 } raw_sock_t;
 
+/* AF_PACKET (kernel/net/packet.c) — link-layer capture: unlike raw_sock_t
+ * above (AF_INET/SOCK_RAW, IP-layer payloads with a 6-byte [src_ip][proto]
+ * prefix this file's raw_input() adds), a pkt_sock_t's rx_queue holds
+ * *complete* Ethernet frames verbatim, header and all — what a tcpdump-
+ * style tool actually wants. No per-socket protocol/interface filter: this
+ * kernel has exactly one physical interface, so every capture socket sees
+ * every frame net_process_incoming() hands up (see packet_input()) — the
+ * ETH_P_ALL wildcard, effectively, with no narrower option offered. */
+typedef struct pkt_sock {
+    net_buf_queue_t  rx_queue;
+    struct thread   *wait_thread;
+    spinlock_t       lock;
+    struct pkt_sock *next;
+} pkt_sock_t;
+
 /* ── AF_UNIX (kernel/net/unix_socket.c) ─────────────────────────────────────
  *
  * SOCK_STREAM: a connected pair is two pipe_t*s (fs/pipe.c), the same
@@ -211,6 +227,7 @@ typedef struct socket {
         udp_sock_t  *udp;
         raw_sock_t  *raw;
         unix_sock_t *uds;
+        pkt_sock_t  *pkt;
     };
     int         so_reuseaddr;
     int         so_reuseport;
@@ -234,6 +251,19 @@ int         sock_get_from_fd(int fd, socket_t **sock_out);
 raw_sock_t *raw_socket_create(int protocol);
 void        raw_socket_close(raw_sock_t *raw);
 void        raw_input(net_buf_t *buf, const ipv4_hdr_t *ip);
+
+/* AF_PACKET API (kernel/net/packet.c) */
+pkt_sock_t *packet_socket_create(void);
+void        packet_socket_close(pkt_sock_t *pkt);
+/* Called from net_process_incoming() (kernel/net/net.c) with every raw
+ * frame the driver hands up, Ethernet header and all, before any
+ * ARP/IP-layer processing or the "addressed to us" filter — see its call
+ * site for why. */
+void        packet_input(const u8 *frame, size_t len);
+/* Transmits a caller-built frame verbatim (Ethernet header included) on the
+ * primary device — the write()/sendto() side of an AF_PACKET/SOCK_RAW
+ * socket. Returns bytes sent, or -1. */
+s64         packet_send(const void *frame, size_t len);
 
 /* AF_UNIX API (kernel/net/unix_socket.c) — mirrors the tcp_* and udp_*
  * shape elsewhere in this header so sys_*_impl in kernel/syscall/syscall.c

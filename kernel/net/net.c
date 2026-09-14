@@ -460,6 +460,15 @@ static bool eth_addressed_to_us(const u8 dst[ETH_ALEN])
 void net_process_incoming(const u8 *pkt, size_t len)
 {
     if (!pkt || len < sizeof(eth_hdr_t)) return;
+
+    /* AF_PACKET capture taps every frame the driver hands up, Ethernet
+     * header and all, before the "addressed to us" filter just below (and
+     * before any ARP/IP processing) — see packet_input()'s comment in
+     * include/azami/socket.h. A capture socket is meant to see what a
+     * promiscuous tap would, not only what this host chose to act on. */
+    extern void packet_input(const u8 *frame, size_t len);
+    packet_input(pkt, len);
+
     const eth_hdr_t *eth = (const eth_hdr_t *)pkt;
     u16 ethertype = ntohs(eth->ethertype);
 

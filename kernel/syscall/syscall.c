@@ -3417,8 +3417,12 @@ static s64 sys_socket_impl(pt_regs_t *r)
     /* Strip non-standard flags like SOCK_CLOEXEC or SOCK_NONBLOCK */
     int base_type = type & 0x0F;
 
-    /* Privilege check for RAW sockets */
-    if (base_type == SOCK_RAW) {
+    /* Privilege check for RAW sockets. AF_PACKET is gated regardless of
+     * `type` — packet_socket_create() (kernel/net/packet.c) doesn't offer a
+     * narrower, unprivileged variant the way AF_INET's SOCK_DGRAM/SOCK_STREAM
+     * do, so requesting it with SOCK_DGRAM instead of SOCK_RAW must not be a
+     * way to dodge this check. */
+    if (base_type == SOCK_RAW || domain == AF_PACKET) {
         if (!security_check_permission(proc, CAP_NET_RAW)) {
             return -(s64)EPERM;
         }
@@ -4049,6 +4053,16 @@ static s64 sys_sendto_impl(pt_regs_t *r)
         return res;
     }
 
+    /* AF_PACKET, same reasoning as the AF_UNIX check above: its SOCK_RAW
+     * type value collides with AF_INET's raw_sock_t dispatch below, and
+     * sock->raw/sock->pkt are the same union storage — sock->raw->protocol
+     * would read a pkt_sock_t's rx_queue as if it were that int. */
+    if (sock->domain == AF_PACKET && sock->pkt) {
+        res = packet_send(kbuf, len);
+        kfree(kbuf);
+        return res;
+    }
+
     if (sock->type == SOCK_STREAM && sock->tcp) {
         res = tcp_send(sock->tcp, kbuf, len, flags);
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
@@ -4160,6 +4174,44 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
          * fds are simply closed, never leaked to any process). */
         kfree(kbuf);
         return res;
+    }
+
+    /* AF_PACKET — same union-aliasing reasoning as sys_sendto_impl's
+     * identical check. `uaddr` (a struct sockaddr_ll on real Linux) is left
+     * unfilled: nothing here builds one, so a caller wanting the frame's
+     * source interface/protocol has to get it from the frame itself (this
+     * kernel has exactly one interface anyway) rather than from recvfrom()'s
+     * address output — a real limitation, not silently wrong data. */
+    if (sock->domain == AF_PACKET && sock->pkt) {
+        for (;;) {
+            net_buf_t *frame = net_buf_queue_pop(&sock->pkt->rx_queue);
+            if (frame) {
+                size_t clen = (frame->len < len) ? frame->len : len;
+                if (copy_to_user(ubuf, frame->data, clen) != 0) {
+                    net_buf_free(frame);
+                    return -(s64)EFAULT;
+                }
+                net_buf_free(frame);
+                return (s64)clen;
+            }
+            if (nonblock) return -(s64)EAGAIN;
+            irqflags_t pflags = spinlock_lock_irqsave(&sock->pkt->lock);
+            if (net_buf_queue_len(&sock->pkt->rx_queue) == 0) {
+                sock->pkt->wait_thread = sched_current_thread();
+                spinlock_unlock_irqrestore(&sock->pkt->lock, pflags);
+                sched_block(THREAD_BLOCKED_PENDING);
+
+                if (proc && (proc->sig_pending & ~proc->sig_blocked)) {
+                    pflags = spinlock_lock_irqsave(&sock->pkt->lock);
+                    if (sock->pkt->wait_thread == sched_current_thread())
+                        sock->pkt->wait_thread = NULL;
+                    spinlock_unlock_irqrestore(&sock->pkt->lock, pflags);
+                    return -(s64)EINTR;
+                }
+            } else {
+                spinlock_unlock_irqrestore(&sock->pkt->lock, pflags);
+            }
+        }
     }
 
     /* Same unbounded-kmalloc guard as sendto. Returning fewer bytes than the

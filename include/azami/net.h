@@ -11,6 +11,10 @@
 #define ETH_ALEN 6
 #define ETH_P_IP  0x0800
 #define ETH_P_ARP 0x0806
+/* Not a real ethertype — the AF_PACKET/SOCK_RAW wildcard protocol value
+ * (htons(3) on the wire in a struct sockaddr_ll), meaning "every frame,
+ * whatever its ethertype". See kernel/net/packet.c. */
+#define ETH_P_ALL 0x0003
 
 typedef struct __attribute__((packed)) {
     u8  dst[ETH_ALEN];
