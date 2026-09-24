@@ -14,6 +14,8 @@
 #   make -C tools/linux busybox    — build BusyBox, static, against musl
 #   make -C tools/linux probe      — build the Linux-ABI conformance probe
 #   make -C tools/linux install    — stage the results into the initrd tree
+#   make -C tools/linux ports      — build the ported third-party software
+#                                    (see ports.mk; not part of `all`)
 #   make -C tools/linux clean      — drop build output, keep the tarballs
 #   make -C tools/linux distclean  — drop everything, including the tarballs
 #
@@ -84,6 +86,14 @@ HOST_CC := $(CCACHE_PREFIX) gcc
 BB_CC := $(CCACHE_PREFIX) $(MUSL_GCC) $(UAPI_INC) $(UAPI_ASM)
 
 NPROC := $(shell nproc 2>/dev/null || echo 4)
+
+# lzip is needed to unpack GNU ed (and any other .tar.lz port). It is not
+# commonly pre-installed; the ports.mk bootstrap will build it from source
+# if missing. Export PATH so make sub-invocations and recipes can find it.
+LZIP := $(shell command -v lzip 2>/dev/null || \
+               command -v $(HOME)/.local/bin/lzip 2>/dev/null || \
+               echo lzip-not-found)
+export PATH := $(HOME)/.local/bin:$(PATH)
 
 .PHONY: all toolchain busybox probe install clean distclean fetch
 
@@ -190,3 +200,9 @@ clean:
 
 distclean: clean
 	rm -rf $(DL_DIR)
+
+# ── Ported third-party software ──────────────────────────────────────────────
+# Kept in its own file: one rule per upstream package, and the list only grows.
+# Not a prerequisite of `all` — ports exist to be installed from the package
+# repository at runtime, not to be baked into the image.
+include ports.mk

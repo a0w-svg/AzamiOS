@@ -13,6 +13,7 @@
 #pragma once
 
 #include "../../include/azami/types.h"
+#include "../lib/rbtree.h"
 
 struct process;
 
@@ -40,12 +41,27 @@ struct process;
  * discarding the request the way this kernel used to. */
 #define VMA_F_LOCKED    0x40
 
+/* Set by UFFDIO_REGISTER: pages faulting in this region will be forwarded
+ * to the associated userfaultfd context, putting the thread to sleep until
+ * userspace resolves the fault using UFFDIO_COPY. */
+#define VMA_F_UFFD_MISSING 0x80
+/* Set by mseal(2): prevents further modifications (mprotect, munmap, mremap)
+ * to the region's VMA structure. */
+#define VMA_F_SEALED    0x100
+/* Kernel-provided special mappings (arch/x86_64/vdso/vdso.c): the shared
+ * vDSO text and its vvar data pages. Named "[vdso]" / "[vvar]" in
+ * /proc/<pid>/maps; their frames are VMM_F_SHARED and never freed. */
+#define VMA_F_VDSO      0x200
+#define VMA_F_VVAR      0x400
+
 typedef struct vm_area {
     u64             start;   /* page-aligned, inclusive */
     u64             end;     /* page-aligned, exclusive */
     u32             prot;    /* VMA_PROT_* */
     u32             flags;   /* VMA_F_*    */
+    void           *uffd_ctx;/* userfaultfd context pointer */
     struct vm_area *next;    /* sorted ascending by start */
+    struct rb_node  rb;      /* Red-Black tree node */
 } vm_area_t;
 
 /** Record region [start,end); merges into an adjacent identical region.
@@ -72,6 +88,15 @@ int vma_set_locked(struct process *p, u64 start, u64 end, bool locked);
 
 /** Set or clear VMA_F_LOCKED on every current VMA (mlockall(2)/munlockall(2)). */
 void vma_set_locked_all(struct process *p, bool locked);
+
+/** Apply VMA_F_SEALED over [start,end) (mseal(2)). Returns 0, or -EPERM if already sealed. */
+int vma_seal(struct process *p, u64 start, u64 end);
+
+/** True if any VMA overlapping [start,end) has any of @flags set. */
+bool vma_range_has_flags(struct process *p, u64 start, u64 end, u32 flags);
+
+/** Check if any VMA in [start,end) is sealed. Returns true if sealed. */
+bool vma_is_sealed(struct process *p, u64 start, u64 end);
 
 /** Probe the region containing addr. If found, stores its VMA_PROT_* bits in
  *  *out_prot (when non-NULL) and returns true. The lookup and the copy happen

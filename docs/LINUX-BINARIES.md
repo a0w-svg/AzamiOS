@@ -43,6 +43,26 @@ The first three happen before a single instruction of `main` runs, which is why
 a missing piece usually shows up as a page fault at an address near zero rather
 than as an error message.
 
+### Filesystem and block-device ABI
+
+Once the program is running, the next thing it tends to want is an honest view
+of the filesystems and disks underneath it. These are answered from real state,
+not from fixed strings:
+
+| What a program asks for | Where the answer comes from |
+| :--- | :--- |
+| `/proc/mounts`, `/proc/self/mountinfo`, `/proc/<pid>/mounts` | the live mount table in `fs/namespace.c` |
+| `/proc/filesystems` | the filesystem registry, with `nodev` from each type's `FS_REQUIRES_DEV` |
+| `/proc/partitions`, `/sys/block/*`, `/sys/class/block/*` | the block-device registry, whole disks followed by their partitions |
+| `mount(2)` flags | `MS_RDONLY`, `MS_NOSUID`, `MS_NODEV`, `MS_NOEXEC`, `MS_NOATIME` are recorded and the first four enforced; `MS_BIND`, `MS_MOVE` and `MS_REMOUNT` all work |
+| `umount(2)` | a real detach that restores the covered directory, `-EBUSY` while anything holds the filesystem open, `MNT_DETACH` to override |
+| `statfs(2)` / `statvfs(3)` | per-filesystem figures, with the mount flags in `f_flags` |
+| `ioctl` on a block device | `BLKGETSIZE64`, `BLKGETSIZE`, `BLKSSZGET`, `BLKPBSZGET`, `BLKBSZGET/SET`, `BLKROGET/SET`, `BLKRRPART`, `BLKFLSBUF`, `BLKDISCARD`, `BLKZEROOUT`, `BLKROTATIONAL`, `HDIO_GETGEO` and the rest of the `0x12` family |
+| `mknod(2)` | every node type, including character and block devices; the node reaches its driver through the device number wherever it is stored |
+| `io_setup(2)` and friends | a real AIO context; submissions complete inside `io_submit(2)` and are collected with `io_getevents(2)` |
+| `fanotify_init(2)` / `fanotify_mark(2)` | path-based marks, queued events carrying an open descriptor, `FAN_MARK_REMOVE` and `FAN_MARK_FLUSH` |
+| `name_to_handle_at(2)` / `open_by_handle_at(2)` | ext2 (inode number + generation) and tmpfs (inode number) |
+
 ---
 
 ## The toolchain
@@ -52,13 +72,23 @@ than as an error message.
 ```
 tools/linux/
 ├── Makefile          the pipeline
+├── ports.mk          the ported third-party software (make ports)
 ├── dl/               downloaded tarballs
 ├── src/              unpacked sources
 ├── musl/             musl 1.2.5, installed — musl/bin/musl-gcc is the compiler
-├── out/bin/          busybox, azami-abi-probe
+├── out/bin/          busybox, azami-abi-probe, and every built port
+├── out/tcc, out/file the ports that ship more than a binary
 ├── log/              build logs
 └── tests/abi-probe.c the ABI conformance probe
 ```
+
+`make -C tools/linux ports` builds the rest of the ported software the same
+way — unmodified upstream releases, static against musl: two toolboxes, two
+shells, a C compiler and GNU Make, Lua and MicroPython, SQLite, jq, gawk,
+three compressors, curl, file, tree, nano and less. They are installed from
+the package repository rather than baked into the image; see
+[PACKAGES.md](PACKAGES.md), and [TOOLCHAIN.md](TOOLCHAIN.md) for the
+compiler.
 
 `musl-gcc` is a wrapper around the host's `gcc` that substitutes musl's headers
 and startup files. It is an ordinary Linux compiler — nothing in it knows about

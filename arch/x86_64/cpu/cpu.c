@@ -16,6 +16,7 @@
  * ============================================================================ */
 
 #include "cpu.h"
+#include <azami/sections.h>
 #include "hwaccel.h"
 #include "mce.h"
 #include "mitigations.h"
@@ -27,23 +28,35 @@ extern int  scnprintf(char *buf, size_t size, const char *fmt, ...);
 
 cpu_features_t g_cpu_info;
 
-/* Global enablement flags */
-u8  g_fsgsbase_enabled = 0;
-u8  g_smep_enabled     = 0;
-u8  g_smap_enabled     = 0;
-u8  g_osxsave_enabled  = 0;
-u8  g_pge_enabled      = 0;
-u8  g_umip_enabled     = 0;
-u8  g_pku_enabled      = 0;
-u8  g_pcid_enabled     = 0;
-u8  g_invpcid_enabled  = 0;
-u8  g_erms_enabled     = 0;
-u8  g_mwait_idle_enabled = 0;
-u8  g_xsave_variant    = XSAVE_VARIANT_FXSAVE;
-u32 g_xsave_area_size  = 512;
-u64 g_xcr0_mask        = 0;
+/* Global enablement flags.
+ *
+ * __ro_after_init: all of these are decided by cpu_enable_features_bsp() and
+ * cpu_pin_cr4() during bring-up and are pure inputs afterwards. g_cr4_pinned
+ * is the one that matters most — it is the mask cpu_write_cr4() forces back
+ * on before every CR4 write, and it is what stops SMEP and SMAP being turned
+ * off by a kernel-mode write, which is the classic prelude to running a
+ * ret2usr payload. Leaving the pin mask itself writable would make the pin a
+ * formality: clear the mask, then clear the bits.
+ *
+ * g_split_lock_detect is deliberately *not* in this set. Unlike the rest it
+ * has a runtime off switch (cpu_disarm_split_lock_detect()), so it is state,
+ * not policy fixed at boot. */
+u8  g_fsgsbase_enabled   __ro_after_init = 0;
+u8  g_smep_enabled       __ro_after_init = 0;
+u8  g_smap_enabled       __ro_after_init = 0;
+u8  g_osxsave_enabled    __ro_after_init = 0;
+u8  g_pge_enabled        __ro_after_init = 0;
+u8  g_umip_enabled       __ro_after_init = 0;
+u8  g_pku_enabled        __ro_after_init = 0;
+u8  g_pcid_enabled       __ro_after_init = 0;
+u8  g_invpcid_enabled    __ro_after_init = 0;
+u8  g_erms_enabled       __ro_after_init = 0;
+u8  g_mwait_idle_enabled __ro_after_init = 0;
+u8  g_xsave_variant      __ro_after_init = XSAVE_VARIANT_FXSAVE;
+u32 g_xsave_area_size    __ro_after_init = 512;
+u64 g_xcr0_mask          __ro_after_init = 0;
 u8  g_split_lock_detect  = 0;
-u64 g_cr4_pinned         = 0;
+u64 g_cr4_pinned         __ro_after_init = 0;
 
 /* MWAIT hint for the idle loop: C-state 0 (C1), sub-state 0 — the one every
  * implementation understands. We deliberately do not use the ECX=1

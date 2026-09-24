@@ -55,6 +55,36 @@ SECTIONS
         *(.dynamic)
     }
 
+    .got     : { *(.got) }
+    .got.plt : { *(.got.plt) }
+
+    /* GCC-emitted global/static constructor pointers, run by
+     * userland/ldso/ldso.c's run_ctors_once() after relocation — see that
+     * file. Writable: RELATIVE relocations fix each entry's absolute
+     * address up in place before it's ever called, and this loader doesn't
+     * implement PT_GNU_RELRO to re-lock the page afterward. */
+    .init_array : ALIGN(8) {
+        PROVIDE_HIDDEN(__init_array_start = .);
+        KEEP(*(.init_array .init_array.*))
+        PROVIDE_HIDDEN(__init_array_end = .);
+    }
+    .fini_array : ALIGN(8) {
+        PROVIDE_HIDDEN(__fini_array_start = .);
+        KEEP(*(.fini_array .fini_array.*))
+        PROVIDE_HIDDEN(__fini_array_end = .);
+    }
+
+    /* Thread-local storage template: userland/libc/tls.c's __init_tls() (a
+     * statically linked binary) or userland/ldso/ldso.c's
+     * setup_static_tls() (a dynamically linked one) copies .tdata and
+     * zero-fills out to .tbss's extent into each thread's own block at
+     * process/thread start — this is only ever the source image, never
+     * touched again at runtime. ld auto-generates the PT_TLS segment
+     * covering these two from their SHF_TLS section flag regardless of
+     * where in the script they're placed, as long as they're contiguous. */
+    .tdata : { *(.tdata .tdata.*) }
+    .tbss : { *(.tbss .tbss.*) }
+
     .data : {
         *(.data .data.*)
     }

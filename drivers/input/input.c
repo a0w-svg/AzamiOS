@@ -48,11 +48,64 @@ int input_register_observer(void (*fn)(const input_event_t *))
     return 0;
 }
 
+/* ── Live per-key/button state bitmap (backs EVIOCGKEY) ──────────────────────
+ * One bit per evdev EV_KEY code (see the "evdev-compatible numbering" block
+ * in input.h). Updated centrally in queue_push(), the single choke point
+ * every event flows through before any consumer — the legacy queue, evdev —
+ * sees it, so this can never drift from what evdev itself reports. */
+static u8 g_key_state[INPUT_KEY_CNT / 8];
+
+static inline void key_state_set(u32 bit, bool on)
+{
+    if (bit / 8 >= sizeof(g_key_state)) return;
+    if (on) g_key_state[bit / 8] |= (u8)(1u << (bit % 8));
+    else    g_key_state[bit / 8] &= (u8)~(1u << (bit % 8));
+}
+
+int input_get_key_state(u8 *bitmap, size_t len)
+{
+    if (!bitmap) return -1;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_input_lock);
+    size_t n = (len < sizeof(g_key_state)) ? len : sizeof(g_key_state);
+    __builtin_memcpy(bitmap, g_key_state, n);
+    spinlock_unlock_irqrestore(&g_input_lock, irqf);
+
+    if (n < len) __builtin_memset(bitmap + n, 0, len - n);
+    return 0;
+}
+
+/* Mouse-button bit -> evdev BTN_* code, in the same order evdev.c's own
+ * press/release translation uses. Unlike g_key_state this is a fixed
+ * protocol mapping, not state, so keeping a second copy carries no risk of
+ * drift. */
+static const struct { u8 mask; u16 code; } g_btn_map[] = {
+    { MOUSE_BTN_LEFT,   INPUT_BTN_LEFT   },
+    { MOUSE_BTN_RIGHT,  INPUT_BTN_RIGHT  },
+    { MOUSE_BTN_MIDDLE, INPUT_BTN_MIDDLE },
+    { MOUSE_BTN_4,      INPUT_BTN_SIDE   },
+    { MOUSE_BTN_5,      INPUT_BTN_EXTRA  },
+};
+
+/* Caller holds g_input_lock. */
+static void key_state_observe(const input_event_t *evt)
+{
+    if (evt->type == INPUT_EVENT_KEY) {
+        u8 sc = evt->scancode & 0x7F;
+        if (sc) key_state_set(sc, (evt->flags & KEY_FLAG_RELEASED) == 0);
+    } else if (evt->type == INPUT_EVENT_MOUSE) {
+        for (u32 i = 0; i < ARRAY_SIZE(g_btn_map); i++) {
+            key_state_set(g_btn_map[i].code, (evt->mouse_buttons & g_btn_map[i].mask) != 0);
+        }
+    }
+}
+
 static void queue_push(const input_event_t *evt)
 {
     for (u32 i = 0; i < g_observer_count; i++) g_observers[i](evt);
 
     irqflags_t irqf = spinlock_lock_irqsave(&g_input_lock);
+    key_state_observe(evt);
     u32 next = (g_queue_head + 1) % INPUT_QUEUE_SIZE;
     if (next == g_queue_tail) {
         /* Queue full — drop oldest event */
@@ -188,6 +241,40 @@ static const u16 g_scancode_e0[128] = {
     [0x5D] = KEY_APPS,
 };
 
+/*
+ * Per-key remap overlay (backs EVIOCGKEYCODE/EVIOCSKEYCODE).
+ *
+ * g_scancode_base/shift/e0 above are `static const` — baked-in defaults, not
+ * something a keymap tool can rewrite.  This table sits in front of them:
+ * index 0..127 is the unprefixed block, 128..255 is 0xE0-prefixed (flagged by
+ * the top bit, mirroring how atkbd folds the same distinction into one flat
+ * space on real Linux). A zero entry means "no override" — see
+ * input_set_scancode_keymap()'s doc comment for why 0 can't also mean
+ * "mapped to nothing".
+ */
+#define SCANCODE_OVERRIDE_SIZE 256
+static u16 g_scancode_override[SCANCODE_OVERRIDE_SIZE];
+
+static inline u16 scancode_flat_index(u8 code, bool extended)
+{
+    return (u16)(extended ? (0x80 | code) : code);
+}
+
+u16 input_get_scancode_keymap(u16 scancode)
+{
+    if (scancode >= SCANCODE_OVERRIDE_SIZE) return 0;
+    if (g_scancode_override[scancode]) return g_scancode_override[scancode];
+
+    u8 code = scancode & 0x7F;
+    return (scancode & 0x80) ? g_scancode_e0[code] : g_scancode_base[code];
+}
+
+void input_set_scancode_keymap(u16 scancode, u16 keycode)
+{
+    if (scancode >= SCANCODE_OVERRIDE_SIZE) return;
+    g_scancode_override[scancode] = keycode;
+}
+
 /* Modifier & State Tracking */
 static volatile bool g_shift_held = false;
 static volatile bool g_ctrl_held  = false;
@@ -228,6 +315,28 @@ static void keyboard_update_leds(void)
     spinlock_unlock_irqrestore(&g_ps2_lock, irqf);
 }
 
+/*
+ * input_set_led() — force one lock LED to a userspace-chosen state.
+ *
+ * evdev's write(2) path (evdev.c) calls this for an EV_LED record instead of
+ * touching hardware directly, so this is the only place that needs to know
+ * both "which tracked boolean" and "which PS/2 LED bit" a lock corresponds
+ * to.  Writing g_capslock/g_numlock/g_scrolllock here — the same booleans
+ * keyboard_emit()'s toggle handling flips on a real keypress — means the two
+ * paths compose: whichever last touched the lock wins, and a subsequent real
+ * keypress toggles from that state rather than from stale hardware state.
+ */
+void input_set_led(u32 led, bool on)
+{
+    switch (led) {
+    case INPUT_LED_CAPSLOCK:   g_capslock   = on; break;
+    case INPUT_LED_NUMLOCK:    g_numlock    = on; break;
+    case INPUT_LED_SCROLLLOCK: g_scrolllock = on; break;
+    default: return;
+    }
+    keyboard_update_leds();
+}
+
 
 /*
  * keyboard_emit() — translate one AT set-1 key event and queue it.
@@ -245,9 +354,10 @@ static void keyboard_emit(u8 code, bool released, bool extended,
                           u8 raw_scancode, bool from_ps2)
 {
     u16 keycode = 0;
+    u16 override = g_scancode_override[scancode_flat_index(code, extended)];
 
     if (extended) {
-        keycode = g_scancode_e0[code];
+        keycode = override ? override : g_scancode_e0[code];
         if (!keycode) return; /* Ignore unmapped or fake shifts */
 
         /* Map specific extended modifiers */
@@ -258,7 +368,7 @@ static void keyboard_emit(u8 code, bool released, bool extended,
         }
     } else {
         /* Base scancode processing */
-        keycode = g_shift_held ? g_scancode_shift[code] : g_scancode_base[code];
+        keycode = override ? override : (g_shift_held ? g_scancode_shift[code] : g_scancode_base[code]);
 
         /* Update standard modifiers */
         if (keycode == KEY_LSHIFT || keycode == KEY_RSHIFT) {
@@ -277,6 +387,12 @@ static void keyboard_emit(u8 code, bool released, bool extended,
             if (keycode == KEY_SCROLLLOCK) { g_scrolllock = !g_scrolllock; leds_changed = true; }
             if (leds_changed && from_ps2) keyboard_update_leds_unlocked();
         }
+
+        /* An overridden key stands entirely on its own — no case-shifting or
+         * Num Lock reinterpretation, since those rules exist to reinterpret
+         * *this physical position* on the assumption it is still a letter or
+         * numpad digit, which a remap has explicitly said it no longer is. */
+        if (override) goto build_event;
 
         /* Apply Caps Lock on alphabetic characters */
         bool is_alpha = (keycode >= 'a' && keycode <= 'z') || (keycode >= 'A' && keycode <= 'Z');
@@ -304,6 +420,7 @@ static void keyboard_emit(u8 code, bool released, bool extended,
         }
     }
 
+build_event:
     if (!keycode) return;
 
     /* Build event */
@@ -334,16 +451,36 @@ void input_inject_scancode(u8 code, bool pressed, bool extended)
 }
 
 /* ── Keyboard IRQ handler (IRQ1 = vector 33) ────────────────────────────────── */
+/*
+ * Upper bound on bytes drained from the 8042 in one interrupt.
+ *
+ * Both handlers below loop until the controller says its output buffer is
+ * empty. That termination depends on the controller answering truthfully —
+ * and when no controller is fitted, or the chipset leaves the port floating,
+ * inb(0x64) reads 0xFF: "data ready" (bit 0) *and* "from the mouse" (bit 5)
+ * are both set, and every read of 0x60 returns 0xFF again. The mouse handler
+ * then never met its exit condition and spun forever inside the interrupt.
+ *
+ * A real burst is a handful of bytes at PS/2 signalling rates, so this bound
+ * is never reached in normal operation; it exists so that a dead or absent
+ * controller costs one bounded interrupt instead of the CPU.
+ */
+#define PS2_ISR_MAX_BYTES 256u
+
+/* 0xFF from the status port means nothing is driving the bus. */
+#define PS2_STATUS_FLOATING 0xFFu
+
 static void keyboard_irq_handler(pt_regs_t *r, void *ctx)
 {
     (void)r; (void)ctx;
     /* NOTE: EOI is sent by isr_dispatch() via hal_irq_eoi() after this
      * handler returns.  Do NOT call lapic_eoi() here. */
 
-    while (1) {
+    for (u32 guard = PS2_ISR_MAX_BYTES; guard; guard--) {
         irqflags_t irqf = spinlock_lock_irqsave(&g_ps2_lock);
         u8 status = inb(0x64);
-        if (!(status & 0x01) || (status & 0x20)) {
+        if (status == PS2_STATUS_FLOATING ||
+            !(status & 0x01) || (status & 0x20)) {
             spinlock_unlock_irqrestore(&g_ps2_lock, irqf);
             break;
         }
@@ -412,10 +549,14 @@ static void mouse_irq_handler(pt_regs_t *r, void *ctx)
     /* NOTE: EOI is sent by isr_dispatch() via hal_irq_eoi() after this
      * handler returns. Do NOT call lapic_eoi() here. */
 
-    while (1) {
+    for (u32 guard = PS2_ISR_MAX_BYTES; guard; guard--) {
         irqflags_t irqf = spinlock_lock_irqsave(&g_ps2_lock);
         u8 status = inb(0x64);
-        if (!(status & 0x01) || !(status & 0x20)) {
+        /* 0xFF is an absent controller, not a mouse byte — and it satisfies
+         * both of the conditions below, which is what used to wedge this
+         * loop. Check it first. */
+        if (status == PS2_STATUS_FLOATING ||
+            !(status & 0x01) || !(status & 0x20)) {
             /* No more mouse data in the output buffer */
             spinlock_unlock_irqrestore(&g_ps2_lock, irqf);
             break;
@@ -613,18 +754,85 @@ static file_operations_t mouse_fops = {
     .read = mouse_fops_read,
 };
 
+/*
+ * PS/2 typematic rate/delay (command 0xF3) encoding.
+ *
+ * The parameter byte is 0b0DDRRRRR: bits 6-5 pick one of four delays before
+ * autorepeat starts, bits 4-0 pick one of 32 repeat rates from the
+ * non-linear table every 8042-compatible keyboard controller implements
+ * (real hardware and QEMU's emulation alike) — see any PS/2 keyboard
+ * interface reference (e.g. the "Set Typematic Rate/Delay" command in the
+ * IBM PS/2 Trackpoint/keyboard technical reference). Rates run from 30.0
+ * characters/sec at index 0 down to 2.0 cps at index 31; the table below is
+ * those periods rounded to the nearest millisecond.
+ */
+static const u16 g_typematic_delay_ms[4] = { 250, 500, 750, 1000 };
+static const u16 g_typematic_period_ms[32] = {
+     33,  37,  42,  46,  50,  54,  58,  62,  67,  75,  83,  92, 100, 109, 116, 125,
+    133, 149, 167, 182, 200, 217, 233, 250, 270, 303, 333, 370, 400, 435, 476, 500,
+};
+
+static u32 g_repeat_delay_ms  = 250;
+static u32 g_repeat_period_ms = 33;
+
+/*
+ * keyboard_write_cmd() — send one command byte to the keyboard itself (not
+ * the 8042 controller) over port 0x60, and wait for its 0xFA ACK. Mirrors
+ * ps2_mouse_write()'s pattern for the auxiliary port; used for both 0xF4
+ * (enable scanning) and 0xF3 (set typematic rate/delay).
+ */
+static bool keyboard_write_cmd(u8 data)
+{
+    ps2_write_data(data);
+    return ps2_read_data() == 0xFA;
+}
+
+/* Index into @table whose value is closest to @ms. */
+static u32 typematic_nearest(u32 ms, const u16 *table, u32 count)
+{
+    u32 best = 0, best_diff = 0xFFFFFFFFu;
+    for (u32 i = 0; i < count; i++) {
+        u32 diff = (ms > table[i]) ? (ms - table[i]) : (table[i] - ms);
+        if (diff < best_diff) { best_diff = diff; best = i; }
+    }
+    return best;
+}
+
+bool input_set_keyboard_repeat(u32 delay_ms, u32 period_ms)
+{
+    u32 di = typematic_nearest(delay_ms, g_typematic_delay_ms, ARRAY_SIZE(g_typematic_delay_ms));
+    u32 ri = typematic_nearest(period_ms, g_typematic_period_ms, ARRAY_SIZE(g_typematic_period_ms));
+    u8  byte = (u8)((di << 5) | ri);
+
+    if (!keyboard_write_cmd(0xF3)) return false;
+    if (!keyboard_write_cmd(byte)) return false;
+
+    /* Store what the hardware actually applied, not the raw request, so
+     * EVIOCGREP reports truth. */
+    g_repeat_delay_ms  = g_typematic_delay_ms[di];
+    g_repeat_period_ms = g_typematic_period_ms[ri];
+    return true;
+}
+
+void input_get_keyboard_repeat(u32 *delay_ms, u32 *period_ms)
+{
+    if (delay_ms)  *delay_ms  = g_repeat_delay_ms;
+    if (period_ms) *period_ms = g_repeat_period_ms;
+}
+
 static void keyboard_init(void)
 {
     /* Enable first PS/2 port (keyboard) */
     ps2_write_cmd(0xAE);
 
     /* Tell keyboard to enable scanning (0xF4) */
-    ps2_wait_write();
-    outb(0x60, 0xF4);
-    ps2_wait_read();
-    if ((inb(0x64) & 0x01) && !(inb(0x64) & 0x20)) {
-        inb(0x60); /* Consume ACK 0xFA */
-    }
+    keyboard_write_cmd(0xF4);
+
+    /* Nothing has ever told the hardware a typematic rate, so it runs at
+     * whatever it powered on with. Apply Linux's own default (250ms delay,
+     * ~33ms period i.e. ~30cps) up front — it happens to land exactly on the
+     * fastest hardware-supported step, so no rounding is even visible. */
+    input_set_keyboard_repeat(250, 33);
 }
 
 void input_init(void)

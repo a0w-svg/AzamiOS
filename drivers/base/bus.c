@@ -18,6 +18,8 @@
 #include "base.h"
 #include "../../kernel/lib/string.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../kernel/sched/sched.h"
+#include "../../kernel/mm/kmalloc.h"
 
 static dm_bus_t  *g_buses;
 static spinlock_t g_bus_lock = SPINLOCK_INIT;
@@ -115,10 +117,23 @@ static int dm_really_probe(dm_device_t *dev, dm_driver_t *drv)
         return ret;
     }
 
-    drv->nbound++;
+    __atomic_add_fetch(&drv->nbound, 1, __ATOMIC_SEQ_CST);
     pr_debug("[DEVCORE] %s: bound '%s' to %s\n", dev->bus->name, drv->name, dev->name);
     dm_uevent("bind", dev);
     return 0;
+}
+
+struct async_probe_args {
+    dm_device_t *dev;
+    dm_driver_t *drv;
+};
+
+static void async_probe_thread(void *arg)
+{
+    struct async_probe_args *args = (struct async_probe_args *)arg;
+    dm_really_probe(args->dev, args->drv);
+    kfree(args);
+    __atomic_sub_fetch(&g_async_probes_pending, 1, __ATOMIC_SEQ_CST);
 }
 
 int dm_bus_probe_device(dm_device_t *dev)
@@ -127,6 +142,18 @@ int dm_bus_probe_device(dm_device_t *dev)
 
     for (dm_driver_t *drv = dev->bus->drivers; drv; drv = drv->bus_next) {
         if (!dev->bus->match(dev, drv)) continue;
+        
+        if (drv->probe_async) {
+            struct async_probe_args *args = kzalloc(sizeof(*args));
+            if (args) {
+                args->dev = dev;
+                args->drv = drv;
+                __atomic_add_fetch(&g_async_probes_pending, 1, __ATOMIC_SEQ_CST);
+                thread_create(sched_kernel_process(), (uintptr_t)async_probe_thread, (uintptr_t)args, true);
+                return 1;
+            }
+        }
+        
         if (dm_really_probe(dev, drv) == 0) return 1;
     }
     return 0;
@@ -165,11 +192,23 @@ int dm_driver_register(dm_driver_t *drv)
     for (dm_device_t *dev = drv->bus->devices; dev; dev = dev->bus_next) {
         if (dev->driver) continue;
         if (!drv->bus->match(dev, drv)) continue;
-        if (dm_really_probe(dev, drv) == 0) bound++;
+        
+        if (drv->probe_async) {
+            struct async_probe_args *args = kzalloc(sizeof(*args));
+            if (args) {
+                args->dev = dev;
+                args->drv = drv;
+                __atomic_add_fetch(&g_async_probes_pending, 1, __ATOMIC_SEQ_CST);
+                thread_create(sched_kernel_process(), (uintptr_t)async_probe_thread, (uintptr_t)args, true);
+                bound++;
+            }
+        } else {
+            if (dm_really_probe(dev, drv) == 0) bound++;
+        }
     }
 
-    pr_debug("[DEVCORE] driver '%s' registered on bus '%s' (%u device%s bound)\n",
-             drv->name, drv->bus->name, bound, bound == 1 ? "" : "s");
+    pr_debug("[DEVCORE] driver '%s' registered on bus '%s' (async: %d, %u device%s bound/queued)\n",
+             drv->name, drv->bus->name, drv->probe_async, bound, bound == 1 ? "" : "s");
     return 0;
 }
 

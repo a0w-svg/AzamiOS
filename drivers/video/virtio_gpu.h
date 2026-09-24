@@ -8,7 +8,7 @@
 
 #include "../../hal/virtio_pci.h"
 
-#define VIRTIO_GPU_F_VIRGL 0 /* We only support 2D for now */
+#define VIRTIO_GPU_F_VIRGL 0 /* Host offers 3D (Virgl) contexts and commands */
 #define VIRTIO_GPU_F_EDID   1 /* Device can report per-scanout EDID blobs */
 
 /* VIRTIO_GPU Control Commands */
@@ -22,7 +22,19 @@ enum virtio_gpu_ctrl_type {
     VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D,
     VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING,
     VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING,
+    VIRTIO_GPU_CMD_GET_CAPSET_INFO = 0x0108,
+    VIRTIO_GPU_CMD_GET_CAPSET = 0x0109,
     VIRTIO_GPU_CMD_GET_EDID = 0x010a,
+
+    /* 3D commands */
+    VIRTIO_GPU_CMD_CTX_CREATE = 0x0200,
+    VIRTIO_GPU_CMD_CTX_DESTROY = 0x0201,
+    VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE = 0x0202,
+    VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE = 0x0203,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_3D = 0x0204,
+    VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D = 0x0205,
+    VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D = 0x0206,
+    VIRTIO_GPU_CMD_SUBMIT_3D = 0x0207,
 
     /* cursor commands (submitted on the cursor queue, index 1) */
     VIRTIO_GPU_CMD_UPDATE_CURSOR = 0x0300,
@@ -31,6 +43,8 @@ enum virtio_gpu_ctrl_type {
     /* success responses */
     VIRTIO_GPU_RESP_OK_NODATA = 0x1100,
     VIRTIO_GPU_RESP_OK_DISPLAY_INFO,
+    VIRTIO_GPU_RESP_OK_CAPSET_INFO = 0x1102,
+    VIRTIO_GPU_RESP_OK_CAPSET = 0x1103,
     VIRTIO_GPU_RESP_OK_EDID = 0x1104,
 
     /* error responses */
@@ -41,6 +55,13 @@ enum virtio_gpu_ctrl_type {
     VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID,
     VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER,
 };
+
+/* Virgl capset ids (VIRTIO_GPU_CMD_GET_CAPSET_INFO / GET_CAPSET). Capset 1
+ * ("virgl") is what every OpenGL-era virglrenderer host advertises; capset 2
+ * ("virgl2") adds a handful of newer-GL-version fields on top of the same
+ * base layout. Matches include/uapi/linux/virtio_gpu.h. */
+#define VIRTIO_GPU_CAPSET_VIRGL  1
+#define VIRTIO_GPU_CAPSET_VIRGL2 2
 
 /* VIRTIO_GPU 2D Formats */
 enum virtio_gpu_formats {
@@ -113,6 +134,23 @@ struct virtio_gpu_resource_create_2d {
     u32 height;
 } __attribute__((packed));
 
+/* RESOURCE_CREATE_3D */
+struct virtio_gpu_resource_create_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 resource_id;
+    u32 target;
+    u32 format;
+    u32 bind;
+    u32 width;
+    u32 height;
+    u32 depth;
+    u32 array_size;
+    u32 last_level;
+    u32 nr_samples;
+    u32 flags;
+    u32 padding;
+} __attribute__((packed));
+
 /* RESOURCE_ATTACH_BACKING */
 struct virtio_gpu_mem_entry {
     u64 addr;
@@ -149,6 +187,92 @@ struct virtio_gpu_resource_flush {
     struct virtio_gpu_rect r;
     u32 resource_id;
     u32 padding;
+} __attribute__((packed));
+
+/* RESOURCE_UNREF — destroy a host resource.
+ * The driver must RESOURCE_DETACH_BACKING first (or the resource was never
+ * attached), then send this to free the host's copy.  Pairs with every
+ * RESOURCE_CREATE_2D call made at bring-up or by the ioctl path. */
+struct virtio_gpu_resource_unref {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 resource_id;
+    u32 padding;
+} __attribute__((packed));
+
+/* RESOURCE_DETACH_BACKING — unregister guest backing pages for a resource.
+ * Must be sent before RESOURCE_UNREF when the resource had attached backing. */
+struct virtio_gpu_resource_detach_backing {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 resource_id;
+    u32 padding;
+} __attribute__((packed));
+
+/* CTX_CREATE */
+struct virtio_gpu_ctx_create {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 nlen;
+    u32 padding;
+    char debug_name[64];
+} __attribute__((packed));
+
+/* CTX_DESTROY */
+struct virtio_gpu_ctx_destroy {
+    struct virtio_gpu_ctrl_hdr hdr;
+} __attribute__((packed));
+
+/* CTX_ATTACH_RESOURCE / CTX_DETACH_RESOURCE */
+struct virtio_gpu_ctx_resource {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 resource_id;
+    u32 padding;
+} __attribute__((packed));
+
+/* SUBMIT_3D */
+struct virtio_gpu_cmd_submit {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 size;
+    u32 padding;
+} __attribute__((packed));
+
+/* GET_CAPSET_INFO */
+struct virtio_gpu_get_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 capset_index;
+    u32 padding;
+} __attribute__((packed));
+
+struct virtio_gpu_resp_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 capset_id;
+    u32 capset_max_version;
+    u32 capset_max_size;
+    u32 padding;
+} __attribute__((packed));
+
+/* GET_CAPSET — request header; the response is a bare ctrl_hdr immediately
+ * followed by capset_max_size bytes of opaque capability data (a struct
+ * virgl_caps_v1/v2 on the host side, which this driver never has to parse —
+ * it only has to shuttle the bytes to userspace so Mesa can). */
+struct virtio_gpu_get_capset {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 capset_id;
+    u32 capset_version;
+} __attribute__((packed));
+
+/* TRANSFER_TO_HOST_3D / TRANSFER_FROM_HOST_3D */
+struct virtio_gpu_box {
+    u32 x, y, z;
+    u32 w, h, d;
+} __attribute__((packed));
+
+struct virtio_gpu_transfer_host_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_box box;
+    u64 offset;
+    u32 resource_id;
+    u32 level;
+    u32 stride;
+    u32 layer_stride;
 } __attribute__((packed));
 
 /* UPDATE_CURSOR / MOVE_CURSOR (cursor queue). Both use this one struct; a
@@ -221,6 +345,75 @@ int virtio_gpu_set_scanout(u32 scanout_id, u32 resource_id, u32 width, u32 heigh
 int virtio_gpu_set_scanout_offset(u32 scanout_id, u32 resource_id, u32 x, u32 y, u32 width, u32 height);
 int virtio_gpu_setup_framebuffer(void);
 
+/* ── 3D (Virgl) command helpers ──────────────────────────────────────────── */
+
+int virtio_gpu_cmd_context_create(u32 ctx_id, const char *name);
+int virtio_gpu_cmd_context_destroy(u32 ctx_id);
+int virtio_gpu_cmd_context_attach_resource(u32 ctx_id, u32 res_id);
+int virtio_gpu_cmd_resource_create_3d(u32 res_id, u32 target, u32 format, u32 bind, u32 width, u32 height, u32 depth, u32 array_size);
+int virtio_gpu_cmd_submit_3d(u32 ctx_id, void *buf, u32 size);
+
+/**
+ * virtio_gpu_resource_attach_backing_pages() — like
+ * virtio_gpu_resource_attach_backing(), but for a resource backed by
+ * @npages individually allocated (not necessarily physically contiguous)
+ * pages, e.g. a GEM object's obj->pages[] array. Sends one
+ * RESOURCE_ATTACH_BACKING mem-entry per page — the command already supports
+ * an arbitrary scatter-gather list, the 2D path just never needed more than
+ * one entry because its framebuffer is one pmm_alloc_pages() allocation.
+ */
+int virtio_gpu_resource_attach_backing_pages(u32 resource_id, const phys_addr_t *pages,
+                                             u32 npages, u32 page_size);
+
+/**
+ * virtio_gpu_cmd_get_capset_info(capset_index, ...) — VIRTIO_GPU_CMD_GET_CAPSET_INFO.
+ * Queries the @capset_index'th capset the host offers (0-based, unrelated to
+ * the capset's own id). Out params receive the capset's id (e.g.
+ * VIRTIO_GPU_CAPSET_VIRGL), its highest supported version, and the byte size
+ * of its capability data at that version. A host with fewer than
+ * @capset_index+1 capsets responds with capset_id 0.
+ */
+int virtio_gpu_cmd_get_capset_info(u32 capset_index, u32 *out_id,
+                                   u32 *out_max_version, u32 *out_max_size);
+
+/**
+ * virtio_gpu_cmd_get_capset(capset_id, capset_version, out_buf, buf_size, out_size)
+ * — VIRTIO_GPU_CMD_GET_CAPSET. Fetches up to @buf_size bytes of the given
+ * capset's capability data (a host-defined struct, e.g. virgl_caps_v2) into
+ * @out_buf. @out_size receives the number of bytes actually written.
+ */
+int virtio_gpu_cmd_get_capset(u32 capset_id, u32 capset_version,
+                              void *out_buf, u32 buf_size, u32 *out_size);
+
+/**
+ * virtio_gpu_cmd_transfer_to_host_3d() — VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D.
+ * Copies @offset..@offset+extent bytes of @resource_id's attached guest
+ * backing pages into the host's copy of the resource, within the 3D box
+ * (x,y,z,w,h,d) at mip @level. For a linear buffer resource (vertex/index/
+ * uniform data, VIRGL_BIND_VERTEX_BUFFER and friends) the box is simply
+ * {0,0,0, size,1,1} and @stride/@layer_stride are 0 — this is what makes
+ * data written into a RESOURCE_CREATE_3D buffer by the guest actually
+ * visible to the host's Gallium driver; without it the resource exists on
+ * the host but is never filled in.
+ */
+int virtio_gpu_cmd_transfer_to_host_3d(u32 ctx_id, u32 resource_id,
+                                       u32 x, u32 y, u32 z, u32 w, u32 h, u32 d,
+                                       u64 offset, u32 level, u32 stride,
+                                       u32 layer_stride);
+
+/**
+ * virtio_gpu_cmd_transfer_from_host_3d() — VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D.
+ * The read-back counterpart of virtio_gpu_cmd_transfer_to_host_3d(): copies
+ * the host's copy of @resource_id within the given box back into the
+ * resource's attached guest backing pages. What makes a rendered frame (or
+ * any other host-side result — a query, a computed buffer) actually
+ * inspectable from the guest instead of only existing on the host's GPU.
+ */
+int virtio_gpu_cmd_transfer_from_host_3d(u32 ctx_id, u32 resource_id,
+                                         u32 x, u32 y, u32 z, u32 w, u32 h, u32 d,
+                                         u64 offset, u32 level, u32 stride,
+                                         u32 layer_stride);
+
 /**
  * virtio_gpu_get_display_info_all(out_modes, max, out_count) — like
  * virtio_gpu_get_display_info(), but returns every scanout the host reports
@@ -287,6 +480,28 @@ int virtio_gpu_resource_flush_rect(u32 resource_id, u32 x, u32 y,
                                    u32 width, u32 height);
 int virtio_gpu_transfer_to_host_2d(u32 resource_id, u32 width, u32 height);
 int virtio_gpu_resource_flush(u32 resource_id, u32 width, u32 height);
+
+/**
+ * virtio_gpu_resource_detach_backing(resource_id) — unregister the guest
+ * physical pages that back @resource_id.  Call this before
+ * virtio_gpu_resource_unref() whenever the resource was created with
+ * virtio_gpu_resource_attach_backing().  Sending RESOURCE_UNREF without
+ * first detaching backing is technically valid per the spec but some host
+ * implementations handle it poorly; detaching first is always safe.
+ */
+int virtio_gpu_resource_detach_backing(u32 resource_id);
+
+/**
+ * virtio_gpu_resource_unref(resource_id) — destroy a host 2D resource.
+ *
+ * Frees the host's copy of the resource.  The guest backing pages are
+ * returned to the physical allocator by the caller separately (the device
+ * does not own guest pages).  Only call after
+ * virtio_gpu_resource_detach_backing() and after making sure no scanout
+ * still references this resource (virtio_gpu_set_scanout(scanout, 0, ...)).
+ * resource_id 0 is the invalid sentinel; this function is a no-op for it.
+ */
+int virtio_gpu_resource_unref(u32 resource_id);
 
 /* ── Hardware cursor plane (cursor queue) ───────────────────────────────────
  * The cursor is a host-side overlay: once its 64x64 image is uploaded, the

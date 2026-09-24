@@ -113,7 +113,15 @@ void mce_init(void)
     }
 
     s_banks = g_cpu_info.mce_banks;
-    if (s_banks > 64) s_banks = 64;   /* MCG_CAP caps at 255; be conservative */
+    if (s_banks > 64) {
+        /* s_bank_ctl/s_bank_status etc. are u64 bitmaps/arrays sized for 64
+         * banks; MCG_CAP's count field can report up to 255. Say so instead
+         * of silently monitoring only the first 64 -- a machine check
+         * landing in a dropped bank would otherwise go completely unlogged. */
+        kprintf("[MCE] WARNING: CPU reports %u MCA banks, only monitoring 64\n",
+                s_banks);
+        s_banks = 64;
+    }
 
     /* Pentium Pro through early Pentium II log spurious external-bus errors in
      * bank 0. Leaving its CTL at the reset value is what every production OS

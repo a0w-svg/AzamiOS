@@ -26,6 +26,17 @@ static dm_class_t  *g_classes;
 static spinlock_t   g_core_lock = SPINLOCK_INIT;
 static bool         g_core_ready;
 
+int g_async_probes_pending = 0;
+
+/* wait_for_device_probe() — spin until all async probes complete */
+void wait_for_device_probe(void)
+{
+    while (__atomic_load_n(&g_async_probes_pending, __ATOMIC_SEQ_CST) > 0) {
+        extern void sched_yield(void);
+        sched_yield();
+    }
+}
+
 const char *const dm_device_generic_attrs[] = {
     "uevent", "modalias", "driver", "dev", NULL
 };

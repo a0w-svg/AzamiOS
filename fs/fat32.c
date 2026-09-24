@@ -505,6 +505,7 @@ static s64 fat32_mount_fs(file_system_type_t *fs_type, const char *dev_name, con
 file_system_type_t g_fat32_type = {
     .name = "fat32",
     .mount = fat32_mount_fs,
+    .fs_flags = FS_REQUIRES_DEV,
     .next = NULL,
 };
 

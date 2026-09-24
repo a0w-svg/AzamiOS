@@ -45,6 +45,11 @@
 extern virtio_gpu_state_t g_gpu;
 extern int devfs_register_device(const char *name, file_operations_t *fops, void *private_data);
 
+/* One half-open damaged box in scanout coordinates. */
+typedef struct {
+    u32 x1, y1, x2, y2;
+} fbdev_box_t;
+
 typedef struct {
     phys_addr_t phys_addr;
     size_t      total_vram_size;
@@ -71,15 +76,103 @@ typedef struct {
     u64         present_gen;
     u64         flushed_gen;
 
-    /* Client-reported damage (FBIOAZ_DAMAGE), stored as an inclusive-exclusive
-     * box and unioned until the next flush. When dmg_valid is set the present
-     * worker transfers only this region instead of the whole scanout. */
+    /* Client-reported damage (FBIOAZ_DAMAGE / FBIOAZ_DAMAGE_LIST), kept as a
+     * bounded list of half-open boxes and accumulated until the next flush.
+     * A list rather than one union box because a compositor frame is rarely
+     * one box: a clock bottom-right and a caret top-left union to the whole
+     * screen, and transferring that every frame is exactly what damage
+     * reporting exists to avoid. When the list is full the two boxes whose
+     * union wastes least are merged, so the worst case degrades to the
+     * bounding box it replaced instead of dropping damage. */
     spinlock_t  dmg_lock;
-    bool        dmg_valid;
-    u32         dmg_x1, dmg_y1, dmg_x2, dmg_y2;
+    u32         dmg_count;
+    fbdev_box_t dmg[FB_AZ_DAMAGE_MAX];
 } fb_driver_state_t;
 
 static fb_driver_state_t g_fb_state;
+
+static inline u64 fbdev_box_area(u32 x1, u32 y1, u32 x2, u32 y2)
+{
+    if (x2 <= x1 || y2 <= y1) return 0;
+    return (u64)(x2 - x1) * (u64)(y2 - y1);
+}
+
+/*
+ * Accumulate one damaged box. Caller holds dmg_lock.
+ *
+ * Boxes that overlap, or whose union costs little more than keeping them
+ * apart, are merged; the rest take their own slot. A full list merges its
+ * cheapest pair to make room, which can only ever make the reported damage
+ * larger — over-reporting costs a redundant copy, under-reporting would
+ * leave stale pixels on the host's scanout.
+ */
+static void fbdev_damage_add_locked(u32 x1, u32 y1, u32 x2, u32 y2)
+{
+    if (x2 > g_fb_state.width)  x2 = g_fb_state.width;
+    if (y2 > g_fb_state.height) y2 = g_fb_state.height;
+    if (x1 >= x2 || y1 >= y2) return;
+
+    /* Merge into an existing box where that is cheap, cascading so one add
+     * can collapse a run of adjacent boxes. */
+    for (;;) {
+        u32 hit = g_fb_state.dmg_count;
+        for (u32 i = 0; i < g_fb_state.dmg_count; i++) {
+            u32 ax1 = g_fb_state.dmg[i].x1, ay1 = g_fb_state.dmg[i].y1;
+            u32 ax2 = g_fb_state.dmg[i].x2, ay2 = g_fb_state.dmg[i].y2;
+
+            if (x1 >= ax1 && y1 >= ay1 && x2 <= ax2 && y2 <= ay2)
+                return;                       /* already covered */
+
+            u32 ux1 = x1 < ax1 ? x1 : ax1, uy1 = y1 < ay1 ? y1 : ay1;
+            u32 ux2 = x2 > ax2 ? x2 : ax2, uy2 = y2 > ay2 ? y2 : ay2;
+
+            u64 have = fbdev_box_area(ax1, ay1, ax2, ay2) + fbdev_box_area(x1, y1, x2, y2);
+            u64 uni  = fbdev_box_area(ux1, uy1, ux2, uy2);
+            if (uni <= have || (uni - have) * 4 <= have) { hit = i; break; }
+        }
+        if (hit == g_fb_state.dmg_count) break;
+
+        if (g_fb_state.dmg[hit].x1 < x1) x1 = g_fb_state.dmg[hit].x1;
+        if (g_fb_state.dmg[hit].y1 < y1) y1 = g_fb_state.dmg[hit].y1;
+        if (g_fb_state.dmg[hit].x2 > x2) x2 = g_fb_state.dmg[hit].x2;
+        if (g_fb_state.dmg[hit].y2 > y2) y2 = g_fb_state.dmg[hit].y2;
+        g_fb_state.dmg[hit] = g_fb_state.dmg[g_fb_state.dmg_count - 1];
+        g_fb_state.dmg_count--;
+    }
+
+    if (g_fb_state.dmg_count >= FB_AZ_DAMAGE_MAX) {
+        /* Merge the cheapest existing pair to free a slot. */
+        u32 bi = 0, bj = 1;
+        u64 best = (u64)-1;
+        for (u32 i = 0; i < g_fb_state.dmg_count; i++) {
+            for (u32 j = i + 1; j < g_fb_state.dmg_count; j++) {
+                u32 ux1 = g_fb_state.dmg[i].x1 < g_fb_state.dmg[j].x1 ? g_fb_state.dmg[i].x1 : g_fb_state.dmg[j].x1;
+                u32 uy1 = g_fb_state.dmg[i].y1 < g_fb_state.dmg[j].y1 ? g_fb_state.dmg[i].y1 : g_fb_state.dmg[j].y1;
+                u32 ux2 = g_fb_state.dmg[i].x2 > g_fb_state.dmg[j].x2 ? g_fb_state.dmg[i].x2 : g_fb_state.dmg[j].x2;
+                u32 uy2 = g_fb_state.dmg[i].y2 > g_fb_state.dmg[j].y2 ? g_fb_state.dmg[i].y2 : g_fb_state.dmg[j].y2;
+                u64 have = fbdev_box_area(g_fb_state.dmg[i].x1, g_fb_state.dmg[i].y1,
+                                          g_fb_state.dmg[i].x2, g_fb_state.dmg[i].y2)
+                         + fbdev_box_area(g_fb_state.dmg[j].x1, g_fb_state.dmg[j].y1,
+                                          g_fb_state.dmg[j].x2, g_fb_state.dmg[j].y2);
+                u64 uni = fbdev_box_area(ux1, uy1, ux2, uy2);
+                u64 waste = uni > have ? uni - have : 0;
+                if (waste < best) { best = waste; bi = i; bj = j; }
+            }
+        }
+        if (g_fb_state.dmg[bj].x1 < g_fb_state.dmg[bi].x1) g_fb_state.dmg[bi].x1 = g_fb_state.dmg[bj].x1;
+        if (g_fb_state.dmg[bj].y1 < g_fb_state.dmg[bi].y1) g_fb_state.dmg[bi].y1 = g_fb_state.dmg[bj].y1;
+        if (g_fb_state.dmg[bj].x2 > g_fb_state.dmg[bi].x2) g_fb_state.dmg[bi].x2 = g_fb_state.dmg[bj].x2;
+        if (g_fb_state.dmg[bj].y2 > g_fb_state.dmg[bi].y2) g_fb_state.dmg[bi].y2 = g_fb_state.dmg[bj].y2;
+        g_fb_state.dmg[bj] = g_fb_state.dmg[g_fb_state.dmg_count - 1];
+        g_fb_state.dmg_count--;
+    }
+
+    g_fb_state.dmg[g_fb_state.dmg_count].x1 = x1;
+    g_fb_state.dmg[g_fb_state.dmg_count].y1 = y1;
+    g_fb_state.dmg[g_fb_state.dmg_count].x2 = x2;
+    g_fb_state.dmg[g_fb_state.dmg_count].y2 = y2;
+    g_fb_state.dmg_count++;
+}
 
 /* Push one rectangle of the scanout resource to the host. The copy is
  * guest-phys to host-phys inside the hypervisor, so the cost scales with the
@@ -444,22 +537,26 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
             if (copy_from_user(&r, (void *)(uintptr_t)arg, sizeof(r)) != 0) return -(s64)EFAULT;
             if (r.w == 0 || r.h == 0) return 0;
 
-            u32 x1 = r.x, y1 = r.y;
-            u32 x2 = r.x + r.w, y2 = r.y + r.h;
-            if (x2 > g_fb_state.width)  x2 = g_fb_state.width;
-            if (y2 > g_fb_state.height) y2 = g_fb_state.height;
-            if (x1 >= x2 || y1 >= y2) return 0;
+            irqflags_t f = spinlock_lock_irqsave(&g_fb_state.dmg_lock);
+            fbdev_damage_add_locked(r.x, r.y, r.x + r.w, r.y + r.h);
+            spinlock_unlock_irqrestore(&g_fb_state.dmg_lock, f);
+            __atomic_add_fetch(&g_fb_state.present_gen, 1, __ATOMIC_RELAXED);
+            return 0;
+        }
+
+        case FBIOAZ_DAMAGE_LIST: {
+            if (!g_fb_state.is_virtio) return 0;   /* nothing to sync; harmless */
+            struct fb_az_damage_list dl;
+            if (copy_from_user(&dl, (void *)(uintptr_t)arg, sizeof(dl)) != 0) return -(s64)EFAULT;
+            if (dl.count == 0) return 0;
+            if (dl.count > FB_AZ_DAMAGE_MAX) return -(s64)EINVAL;
 
             irqflags_t f = spinlock_lock_irqsave(&g_fb_state.dmg_lock);
-            if (!g_fb_state.dmg_valid) {
-                g_fb_state.dmg_x1 = x1; g_fb_state.dmg_y1 = y1;
-                g_fb_state.dmg_x2 = x2; g_fb_state.dmg_y2 = y2;
-                g_fb_state.dmg_valid = true;
-            } else {
-                if (x1 < g_fb_state.dmg_x1) g_fb_state.dmg_x1 = x1;
-                if (y1 < g_fb_state.dmg_y1) g_fb_state.dmg_y1 = y1;
-                if (x2 > g_fb_state.dmg_x2) g_fb_state.dmg_x2 = x2;
-                if (y2 > g_fb_state.dmg_y2) g_fb_state.dmg_y2 = y2;
+            for (u32 i = 0; i < dl.count; i++) {
+                if (dl.rects[i].w == 0 || dl.rects[i].h == 0) continue;
+                fbdev_damage_add_locked(dl.rects[i].x, dl.rects[i].y,
+                                        dl.rects[i].x + dl.rects[i].w,
+                                        dl.rects[i].y + dl.rects[i].h);
             }
             spinlock_unlock_irqrestore(&g_fb_state.dmg_lock, f);
             __atomic_add_fetch(&g_fb_state.present_gen, 1, __ATOMIC_RELAXED);
@@ -643,22 +740,28 @@ static void fbdev_flusher(void *arg)
             !__atomic_load_n(&g_fb_state.mmap_active, __ATOMIC_RELAXED))
             continue;
 
-        /* Precise path: the client told us exactly what it drew (FBIOAZ_DAMAGE).
-         * Transfer just that box — a moved window edge or a blinking caret is
-         * a few KiB across the virtqueue, not 4 MiB. */
+        /* Precise path: the client told us exactly what it drew (FBIOAZ_DAMAGE
+         * or FBIOAZ_DAMAGE_LIST). Transfer just those boxes — a moved window
+         * edge or a blinking caret is a few KiB across the virtqueue, not
+         * 4 MiB, and two far-apart boxes stay two small transfers instead of
+         * becoming the screen-sized box that contains them. */
+        fbdev_box_t dmg[FB_AZ_DAMAGE_MAX];
+        u32 ndmg;
+
         irqflags_t df = spinlock_lock_irqsave(&g_fb_state.dmg_lock);
-        bool have_dmg = g_fb_state.dmg_valid;
-        u32 dx = g_fb_state.dmg_x1, dy = g_fb_state.dmg_y1;
-        u32 dw = have_dmg ? g_fb_state.dmg_x2 - g_fb_state.dmg_x1 : 0;
-        u32 dh = have_dmg ? g_fb_state.dmg_y2 - g_fb_state.dmg_y1 : 0;
-        g_fb_state.dmg_valid = false;
+        ndmg = g_fb_state.dmg_count;
+        for (u32 i = 0; i < ndmg; i++) dmg[i] = g_fb_state.dmg[i];
+        g_fb_state.dmg_count = 0;
         spinlock_unlock_irqrestore(&g_fb_state.dmg_lock, df);
 
         u64 gen = __atomic_load_n(&g_fb_state.present_gen, __ATOMIC_RELAXED);
 
-        if (have_dmg) {
+        if (ndmg > 0) {
             __atomic_store_n(&g_fb_state.present_gen, gen, __ATOMIC_RELAXED);
-            fbdev_virtio_present_rect(dx, dy, dw, dh);
+            for (u32 i = 0; i < ndmg; i++)
+                fbdev_virtio_present_rect(dmg[i].x1, dmg[i].y1,
+                                          dmg[i].x2 - dmg[i].x1,
+                                          dmg[i].y2 - dmg[i].y1);
             continue;
         }
 

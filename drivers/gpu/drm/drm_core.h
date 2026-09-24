@@ -94,6 +94,18 @@ typedef struct drm_gem_object {
     u64                mmap_offset;     /* fake offset handed to mmap()      */
     u32                name;            /* GEM flink name, 0 if unnamed      */
     int                refcount;
+
+    /**
+     * driver_private — driver-specific opaque value.
+     *
+     * The core never reads or writes this field; it is entirely the driver's
+     * business.  Typical uses:
+     *   virtio-gpu: host-assigned resource_id (u32, stored as u64).
+     *   bochs/vmwgfx: unused (0).
+     * Initialised to 0 by drm_gem_object_create() via kzalloc.
+     */
+    u64                driver_private;
+
     struct drm_gem_object *next;
 } drm_gem_object_t;
 
@@ -227,6 +239,7 @@ typedef struct drm_pending_event {
 } drm_pending_event_t;
 
 typedef struct drm_file {
+    spinlock_t         file_lock;
     struct drm_device *dev;
     bool               is_master;
     bool               is_render_node;
@@ -242,6 +255,15 @@ typedef struct drm_file {
 
     drm_pending_event_t events[DRM_MAX_EVENTS];
     u32                event_head, event_tail;
+
+    /* virtio-gpu/virgl: the 3D context this file created via
+     * DRM_IOCTL_VIRTGPU_CONTEXT_INIT, if any. AzamiOS keeps one context per
+     * open file (the common single-context-per-fd case every real Virgl
+     * client — Mesa's virgl winsys included — actually uses), so a resource
+     * created on this file after CONTEXT_INIT can be auto-attached to that
+     * context instead of requiring a separate explicit attach ioctl. */
+    u32                virtgpu_ctx_id;
+    bool               virtgpu_ctx_valid;
 } drm_file_t;
 
 /* ── Driver operations ───────────────────────────────────────────────────── */

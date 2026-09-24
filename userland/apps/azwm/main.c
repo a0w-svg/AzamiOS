@@ -21,8 +21,12 @@
 #include "../shared/de_log.h"
 #include "../../libc/include/az/ipc.h"
 #include "../../libc/include/stdio.h"
+#include "../../libc/include/stdlib.h"
 #include "../../libc/include/string.h"
 #include "../../libc/include/unistd.h"
+#include "../../libc/include/signal.h"
+#include "../../libc/include/errno.h"
+#include "../../libc/include/sys/wait.h"
 #include <stdbool.h>
 
 /* Display geometry is resolved at runtime via az_fb_info() — these are
@@ -283,9 +287,176 @@ static void sync_window_surface(az_compositor_t *comp, az_window_t *win)
     az_channel_send_nb((int)win->client_chan, (az_ipc_msg_t *)&rmsg);
 }
 
+/* Reads the Display tab's VSync toggle out of /etc/desktop.conf (the same
+ * file userland/apps/settings/main.c writes on every toggle -- see
+ * save_display_settings()/apply_theme() there). Defaults to on (matching
+ * Settings' own default and prior behavior) when the file is missing or has
+ * no vsync= line, so a system that never opened Settings keeps presenting
+ * exactly as it always did. */
+static bool desktop_config_vsync_enabled(void)
+{
+    int fd = open("/etc/desktop.conf", O_RDONLY);
+    if (fd < 0) return true;
+    char buf[512];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return true;
+    buf[n] = '\0';
+    char *v = strstr(buf, "vsync=");
+    if (!v) return true;
+    return atoi(v + 6) != 0;
+}
+
 /* ============================================================================
  * _start
  * ============================================================================ */
+/* ── Display blanking ───────────────────────────────────────────────────────
+ *
+ * Settings > Power has a "Screen timeout" row (5 / 15 / 30 / Never) and a
+ * "Standby" button. Both used to be writing-only: the timeout was saved to
+ * /etc/power.conf and nothing ever read it, and Standby set a status line
+ * saying "Entering ACPI S3 Standby state..." while nothing entered
+ * anything — this kernel implements ACPI S5 (soft off) and no sleep
+ * states.
+ *
+ * What is actually implementable here is display blanking, and the
+ * compositor is the only process that sees every input event, so it owns
+ * it: after the configured idle time the screen goes black, and the next
+ * key or mouse event brings it back. The Standby button now asks for the
+ * same thing immediately (AZ_WM_BLANK_SCREEN), which is a real action that
+ * matches its label rather than a message about one.
+ *
+ * The wake event is swallowed rather than delivered: the click that wakes
+ * a blanked screen should not also press whatever button happens to be
+ * under the pointer. */
+/* Input is ignored for this long right after the screen blanks, so the
+ * release of the click that requested it does not wake it again. */
+#define AZWM_BLANK_GRACE_NS   600000000LL   /* 600ms */
+
+static unsigned int g_last_hover_wid = 0;   /* window the pointer was last over */
+static int      g_screen_blanked = 0;
+static long long g_last_input_ns = 0;
+static int      g_idle_timeout_min = 0;      /* 0 = never blank */
+static long long g_powerconf_checked_ns = 0;
+static long long g_blank_started_ns = 0;
+
+/* screen_timeout= from /etc/power.conf, in minutes (0/absent = never). */
+static int read_screen_timeout(void)
+{
+    int fd = open("/etc/power.conf", 0, 0);
+    if (fd < 0) return 0;
+    char buf[256];
+    long n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+
+    for (char *line = buf; line && *line; ) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strncmp(line, "screen_timeout=", 15) == 0) {
+            int v = atoi(line + 15);
+            return (v > 0) ? v : 0;
+        }
+        line = nl ? nl + 1 : (char *)0;
+    }
+    return 0;
+}
+
+static void blank_screen(az_compositor_t *comp)
+{
+    if (g_screen_blanked) return;
+    g_screen_blanked = 1;
+    g_blank_started_ns = compositor_now_ns();
+
+    unsigned int px = comp->fb_width * comp->fb_height;
+    for (unsigned int i = 0; i < px; i++) comp->backbuf[i] = 0xFF000000;
+    compositor_damage_all(comp);
+    compositor_present(comp);
+}
+
+static void unblank_screen(az_compositor_t *comp)
+{
+    if (!g_screen_blanked) return;
+    g_screen_blanked = 0;
+    compositor_damage_all(comp);
+    compose_screen(comp);
+}
+
+/* ── Reap windows whose client is gone ──────────────────────────────────────
+ *
+ * A client is supposed to send AZ_WM_DESTROY_WINDOW before it exits, and
+ * most do. One that exits without it — an app killed from the terminal, a
+ * crash, a program that just calls exit() — used to leave its window on
+ * screen forever: still composited, still stacked above the others, still
+ * listed in the taskbar, and closable only by a button whose click no one
+ * was left to read.
+ *
+ * Runs once a second rather than per frame: a dead client is not urgent,
+ * and this asks the kernel a question per window. Returns true if anything
+ * was destroyed, so the caller knows to recompose. */
+static bool reap_dead_clients(az_compositor_t *comp, de_comp_state_t *de_state)
+{
+    bool destroyed_any = false;
+
+    /* Collect exited children. The WM spawns apps itself (AZ_WM_LAUNCH_APP
+     * -> az_spawn), so it is their parent and has to wait for them; init
+     * does the same for orphans. */
+    int status;
+    while (waitpid(-1, &status, WNOHANG) > 0) { }
+
+    for (unsigned int i = 0; i < AZWM_MAX_WINDOWS; i++) {
+        az_window_t *win = &comp->window_pool[i];
+        if (win->wid == 0 || win->client_chan == 0) continue;
+
+        /* Liveness by channel, not by PID.
+         *
+         * The kernel tears down every channel a process owns when it
+         * exits (ipc_channel_close_all), so the client's own channel says
+         * whether it is still there, immediately and without depending on
+         * anyone else.
+         *
+         * A PID does not answer the same question as directly. kill(pid, 0)
+         * succeeds for a zombie — correctly, POSIX says a zombie is still a
+         * process — so a window would linger for as long as nobody waited
+         * for its owner, which used to be forever (init only slept, and
+         * /proc/<pid> outlived the process on top of that; both are fixed
+         * now, in init's idle loop and procfs_pid_exited()). Even with
+         * those fixed, "has the parent got round to waiting yet" is the
+         * wrong question to gate a window on.
+         *
+         * AZ_WM_PING is a message clients ignore; the mouse-forward path
+         * already destroys a window on the same -EPIPE, this just asks the
+         * question for windows nothing happens to be pointing at. */
+        az_wm_msg_t probe;
+        for (unsigned int b = 0; b < sizeof(probe); b++) ((char *)&probe)[b] = 0;
+        probe.type = AZ_WM_PING;
+        probe.wid  = win->wid;
+
+        int probe_rc = az_channel_send_nb(win->client_chan, (az_ipc_msg_t *)&probe);
+
+        /* Two answers mean the client is gone: -EPIPE from a channel that
+         * is closed but still registered, and -EINVAL from one the kernel
+         * has already unregistered (ipc_channel_find() fails, which is
+         * what a process's exit teardown leaves behind). The probe message
+         * is built here and always well-formed, so -EINVAL cannot mean
+         * anything else. A full queue answers -EAGAIN — a busy client, not
+         * a dead one — and is left alone. */
+        if (probe_rc != -EPIPE && probe_rc != -EINVAL)
+            continue;
+
+        unsigned int dead_wid = win->wid;
+        unsigned int prev_focus = comp->focused_window ? comp->focused_window->wid : 0;
+        compositor_destroy_window(comp, dead_wid);
+        unsigned int new_focus = comp->focused_window ? comp->focused_window->wid : 0;
+        if (prev_focus != new_focus)
+            de_comp_broadcast_focus(de_state, prev_focus, new_focus);
+        de_comp_broadcast_destroyed(de_state, dead_wid);
+        destroyed_any = true;
+    }
+    return destroyed_any;
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -333,14 +504,21 @@ int main(int argc, char **argv)
     compositor_init(&comp, frontbuf, backbuf,
                     screen_w, screen_h, screen_pitch, server_chan);
 
-    if (disp.buffers >= 2) {
+    /* The Display tab's VSync toggle only has a real choice to make when the
+     * hardware actually has two buffers to flip between; with one buffer,
+     * damage-copy is the only option regardless of the setting. */
+    if (disp.buffers >= 2 && desktop_config_vsync_enabled()) {
         compositor_enable_page_flip(&comp, disp.fb_fd, frontbuf, disp.yres);
         de_log("[azwm] Double-buffered: presenting by page flip at vsync");
     } else {
         /* Keep /dev/fb0 for FBIOAZ_DAMAGE so a host-backed scanout transfers
-         * only the rows that changed. */
+         * only the rows that changed. Also the deliberate "VSync off" path
+         * on double-buffered hardware: present immediately by damage copy
+         * instead of waiting for the flip, at the cost of possible tearing. */
         comp.fb_fd = disp.fb_fd;
-        de_log("[azwm] Single-buffered display: presenting by damage copy");
+        de_log(disp.buffers >= 2
+               ? "[azwm] Double-buffered, VSync disabled: presenting by damage copy"
+               : "[azwm] Single-buffered display: presenting by damage copy");
     }
 
     /* Hand the pointer to the display's cursor overlay if it has one — then a
@@ -399,6 +577,11 @@ int main(int argc, char **argv)
     long long last_frame_ns = compositor_now_ns();
 
     bool running = true;
+    long long last_reap_ns = compositor_now_ns();
+    g_last_input_ns = last_reap_ns;
+    g_powerconf_checked_ns = last_reap_ns;
+    g_idle_timeout_min = read_screen_timeout();
+
     while (running) {
         bool redraw_needed = false;
         bool cursor_moved = false;
@@ -406,6 +589,22 @@ int main(int argc, char **argv)
         /* ── 1. Poll for hardware input events (non-blocking) ──────────── */
         az_input_event_t ev;
         while (az_input_poll(&ev) == 0) {
+            /* Any input counts as activity for the blank timer; while the
+             * screen is blanked the first event only wakes it, so the click
+             * that woke the display does not also land on a button. */
+            g_last_input_ns = compositor_now_ns();
+            if (g_screen_blanked) {
+                /* Ignore input for a moment after blanking, then wake on
+                 * the next event. Without the grace period the release of
+                 * the very click that asked for the blank (Settings >
+                 * Power > Blank Display) arrives a few milliseconds later
+                 * and wakes the screen again, so the button looked like it
+                 * did nothing at all. */
+                if (g_last_input_ns - g_blank_started_ns >= AZWM_BLANK_GRACE_NS)
+                    unblank_screen(&comp);
+                continue;
+            }
+
             if (ev.type == AZ_INPUT_EVENT_MOUSE) {
                 /* Smooth acceleration curve */
                 int mdx = (int)ev.mouse_dx;
@@ -887,6 +1086,35 @@ int main(int argc, char **argv)
                     az_window_t *target_win = find_window_at(&comp, abs_x, abs_y);
                     if (!target_win) target_win = comp.focused_window;
 
+                    /* Pointer-leave: the window the pointer was last over
+                     * gets one final move event, carrying the (now
+                     * outside) position, so it can undo whatever it was
+                     * showing for the hover. Without it a window only ever
+                     * hears about the pointer while it is inside, and
+                     * anything hover-driven stays stuck on: the taskbar's
+                     * tooltip hung around over the desktop long after the
+                     * pointer had left the panel, because the last thing
+                     * the panel heard was "pointer is over the Start
+                     * button". */
+                    if (g_last_hover_wid != 0 &&
+                        (!target_win || target_win->wid != g_last_hover_wid)) {
+                        for (unsigned int wi = 0; wi < AZWM_MAX_WINDOWS; wi++) {
+                            az_window_t *lw = &comp.window_pool[wi];
+                            if (lw->wid != g_last_hover_wid) continue;
+                            az_wm_msg_t leave;
+                            for (unsigned int lb = 0; lb < sizeof(leave); lb++)
+                                ((char *)&leave)[lb] = 0;
+                            leave.type = AZ_WM_MOUSE_EVENT;
+                            leave.wid  = lw->wid;
+                            leave.mouse.abs_x   = (short)(abs_x - lw->x);
+                            leave.mouse.abs_y   = (short)(abs_y - lw->y);
+                            leave.mouse.buttons = 0;
+                            az_channel_send_nb(lw->client_chan, (az_ipc_msg_t *)&leave);
+                            break;
+                        }
+                    }
+                    g_last_hover_wid = target_win ? target_win->wid : 0;
+
                     if (target_win) {
                         az_wm_msg_t fwd;
                         int j;
@@ -1222,7 +1450,7 @@ int main(int argc, char **argv)
             case AZ_WM_CREATE_WINDOW: {
                 unsigned int shmem_id = 0;
                 int wid = compositor_create_window(&comp,
-                                                   0, /* owner_pid */
+                                                   msg.create.pid, /* owner_pid */
                                                    msg.client_chan,
                                                    msg.create.x, msg.create.y,
                                                    msg.create.w, msg.create.h,
@@ -1424,6 +1652,14 @@ int main(int argc, char **argv)
                     redraw_needed = true;
                 break;
 
+            case AZ_WM_BLANK_SCREEN:
+                /* Settings > Power > Standby, or anything else that wants
+                 * the display off now. Input wakes it, same as the idle
+                 * timeout's blank. */
+                blank_screen(&comp);
+                redraw_needed = false;
+                break;
+
             case AZ_WM_SET_OPACITY: {
                 az_window_t *win = (az_window_t *)0;
                 for (unsigned int i = 0; i < AZWM_MAX_WINDOWS; i++) {
@@ -1490,11 +1726,44 @@ int main(int argc, char **argv)
             }
         }
 
+        /* ── Drop windows whose client is gone ─────────────────────────── */
+        {
+            long long now_reap_ns = compositor_now_ns();
+            if (now_reap_ns - last_reap_ns >= 1000000000LL) {
+                last_reap_ns = now_reap_ns;
+                if (reap_dead_clients(&comp, &de_state)) redraw_needed = true;
+
+                /* Re-read the timeout every few seconds so changing it in
+                 * Settings takes effect without a restart. */
+                if (now_reap_ns - g_powerconf_checked_ns >= 5000000000LL) {
+                    g_powerconf_checked_ns = now_reap_ns;
+                    g_idle_timeout_min = read_screen_timeout();
+                }
+                if (!g_screen_blanked && g_idle_timeout_min > 0) {
+                    long long idle_ns = now_reap_ns - g_last_input_ns;
+                    if (idle_ns >= (long long)g_idle_timeout_min * 60LL * 1000000000LL) {
+                        blank_screen(&comp);
+                        redraw_needed = false;
+                    }
+                }
+            }
+        }
+
         /* ── Animate active window transitions ─────────────────────────── */
         if (comp.has_animating_windows) {
             if (compositor_animate_step(&comp)) {
                 redraw_needed = true;
             }
+        }
+
+        /* A blanked screen stays black until something wakes it. Clients
+         * carry on drawing into their own buffers and sending
+         * AZ_WM_INVALIDATE — the taskbar's clock alone does it every
+         * second — and compositing any of that would put the desktop back
+         * on the glass while the WM still believed it was blanked. */
+        if (g_screen_blanked) {
+            redraw_needed = false;
+            cursor_moved  = false;
         }
 
         if (redraw_needed) {

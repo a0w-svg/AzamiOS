@@ -77,6 +77,13 @@ struct stat {
     s64 _unused[3];
 };
 
+/* Linux x86_64 struct statfs, field for field.
+ *
+ * f_fsid used to be declared u64[2] — 16 bytes where the kernel ABI has 8
+ * (fsid_t is two ints) — so every field after it sat 8 bytes too far along.
+ * A libc reading the result got f_namelen where it expected f_frsize and
+ * f_frsize where it expected f_flags, which is why statvfs(3) reported a
+ * filesystem's mount flags as whatever its fragment size happened to be. */
 struct statfs {
     u64 f_type;
     u64 f_bsize;
@@ -85,7 +92,7 @@ struct statfs {
     u64 f_bavail;
     u64 f_files;
     u64 f_ffree;
-    u64 f_fsid[2];
+    u32 f_fsid[2];    /* fsid_t: two 32-bit words, 8 bytes total */
     u64 f_namelen;
     u64 f_frsize;
     u64 f_flags;
@@ -114,17 +121,42 @@ typedef struct super_operations {
 } super_operations_t;
 
 /* --------------------------------------------------------------------------
+ * Export Operations (for file handles)
+ * -------------------------------------------------------------------------- */
+/* The Linux file_handle ABI (include/azami/uapi/file_handle.h defines the
+ * same shape for userspace). Declared here rather than only there so a
+ * filesystem implementing ->fh_to_dentry can reach into it. */
+struct file_handle {
+    unsigned int handle_bytes;   /* size of f_handle[] */
+    int handle_type;             /* which ->encode_fh produced it */
+    unsigned char f_handle[];
+};
+#define MAX_HANDLE_SZ 128
+
+typedef struct export_operations {
+    s64 (*encode_fh)(struct inode *inode, u32 *fh, int *max_len, struct inode *parent);
+    struct dentry *(*fh_to_dentry)(struct super_block *sb, struct file_handle *handle);
+} export_operations_t;
+
+/* --------------------------------------------------------------------------
  * Superblock
  * -------------------------------------------------------------------------- */
 typedef struct super_block {
     u32 s_magic;
     u32 s_blocksize;
+    /* The MS_* flags this filesystem was mounted with (fs/namespace.h).
+     * Kept on the superblock rather than only in the mount table because
+     * the checks that enforce them — EROFS on a write, "no device nodes
+     * here", the atime policy — all run from a path that has an inode in
+     * hand and no cheap way back to a mountpoint. */
+    u32 s_flags;
     u64 s_dev;   /* st_dev every inode on this mount reports: the backing
                   * block device's rdev for a disk-backed filesystem, or a
                   * vfs_alloc_anon_dev() id for a pseudo one (devfs, procfs,
                   * sysfs, tmpfs, devpts, ...) */
     struct file_system_type *s_type;
     super_operations_t *s_op;
+    export_operations_t *s_export_op;
     struct dentry *s_root;
     void *s_fs_info; /* Filesystem specific private data */
     struct super_block *next;
@@ -158,6 +190,12 @@ typedef struct inode_operations {
     /* Hard link: attach @dentry in @dir to the inode @old_dentry already
      * names. Distinct from ->symlink, which makes a new inode holding a path. */
     s64 (*link)(struct inode *dir, struct dentry *old_dentry, struct dentry *dentry);
+    /* mknod(2): create a node of any type, including a character or block
+     * device (@rdev is its device number) and a socket. ->create only ever
+     * makes a regular file, so without this mknod(2) could not make the
+     * device nodes a /dev populated by mdev, udev or MAKEDEV consists of —
+     * it returned -EPERM for every S_IFCHR/S_IFBLK/S_IFSOCK request. */
+    s64 (*mknod)(struct inode *dir, struct dentry *dentry, u32 mode, u64 rdev);
 } inode_operations_t;
 
 /* --------------------------------------------------------------------------
@@ -185,6 +223,7 @@ typedef struct inode {
     u32 i_flock_count;  /* Number of shared lock holders, or 1 for exclusive */
     u32 i_flock_owner;  /* PID of exclusive lock owner (or first locker) */
 
+    void *i_fanotify_marks; /* Linked list of fanotify_mark_t */
     void *i_private; /* Filesystem specific private data */
 } inode_t;
 
@@ -257,11 +296,19 @@ typedef struct file {
 /* --------------------------------------------------------------------------
  * File System Type Registration
  * -------------------------------------------------------------------------- */
+/* fs_flags bits */
+#define FS_REQUIRES_DEV  0x0001u  /* needs a backing block device to mount */
+
 typedef struct file_system_type {
     const char *name;
     s64 (*mount)(struct file_system_type *fs_type, const char *dev_name, const char *dir_name, void *data);
+    u32 fs_flags;             /* FS_* above; drives /proc/filesystems' "nodev" */
     struct file_system_type *next;
 } file_system_type_t;
+
+/** vfs_format_filesystems() — render /proc/filesystems from the registry.
+ *  Returns bytes written. */
+size_t vfs_format_filesystems(char *buf, size_t max);
 
 /* --------------------------------------------------------------------------
  * VFS Core API
@@ -276,11 +323,29 @@ s64 vfs_register_fs(file_system_type_t *fs);
 /** vfs_find_fs() — Find a registered filesystem type by name. */
 file_system_type_t *vfs_find_fs(const char *name);
 
-/** vfs_mount() — Mount a filesystem. */
+/** vfs_mount() — Mount a filesystem with no flags. Implemented in
+ *  fs/namespace.c; see vfs_mount_flags() there for the full form. */
 s64 vfs_mount(const char *source, const char *target, const char *fstype, void *data);
 
-/** vfs_umount() — Unmount a filesystem at target. */
+/** vfs_umount() — Unmount the filesystem mounted at @target, restoring
+ *  whatever the mountpoint directory held before. @flags takes MNT_FORCE /
+ *  MNT_DETACH (fs/namespace.h). Returns -EBUSY when a process still has the
+ *  filesystem open or has its cwd inside it, -EINVAL when nothing is
+ *  mounted there. Implemented in fs/namespace.c. */
 s64 vfs_umount(const char *target, int flags);
+
+/** sb_is_rdonly() — true when this superblock was mounted MS_RDONLY, so the
+ *  operation about to be attempted must fail with -EROFS. */
+static inline bool sb_is_rdonly(const struct super_block *sb)
+{
+    return sb && (sb->s_flags & (1u << 0)) != 0;   /* MS_RDONLY */
+}
+
+/** inode_is_rdonly() — sb_is_rdonly() for the superblock @inode lives on. */
+static inline bool inode_is_rdonly(const struct inode *inode)
+{
+    return inode && sb_is_rdonly(inode->i_sb);
+}
 
 /** vfs_sync_all() — Flush every filesystem's cached writes to stable storage.
  *  Backs sync(2) and the pre-reboot flush. */
@@ -324,8 +389,13 @@ s64 vfs_link(const char *oldpath, const char *newpath);
 s64 vfs_stat(const char *path, struct stat *statbuf);
 s64 vfs_lstat(const char *path, struct stat *statbuf);
 s64 vfs_fstat(file_t *file, struct stat *statbuf);
+/** vfs_notify_event() — Generate an event on an inode for fanotify/inotify listeners */
+void vfs_notify_event(inode_t *inode, u64 mask);
 s64 vfs_ioctl(file_t *file, u32 cmd, u64 arg);
 s64 vfs_mkdir(const char *path, u32 mode);
+/** vfs_mknod() — back mknod(2)/mknodat(2). @mode carries the S_IF* type;
+ *  @rdev is the device number for S_IFCHR/S_IFBLK and ignored otherwise. */
+s64 vfs_mknod(const char *path, u32 mode, u64 rdev);
 s64 vfs_rmdir(const char *path);
 s64 vfs_unlink(const char *path);
 s64 vfs_rename(const char *oldpath, const char *newpath);
@@ -355,4 +425,14 @@ s64 vfs_flock(file_t *file, int operation);
 /* DevFS API */
 int devfs_register_device(const char *name, file_operations_t *fops, void *private_data);
 int devfs_register_block_device(const char *name, file_operations_t *fops, void *private_data);
+/** devfs_unregister_device() — remove a node from /dev. The inode survives
+ *  for anything still holding it open; only the name stops resolving. */
+int devfs_unregister_device(const char *name);
+/** devfs_set_size() — set the st_size a /dev node reports, which is what
+ *  lseek(SEEK_END) on a block device computes from. */
+int devfs_set_size(const char *name, u64 size);
+/** devfs_lookup_rdev() — the fops and private pointer of the driver that
+ *  registered device number @rdev, so a device node stored on any
+ *  filesystem (not just /dev) reaches its driver. 0 on a hit, -1 if none. */
+int devfs_lookup_rdev(u64 rdev, file_operations_t **out_fops, void **out_priv);
 void devfs_init(void);

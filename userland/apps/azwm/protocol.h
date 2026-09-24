@@ -106,6 +106,14 @@ enum az_wm_msg_type {
 #define AZ_MOD_NUM       0x0010
 
 /* ── Window Server Message (fits in ipc_msg_t.data[256]) ──────────────────── */
+/*
+ * Note on create.pid: the kernel does not stamp a sender PID on IPC
+ * messages — this struct is overlaid directly on az_ipc_msg_t, whose first
+ * word (nominally "sender_pid") is this protocol's `type` field. A client
+ * that wants the server to know which process it is has to say so, which
+ * is what create.pid is for: the compositor stores it as the window's
+ * owner and uses it to drop windows whose process has exited.
+ */
 typedef struct {
     unsigned int type;         /* az_wm_msg_type */
     unsigned int wid;          /* Window ID (0 if not applicable) */
@@ -119,6 +127,7 @@ typedef struct {
             unsigned int w, h;
             char title[64];
             unsigned int flags;  /* AZ_WIN_FLAG_* above; 0 for a plain window */
+            unsigned int pid;    /* Client's own PID (getpid()), 0 if unknown */
         } create;
 
         /* AZ_WM_WINDOW_CREATED: server → client */

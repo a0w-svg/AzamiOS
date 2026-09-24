@@ -80,11 +80,24 @@ typedef struct __packed {
 
 BUILD_ASSERT(sizeof(tss_t) == 104, "tss_t must be 104 bytes per Intel SDM");
 
+/* ── I/O Permission Bitmap ────────────────────────────────────────────────
+ * One bit per I/O port (65536 ports = 8192 bytes), plus the mandatory
+ * trailing all-ones byte the Intel SDM requires past the last mapped byte
+ * of the bitmap (Vol. 3A §18.5.2) so a port access one past the end is
+ * still correctly denied instead of reading into whatever follows the TSS
+ * segment limit. A set bit denies the port to ring 3; a clear bit allows
+ * it. This must sit immediately after `tss` in cpu_gdt_t — iopb_offset is
+ * a byte offset from the TSS base, and the TSS descriptor's segment limit
+ * (encoded in gdt.c) is sized to cover tss + io_bitmap together. */
+#define TSS_IOPB_BYTES      8192
+#define TSS_IOPB_TOTAL      (TSS_IOPB_BYTES + 1)
+
 /* ── Per-CPU GDT storage (exported for SMP AP use) ──────────────────────── */
 typedef struct {
     gdt_entry_t        entries[7];  /* Slots 0–4 (8-byte descriptors) + Slots 5–6 (16-byte TSS) */
     gdt_ptr_t          ptr;
     tss_t              tss          __aligned(16);
+    u8                 io_bitmap[TSS_IOPB_TOTAL];  /* Immediately follows tss; see above. */
 } __aligned(64) cpu_gdt_t;
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
@@ -120,6 +133,22 @@ void gdt_set_rsp0(u32 core_id, uintptr_t stack_top);
  * @index  1–7 (IST1 through IST7).
  */
 void gdt_set_ist(u32 core_id, int index, uintptr_t stack_top);
+
+/**
+ * gdt_set_iopb(core_id, bitmap) — Install a process's I/O permission bitmap
+ * into the given core's TSS ahead of a context switch onto that process.
+ *
+ * @bitmap  TSS_IOPB_BYTES-byte bitmap (see ioperm(2)/tss_t.iopb_offset), or
+ *          NULL to deny all port access (the default: every process starts
+ *          with no ioperm() grants).
+ *
+ * Must be called on every switch to a thread whose process may differ from
+ * the one last scheduled on this core, mirroring gdt_set_rsp0(). The copy is
+ * a fixed 8 KiB regardless of how many ports are actually granted — ioperm()
+ * is rare enough (legacy port I/O only) that this is simpler and safer than
+ * tracking a dirty range per process.
+ */
+void gdt_set_iopb(u32 core_id, const u8 *bitmap);
 
 /* ── Assembly stubs (defined in gdt_flush.asm) ───────────────────────────── */
 extern void gdt_flush(gdt_ptr_t *ptr);   /* lgdt + far-return to reload CS */

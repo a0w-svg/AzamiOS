@@ -958,6 +958,7 @@ int main(int argc, char **argv)
     req.create.w        = screen_w;
     req.create.h        = screen_h;
     req.create.title[0] = '\0';   /* blank title */
+    req.create.pid      = (unsigned int)sys_getpid();
 
     if (az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&req) < 0) {
         de_log("[wallpaper] FATAL: channel_send failed");

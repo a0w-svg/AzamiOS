@@ -823,6 +823,13 @@ int reboot(int cmd)
     return (int)__syscall_ret(syscall4(SYS_reboot, 0xfee1dead, 672274793, (long)cmd, 0));
 }
 
+int kexec_file_load(int kernel_fd, int initrd_fd, unsigned long cmdline_len,
+                     const char *cmdline_ptr, unsigned long flags)
+{
+    return (int)__syscall_ret(syscall5(SYS_kexec_file_load, kernel_fd, initrd_fd,
+                                        (long)cmdline_len, (long)cmdline_ptr, (long)flags));
+}
+
 int utime(const char *filename, const struct utimbuf *times)
 {
     return (int)__syscall_ret(syscall2(SYS_utime, (long)filename, (long)times));
@@ -845,16 +852,46 @@ int umount2(const char *dir, int flags)
     return (int)__syscall_ret(syscall2(SYS_umount2, (long)dir, flags));
 }
 
+/* Counts the "processor : N" lines /proc/cpuinfo emits, one per CPU
+ * smp_cpu_count() actually found at boot (see fs/procfs.c). There is no
+ * dedicated "give me the CPU count" syscall, so this reads the same real
+ * enumeration every other consumer of that count (e.g. the `fetch` app)
+ * already reads, rather than guessing a fixed number that would be wrong on
+ * any machine with more or fewer than that many CPUs. */
+static long sysconf_nprocessors(void)
+{
+    int fd = open("/proc/cpuinfo", O_RDONLY, 0);
+    if (fd < 0) return 1;
+
+    long count = 0;
+    char buf[2048];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i + 9 < n; i++) {
+            if (memcmp(buf + i, "processor", 9) == 0) count++;
+        }
+    }
+    close(fd);
+    return count > 0 ? count : 1;
+}
+
 long sysconf(int name)
 {
     switch (name) {
         case 1: /* _SC_CLK_TCK */ return 100;
         case 2: /* _SC_PAGESIZE */ return 4096;
         case 3: /* _SC_NPROCESSORS_CONF */
-        case 4: /* _SC_NPROCESSORS_ONLN */ return 4;
+        case 4: /* _SC_NPROCESSORS_ONLN */ return sysconf_nprocessors();
         case 5: /* _SC_OPEN_MAX */ return 1024;
-        case 6: /* _SC_PHYS_PAGES */ return 131072;
-        case 7: /* _SC_AVPHYS_PAGES */ return 120000;
+        case 6: /* _SC_PHYS_PAGES */
+        case 7: /* _SC_AVPHYS_PAGES */ {
+            struct sysinfo si;
+            if (sys_sysinfo(&si) != 0 || si.mem_unit == 0) {
+                return (name == 6) ? 131072 : 120000;
+            }
+            unsigned long ram = (name == 6) ? si.totalram : si.freeram;
+            return (long)((ram * si.mem_unit) / 4096);
+        }
         default: return -1;
     }
 }
@@ -1323,15 +1360,22 @@ int statvfs(const char *path, struct statvfs *buf)
     if (r < 0) return r;
     if (buf) {
         buf->f_bsize = sfs.f_bsize;
-        buf->f_frsize = sfs.f_bsize;
+        /* The kernel reports a real fragment size; falling back to f_bsize
+         * only when it does not. */
+        buf->f_frsize = sfs.f_frsize ? sfs.f_frsize : sfs.f_bsize;
         buf->f_blocks = sfs.f_blocks;
         buf->f_bfree = sfs.f_bfree;
         buf->f_bavail = sfs.f_bavail;
         buf->f_files = sfs.f_files;
         buf->f_ffree = sfs.f_ffree;
         buf->f_favail = sfs.f_ffree;
-        buf->f_fsid = 0;
-        buf->f_flag = 0;
+        buf->f_fsid = (unsigned long)sfs.f_fsid[0] |
+                      ((unsigned long)sfs.f_fsid[1] << 32);
+        /* ST_RDONLY, ST_NOSUID and the rest share their values with the
+         * MS_* mount flags the kernel records, so this passes straight
+         * through. It used to be hard-zeroed, so statvfs(3) reported every
+         * filesystem as writable no matter how it was mounted. */
+        buf->f_flag = sfs.f_flags;
         buf->f_namemax = sfs.f_namelen;
     }
     return 0;
@@ -1344,15 +1388,22 @@ int fstatvfs(int fd, struct statvfs *buf)
     if (r < 0) return r;
     if (buf) {
         buf->f_bsize = sfs.f_bsize;
-        buf->f_frsize = sfs.f_bsize;
+        /* The kernel reports a real fragment size; falling back to f_bsize
+         * only when it does not. */
+        buf->f_frsize = sfs.f_frsize ? sfs.f_frsize : sfs.f_bsize;
         buf->f_blocks = sfs.f_blocks;
         buf->f_bfree = sfs.f_bfree;
         buf->f_bavail = sfs.f_bavail;
         buf->f_files = sfs.f_files;
         buf->f_ffree = sfs.f_ffree;
         buf->f_favail = sfs.f_ffree;
-        buf->f_fsid = 0;
-        buf->f_flag = 0;
+        buf->f_fsid = (unsigned long)sfs.f_fsid[0] |
+                      ((unsigned long)sfs.f_fsid[1] << 32);
+        /* ST_RDONLY, ST_NOSUID and the rest share their values with the
+         * MS_* mount flags the kernel records, so this passes straight
+         * through. It used to be hard-zeroed, so statvfs(3) reported every
+         * filesystem as writable no matter how it was mounted. */
+        buf->f_flag = sfs.f_flags;
         buf->f_namemax = sfs.f_namelen;
     }
     return 0;

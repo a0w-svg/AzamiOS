@@ -110,15 +110,25 @@ static void gdt_init_core(u32 core_id, uintptr_t kernel_stack_top)
 
     tss->iopb_offset = (u16)sizeof(tss_t);
 
+    /* Deny every port by default; ioperm(2) clears individual bits later. */
+    for (u32 i = 0; i < sizeof(g->io_bitmap); i++)
+        g->io_bitmap[i] = 0xFF;
+
     encode_entry(&g->entries[0], 0, 0, 0, 0);
     encode_entry(&g->entries[1], 0, 0xFFFFF, 0x9A, 0x20);
     encode_entry(&g->entries[2], 0, 0xFFFFF, 0x92, 0x00);
     encode_entry(&g->entries[3], 0, 0xFFFFF, 0xF2, 0x00);
     encode_entry(&g->entries[4], 0, 0xFFFFF, 0xFA, 0x20);
 
+    /* Limit covers tss + io_bitmap: both must sit inside the TSS segment or
+     * the CPU treats any IOPB byte past the limit as absent (i.e. denies the
+     * port anyway), but an in-bounds access beyond a too-small limit would
+     * instead fault. io_bitmap is laid out immediately after tss in
+     * cpu_gdt_t (see gdt.h), so this is exactly the span the descriptor must
+     * cover. */
     encode_tss_descriptor(&g->entries[5],
                           (uintptr_t)tss,
-                          (u32)(sizeof(tss_t) - 1));
+                          (u32)(sizeof(tss_t) + sizeof(g->io_bitmap) - 1));
 
     g->ptr.limit = (u16)(sizeof(g->entries) - 1);
     g->ptr.base  = (u64)(uintptr_t)g->entries;
@@ -176,6 +186,18 @@ void gdt_set_rsp0(u32 core_id, uintptr_t stack_top)
      */
     if (unlikely(core_id >= HAL_MAX_CPUS)) return;
     g_cpu_gdt[core_id].tss.rsp0 = stack_top;
+}
+
+void gdt_set_iopb(u32 core_id, const u8 *bitmap)
+{
+    if (unlikely(core_id >= HAL_MAX_CPUS)) return;
+    u8 *dst = g_cpu_gdt[core_id].io_bitmap;
+    if (bitmap) {
+        for (u32 i = 0; i < TSS_IOPB_BYTES; i++) dst[i] = bitmap[i];
+    } else {
+        for (u32 i = 0; i < TSS_IOPB_BYTES; i++) dst[i] = 0xFF;
+    }
+    dst[TSS_IOPB_BYTES] = 0xFF;  /* mandatory trailing all-ones byte */
 }
 
 void gdt_set_ist(u32 core_id, int index, uintptr_t stack_top)

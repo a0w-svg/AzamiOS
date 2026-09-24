@@ -39,6 +39,25 @@ __noreturn void kernel_panic(const char *fmt, ...)
 {
     cpu_cli();
 
+    /*
+     * Stop every other core before printing anything.
+     *
+     * On an SMP machine a panic on one CPU leaves the others running: they
+     * keep scheduling, keep taking interrupts, and keep writing to the same
+     * console this function is about to use — so the panic message comes out
+     * interleaved with whatever else the system was doing, which is exactly
+     * the output a post-mortem most needs to be legible. Worse, the fault
+     * that caused the panic has usually left shared state inconsistent, and
+     * the other cores are still acting on it.
+     *
+     * smp_stop_other_cpus() asks politely by IPI first and escalates to an
+     * NMI for anything that does not answer, so a core spinning on a lock
+     * this one holds still gets stopped. It is safe here even though we are
+     * inside an exception, and it is a no-op on a single-CPU boot.
+     */
+    extern void smp_stop_other_cpus(void);
+    smp_stop_other_cpus();
+
     kprintf("\n\n");
     kprintf("=====================================\n");
     kprintf("       AzamiOS  KERNEL  PANIC        \n");

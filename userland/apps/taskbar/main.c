@@ -23,6 +23,9 @@
 #include "../../libc/include/string.h"
 #include "../../libc/include/sys/syscall.h"
 #include "../../libc/include/sys/sysinfo.h"
+#include "../../libc/include/fcntl.h"
+#include "../../libc/include/unistd.h"
+#include "../../libc/include/sys/ioctl.h"
 #include "../azwm/protocol.h"
 #include "../azwm/de_protocol.h"
 #include "../azwm/de_font.h"
@@ -31,13 +34,31 @@
 /* ── Configuration ─────────────────────────────────────────────────────────── */
 #define SERVER_CHAN        1
 #define TASKBAR_H         52      /* Panel pixel height (increased from 44)      */
+
+/* Transparent strip the taskbar window owns *above* the panel, used for
+ * tooltips and toasts.
+ *
+ * They used to be drawn inside the panel itself, at y=8..40 — directly over
+ * the buttons they describe: hovering the Start button covered it (and the
+ * first dock icon) with the word "Applications", and a volume toast sat on
+ * top of the window buttons. A panel is 52px tall; there is nowhere inside
+ * it for a 32px popup to go that is not on top of something.
+ *
+ * The window is therefore TT_H taller than the panel and positioned that
+ * much higher, with the extra rows left fully transparent (the compositor
+ * honours per-pixel alpha, see composite_blend_span()). The strut stays
+ * TASKBAR_H, so maximized windows still use the space the strip floats
+ * over. */
+#define TT_H              34      /* transparent tooltip/toast strip height      */
+#define PANEL_Y           TT_H    /* panel's top edge within the window surface  */
+#define WINDOW_H          (TASKBAR_H + TT_H)
 #define DEFAULT_WIDTH   1280
 #define DEFAULT_HEIGHT   800
 #define TASKBAR_MAP_ADDR  ((void *)0x73000000)
 
 /* Start button */
 #define SB_X    6
-#define SB_Y    6
+#define SB_Y    (PANEL_Y + 6)
 #define SB_W   92
 #define SB_H   40
 
@@ -56,6 +77,7 @@
 #define WB_H        40
 #define WB_GAP       5
 #define WB_MAX        12  /* maximum visible window buttons before overflow */
+#define WB_W_MIN      64  /* buttons shrink to this before anything overflows */
 #define WB_RADIUS     8   /* pill corner radius */
 
 /* ── Quick Launch Dock ─────────────────────────────────────────────────────
@@ -120,7 +142,7 @@ static int          g_num_dock_apps = 0;
 static unsigned int *g_px   = (unsigned int *)0;
 static unsigned int  g_w    = DEFAULT_WIDTH;
 static unsigned int  g_sh   = DEFAULT_HEIGHT;
-static unsigned int  g_h    = TASKBAR_H;
+static unsigned int  g_h    = WINDOW_H;
 
 /* Global IPC handles */
 static int           g_srv  = SERVER_CHAN;
@@ -179,6 +201,29 @@ static char          g_toast_msg[48] = "";
 static int           g_toast_ticks = 0;   /* countdown in 100ms ticks */
 static char          g_hover_tooltip[48] = "";
 static int           g_hover_x = 0;
+
+/* This kernel's interface is named "net0", not "eth0" (see ifconfig.elf,
+ * tab_network.c, and fs/procfs.c's format_proc_net_dev() default name) --
+ * "eth0" doesn't exist here. Queries the real IP via the same /dev/net0
+ * SIOCGIFADDR ioctl ifconfig.elf already uses, instead of a fixed
+ * "10.0.2.15" that stayed the same no matter what the interface was
+ * actually configured to. */
+static void tb_get_net_info(char *out, size_t max)
+{
+    int fd = open("/dev/net0", O_RDWR, 0);
+    if (fd < 0) {
+        snprintf(out, max, "not connected");
+        return;
+    }
+    unsigned char ip[4] = {0};
+    if (ioctl(fd, 0x8915 /* SIOCGIFADDR */, (unsigned long)ip) == 0 &&
+        (ip[0] || ip[1] || ip[2] || ip[3])) {
+        snprintf(out, max, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    } else {
+        snprintf(out, max, "no address");
+    }
+    close(fd);
+}
 
 static void tb_show_toast(const char *msg)
 {
@@ -476,6 +521,126 @@ static int tb_wb_origin(void)
     return DOCK_X + g_num_dock_apps * (DOCK_BTN_W + DOCK_GAP) + 8;
 }
 
+/* How wide each window button may be, and how many fit.
+ *
+ * The strip used to use a fixed 140px button and stop as soon as the next
+ * one would not fit, which with the 16-icon quick-launch dock meant two
+ * buttons and a "+N" badge while most of the strip sat empty. Real
+ * taskbars shrink their buttons instead: the width is whatever divides the
+ * space between the windows that exist, down to a floor where a title is
+ * still readable, and only past that does anything overflow. */
+static int tb_wb_layout(int *out_width)
+{
+    int count = 0;
+    for (unsigned int i = 0; i < DE_TASKBAR_MAX_WINDOWS; i++)
+        if (g_wins[i].active) count++;
+    if (count > WB_MAX) count = WB_MAX;
+
+    int avail = ((int)g_w - TRAY_W - TRAY_M - 8) - tb_wb_origin();
+    if (avail < 0) avail = 0;
+
+    int width = WB_W;
+    if (count > 0) {
+        width = (avail - (count - 1) * WB_GAP) / count;
+        if (width > WB_W)     width = WB_W;
+        if (width < WB_W_MIN) width = WB_W_MIN;
+    }
+    if (out_width) *out_width = width;
+
+    int fits = (width > 0) ? (avail + WB_GAP) / (width + WB_GAP) : 0;
+    return (count < fits) ? count : fits;
+}
+
+/* Startup state for the tray speaker: whatever /etc/audio.conf says, so
+ * the icon's level bars and the first click agree with the device and with
+ * Settings > Audio rather than starting from an assumed 80%. */
+static void tb_load_volume(void)
+{
+    char buf[512];
+    int fd = sys_open("/etc/audio.conf", 0, 0);
+    if (fd < 0) return;
+    int n = (int)sys_read(fd, buf, sizeof(buf) - 1);
+    sys_close(fd);
+    if (n <= 0) return;
+    buf[n] = '\0';
+
+    char *line = buf;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strncmp(line, "volume=", 7) == 0) {
+            int v = atoi(line + 7);
+            if (v >= 0 && v <= 100) g_vol_level = v;
+        } else if (strncmp(line, "master_mute=", 12) == 0) {
+            g_vol_muted = (atoi(line + 12) != 0);
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    if (g_vol_muted) g_vol_level = 0;
+}
+
+/* ── Volume ─────────────────────────────────────────────────────────────────
+ *
+ * The tray's speaker used to move a number and pop a toast saying so,
+ * while the audio device carried on at whatever level it was already at:
+ * clicking it changed nothing you could hear. It now drives the same
+ * ioctl the Settings > Audio slider uses (SOUND_PCM_WRITE_VOLUME on
+ * /dev/dsp, left and right in the low two bytes) and writes the level back
+ * to /etc/audio.conf, so the tray, the Settings slider and the next boot
+ * all agree. */
+#define SOUND_PCM_WRITE_VOLUME 0x40045004
+
+static void tb_apply_volume(int pct)
+{
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+
+    int fd = sys_open("/dev/dsp", 0, 0);
+    if (fd >= 0) {
+        unsigned int vol = (unsigned int)pct | ((unsigned int)pct << 8);
+        syscall3(SYS_ioctl, fd, SOUND_PCM_WRITE_VOLUME, (long)&vol);
+        sys_close(fd);
+    }
+
+    /* Persist, preserving the rest of /etc/audio.conf's keys. */
+    char buf[512];
+    int n = 0;
+    int rfd = sys_open("/etc/audio.conf", 0, 0);
+    if (rfd >= 0) {
+        n = (int)sys_read(rfd, buf, sizeof(buf) - 1);
+        sys_close(rfd);
+    }
+    if (n < 0) n = 0;
+    buf[n] = '\0';
+
+    char out[640];
+    int olen = 0;
+    int wrote_vol = 0, wrote_mute = 0;
+    char *line = buf;
+    while (line && *line && olen < (int)sizeof(out) - 64) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strncmp(line, "volume=", 7) == 0) {
+            olen += snprintf(out + olen, sizeof(out) - olen, "volume=%d\n", pct);
+            wrote_vol = 1;
+        } else if (strncmp(line, "master_mute=", 12) == 0) {
+            olen += snprintf(out + olen, sizeof(out) - olen, "master_mute=%d\n", g_vol_muted ? 1 : 0);
+            wrote_mute = 1;
+        } else if (line[0]) {
+            olen += snprintf(out + olen, sizeof(out) - olen, "%s\n", line);
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    if (!wrote_vol)  olen += snprintf(out + olen, sizeof(out) - olen, "volume=%d\n", pct);
+    if (!wrote_mute) olen += snprintf(out + olen, sizeof(out) - olen, "master_mute=%d\n", g_vol_muted ? 1 : 0);
+
+    int wfd = sys_open("/etc/audio.conf", 0x001 | 0x040 | 0x200 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
+    if (wfd >= 0) {
+        sys_write(wfd, out, (unsigned long)olen);
+        sys_close(wfd);
+    }
+}
+
 /* ── WiFi icon ──────────────────────────────────────────────────────────────── */
 static void tb_draw_wifi(int bx, int by, unsigned int col)
 {
@@ -534,8 +699,8 @@ static void tb_draw_lock(int bx, int by, unsigned int col)
 static void tb_separator(int x)
 {
     int y;
-    for (y = 8; y < (int)g_h - 8; y++) {
-        unsigned int mid = (unsigned int)(g_h / 2);
+    for (y = PANEL_Y + 8; y < (int)g_h - 8; y++) {
+        unsigned int mid = (unsigned int)(PANEL_Y + TASKBAR_H / 2);
         unsigned int dist = (unsigned int)(y < (int)mid ? mid - (unsigned int)y : (unsigned int)y - mid);
         unsigned int a = 80 - (dist * 80 / mid);
         unsigned int col = tb_blend(C_BG, C_SEPARATOR, a);
@@ -613,12 +778,16 @@ static void taskbar_draw(void)
     if (!g_px) return;
 
     /* ── Background with subtle top gradient highlight ───────────────────── */
-    tb_fill_rect(0, 0, (int)g_w, (int)g_h, C_BG);
+    /* The strip above the panel is cleared to fully transparent, not to a
+     * colour: those rows sit over the desktop and only a tooltip or toast
+     * ever paints there. */
+    tb_fill_rect(0, 0, (int)g_w, PANEL_Y, 0x00000000);
+    tb_fill_rect(0, PANEL_Y, (int)g_w, TASKBAR_H, C_BG);
     /* Top highlight: 2px gradient fade from C_BG_TOP to C_BG */
     for (i = 0; i < 2; i++) {
         unsigned int a = (i == 0) ? 120 : 60;
         unsigned int col = tb_blend(C_BG, C_BG_TOP, a);
-        tb_hline(0, (int)i, (int)g_w, col);
+        tb_hline(0, PANEL_Y + (int)i, (int)g_w, col);
     }
 
     /* ── Start button (pill-shaped with gradient) ────────────────────────── */
@@ -726,13 +895,15 @@ static void taskbar_draw(void)
     /* ── Window button strip (pill-shaped buttons) ───────────────────────── */
     int tray_start_x = (int)g_w - TRAY_W - TRAY_M;
     int strip_end_x  = tray_start_x - 8;
+    int wb_w = WB_W;
+    int wb_fit = tb_wb_layout(&wb_w);
     int bx = tb_wb_origin();
     int visible = 0;
     g_overflow = 0;
 
-    for (i = 0; i < DE_TASKBAR_MAX_WINDOWS && visible < WB_MAX; i++) {
+    for (i = 0; i < DE_TASKBAR_MAX_WINDOWS && visible < wb_fit; i++) {
         if (!g_wins[i].active) continue;
-        if (bx + WB_W > strip_end_x) {
+        if (bx + wb_w > strip_end_x) {
             g_overflow = 1;
             break;
         }
@@ -742,14 +913,14 @@ static void taskbar_draw(void)
         unsigned int fg  = is_foc ? C_WB_TXT_ACT : C_WB_TXT_IDL;
 
         /* Pill background */
-        tb_fill_rounded(bx, SB_Y, WB_W, WB_H, WB_RADIUS, bg);
+        tb_fill_rounded(bx, SB_Y, wb_w, WB_H, WB_RADIUS, bg);
 
         /* Active window: mauve glow tint + accent underline */
         if (is_foc) {
             /* Subtle glow tint over button */
             int gx, gy;
             for (gy = SB_Y; gy < SB_Y + WB_H; gy++) {
-                for (gx = bx; gx < bx + WB_W; gx++) {
+                for (gx = bx; gx < bx + wb_w; gx++) {
                     int px = gx, py = gy;
                     if (px < 0 || (unsigned int)px >= g_w) continue;
                     if (py < 0 || (unsigned int)py >= g_h) continue;
@@ -762,17 +933,17 @@ static void taskbar_draw(void)
             tb_fill_rounded(bx, SB_Y + 6, 3, WB_H - 12, 1, C_WB_ACCENT);
             /* Bottom accent line */
             int ay;
-            for (ay = bx + WB_RADIUS; ay < bx + WB_W - WB_RADIUS; ay++)
+            for (ay = bx + WB_RADIUS; ay < bx + wb_w - WB_RADIUS; ay++)
                 tb_put_pixel(ay, SB_Y + WB_H - 2, C_WB_ACCENT);
         }
 
         /* Title text (clipped to pill interior, leaving room for left bar) */
         int text_x = bx + (is_foc ? 9 : 6);
         int text_y = SB_Y + (WB_H - 16) / 2;
-        int max_px = WB_W - 12;
+        int max_px = wb_w - 12;
         tb_str_clip(text_x, text_y, g_wins[i].title, fg, max_px);
 
-        bx += WB_W + WB_GAP;
+        bx += wb_w + WB_GAP;
         visible++;
     }
 
@@ -799,7 +970,7 @@ static void taskbar_draw(void)
     tb_separator(tray_start_x - 3);
 
     /* ── System tray ──────────────────────────────────────────────────────── */
-    tb_fill_rect(tray_start_x, 0, TRAY_W, (int)g_h, C_TRAY_BG);
+    tb_fill_rect(tray_start_x, PANEL_Y, TRAY_W, TASKBAR_H, C_TRAY_BG);
 
     /* WiFi icon */
     tb_draw_wifi(tray_start_x + 8, SB_Y + 12, C_WIFI);
@@ -867,8 +1038,8 @@ static void taskbar_draw(void)
         int tw = tlen * 8 + 24;
         int tx = tray_start_x - tw - 12;
         if (tx < (int)g_w / 2) tx = (int)g_w / 2;
-        int ty = 8;
-        int th = 36;
+        int ty = 0;                      /* in the transparent strip */
+        int th = TT_H - 4;
         tb_fill_rounded(tx, ty, tw, th, 8, 0xFF181825);
         tb_fill_rect(tx + 2, ty + 2, 3, th - 4, 0xFFCBA6F7);
         tb_str(tx + 12, ty + 10, g_toast_msg, 0xFFCDD6F4);
@@ -878,8 +1049,8 @@ static void taskbar_draw(void)
         int tx = g_hover_x - tw / 2;
         if (tx < 10) tx = 10;
         if (tx + tw > (int)g_w - 10) tx = (int)g_w - tw - 10;
-        int ty = 10;
-        int th = 32;
+        int ty = 2;                      /* in the transparent strip */
+        int th = TT_H - 8;
         tb_fill_rounded(tx, ty, tw, th, 6, 0xFF1E1E2E);
         tb_str(tx + 8, ty + 8, g_hover_tooltip, 0xFFBAC2DE);
     }
@@ -957,10 +1128,19 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
 
     int tray_start_x = (int)g_w - TRAY_W - TRAY_M;
 
-    /* Tray & Dock tooltips on hover */
+    /* Tray & Dock tooltips on hover.
+     *
+     * None are computed while the launcher is open: it covers the
+     * bottom-left of the screen, so a tooltip floating above the Start
+     * button would land on the launcher's own footer. Leaving
+     * new_tooltip empty also clears one that is already showing, via the
+     * comparison at the end of the chain. */
     const char *new_tooltip = "";
     int hover_x = lx;
-    if (g_sb_hot) {
+
+    if (g_launcher_wid != 0) {
+        /* nothing to show */
+    } else if (g_sb_hot) {
         new_tooltip = "Applications";
         hover_x = SB_X + SB_W / 2;
     } else if (dock_hit >= 0 && dock_hit < g_num_dock_apps) {
@@ -968,7 +1148,11 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
         hover_x = DOCK_X + dock_hit * (DOCK_BTN_W + DOCK_GAP) + DOCK_BTN_W / 2;
     } else if (lx >= tray_start_x && lx < (int)g_w) {
         if (lx < tray_start_x + 20) {
-            new_tooltip = "Network (eth0)";
+            static char net_tooltip[48];
+            char net_info[40];
+            tb_get_net_info(net_info, sizeof(net_info));
+            snprintf(net_tooltip, sizeof(net_tooltip), "Network (net0: %s)", net_info);
+            new_tooltip = net_tooltip;
             hover_x = tray_start_x + 10;
         } else if (lx < tray_start_x + 50) {
             new_tooltip = g_vol_muted ? "Volume: Muted" : "Volume Control";
@@ -1051,26 +1235,35 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
             pl->path[j] = path[j];
         pl->path[j] = '\0';
         az_channel_send(g_srv, (az_ipc_msg_t *)&lmsg);
-        tb_show_toast("Network: eth0 (10.0.2.15)");
+        {
+            char net_info[40];
+            char toast[48];
+            tb_get_net_info(net_info, sizeof(net_info));
+            snprintf(toast, sizeof(toast), "Network: net0 (%s)", net_info);
+            tb_show_toast(toast);
+        }
         taskbar_draw();
         return;
     }
 
     /* Left-click on Tray Sound / Volume area → cycle volume / toggle mute */
     if (lclick && lx >= tray_start_x + 20 && lx < tray_start_x + 50) {
+        char msg[32];
         if (g_vol_muted) {
             g_vol_muted = 0;
-            char msg[32];
+            if (g_vol_level == 0) g_vol_level = 25;
+            tb_apply_volume(g_vol_level);
             snprintf(msg, sizeof(msg), "Volume: %d%%", g_vol_level);
             tb_show_toast(msg);
         } else if (g_vol_level >= 100) {
             g_vol_muted = 1;
             g_vol_level = 0;
+            tb_apply_volume(0);
             tb_show_toast("Audio Muted");
         } else {
-            g_vol_level = (g_vol_level + 25);
+            g_vol_level += 25;
             if (g_vol_level > 100) g_vol_level = 100;
-            char msg[32];
+            tb_apply_volume(g_vol_level);
             snprintf(msg, sizeof(msg), "Volume: %d%%", g_vol_level);
             tb_show_toast(msg);
         }
@@ -1129,13 +1322,17 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
 
     /* Left-click on a window button */
     if (lclick) {
+        int wb_w = WB_W;
+        int wb_fit = tb_wb_layout(&wb_w);
         int wbx = tb_wb_origin();
         int tray_end = (int)g_w - TRAY_W - TRAY_M;
+        int shown = 0;
         unsigned int i;
-        for (i = 0; i < DE_TASKBAR_MAX_WINDOWS; i++) {
+        for (i = 0; i < DE_TASKBAR_MAX_WINDOWS && shown < wb_fit; i++) {
             if (!g_wins[i].active) continue;
-            if (wbx + WB_W > tray_end) break;
-            if (lx >= wbx && lx < wbx + WB_W && ly >= SB_Y && ly < SB_Y + WB_H) {
+            if (wbx + wb_w > tray_end) break;
+            shown++;
+            if (lx >= wbx && lx < wbx + wb_w && ly >= SB_Y && ly < SB_Y + WB_H) {
                 if (g_focus_wid == g_wins[i].wid) {
                     az_wm_msg_t min_msg;
                     memset(&min_msg, 0, sizeof(min_msg));
@@ -1153,7 +1350,7 @@ static void tb_handle_mouse(short abs_x, short abs_y, unsigned char btns)
                 taskbar_draw();
                 return;
             }
-            wbx += WB_W + WB_GAP;
+            wbx += wb_w + WB_GAP;
         }
     }
 }
@@ -1174,6 +1371,7 @@ int main(int argc, char **argv)
     }
 
     tb_init_dock();
+    tb_load_volume();
 
     /* ── Screen geometry ──────────────────────────────────────────────────── */
     az_fb_info_t fb;
@@ -1195,10 +1393,11 @@ int main(int argc, char **argv)
     req.type           = AZ_WM_CREATE_WINDOW;
     req.client_chan     = (unsigned int)g_cli;
     req.create.x       = 0;
-    req.create.y       = (int)(sh - TASKBAR_H);
+    req.create.y       = (int)(sh - WINDOW_H);
     req.create.w       = sw;
-    req.create.h       = TASKBAR_H;
+    req.create.h       = WINDOW_H;
     req.create.title[0]= '\0';
+    req.create.pid     = (unsigned int)sys_getpid();
 
     if (az_channel_send(g_srv, (az_ipc_msg_t *)&req) < 0) {
         de_log("[taskbar] FATAL: channel_send"); return -1;

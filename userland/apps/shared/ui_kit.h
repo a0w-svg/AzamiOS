@@ -1055,17 +1055,109 @@ static inline void uk_icon_audioplayer(uk_window_t *w, int ix, int iy)
  * ============================================================================ */
 
 /*
+ * uk_row_changed_span() — the first and last pixel where two rows differ.
+ *
+ * Returns 0 when the rows are identical. Compares four pixels at a time so
+ * the scan costs about what the copy it replaces would have.
+ */
+static inline int uk_row_changed_span(const unsigned int *a, const unsigned int *b,
+                                      int n, int *first, int *last)
+{
+    int x = 0;
+#if defined(__x86_64__)
+    for (; x + 4 <= n; x += 4) {
+        __m128i va = _mm_loadu_si128((const __m128i *)(a + x));
+        __m128i vb = _mm_loadu_si128((const __m128i *)(b + x));
+        if (_mm_movemask_epi8(_mm_cmpeq_epi32(va, vb)) != 0xFFFF) break;
+    }
+#endif
+    while (x < n && a[x] == b[x]) x++;
+    if (x == n) return 0;
+
+    int e = n - 1;
+#if defined(__x86_64__)
+    for (; e - 3 >= x; e -= 4) {
+        __m128i va = _mm_loadu_si128((const __m128i *)(a + e - 3));
+        __m128i vb = _mm_loadu_si128((const __m128i *)(b + e - 3));
+        if (_mm_movemask_epi8(_mm_cmpeq_epi32(va, vb)) != 0xFFFF) break;
+    }
+#endif
+    while (e > x && a[e] == b[e]) e--;
+
+    *first = x;
+    *last  = e;
+    return 1;
+}
+
+/*
  * uk_invalidate() — publish the frame just drawn and tell the compositor.
  *
- * This is the commit point: the private buffer is copied to the shared surface
- * as one linear pass, so azwm never composites a half-drawn window.
+ * This is the commit point: what the app drew into its private buffer becomes
+ * visible to azwm here, so the compositor never sees a half-drawn window.
+ *
+ * Rather than publish the whole window and claim all of it changed, this
+ * diffs the private buffer against the surface already published and reports
+ * only the rectangle that actually differs. The shared surface is write-only
+ * from this side and read-only from the compositor's, so it holds exactly the
+ * last frame this app published — which makes it a free, always-correct
+ * reference to diff against.
+ *
+ * Three things fall out of that, for every caller, with no change at the call
+ * site:
+ *   - an app that redraws its whole window to change a clock label damages the
+ *     label, not the window;
+ *   - the copy to the shared surface shrinks to the changed rows;
+ *   - a frame that came out identical to the last one publishes nothing at
+ *     all and wakes no compositor work.
+ *
+ * A caller that already knows what it changed should use uk_invalidate_rect()
+ * instead and skip the scan; uk_invalidate_rect(win, 0, 0, w, h) is also the
+ * way to force a full republish without diffing.
  */
 static inline void uk_invalidate(uk_window_t *win)
 {
+    if (!win || win->wid == 0) return;
+
     if (win->shared && win->pixels && win->shared != win->pixels) {
-        uk_commit_frame(win->shared, win->pixels,
-                        (size_t)win->width * win->height);
+        int w = (int)win->width, h = (int)win->height;
+        int min_x = w, min_y = -1, max_x = -1, max_y = -1;
+
+        for (int y = 0; y < h; y++) {
+            size_t off = (size_t)y * (size_t)w;
+            int f, l;
+            if (!uk_row_changed_span(win->pixels + off, win->shared + off, w, &f, &l))
+                continue;
+            if (f < min_x) min_x = f;
+            if (l > max_x) max_x = l;
+            if (min_y < 0) min_y = y;
+            max_y = y;
+        }
+
+        /* Identical to what is already on screen — nothing to publish and
+         * nothing for the compositor to recomposite. */
+        if (max_y < 0) return;
+
+        int span = max_x - min_x + 1;
+        for (int y = min_y; y <= max_y; y++) {
+            size_t off = (size_t)y * (size_t)w + (size_t)min_x;
+            uk_commit_frame(win->shared + off, win->pixels + off, (size_t)span);
+        }
+
+        az_wm_msg_t inv;
+        memset(&inv, 0, sizeof(inv));
+        inv.type = AZ_WM_INVALIDATE;
+        inv.wid  = win->wid;
+        inv.invalidate.x = min_x;
+        inv.invalidate.y = min_y;
+        inv.invalidate.w = (unsigned int)span;
+        inv.invalidate.h = (unsigned int)(max_y - min_y + 1);
+        az_channel_send(win->server_chan, (az_ipc_msg_t *)&inv);
+        return;
     }
+
+    /* No private backbuffer: the app drew straight into the shared surface,
+     * so there is nothing to diff it against. Damage the whole frame, as
+     * this always has. */
 
     az_wm_msg_t inv;
     memset(&inv, 0, sizeof(inv));
@@ -1258,6 +1350,9 @@ static inline int uk_window_connect_ex(uk_window_t *win,
         req.create.title[i] = title[i];
     req.create.title[i] = '\0';
     req.create.flags = flags;
+    /* Tell the server which process owns this window, so it can drop the
+     * window if we die without destroying it (azwm's reap_dead_clients). */
+    req.create.pid = (unsigned int)sys_getpid();
 
     de_log("[ui_kit] Sending AZ_WM_CREATE_WINDOW...");
     if (az_channel_send(server_chan, (az_ipc_msg_t *)&req) < 0) {

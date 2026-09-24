@@ -148,16 +148,25 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_
     /* All PTHREAD_JOIN_MAX slots in use just means this thread can't be
      * pthread_join()'d — not a reason to fail thread creation outright. */
     ctx->slot = join_slot_alloc();
+    /* Cache locally: the new thread can start running on another core the
+     * instant SYS_AZ_THREAD_CREATE enqueues it, and thread_startup_trampoline()
+     * frees `ctx` as its very first act after reading out of it. A start_routine
+     * that returns quickly can easily win that race against this function's own
+     * remaining instructions on real, genuinely-parallel hardware (this was
+     * invisible under QEMU/TCG, where the timing never lined up the same way),
+     * so `ctx` must not be dereferenced again after the syscall returns —
+     * everything needed from it has to be read before, into locals. */
+    join_slot_t *slot = ctx->slot;
 
     long tid = syscall3(SYS_AZ_THREAD_CREATE, (long)thread_startup_trampoline, (long)stack_top, (long)ctx);
     if (tid < 0) {
-        if (ctx->slot) { join_lock(); ctx->slot->in_use = 0; join_unlock(); }
+        if (slot) { join_lock(); slot->in_use = 0; join_unlock(); }
         free(ctx);
         free(stack);
         return -1;
     }
 
-    if (ctx->slot) ctx->slot->tid = (pthread_t)tid;
+    if (slot) slot->tid = (pthread_t)tid;
     if (thread) *thread = (pthread_t)tid;
     return 0;
 }

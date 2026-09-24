@@ -22,6 +22,8 @@ static s64 ext2_file_fadvise(struct file *filp, u64 offset, u64 len, int advice)
 static s64 ext2_file_fallocate(struct file *filp, int mode, u64 offset, u64 len);
 static s64 ext2_create(struct inode *dir, struct dentry *dentry, u32 mode);
 static s64 ext2_mkdir(struct inode *dir, struct dentry *dentry, u32 mode);
+static s64 ext2_mknod(struct inode *dir, struct dentry *dentry, u32 mode, u64 rdev);
+static u64 ext2_decode_rdev(u32 old_word, u32 new_word);
 static s64 ext2_unlink(struct inode *dir, struct dentry *dentry);
 static s64 ext2_rmdir(struct inode *dir, struct dentry *dentry);
 static s64 ext2_rename(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry);
@@ -29,6 +31,7 @@ static s64 ext2_symlink(struct inode *dir, struct dentry *dentry, const char *sy
 static s64 ext2_link(struct inode *dir, struct dentry *old_dentry, struct dentry *dentry);
 static s64 ext2_readlink(struct dentry *dentry, char *buf, size_t bufsiz);
 static u32 ext2_get_pblk(struct inode *inode, u32 lblk, bool allocate);
+static export_operations_t ext2_export_ops;
 
 
 static inode_operations_t ext2_inode_ops = {
@@ -41,6 +44,7 @@ static inode_operations_t ext2_inode_ops = {
     .symlink = ext2_symlink,
     .readlink = ext2_readlink,
     .link = ext2_link,
+    .mknod = ext2_mknod,
 };
 
 static file_operations_t ext2_file_ops = {
@@ -494,9 +498,19 @@ static s64 ext2_statfs(struct super_block *sb, struct statfs *buf)
     buf->f_files   = fs->sb->s_inodes_count;
     buf->f_ffree   = fs->sb->s_free_inodes_count;
     buf->f_namelen = 255;
-    /* f_fsid: the two halves of the on-disk volume UUID, as statvfs(3) expects. */
-    __builtin_memcpy(&buf->f_fsid[0], &fs->sb->s_uuid[0], 8);
-    __builtin_memcpy(&buf->f_fsid[1], &fs->sb->s_uuid[8], 8);
+    /* f_fsid: a 64-bit digest of the on-disk volume UUID, split across the
+     * two 32-bit halves of fsid_t, as statvfs(3) expects. The whole 128-bit
+     * UUID does not fit — fsid_t is 8 bytes — so fold it instead of
+     * truncating, which would make two volumes sharing a UUID prefix
+     * indistinguishable. */
+    {
+        u64 lo, hi;
+        __builtin_memcpy(&lo, &fs->sb->s_uuid[0], 8);
+        __builtin_memcpy(&hi, &fs->sb->s_uuid[8], 8);
+        u64 fsid = lo ^ hi;
+        buf->f_fsid[0] = (u32)fsid;
+        buf->f_fsid[1] = (u32)(fsid >> 32);
+    }
     return 0;
 }
 
@@ -758,15 +772,36 @@ static s64 ext2_mount(file_system_type_t *fs_type, const char *dev_name, const c
     block_dev_t *bdev = block_dev_get(dev_name);
     if (!bdev) return -(s64)ENODEV;
     
-    /* Read superblock (always at offset 1024, which is LBA 2 for 512b sectors) */
+    /* The superblock is always at *byte* offset 1024 -- LBA 2 for 512-byte
+     * sectors, but real 4Kn-native drives and NVMe namespaces can report a
+     * different bdev->sector_size (AHCI/NVMe already set it from the real
+     * negotiated LBA format), in which case a hardcoded (LBA 2, count 2)
+     * reads the wrong bytes entirely. Derive the LBA/count from the real
+     * sector size instead, the same way fs/squashfs/squashfs.c's
+     * sqfs_read_bytes() already does for exactly this reason. */
     void *sb_buf = kzalloc(1024);
     if (!sb_buf) return -(s64)ENOMEM;
-    
-    if (bdev->ops->read_sectors(bdev, 2, 2, sb_buf) < 0) {
+
+    u32 sec_sz = bdev->sector_size ? bdev->sector_size : 512;
+    u64 first_lba = 1024 / sec_sz;
+    u64 last_lba  = (1024 + 1024 + sec_sz - 1) / sec_sz;
+    u32 nsectors  = (u32)(last_lba - first_lba);
+    u32 skip      = (u32)(1024 % sec_sz);
+
+    void *sec_buf = kzalloc((size_t)nsectors * sec_sz);
+    if (!sec_buf) {
+        kfree(sb_buf);
+        return -(s64)ENOMEM;
+    }
+
+    if (bdev->ops->read_sectors(bdev, first_lba, nsectors, sec_buf) < 0) {
+        kfree(sec_buf);
         kfree(sb_buf);
         return -(s64)EIO;
     }
-    
+    __builtin_memcpy(sb_buf, (u8 *)sec_buf + skip, 1024);
+    kfree(sec_buf);
+
     ext2_superblock_t *sb_disk = (ext2_superblock_t *)sb_buf;
     if (sb_disk->s_magic != EXT2_SUPER_MAGIC) {
         kfree(sb_buf);
@@ -843,6 +878,8 @@ static s64 ext2_mount(file_system_type_t *fs_type, const char *dev_name, const c
     vfs_sb->s_blocksize = fs->block_size;
     vfs_sb->s_fs_info = fs;
     vfs_sb->s_op = &ext2_super_ops;
+    /* Lets name_to_handle_at(2)/open_by_handle_at(2) work on this volume. */
+    vfs_sb->s_export_op = &ext2_export_ops;
 
     root_inode->i_ino = EXT2_ROOT_INO;
     root_inode->i_mode = root_ino_disk.i_mode;
@@ -992,7 +1029,9 @@ static struct dentry *ext2_lookup(struct inode *dir, struct dentry *dentry)
                     inode->i_sb = dir->i_sb;
                     inode->i_op = &ext2_inode_ops;
                     inode->i_fop = &ext2_file_ops;
-                    
+                    if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode))
+                        inode->i_rdev = ext2_decode_rdev(ino_disk.i_block[0], ino_disk.i_block[1]);
+
                     ext2_inode_info_t *priv = kzalloc(sizeof(ext2_inode_info_t));
                     if (!priv) {
                         kfree(inode);
@@ -1660,9 +1699,99 @@ static s64 ext2_file_readdir(struct file *filp, void *dirent_buf, size_t len, u6
     return (s64)written;
 }
 
+/* ── Export operations (name_to_handle_at / open_by_handle_at) ────────────
+ *
+ * A file handle is a filesystem-specific name for an inode that survives the
+ * path it was found under being renamed or removed. ext2 has one naturally:
+ * the inode number, paired with the generation counter the on-disk inode
+ * carries for exactly this purpose — so a handle to a deleted file whose
+ * inode number has since been reused is rejected instead of silently opening
+ * the wrong file.
+ */
+struct ext2_fid {
+    u32 ino;
+    u32 gen;
+};
+
+static s64 ext2_encode_fh(struct inode *inode, u32 *fh, int *max_len, struct inode *parent)
+{
+    (void)parent;
+    if (!inode || !fh || !max_len) return -(s64)EINVAL;
+    if (*max_len < (int)(sizeof(struct ext2_fid) / sizeof(u32))) {
+        *max_len = (int)(sizeof(struct ext2_fid) / sizeof(u32));
+        return -(s64)EOVERFLOW;
+    }
+
+    ext2_fs_info_t *fs = inode->i_sb ? (ext2_fs_info_t *)inode->i_sb->s_fs_info : NULL;
+    ext2_inode_t disk;
+    u32 gen = 0;
+    if (fs && ext2_read_inode(fs, (u32)inode->i_ino, &disk) >= 0) gen = disk.i_generation;
+
+    struct ext2_fid fid = { .ino = (u32)inode->i_ino, .gen = gen };
+    __builtin_memcpy(fh, &fid, sizeof(fid));
+    *max_len = (int)(sizeof(fid) / sizeof(u32));
+    return 1;   /* FILEID_INO32_GEN */
+}
+
+static struct dentry *ext2_fh_to_dentry(struct super_block *sb, struct file_handle *handle)
+{
+    if (!sb || !handle) return NULL;
+    if (handle->handle_bytes < sizeof(struct ext2_fid)) return NULL;
+
+    ext2_fs_info_t *fs = (ext2_fs_info_t *)sb->s_fs_info;
+    if (!fs) return NULL;
+
+    struct ext2_fid fid;
+    __builtin_memcpy(&fid, handle->f_handle, sizeof(fid));
+    if (fid.ino == 0) return NULL;
+
+    ext2_inode_t disk;
+    if (ext2_read_inode(fs, fid.ino, &disk) < 0) return NULL;
+    /* links_count 0 means the inode is free; the handle outlived its file. */
+    if (disk.i_links_count == 0) return NULL;
+    if (disk.i_generation != fid.gen) return NULL;
+
+    inode_t *inode = (inode_t *)kzalloc(sizeof(inode_t));
+    if (!inode) return NULL;
+    inode->i_ino    = fid.ino;
+    inode->i_mode   = disk.i_mode;
+    inode->i_nlink  = disk.i_links_count;
+    inode->i_size   = disk.i_size;
+    inode->i_blocks = disk.i_blocks;
+    inode->i_uid    = disk.i_uid;
+    inode->i_gid    = disk.i_gid;
+    inode->i_atime  = disk.i_atime;
+    inode->i_mtime  = disk.i_mtime;
+    inode->i_ctime  = disk.i_ctime;
+    inode->i_sb     = sb;
+    inode->i_op     = &ext2_inode_ops;
+    inode->i_fop    = &ext2_file_ops;
+    if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode))
+        inode->i_rdev = ext2_decode_rdev(disk.i_block[0], disk.i_block[1]);
+
+    ext2_inode_info_t *priv = (ext2_inode_info_t *)kzalloc(sizeof(ext2_inode_info_t));
+    if (!priv) { kfree(inode); return NULL; }
+    __builtin_memcpy(priv->i_block, disk.i_block, sizeof(priv->i_block));
+    inode->i_private = priv;
+
+    /* The handle names an inode, not a path, so the dentry it resolves to is
+     * detached — which is all open_by_handle_at(2) needs. */
+    dentry_t *d = dcache_alloc(NULL, "");
+    if (!d) { kfree(priv); kfree(inode); return NULL; }
+    d->d_inode = inode;
+    d->d_sb    = sb;
+    return d;
+}
+
+static export_operations_t ext2_export_ops = {
+    .encode_fh    = ext2_encode_fh,
+    .fh_to_dentry = ext2_fh_to_dentry,
+};
+
 static file_system_type_t ext2_fs_type = {
     .name = "ext2",
     .mount = ext2_mount,
+    .fs_flags = FS_REQUIRES_DEV,
     .next = NULL
 };
 
@@ -1817,7 +1946,18 @@ static s64 ext2_create(struct inode *dir, struct dentry *dentry, u32 mode) {
     inode->i_sb = dir->i_sb;
     inode->i_op = &ext2_inode_ops;
     inode->i_fop = &ext2_file_ops;
-    
+
+    /* Owned by whoever actually created it, not left at zero (root) --
+     * now that open() enforces permission bits/ACLs (see
+     * check_open_permission() in kernel/syscall/syscall.c), a file that
+     * silently belonged to root regardless of its real creator would make
+     * that enforcement behave wrong for the next non-root process to touch
+     * it. fsuid/fsgid, not uid/gid, is the real-UNIX rule for ownership of
+     * newly created files. */
+    process_t *creator = sched_current_process();
+    inode->i_uid = creator ? creator->fsuid : 0;
+    inode->i_gid = creator ? creator->fsgid : 0;
+
     rtc_time_t t;
     rtc_read_time(&t);
     u64 unix_t = rtc_to_unix_time(&t);
@@ -1837,6 +1977,107 @@ static s64 ext2_create(struct inode *dir, struct dentry *dentry, u32 mode) {
         return err;
     }
     
+    dentry->d_inode = inode;
+    return 0;
+}
+
+
+/* ── Device numbers on disk ───────────────────────────────────────────────
+ *
+ * ext2 stores a device node's number inside the inode's i_block array, which
+ * a device node does not otherwise use. Two encodings exist: the original
+ * 16-bit one in i_block[0] (major 0-255, minor 0-255), and the one Linux
+ * added in i_block[1] to carry the wider numbers modern devices need. A
+ * filesystem written by Linux uses whichever fits, so both must be read.
+ */
+/* Takes the two words by value rather than by pointer: i_block lives inside a
+ * packed on-disk struct, and taking its address yields a possibly-unaligned
+ * pointer. */
+static u64 ext2_decode_rdev(u32 old_word, u32 new_word)
+{
+    if (old_word) return MKDEV((old_word >> 8) & 0xFF, old_word & 0xFF);
+    if (!new_word) return 0;
+    u32 major = (new_word >> 8) & 0xFFF;
+    u32 minor = (new_word & 0xFF) | ((new_word >> 12) & 0xFFF00);
+    return MKDEV(major, minor);
+}
+
+static void ext2_encode_rdev(u32 i_block[15], u64 rdev)
+{
+    u32 major = MAJOR(rdev), minor = MINOR(rdev);
+    i_block[0] = 0;
+    i_block[1] = 0;
+    if (major < 256 && minor < 256) {
+        i_block[0] = (major << 8) | minor;
+    } else {
+        i_block[1] = (minor & 0xFF) | ((major & 0xFFF) << 8) | ((minor & 0xFFF00) << 12);
+    }
+}
+
+/* mknod(2) on ext2. Same shape as ext2_create() above, but it honours the
+ * S_IF* type the caller asked for and — for a character or block device —
+ * writes the device number into the inode so it survives a remount. */
+static s64 ext2_mknod(struct inode *dir, struct dentry *dentry, u32 mode, u64 rdev)
+{
+    ext2_fs_info_t *fs = (ext2_fs_info_t *)dir->i_sb->s_fs_info;
+
+    u32 fmt = mode & S_IFMT;
+    if (fmt == 0) fmt = S_IFREG;
+    u8 ftype;
+    switch (fmt) {
+    case S_IFREG:  ftype = EXT2_FT_REG_FILE; break;
+    case S_IFCHR:  ftype = EXT2_FT_CHRDEV;   break;
+    case S_IFBLK:  ftype = EXT2_FT_BLKDEV;   break;
+    case S_IFIFO:  ftype = EXT2_FT_FIFO;     break;
+    case S_IFSOCK: ftype = EXT2_FT_SOCK;     break;
+    default: return -(s64)EINVAL;
+    }
+
+    u32 ino = ext2_alloc_inode(fs);
+    if (!ino) return -(s64)ENOSPC;
+
+    struct inode *inode = kzalloc(sizeof(struct inode));
+    ext2_inode_info_t *priv = kzalloc(sizeof(ext2_inode_info_t));
+    if (!inode || !priv) {
+        kfree(priv);
+        kfree(inode);
+        ext2_free_inode(fs, ino);
+        return -(s64)ENOMEM;
+    }
+
+    inode->i_ino   = ino;
+    inode->i_mode  = fmt | (mode & 07777);
+    inode->i_nlink = 1;
+    inode->i_size  = 0;
+    inode->i_sb    = dir->i_sb;
+    inode->i_op    = &ext2_inode_ops;
+    inode->i_fop   = &ext2_file_ops;
+
+    process_t *creator = sched_current_process();
+    inode->i_uid = creator ? creator->fsuid : 0;
+    inode->i_gid = creator ? creator->fsgid : 0;
+
+    rtc_time_t t;
+    rtc_read_time(&t);
+    u64 unix_t = rtc_to_unix_time(&t);
+    inode->i_atime = inode->i_mtime = inode->i_ctime = unix_t;
+
+    if (fmt == S_IFCHR || fmt == S_IFBLK) {
+        inode->i_rdev = rdev;
+        ext2_encode_rdev(priv->i_block, rdev);
+    }
+    inode->i_private = priv;
+
+    ext2_sync_inode(fs, inode);
+
+    s64 err = ext2_add_dir_entry(dir, ino, dentry->d_name, ftype);
+    if (err < 0) {
+        ext2_free_inode(fs, ino);
+        kfree(priv);
+        kfree(inode);
+        return err;
+    }
+
     dentry->d_inode = inode;
     return 0;
 }
@@ -1865,7 +2106,13 @@ static s64 ext2_mkdir(struct inode *dir, struct dentry *dentry, u32 mode) {
     inode->i_sb = dir->i_sb;
     inode->i_op = &ext2_inode_ops;
     inode->i_fop = &ext2_file_ops;
-    
+
+    /* See the matching comment in ext2_create() -- owned by its real
+     * creator, not left at zero (root). */
+    process_t *creator = sched_current_process();
+    inode->i_uid = creator ? creator->fsuid : 0;
+    inode->i_gid = creator ? creator->fsgid : 0;
+
     rtc_time_t t;
     rtc_read_time(&t);
     u64 unix_t = rtc_to_unix_time(&t);

@@ -67,6 +67,7 @@
 #define DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST   0xC0306447
 #define DRM_IOCTL_VIRTGPU_WAIT            0xC0086448
 #define DRM_IOCTL_VIRTGPU_GET_CAPS        0xC0186449
+#define DRM_IOCTL_VIRTGPU_CONTEXT_INIT    0xC008644A
 
 /* ── Capabilities ────────────────────────────────────────────────────────── */
 #define DRM_CAP_DUMB_BUFFER              0x1
@@ -157,6 +158,17 @@ struct drm_mode_get_property {
 #define DRM_FORMAT_XRGB8888              0x34325258  /* 'XR24' */
 #define DRM_FORMAT_ARGB8888              0x34325241  /* 'AR24' */
 #define DRM_FORMAT_RGB565                0x36314752  /* 'RG16' */
+#define DRM_FORMAT_XRGB1555              0x35315258  /* 'XR15' */
+
+/* ── Format modifiers ────────────────────────────────────────────────────── */
+/* DRM_FORMAT_MOD_INVALID — sentinel: modifier array slot is unused.
+ * Linux uses 0xFFFFFFFF_FFFFFFFF; same value here for ABI compatibility. */
+#define DRM_FORMAT_MOD_INVALID           0xFFFFFFFFFFFFFFFFULL
+/* DRM_FORMAT_MOD_LINEAR — plain row-major, no tiling.
+ * All three AzamiOS GPU backends operate in linear layout; no tiling hardware. */
+#define DRM_FORMAT_MOD_LINEAR            0ULL
+/* Alias accepted by some Mesa paths; identical to MOD_LINEAR. */
+#define DRM_FORMAT_MOD_NONE              0ULL
 
 /* ── WAIT_VBLANK request types ───────────────────────────────────────────── */
 #define _DRM_VBLANK_ABSOLUTE             0x0
@@ -488,7 +500,7 @@ struct drm_virtgpu_execbuffer {
     u64 command;            /* raw virgl/TGSI command stream, opaque here   */
     u64 bo_handles;         /* u32[num_bo_handles]: GEM handles referenced  */
     u32 num_bo_handles;
-    u32 pad;
+    u32 ring_idx;
 };
 
 #define VIRTGPU_PARAM_3D_FEATURES 1   /* value: 1 if 3D contexts may be created */
@@ -542,5 +554,10 @@ struct drm_virtgpu_get_caps {
     u32 cap_set_ver;
     u64 addr;               /* out buffer                                   */
     u32 size;               /* in: capacity of @addr; out: bytes written    */
+    u32 pad;
+};
+
+struct drm_virtgpu_context_init {
+    u32 ctx_id;
     u32 pad;
 };

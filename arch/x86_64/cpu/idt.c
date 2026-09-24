@@ -4,6 +4,7 @@
  * ============================================================================ */
 
 #include "idt.h"
+#include <azami/sections.h>
 #include "gdt.h"     /* SEL_KERNEL_CODE */
 #include "smp.h"     /* smp_get_cpu */
 #include "pic.h"     /* pic_eoi() */
@@ -20,9 +21,18 @@
 #include "hwaccel.h"
 #include "cpu.h"
 #include "mce.h"
+#include "../../../kernel/kexec.h"
 
 /* ── IDT storage (256 entries × 16 bytes = 4 KB, page-aligned) ───────────── */
-static idt_entry_t g_idt[256] __aligned(4096);
+/* __ro_after_init: 256 gate descriptors, each one a code pointer the CPU
+ * jumps through with no check of its own. Overwriting a single entry — the
+ * page-fault gate, say — is ring-0 code execution on the attacker's next
+ * deliberate fault, and nothing in the kernel would be involved in the
+ * transfer. idt_set_gate() runs only from idt_init(), on every CPU during
+ * bring-up and never afterwards; drivers that register interrupt handlers at
+ * runtime go through idt_register_irq(), which writes g_irq_table below and
+ * leaves the descriptors alone. Exactly one page, and already page-aligned. */
+static idt_entry_t g_idt[256] __aligned(4096) __ro_after_init;
 static idt_ptr_t   g_idt_ptr;
 
 /* ── Forward declarations of all ISR stubs (defined in isr.asm) ──────────── */
@@ -47,7 +57,9 @@ DECL_ISR(44);  DECL_ISR(45);  DECL_ISR(46);  DECL_ISR(47);
 /* LAPIC timer (48), TLB shootdown (251), spurious (255) */
 DECL_ISR(48);
 DECL_ISR(49);  /* SMP reschedule IPI — also declared explicitly below */
+DECL_ISR(250);
 DECL_ISR(251);
+DECL_ISR(252);
 DECL_ISR(255);
 
 /* BUG-D fix: dedicated stub for unhandled vectors that issues an EOI and
@@ -144,8 +156,19 @@ void idt_init(void)
     /* SMP Reschedule IPI */
     extern void isr_49(void);
     idt_set_gate(49,  (uintptr_t)isr_49,  IST_NONE, 0, IDT_TYPE_INT_GATE);
+    /* kexec AP-park IPI (see kernel/kexec.h) — claim this vector explicitly
+     * so the "any still-unclaimed vector gets isr_spurious" loop below
+     * leaves it alone. isr_60 itself is one of the generic isr.asm stubs
+     * (the %rep block covering 49..250); the vector number is arbitrary,
+     * just claimed and documented in one place (KEXEC_PARK_VECTOR). */
+    extern void isr_60(void);
+    idt_set_gate(KEXEC_PARK_VECTOR, (uintptr_t)isr_60, IST_NONE, 0, IDT_TYPE_INT_GATE);
+    /* Cross-CPU function-call IPI (smp_call_function*) */
+    idt_set_gate(SMP_VEC_CALL_FUNC, (uintptr_t)isr_250, IST_NONE, 0, IDT_TYPE_INT_GATE);
     /* TLB shootdown IPI */
-    idt_set_gate(251, (uintptr_t)isr_251, IST_NONE, 0, IDT_TYPE_INT_GATE);
+    idt_set_gate(SMP_VEC_TLB_FLUSH, (uintptr_t)isr_251, IST_NONE, 0, IDT_TYPE_INT_GATE);
+    /* Emergency-stop IPI, sent by the panic path (smp_stop_other_cpus) */
+    idt_set_gate(SMP_VEC_STOP, (uintptr_t)isr_252, IST_NONE, 0, IDT_TYPE_INT_GATE);
     /* LAPIC spurious */
     idt_set_gate(255, (uintptr_t)isr_255, IST_NONE, 0, IDT_TYPE_INT_GATE);
 
@@ -194,9 +217,8 @@ static bool handle_user_page_fault(pt_regs_t *r, uintptr_t fault_addr)
     if (!proc || fault_addr >= 0x0000800000000000ULL)
         return false;
 
-    /* ── Copy-on-Write: present page, write fault ──────────── */
+    u64 pte_fl = vmm_query_flags(proc->pml4_phys, fault_addr);
     if ((r->err_code & 3) == 3) {
-        u64 pte_fl = vmm_query_flags(proc->pml4_phys, fault_addr);
         if (pte_fl & (1ULL << 10) /* VMM_F_COW */) {
             u32 vma_prot = 0;
             bool vma_ok = vma_probe(proc, fault_addr, &vma_prot);
@@ -240,6 +262,14 @@ static bool handle_user_page_fault(pt_regs_t *r, uintptr_t fault_addr)
         else if (have_probe && (probed & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC))) {
             valid_fault = true;
             region_prot = probed;
+        }
+        
+        /* ── Userfaultfd Interception ── */
+        if (have_probe && (probed & 0x80 /* VMA_F_UFFD_MISSING */)) {
+            extern bool userfaultfd_handle_fault(process_t *proc, u64 fault_addr, u64 err_code);
+            if (userfaultfd_handle_fault(proc, fault_addr, r->err_code)) {
+                return true; /* Fault paused, will retry later */
+            }
         }
         /* Stack-region fallback for a fault vma_probe() didn't resolve. This
          * used to accept any address in a hardcoded ~128 GB window
@@ -311,16 +341,54 @@ static void isr_dispatch_inner(pt_regs_t *r)
     }
 
     /* Handle TLB shootdown IPI (251): flush and acknowledge, nothing else. */
-    if (vec == 251) {
+    if (vec == SMP_VEC_TLB_FLUSH) {
         extern void lapic_eoi(void);
         extern void tlb_shootdown_ipi(void);
+        cpu_info_t *cpu = smp_get_cpu();
+        if (cpu) cpu->ipis_tlb++;
         tlb_shootdown_ipi();
         lapic_eoi();
         return;
     }
 
+    /* Cross-CPU function call (250). Runs every request another CPU queued
+     * for this one and acknowledges each. EOI happens first: the callbacks
+     * are arbitrary kernel code and may take a while, and holding the
+     * interrupt in-service for that long would block every lower-priority
+     * vector on this core — including the scheduler tick. */
+    if (vec == SMP_VEC_CALL_FUNC) {
+        extern void lapic_eoi(void);
+        lapic_eoi();
+        smp_call_function_interrupt();
+        return;
+    }
+
+    /* Emergency stop (252). Never returns — see smp_stop_other_cpus(). */
+    if (vec == SMP_VEC_STOP) {
+        extern void smp_stop_interrupt(void);
+        smp_stop_interrupt();
+        return;
+    }
+
+    /* Handle kexec AP-park IPI (see kernel/kexec.h). Deliberately minimal:
+     * bump the counter kexec_execute() is spin-waiting on, then sit here
+     * forever with interrupts disabled. This must NOT fall through to
+     * isr_dispatch()'s normal post-processing (signal delivery, and — for
+     * every other vector — an EOI): kexec_execute() may already be
+     * rewriting this core's view of kernel memory by the time anything
+     * wakes this loop (nothing should, short of an NMI), and none of that
+     * machinery is safe to touch once parked. No lock is taken, nothing
+     * else is dereferenced — matches the reschedule IPI's minimalism, minus
+     * the part where that one comes back. */
+    if (vec == KEXEC_PARK_VECTOR) {
+        __atomic_add_fetch(&g_kexec_park_count, 1, __ATOMIC_SEQ_CST);
+        for (;;) {
+            __asm__ volatile("cli; hlt");
+        }
+    }
+
     /* Handle SMP Reschedule IPI (49) */
-    if (vec == 49) {
+    if (vec == SMP_VEC_RESCHEDULE) {
         extern void lapic_eoi(void);
         lapic_eoi();
         cpu_info_t *cpu = smp_get_cpu();
@@ -335,6 +403,16 @@ static void isr_dispatch_inner(pt_regs_t *r)
         /* ── CPU exception ───────────────────────────────────────────────── */
         /* BUG-G fix: removed dead ternary — vec < 32 is always true here. */
         const char *name = g_exc_names[vec];
+
+        /* NMI (2): checked before the generic exception machinery, because
+         * the one NMI this kernel generates on purpose is the second stage of
+         * smp_stop_other_cpus() — the stage that reaches a core that is not
+         * taking maskable interrupts at all, which is exactly the state a
+         * core spinning on a lock held by the panicking CPU is in. If a stop
+         * is in flight, this call parks the core and never comes back; if it
+         * is not, the NMI came from the platform (a watchdog, a hardware
+         * error line) and falls through to be reported like any other. */
+        if (vec == 2 && smp_nmi_stop_self()) return;
 
         /* #MC (18): the CPU reporting its own hardware failure. Decoded before
          * anything else touches the frame — the record in the MCA banks is
@@ -596,6 +674,12 @@ static void isr_dispatch_inner(pt_regs_t *r)
     } else {
         /* ── Hardware IRQ or APIC vector ─────────────────────────────────── */
         u64 slot = vec - 32;
+
+        /* Per-IRQ and per-CPU counters for /proc/interrupts. Bumped before
+         * the handler runs so a handler that never returns (a wedged device)
+         * still shows up in the counts as having fired. */
+        hal_irq_account((u8)vec);
+
         if (slot < 224 && g_irq_table[slot].fn) {
             g_irq_table[slot].fn(r, g_irq_table[slot].ctx);
         }

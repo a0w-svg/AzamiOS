@@ -85,6 +85,15 @@ binary you point it at. See **[docs/LINUX-BINARIES.md](docs/LINUX-BINARIES.md)**
 for how to port your own programs and how to diagnose a syscall the kernel does
 not yet answer.
 
+`make -C tools/linux ports` builds the rest of the ported software the same
+way — two toolboxes, GNU Bash (the system shell), TinyCC and GNU Make (the
+on-device toolchain), Lua, MicroPython, SQLite, jq, gawk, three compressors,
+curl, file, tree, nano and less — installable with `pkg`. See
+**[docs/PACKAGES.md](docs/PACKAGES.md)**, **[docs/SHELL.md](docs/SHELL.md)**
+and **[docs/TOOLCHAIN.md](docs/TOOLCHAIN.md)**.
+The desktop environment — what each control does, and how windows, the
+panel and the launcher fit together — is **[docs/DESKTOP.md](docs/DESKTOP.md)**.
+
 ---
 
 ## 📦 Userland Utilities
@@ -111,7 +120,8 @@ AzamiOS ships an extensive set of POSIX shell utilities:
 ### System & Environment
 | Utility | Description |
 | :--- | :--- |
-| `sh` | POSIX shell with pipes, redirection, and scripting |
+| `sh`, `bash` | GNU Bash 5.2 is the system shell — `/bin/sh` and `/bin/sh.elf` both point at it (see [docs/SHELL.md](docs/SHELL.md)) |
+| `azami-sh` | The original small native shell, still installed as `/bin/azami-sh.elf` |
 | `expr`, `test` | Shell arithmetic and logical expressions |
 | `env`, `printenv`, `export` | Environment variable management |
 | `date`, `time`, `cal`, `timeout` | Date, time, calendar, and timed command execution |

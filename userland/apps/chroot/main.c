@@ -46,7 +46,7 @@ int main(int argc, char *argv[])
     }
 
     const char *shell = getenv("SHELL");
-    if (!shell || !*shell) shell = "/bin/sh.elf";
+    if (!shell || !*shell) shell = "/bin/sh";
 
     char *const sh_args[] = { (char *)shell, (char *)"-i", NULL };
     execvp(shell, sh_args);

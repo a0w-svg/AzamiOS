@@ -18,6 +18,23 @@ endif
 # accurate gdb single-stepping; default is the release tuning this build
 # already used.
 DEBUG ?= 0
+
+# ── Boot self-test suites ────────────────────────────────────────────────────
+# init.elf runs several verification suites at boot, each gated on a marker
+# file in /etc — see the access() checks at the top of apps/init/main.c, whose
+# messages already describe them as off-by-default ("touch /etc/run-... to
+# re-enable"). The image build used to install three of those markers
+# unconditionally, which made the opt-in an opt-out nobody had opted into: a
+# measured boot spent 10 s in the native GCC smoke test and another 13 s in
+# the userspace and dynamic-linking suites, against about 7 s of actual kernel
+# and desktop startup. Roughly four fifths of every boot was self-test.
+#
+# They are worth having — they are how the toolchain and the dynamic linker
+# get exercised on real hardware — so this switches them on with
+# `make SELFTESTS=1` rather than deleting them. The POSIX suite
+# (/etc/run-posix-selftest) and the hardware benchmark (/etc/run-hwtest) were
+# already opt-in and stay that way; SELFTESTS=1 does not turn them on.
+SELFTESTS ?= 0
 ifeq ($(DEBUG),1)
   OPT_FLAGS := -O0
 else
@@ -34,7 +51,7 @@ CFLAGS = -std=c11 -ffreestanding -fstack-protector-strong -mstack-protector-guar
          -Wall -Wextra -Wformat=2 -Wformat-security -Wno-unused-parameter \
          $(OPT_FLAGS) -fno-semantic-interposition -pipe \
          -ffunction-sections -fdata-sections \
-         -I. -Ilibc/include -Iapps/shared -Iapps/azwm
+         -I. -Ilibc/include -Iapps/shared -Iapps/azwm -Ilibgame/include
 
 # Header dependency tracking (libc/Makefile already does this for libc itself;
 # this is the same fix for the app layer). Without it, editing a shared header
@@ -70,13 +87,13 @@ SBIN_APPS = \
     $(SBIN_DIR)/notifyd.elf \
     $(SBIN_DIR)/lockscreen.elf
 
-BIN_APPS = \
+BIN_APPS_SIMPLE = \
     $(BIN_DIR)/testarch.elf \
     $(BIN_DIR)/hwtest.elf \
-    $(BIN_DIR)/sh.elf \
     $(BIN_DIR)/strace.elf \
     $(BIN_DIR)/ktrace.elf \
     $(BIN_DIR)/sem_test.elf \
+    $(BIN_DIR)/kexec_test.elf \
     $(BIN_DIR)/lock.elf \
     $(BIN_DIR)/ptraceperf.elf \
     $(BIN_DIR)/ls.elf \
@@ -92,7 +109,6 @@ BIN_APPS = \
     $(BIN_DIR)/texteditor.elf \
     $(BIN_DIR)/filemanager.elf \
     $(BIN_DIR)/terminal.elf \
-    $(BIN_DIR)/settings.elf \
     $(BIN_DIR)/fetch.elf \
     $(BIN_DIR)/pwd.elf \
     $(BIN_DIR)/uname.elf \
@@ -146,6 +162,7 @@ BIN_APPS = \
     $(BIN_DIR)/minesweeper.elf \
     $(BIN_DIR)/2048.elf \
     $(BIN_DIR)/snake.elf \
+    $(BIN_DIR)/pasjans.elf \
     $(BIN_DIR)/getfacl.elf \
     $(BIN_DIR)/setfacl.elf \
     $(BIN_DIR)/xorg.elf \
@@ -232,9 +249,9 @@ BIN_APPS = \
     $(BIN_DIR)/ide.elf
 
 
-.PHONY: all clean libc apps skeleton etc icons fonts music images templates toolchain
+.PHONY: all clean libc libgame apps skeleton etc icons fonts music images templates toolchain
 
-all: skeleton libc apps toolchain etc icons fonts music images templates pkgrepo
+all: skeleton libc libgame apps toolchain dynlink etc icons fonts music images templates pkgrepo
 
 skeleton:
 	@mkdir -p $(BUILD_DIR) $(BIN_DIR) $(SBIN_DIR) $(OBJ_DIR) $(BUILD_DIR)/etc $(BUILD_DIR)/boot $(BUILD_DIR)/dev $(BUILD_DIR)/proc $(BUILD_DIR)/sys $(BUILD_DIR)/root $(BUILD_DIR)/root/.config $(BUILD_DIR)/home/azami/Desktop $(BUILD_DIR)/home/azami/Music $(BUILD_DIR)/home/azami/Pictures $(BUILD_DIR)/home/azami/Templates $(BUILD_DIR)/home/azami/.notes $(BUILD_DIR)/home/azami/.config $(BUILD_DIR)/desktop $(BUILD_DIR)/usr/bin $(BUILD_DIR)/usr/sbin $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/share/icons $(BUILD_DIR)/usr/share/wallpapers $(BUILD_DIR)/usr/share/fonts $(BUILD_DIR)/usr/share/themes $(BUILD_DIR)/usr/share/music $(BUILD_DIR)/usr/share/templates $(BUILD_DIR)/music $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/var $(BUILD_DIR)/tmp
@@ -291,95 +308,133 @@ libc/libc.a: $(UAPI_COPIES) $(LIBC_SRCS)
 libc/crt0.o: libc/libc.a
 	@:
 
-toolchain: skeleton libc
-	@rm -rf $(BUILD_DIR)/home/a0wsvg $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 2>/dev/null || true
-	@mkdir -p $(BUILD_DIR)/lib64 $(BUILD_DIR)/lib/x86_64-linux-gnu $(BUILD_DIR)/lib $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/bin $(BUILD_DIR)/bin $(BUILD_DIR)/usr/local/lib $(BUILD_DIR)/usr/local/bin
-	@mkdir -p $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0
-	@mkdir -p $(BUILD_DIR)/usr/lib/ldscripts $(BUILD_DIR)/lib/ldscripts $(BUILD_DIR)/usr/lib/bfd-plugins
+# libc/Makefile's own default goal (`all`) already builds libc.so and
+# crt0_dyn.o as a side effect of the same submake invocation that builds
+# libc.a/crt0.o (see libc/Makefile: `all: libc.a crt0.o libc.so
+# crt0_dyn.o`) — these two dummy rules just give them a place in *this*
+# Makefile's dependency graph (mirroring libc/crt0.o above) so
+# $(BUILD_DIR)/lib/libc.so and the dynamic app-build path below can depend
+# on them without triggering a second, redundant `$(MAKE) -C libc`.
+libc/libc.so: libc/libc.a
+	@:
+libc/crt0_dyn.o: libc/libc.a
+	@:
+
+LIBGAME_SRCS := $(wildcard libgame/*.c) $(wildcard libgame/include/game/*.h) libgame/Makefile
+
+libgame: libgame/libgame.a
+
+libgame/libgame.a: $(LIBGAME_SRCS) libc/libc.a
+	$(MAKE) -C libgame
+
+# ── On-device development environment ───────────────────────────────────────
+#
+# This target used to copy the entire host cross-toolchain into the image:
+# x86_64-elf-gcc and every binutil, cc1, collect2, lto-wrapper, the gcc
+# internal headers, the linker scripts, and a farm of symlinks recreating
+# /home/<developer>/opt/cross-x86_64 inside the rootfs so that gcc could find
+# its own guts at the absolute paths it was configured with. That was ~84 MB
+# of a 512 MB root partition, it embedded one machine's home directory in the
+# image, and none of it was built for AzamiOS — it was a Linux toolchain that
+# happened to run under the Linux-ABI layer.
+#
+# The compiler on the image is now TinyCC, built from source by
+# tools/linux/ports.mk and configured there for *this* filesystem's layout
+# (/usr/include, /usr/lib, /usr/lib/tcc). It is ~0.5 MB including its runtime
+# library and headers, it compiles and links in one pass with no external
+# assembler or linker, and `tcc hello.c -o hello` on a booted AzamiOS
+# produces a working native binary. See docs/TOOLCHAIN.md.
+#
+# What stays here is what a compiler needs to target this system and what the
+# rest of the build depends on: the libc/libgame headers under /usr/include,
+# the static libraries and startup object under /usr/lib and /lib, and the
+# glibc loader copies that let dynamically linked Linux binaries run.
+TCC_PORT_BIN  := ../tools/linux/out/bin/tcc
+BASH_PORT_BIN := ../tools/linux/out/bin/bash
+TCC_PORT_TREE := ../tools/linux/out/tcc/usr
+
+toolchain: skeleton libc libgame
+	@# Drop what older images staged here, so an incremental rebuild does not
+	@# leave 84 MB of dead cross-toolchain behind in build/.
+	@rm -rf $(BUILD_DIR)/home/a0wsvg $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 \
+	        $(BUILD_DIR)/usr/libexec $(BUILD_DIR)/usr/lib/gcc \
+	        $(BUILD_DIR)/usr/lib/ldscripts $(BUILD_DIR)/usr/lib/bfd-plugins \
+	        $(BUILD_DIR)/usr/x86_64-elf $(BUILD_DIR)/x86_64-elf 2>/dev/null || true
+	@for tool in gcc g++ c++ cpp as ld ld.bfd ar ranlib nm objdump objcopy strip \
+	             strings readelf size addr2line c++filt gcov gcov-dump gcov-tool \
+	             elfedit lto-wrapper x86_64-elf-gcc x86_64-elf-as x86_64-elf-ld; do \
+	    rm -f $(BUILD_DIR)/usr/bin/$$tool $(BUILD_DIR)/bin/$$tool; \
+	done
+	@mkdir -p $(BUILD_DIR)/lib64 $(BUILD_DIR)/lib/x86_64-linux-gnu $(BUILD_DIR)/lib \
+	          $(BUILD_DIR)/usr/lib $(BUILD_DIR)/usr/bin $(BUILD_DIR)/bin \
+	          $(BUILD_DIR)/usr/local/lib $(BUILD_DIR)/usr/local/bin \
+	          $(BUILD_DIR)/usr/include $(BUILD_DIR)/usr/local/include
+
+	@# ── Headers a compiler on the OS needs to target it ──────────────────
+	@# Wiped and re-staged rather than copied over: the old target dumped
+	@# gcc's entire internal include directory here too — 125 files, 3.5 MB,
+	@# almost all of it x86 intrinsics headers full of __builtin_ia32_*
+	@# calls that only gcc implements. Left in place they would also shadow
+	@# the compiler's own <stdarg.h>/<stddef.h>, which is a hard error: this
+	@# libc ships neither, and gcc's stdarg.h is written against
+	@# __builtin_va_list, which tcc does not have.
+	@rm -rf $(BUILD_DIR)/usr/include $(BUILD_DIR)/usr/local/include
 	@mkdir -p $(BUILD_DIR)/usr/include $(BUILD_DIR)/usr/local/include
-	@for tool in gcc g++ c++ cpp as ld ar ranlib nm objdump objcopy strip strings readelf size addr2line c++filt gcov gcov-dump gcov-tool elfedit; do \
-		src="/home/a0wsvg/opt/cross-x86_64/bin/x86_64-elf-$$tool"; \
-		if [ -f "$$src" ]; then \
-			strip --strip-debug "$$src" -o $(BUILD_DIR)/usr/bin/$$tool 2>/dev/null || cp "$$src" $(BUILD_DIR)/usr/bin/$$tool; \
-			ln -sf /usr/bin/$$tool $(BUILD_DIR)/bin/$$tool 2>/dev/null || cp $(BUILD_DIR)/usr/bin/$$tool $(BUILD_DIR)/bin/$$tool; \
-		fi; \
-	done
-	@ln -sf /usr/bin/gcc $(BUILD_DIR)/bin/cc 2>/dev/null || cp $(BUILD_DIR)/usr/bin/gcc $(BUILD_DIR)/bin/cc
-	@ln -sf /usr/bin/gcc $(BUILD_DIR)/usr/bin/cc 2>/dev/null || true
-	@ln -sf /usr/bin/gcc $(BUILD_DIR)/usr/bin/x86_64-elf-gcc 2>/dev/null || true
-	@ln -sf /usr/bin/gcc $(BUILD_DIR)/bin/x86_64-elf-gcc 2>/dev/null || true
-	@ln -sf /usr/bin/as $(BUILD_DIR)/usr/bin/x86_64-elf-as 2>/dev/null || true
-	@ln -sf /usr/bin/as $(BUILD_DIR)/bin/x86_64-elf-as 2>/dev/null || true
-	@ln -sf /usr/bin/ld $(BUILD_DIR)/bin/ld.bfd 2>/dev/null || true
-	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/bin/ld.bfd 2>/dev/null || true
-	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/bin/x86_64-elf-ld 2>/dev/null || true
-	@ln -sf /usr/bin/ld $(BUILD_DIR)/bin/x86_64-elf-ld 2>/dev/null || true
-	@for pass in cc1 collect2 lto-wrapper liblto_plugin.so; do \
-		src="/home/a0wsvg/opt/cross-x86_64/libexec/gcc/x86_64-elf/14.2.0/$$pass"; \
-		if [ -f "$$src" ]; then \
-			strip --strip-debug "$$src" -o $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/$$pass 2>/dev/null || cp "$$src" $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/$$pass; \
-		fi; \
-	done
-	@ln -sf /usr/bin/as $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/as 2>/dev/null || true
-	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/ld 2>/dev/null || true
-	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/libexec/gcc/x86_64-elf/14.2.0/real-ld 2>/dev/null || true
-	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/cc1 $(BUILD_DIR)/usr/libexec/cc1 2>/dev/null || true
-	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/collect2 $(BUILD_DIR)/usr/libexec/collect2 2>/dev/null || true
-	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/lto-wrapper $(BUILD_DIR)/usr/libexec/lto-wrapper 2>/dev/null || true
-	@ln -sf /usr/bin/as $(BUILD_DIR)/usr/libexec/as 2>/dev/null || true
-	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/libexec/ld 2>/dev/null || true
-	@ln -sf /usr/bin/ld $(BUILD_DIR)/usr/libexec/real-ld 2>/dev/null || true
-
-
-	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/liblto_plugin.so $(BUILD_DIR)/usr/lib/bfd-plugins/liblto_plugin.so 2>/dev/null || true
-	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/liblto_plugin.so $(BUILD_DIR)/usr/lib/liblto_plugin.so 2>/dev/null || true
-	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/liblto_plugin.so $(BUILD_DIR)/lib/liblto_plugin.so 2>/dev/null || true
-	@ln -sf /usr/libexec/gcc/x86_64-elf/14.2.0/lto-wrapper $(BUILD_DIR)/usr/bin/lto-wrapper 2>/dev/null || true
-	@cp -r /home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/ldscripts/* $(BUILD_DIR)/usr/lib/ldscripts/ 2>/dev/null || true
-	@cp -r /home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib/ldscripts/* $(BUILD_DIR)/lib/ldscripts/ 2>/dev/null || true
-	@mkdir -p $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0/include $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0/include-fixed
-	@cp -r /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include/* $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0/include/ 2>/dev/null || true
-	@cp -r /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include-fixed/* $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0/include-fixed/ 2>/dev/null || true
-	@cp -r /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include/* $(BUILD_DIR)/usr/include/ 2>/dev/null || true
 	@cp -r libc/include/* $(BUILD_DIR)/usr/include/ 2>/dev/null || true
 	@cp -r libc/include/* $(BUILD_DIR)/usr/local/include/ 2>/dev/null || true
-	@mkdir -p $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf
-	@mkdir -p $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0
-	@mkdir -p $(BUILD_DIR)/lib/gcc/x86_64-elf/14.2.0
-	@mkdir -p $(BUILD_DIR)/usr/x86_64-elf $(BUILD_DIR)/x86_64-elf $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0
-	@ln -sf /usr/lib/gcc/x86_64-elf/14.2.0/include $(BUILD_DIR)/lib/gcc/x86_64-elf/14.2.0/include 2>/dev/null || true
-	@ln -sf /usr/lib/gcc/x86_64-elf/14.2.0/include-fixed $(BUILD_DIR)/lib/gcc/x86_64-elf/14.2.0/include-fixed 2>/dev/null || true
-	@ln -sf /usr/lib/gcc/x86_64-elf/14.2.0/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include 2>/dev/null || true
-	@ln -sf /usr/lib/gcc/x86_64-elf/14.2.0/include-fixed $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/include-fixed 2>/dev/null || true
-	@ln -sf /usr/bin $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/bin 2>/dev/null || true
-	@ln -sf /usr/libexec $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/libexec 2>/dev/null || true
-	@ln -sf /usr/lib $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib 2>/dev/null || true
-	@ln -sf /usr/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/include 2>/dev/null || true
-	@ln -sf /usr/bin $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/bin 2>/dev/null || true
-	@ln -sf /usr/lib $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib 2>/dev/null || true
-	@ln -sf /usr/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/include 2>/dev/null || true
-	@ln -sf /usr/local/include $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/sys-include 2>/dev/null || true
-	@ln -sf /usr/bin $(BUILD_DIR)/usr/x86_64-elf/bin 2>/dev/null || true
-	@ln -sf /usr/lib $(BUILD_DIR)/usr/x86_64-elf/lib 2>/dev/null || true
-	@ln -sf /usr/include $(BUILD_DIR)/usr/x86_64-elf/include 2>/dev/null || true
-	@ln -sf /usr/local/include $(BUILD_DIR)/usr/x86_64-elf/sys-include 2>/dev/null || true
-	@ln -sf /usr/bin $(BUILD_DIR)/x86_64-elf/bin 2>/dev/null || true
-	@ln -sf /usr/lib $(BUILD_DIR)/x86_64-elf/lib 2>/dev/null || true
-	@ln -sf /usr/include $(BUILD_DIR)/x86_64-elf/include 2>/dev/null || true
-	@ln -sf /usr/local/include $(BUILD_DIR)/x86_64-elf/sys-include 2>/dev/null || true
-	@ln -sf /usr/libexec $(BUILD_DIR)/x86_64-elf/libexec 2>/dev/null || true
-	@for d in $(BUILD_DIR)/usr/lib $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/usr/local/lib $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0 $(BUILD_DIR)/home/a0wsvg/opt/cross-x86_64/x86_64-elf/lib $(BUILD_DIR)/usr/lib/gcc/x86_64-elf/14.2.0 $(BUILD_DIR)/x86_64-elf/lib; do \
-		mkdir -p "$$d" 2>/dev/null || true; \
-		cp /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/crtbegin*.o "$$d"/ 2>/dev/null || true; \
-		cp /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/crtend*.o "$$d"/ 2>/dev/null || true; \
-		cp /home/a0wsvg/opt/cross-x86_64/lib/gcc/x86_64-elf/14.2.0/libgcc*.a "$$d"/ 2>/dev/null || true; \
-		cp libc/crt0.o "$$d"/crt0.o 2>/dev/null || true; \
-		cp libc/libc.a "$$d"/libc.a 2>/dev/null || true; \
-		cp libc/libc.a "$$d"/libm.a 2>/dev/null || true; \
-		cp libc/libc.a "$$d"/libg.a 2>/dev/null || true; \
-		cp libc/libc.a "$$d"/libnosys.a 2>/dev/null || true; \
+	@mkdir -p $(BUILD_DIR)/usr/include/game $(BUILD_DIR)/usr/local/include/game
+	@cp -r libgame/include/game/* $(BUILD_DIR)/usr/include/game/ 2>/dev/null || true
+	@cp -r libgame/include/game/* $(BUILD_DIR)/usr/local/include/game/ 2>/dev/null || true
+
+	@# ── Startup object and static libraries, in every path a linker looks ─
+	@# libm/libg/libnosys are the same archive under the names a build might
+	@# ask for with -lm and friends; this libc implements all of it.
+	@for d in $(BUILD_DIR)/usr/lib $(BUILD_DIR)/lib $(BUILD_DIR)/lib64 $(BUILD_DIR)/usr/local/lib; do \
+	    mkdir -p "$$d" 2>/dev/null || true; \
+	    cp libc/crt0.o    "$$d"/crt0.o    2>/dev/null || true; \
+	    cp libc/libc.a    "$$d"/libc.a    2>/dev/null || true; \
+	    cp libc/libc.a    "$$d"/libm.a    2>/dev/null || true; \
+	    cp libc/libc.a    "$$d"/libg.a    2>/dev/null || true; \
+	    cp libc/libc.a    "$$d"/libnosys.a 2>/dev/null || true; \
+	    cp libgame/libgame.a "$$d"/libgame.a 2>/dev/null || true; \
 	done
-	@mkdir -p $(BUILD_DIR)/lib64 $(BUILD_DIR)/lib/x86_64-linux-gnu $(BUILD_DIR)/lib $(BUILD_DIR)/usr/lib
+
+	@# ── crt1/crti/crtn, the names a stock compiler driver links by ───────
+	@# tcc (like gcc) links crt1.o, crti.o and crtn.o into every executable
+	@# unless told -nostdlib. AzamiOS's startup object is crt0.o and its
+	@# libc has no .init/.fini fragments at all — crt0.asm calls
+	@# __init_tls/__libc_init directly and never _init — so crt1.o is that
+	@# same object under the expected name, and crti/crtn are empty objects
+	@# that satisfy the link without contributing anything.
+	@printf '' > $(OBJ_DIR)/empty-crt.s
+	@for d in $(BUILD_DIR)/usr/lib $(BUILD_DIR)/lib; do \
+	    cp libc/crt0.o "$$d"/crt1.o 2>/dev/null || true; \
+	    $(CC) -c -x assembler $(OBJ_DIR)/empty-crt.s -o "$$d"/crti.o 2>/dev/null || true; \
+	    $(CC) -c -x assembler $(OBJ_DIR)/empty-crt.s -o "$$d"/crtn.o 2>/dev/null || true; \
+	done
+
+	@# ── TinyCC, when tools/linux/ports.mk has built it ───────────────────
+	@# Absent, the image simply has no compiler and `pkg install tcc` adds
+	@# one at runtime — the package installs the identical files to these
+	@# paths. Present, it is installed as cc/tcc and the OS can build C
+	@# programs with nothing else mounted.
+	@if [ -x $(TCC_PORT_BIN) ]; then \
+	    cp $(TCC_PORT_BIN) $(BUILD_DIR)/usr/bin/tcc; \
+	    mkdir -p $(BUILD_DIR)/usr/lib/tcc; \
+	    cp -r $(TCC_PORT_TREE)/lib/tcc/* $(BUILD_DIR)/usr/lib/tcc/ 2>/dev/null || true; \
+	    cp $(TCC_PORT_TREE)/lib/libtcc.a $(BUILD_DIR)/usr/lib/ 2>/dev/null || true; \
+	    cp $(TCC_PORT_TREE)/include/libtcc.h $(BUILD_DIR)/usr/include/ 2>/dev/null || true; \
+	    ln -sf /usr/bin/tcc $(BUILD_DIR)/usr/bin/cc; \
+	    ln -sf /usr/bin/tcc $(BUILD_DIR)/bin/tcc; \
+	    ln -sf /usr/bin/tcc $(BUILD_DIR)/bin/cc; \
+	    echo "  ✓  On-device compiler: tcc ($$(wc -c < $(TCC_PORT_BIN)) bytes) -> /usr/bin/tcc, cc"; \
+	else \
+	    echo "  ·  No on-device compiler staged (build one with: make -C tools/linux ports)"; \
+	fi
+
+	@# ── glibc loader + shared libc, for dynamically linked Linux binaries ─
+	@# Nothing to do with the compiler; this is the PT_INTERP path of the
+	@# Linux-ABI layer (docs/LINUX-BINARIES.md).
 	@cp -L /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 $(BUILD_DIR)/lib64/ld-linux-x86-64.so.2 2>/dev/null || true
 	@cp -L /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 $(BUILD_DIR)/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 2>/dev/null || true
 	@cp -L /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 $(BUILD_DIR)/lib/ld-linux-x86-64.so.2 2>/dev/null || true
@@ -392,8 +447,158 @@ toolchain: skeleton libc
 	@cp -L /lib/x86_64-linux-gnu/libm.so.6 $(BUILD_DIR)/lib/libm.so.6 2>/dev/null || true
 	@cp -L /lib/x86_64-linux-gnu/libm.so.6 $(BUILD_DIR)/usr/lib/libm.so.6 2>/dev/null || true
 
+# ── ld-azami.so and the dltest smoke test (see userland/ldso/ldso.c) ───────
+# Every object below is ET_DYN, position-independent, and freestanding —
+# none of it links against libc.a (see ldso.c's top-of-file comment on why).
+# -ftls-model=initial-exec matches what ldso.c's relocation pass actually
+# implements (R_X86_64_TPOFF64); the general-dynamic model's
+# DTPMOD64/DTPOFF64 relocations, which -fpic would otherwise default TLS
+# access to, are unsupported (see that file for why).
+DYNLINK_CFLAGS = -std=c11 -ffreestanding -fno-stack-protector -fpic -fno-plt \
+                 -m64 -Wall -Wextra -O2 -ftls-model=initial-exec
+
+ldso/ldso.o: ldso/ldso.c libc/include/sys/syscall.h
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+ldso/crt0.o: ldso/crt0.asm
+	nasm -f elf64 $< -o $@
+
+# IMPORTANT: `toolchain` (a normal, non-order-only prerequisite here — not
+# "| toolchain") is deliberate, and the reasoning below is the second half
+# of a two-part bug found empirically, not just in theory:
+#
+#   1. Under -j, GNU make gives no ordering guarantee between a target's own
+#      prerequisites, so a plain (non-order-only) `toolchain` prerequisite
+#      lets toolchain's `rm -rf $(BUILD_DIR)/lib` recipe race these rules'
+#      `mkdir -p $(BUILD_DIR)/lib` and delete the very file they just
+#      installed. That's what an order-only "| toolchain" fixes — and is
+#      exactly what this file used to say here.
+#
+#   2. But order-only prerequisites are *never* consulted for "is this
+#      target out of date" — only for ordering. Since toolchain is phony (it
+#      has no mtime and its recipe unconditionally reruns on every `make`
+#      invocation), a *second* `make all` run reproduces the bug the other
+#      way around: ld-azami.so/dltest_lib.so already exist and are newer
+#      than their real (ldso.o/dltest_lib.o) prerequisites, so make decides
+#      they're up to date and never reruns their recipe — but toolchain's
+#      rm -rf still deletes them anyway, since it always runs. The result:
+#      a first `make all` produces a working image; every `make all` after
+#      that silently ships an image with no ld-azami.so/dltest_lib.so/
+#      libc.so at all. Confirmed by actually running `make all` twice in a
+#      row and checking $(BUILD_DIR)/lib afterward.
+#
+# A plain `toolchain` prerequisite fixes both at once: since toolchain is
+# phony, make treats it as unconditionally "newer" than any real target that
+# names it as an ordinary prerequisite, forcing these rules' recipes to
+# rerun on every invocation (fixing #2) while still guaranteeing toolchain's
+# recipe finishes first (fixing #1) — the tiny, cheap relink cost is not
+# worth reintroducing either bug to avoid.
+$(BUILD_DIR)/lib/ld-azami.so: ldso/crt0.o ldso/ldso.o toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared -T ../scripts/user-pic.ld -nostdlib -z max-page-size=0x1000 \
+	    ldso/crt0.o ldso/ldso.o -o $@
+
+examples/dltest_lib.o: examples/dltest_lib.c
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/lib/dltest_lib.so: examples/dltest_lib.o toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=dltest_lib.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_lib.o -o $@
+
+examples/dltest_crt0.o: examples/dltest_crt0.asm
+	nasm -f elf64 $< -o $@
+
+examples/dltest_app.o: examples/dltest_app.c
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+$(BIN_DIR)/dltest_app.elf: examples/dltest_crt0.o examples/dltest_app.o $(BUILD_DIR)/lib/dltest_lib.so
+	@mkdir -p $(BIN_DIR)
+	$(LD) -pie -T ../scripts/user-pic.ld --dynamic-linker=/lib/ld-azami.so \
+	    -nostdlib -z max-page-size=0x1000 \
+	    examples/dltest_crt0.o examples/dltest_app.o $(BUILD_DIR)/lib/dltest_lib.so -o $@
+
+# ── libc.so install (see userland/libc/Makefile for the *.pic.o build) ─────
+# Same "plain `toolchain` prerequisite" reasoning as ld-azami.so/
+# dltest_lib.so above — this one more real target under $(BUILD_DIR)/lib
+# subject to the exact same two-part race/idempotency bug.
+$(BUILD_DIR)/lib/libc.so: libc/libc.so toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	cp libc/libc.so $@
+
+# ── Dynamic PIE apps linked against libc.so (real DT_NEEDED, not eager
+# static-libc.a linking) — userland/libc/crt0_dyn.asm is the entry point,
+# libc/libc.so (built above) is the real runtime dependency. A small,
+# representative subset of the app suite (not a full ~150-app conversion —
+# see the top-level task's own guidance on why: real risk of breaking every
+# existing app, so the static path stays the default everywhere else):
+#   - dlopen_demo.elf: dlopen()/dlsym()/dlclose() exercised for real at
+#     runtime (see examples/dlopen_demo.c) — the actual proof dlfcn.c works,
+#     distinct from dltest_app.elf's eager-DT_NEEDED-only coverage.
+#   - fetch_dyn.elf: apps/fetch/main.c, unmodified, rebuilt dynamic — a
+#     printf/malloc-heavy real app, for side-by-side output comparison
+#     against the existing static fetch.elf.
+#   - thread_tls_test_dyn.elf: examples/thread_tls_test.c, unmodified,
+#     rebuilt dynamic — exercises pthread_create() + combined static TLS
+#     (libc.so's own __thread errno and pthread.c's TSD arrays) for real,
+#     the single riskiest new mechanism in this whole change.
+# Same -fpic (not -fpie) choice as DYNLINK_CFLAGS above/dltest_app.c: that's
+# the combination already confirmed to link and run correctly for a -pie
+# executable with this toolchain, so this reuses it rather than assuming
+# -fpie is needed too.
+DYNAPP_CFLAGS = -std=c11 -ffreestanding -fno-stack-protector -fpic -fno-plt \
+                -m64 -Wall -Wextra -Wno-unused-parameter -O2 -ftls-model=initial-exec \
+                -I. -Ilibc/include
+
+DYNAPP_LDFLAGS = -pie -T ../scripts/user-pic.ld --dynamic-linker=/lib/ld-azami.so \
+                 -nostdlib -z max-page-size=0x1000
+
+examples/dlopen_demo.o: examples/dlopen_demo.c
+	$(CC) $(DYNAPP_CFLAGS) -c $< -o $@
+
+$(BIN_DIR)/dlopen_demo.elf: libc/crt0_dyn.o examples/dlopen_demo.o $(BUILD_DIR)/lib/libc.so $(BUILD_DIR)/lib/dltest_lib.so
+	@mkdir -p $(BIN_DIR)
+	$(LD) $(DYNAPP_LDFLAGS) libc/crt0_dyn.o examples/dlopen_demo.o $(BUILD_DIR)/lib/libc.so -o $@
+
+$(OBJ_DIR)/dyn_fetch.o: apps/fetch/main.c | skeleton
+	$(CC) $(DYNAPP_CFLAGS) -Iapps/shared -c $< -o $@
+
+$(BIN_DIR)/fetch_dyn.elf: libc/crt0_dyn.o $(OBJ_DIR)/dyn_fetch.o $(BUILD_DIR)/lib/libc.so
+	@mkdir -p $(BIN_DIR)
+	$(LD) $(DYNAPP_LDFLAGS) libc/crt0_dyn.o $(OBJ_DIR)/dyn_fetch.o $(BUILD_DIR)/lib/libc.so -o $@
+
+$(OBJ_DIR)/dyn_thread_tls_test.o: examples/thread_tls_test.c | skeleton
+	$(CC) $(DYNAPP_CFLAGS) -c $< -o $@
+
+$(BIN_DIR)/thread_tls_test_dyn.elf: libc/crt0_dyn.o $(OBJ_DIR)/dyn_thread_tls_test.o $(BUILD_DIR)/lib/libc.so
+	@mkdir -p $(BIN_DIR)
+	$(LD) $(DYNAPP_LDFLAGS) libc/crt0_dyn.o $(OBJ_DIR)/dyn_thread_tls_test.o $(BUILD_DIR)/lib/libc.so -o $@
+
+# Same source, ordinary static build — a side-by-side baseline for the
+# per-thread TLS boot test (see the init.c /etc/run-dynlink-test block):
+# confirms the combined-static-TLS mechanism in ld-azami.so/libc.so's
+# dynamic path behaves identically to the single-module static path already
+# in production use, not just "passes in isolation".
+$(OBJ_DIR)/thread_tls_test.o: examples/thread_tls_test.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BIN_DIR)/thread_tls_test.elf: $(OBJ_DIR)/thread_tls_test.o libc/libc.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/thread_tls_test.o libc/libc.a -o $@
+
+.PHONY: dynlink
+dynlink: toolchain $(BUILD_DIR)/lib/ld-azami.so $(BUILD_DIR)/lib/libc.so $(BIN_DIR)/dltest_app.elf \
+    $(BIN_DIR)/dlopen_demo.elf $(BIN_DIR)/fetch_dyn.elf $(BIN_DIR)/thread_tls_test_dyn.elf \
+    $(BIN_DIR)/thread_tls_test.elf
 
 
+
+
+GAME_APPS = \
+    $(BIN_DIR)/3d_test.elf \
+    $(BIN_DIR)/demo3d.elf \
+    $(BIN_DIR)/breakout.elf
+
+BIN_APPS = $(BIN_APPS_SIMPLE) $(BIN_DIR)/settings.elf $(GAME_APPS) $(BIN_DIR)/azami-sh.elf
 
 apps: $(SBIN_APPS) $(BIN_APPS)
 	@for f in $(BIN_DIR)/*.elf; do \
@@ -406,8 +611,34 @@ apps: $(SBIN_APPS) $(BIN_APPS)
 		base=$$(basename "$$f" .elf); \
 		ln -sf "$$base.elf" "$(SBIN_DIR)/$$base" 2>/dev/null || true; \
 	done
-	@ln -sf sh.elf $(BIN_DIR)/bash 2>/dev/null || true
-	@ln -sf sh.elf $(BIN_DIR)/sh 2>/dev/null || true
+	@# ── The system shell ─────────────────────────────────────────────────
+	@# GNU bash, built from upstream source by tools/linux/ports.mk, is the
+	@# shell: /bin/bash is the binary and /bin/sh and /bin/sh.elf point at
+	@# it, so everything that already execs a shell by any of those three
+	@# names — libc's system(), the terminal's fallback path, a #!/bin/sh
+	@# script, the kernel's emergency init — gets bash without knowing.
+	@#
+	@# The small native shell is still built and still installed, as
+	@# /bin/azami-sh.elf. It is what the image falls back to when the ports
+	@# have not been built: an image with no shell at all would be a brick,
+	@# and "the shell is missing" is not a failure worth risking to save
+	@# 200 KB.
+	@rm -f $(BIN_DIR)/sh.elf $(BIN_DIR)/sh $(BIN_DIR)/bash
+	@if [ -x $(BASH_PORT_BIN) ]; then \
+	    cp $(BASH_PORT_BIN) $(BIN_DIR)/bash; \
+	    ln -sf bash $(BIN_DIR)/sh; \
+	    ln -sf bash $(BIN_DIR)/sh.elf; \
+	    ln -sf /bin/bash $(BUILD_DIR)/usr/bin/bash 2>/dev/null || true; \
+	    ln -sf /bin/bash $(BUILD_DIR)/usr/bin/sh 2>/dev/null || true; \
+	    ln -sf /bin/bash $(BUILD_DIR)/usr/bin/sh.elf 2>/dev/null || true; \
+	    echo "  ✓  System shell: GNU bash ($$(wc -c < $(BASH_PORT_BIN)) bytes) -> /bin/{sh,sh.elf,bash}"; \
+	else \
+	    ln -sf azami-sh.elf $(BIN_DIR)/sh.elf; \
+	    ln -sf azami-sh.elf $(BIN_DIR)/sh; \
+	    ln -sf azami-sh.elf $(BIN_DIR)/bash; \
+	    ln -sf /bin/azami-sh.elf $(BUILD_DIR)/usr/bin/sh 2>/dev/null || true; \
+	    echo "  ·  System shell: native azami-sh (bash not built — make -C tools/linux ports)"; \
+	fi
 	@ln -sf test.elf $(BIN_DIR)/[ 2>/dev/null || true
 	@ln -sf /bin/test.elf $(BUILD_DIR)/usr/bin/[ 2>/dev/null || true
 	@ln -sf /bin/env.elf $(BUILD_DIR)/usr/bin/env 2>/dev/null || true
@@ -423,10 +654,11 @@ apps: $(SBIN_APPS) $(BIN_APPS)
 	@ln -sf /bin/sha256sum.elf $(BUILD_DIR)/usr/bin/sha512sum 2>/dev/null || true
 
 etc: skeleton
-	@echo "root:x:0:0:root:/root:/bin/sh.elf" > $(BUILD_DIR)/etc/passwd
-	@echo "azami:x:1000:1000:Azami User:/home/azami:/bin/sh.elf" >> $(BUILD_DIR)/etc/passwd
+	@echo "root:x:0:0:root:/root:/bin/bash" > $(BUILD_DIR)/etc/passwd
+	@echo "azami:x:1000:1000:Azami User:/home/azami:/bin/bash" >> $(BUILD_DIR)/etc/passwd
 	@echo "root:4813494d137e1631bba301d5acab6e7bb7aa74ce1185d456565ef51d737677b2:19000:0:99999:7:::" > $(BUILD_DIR)/etc/shadow
 	@echo "azami:f58bf0947db3ff9d404be3b7fca4251831d8f2c4dd0b618cfcce7b7a2fcd11ac:19000:0:99999:7:::" >> $(BUILD_DIR)/etc/shadow
+	@chmod 600 $(BUILD_DIR)/etc/shadow
 	@echo "root:x:0:" > $(BUILD_DIR)/etc/group
 	@echo "wheel:x:10:root,azami" >> $(BUILD_DIR)/etc/group
 	@echo "users:x:100:azami" >> $(BUILD_DIR)/etc/group
@@ -462,21 +694,48 @@ etc: skeleton
 	@# load_default_file_assoc()) so a missing/corrupt file degrades
 	@# gracefully — but these are the real, editable source of truth.
 	@printf "# Quick Launch Dock entries: glyph|label|path|0xAARRGGBB\nT|Terminal|/bin/terminal.elf|0xFFA6E3A1\nF|Files|/bin/filemanager.elf|0xFFF9E2AF\nI|Images|/bin/imageviewer.elf|0xFF89DCEB\nN|Notes|/bin/notes.elf|0xFFF9E2AF\nD|Studio|/bin/ide.elf|0xFFCBA6F7\nV|Fonts|/bin/fontviewer.elf|0xFFFAB387\nE|Editor|/bin/texteditor.elf|0xFF89B4FA\nC|Calc|/bin/calculator.elf|0xFFFAB387\nP|Paint|/bin/paint.elf|0xFFCBA6F7\nA|Audio|/bin/audioplayer.elf|0xFFF38BA8\nS|Settings|/bin/settings.elf|0xFF74C7EC\nM|Sysmon|/bin/sysmon.elf|0xFF94E2D5\nX|XClock|/bin/xclock.elf|0xFF89DCEB\nY|XEyes|/bin/xeyes.elf|0xFFF5C2E7\nK|XCalc|/bin/xcalc.elf|0xFFF9E2AF\nG|XDemo|/bin/xgui_demo.elf|0xFFB4BEFE\n" > $(BUILD_DIR)/etc/taskbar_dock.conf
-	@printf "# App Launcher registry: appname=category:subtitle, or appname=hidden\nterminal=system:Command Terminal\nfilemanager=system:Files & Storage\nimageviewer=media:Image & Photo Viewer\nnotes=productivity:Sticky Notes\ntexteditor=productivity:Code & Text Editor\nide=productivity:Code Studio & IDE\nfontviewer=system:Font & Typography Inspector\nsysmon=system:Activity Monitor\ncalculator=productivity:Math & Calculations\nclock=productivity:Clock & World Times\nsettings=system:System Control\nabout=system:System Info\nfetch=system:System Telemetry\nscreenshot=system:Screen Capture\npaint=productivity:Paint & Sketch\naudioplayer=media:Music & Synthwave\nminesweeper=games:Minesweeper Puzzle\n2048=games:2048 Number Puzzle\nsnake=games:Arcade Snake Game\n# Internal services & CLI tools: excluded from the app grid\ninit=hidden\nsessiond=hidden\nazwm=hidden\nwallpaper=hidden\ntaskbar=hidden\nlauncher=hidden\ngui_test=hidden\nsh=hidden\nplay=hidden\nls=hidden\ncat=hidden\necho=hidden\npwd=hidden\nuname=hidden\nhead=hidden\ntail=hidden\nwc=hidden\ngrep=hidden\nmkdir=hidden\nrm=hidden\ntouch=hidden\ncp=hidden\nmv=hidden\ndate=hidden\nuptime=hidden\ndf=hidden\nfree=hidden\nifconfig=hidden\nping=hidden\nlspci=hidden\nenv=hidden\nwhich=hidden\nsleep=hidden\nkill=hidden\nchmod=hidden\nclear=hidden\nhexdump=hidden\nbase64=hidden\nmd5sum=hidden\ncut=hidden\nsort=hidden\nuniq=hidden\nps=hidden\ntop=hidden\ndmesg=hidden\ntree=hidden\ncal=hidden\nwatch=hidden\nnetstat=hidden\npoweroff=hidden\nreboot=hidden\ngetfacl=hidden\nsetfacl=hidden\nless=hidden\nbc=hidden\nhexedit=hidden\n" > $(BUILD_DIR)/etc/launcher.conf
+	@printf "# App Launcher registry: appname=category:subtitle\n#\n# This is an allowlist. The launcher shows the apps named here and\n# nothing else, so the ~200 command-line tools in /bin stay out of the\n# app grid instead of appearing as entries that open no window. A new\n# GUI app becomes visible by adding one line.\n# Categories: system, productivity, media, games.\nterminal=system:Command Terminal\nfilemanager=system:Files & Storage\nsettings=system:System Control\nsysmon=system:Activity Monitor\nabout=system:System Info\nfetch=system:System Telemetry\nscreenshot=system:Screen Capture\nfontviewer=system:Font & Typography Inspector\ntexteditor=productivity:Code & Text Editor\nide=productivity:Code Studio & IDE\nnotes=productivity:Sticky Notes\ncalculator=productivity:Math & Calculations\nclock=productivity:Clock & World Times\npaint=productivity:Paint & Sketch\nimageviewer=media:Image & Photo Viewer\naudioplayer=media:Music & Synthwave\nminesweeper=games:Minesweeper Puzzle\n2048=games:2048 Number Puzzle\nsnake=games:Arcade Snake Game\npasjans=games:Solitaire Card Game\nbreakout=games:Breakout Arcade\n3d_test=games:3D Renderer Demo\ndemo3d=games:3D Scene Demo\nxcalc=system:X11 Calculator\nxclock=system:X11 Clock\nxeyes=system:X11 Eyes\nxgui_demo=system:X11 Widget Demo\n" > $(BUILD_DIR)/etc/launcher.conf
 	@printf "# File manager sidebar places: label|path|icon\nRoot|/|/\nBoot|/boot|O\nMusic|/music|M\nDesktop|/home/azami/Desktop|D\nHard Disk|/hdd|H\nBinaries|/bin|B\nSystem|/sbin|S\nConfig|/etc|E\nProc FS|/proc|P\nDevices|/dev|D\nTemporary|/tmp|T\n" > $(BUILD_DIR)/etc/filemanager_places.conf
 	@printf "# AzamiOS Kernel Runtime Configuration\n# File: /etc/sysctl.conf\n\n# Security Hardening Mitigations\nkernel.dmesg_restrict = 1\nkernel.kptr_restrict = 1\nkernel.mmap_min_addr = 65536\nkernel.yama.ptrace_scope = 1\nfs.protected_hardlinks = 1\nfs.protected_symlinks = 1\n\n# System & Hostname Defaults\nkernel.hostname = azamios\nfs.file-max = 65536\n" > $(BUILD_DIR)/etc/sysctl.conf
 	@printf "# File extension -> GUI app associations: ext=/path/to/app.elf\ntxt=/bin/texteditor.elf\nmd=/bin/texteditor.elf\nc=/bin/texteditor.elf\nh=/bin/texteditor.elf\nconf=/bin/texteditor.elf\ncfg=/bin/texteditor.elf\nini=/bin/texteditor.elf\nlog=/bin/texteditor.elf\nsh=/bin/texteditor.elf\njson=/bin/texteditor.elf\nppm=/bin/imageviewer.elf\nbmp=/bin/imageviewer.elf\ntga=/bin/imageviewer.elf\nqoi=/bin/imageviewer.elf\nicn=/bin/imageviewer.elf\npng=/bin/imageviewer.elf\nazf=/bin/fontviewer.elf\nwav=/bin/audioplayer.elf\nmp3=/bin/audioplayer.elf\n" > $(BUILD_DIR)/etc/mime.conf
-	@printf "/bin/sh\n/bin/sh.elf\n/bin/bash\n/usr/bin/sh\n" > $(BUILD_DIR)/etc/shells
+	@printf "/bin/bash\n/bin/sh\n/bin/sh.elf\n/usr/bin/bash\n/usr/bin/sh\n/bin/azami-sh.elf\n" > $(BUILD_DIR)/etc/shells
 	@printf "Welcome to AzamiOS 7.0 (x86_64) - \\\\l\n\n" > $(BUILD_DIR)/etc/issue
 	@printf "ext2\nprocfs\ndevfs\n*\n" > $(BUILD_DIR)/etc/filesystems
-	@printf "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nLANG=C.UTF-8\nEDITOR=/bin/texteditor.elf\nPAGER=/bin/less.elf\n" > $(BUILD_DIR)/etc/environment
-	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nexport USER=root\nexport HOME=/root\nexport TERM=azami\nexport SHELL=/bin/sh.elf\nexport TMPDIR=/tmp\nexport COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec/:/usr/bin:/bin\nexport LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib\nexport PS1=\"root@azamios:\w\\$$ \"\n" > $(BUILD_DIR)/etc/profile
+	@printf "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nLANG=C.UTF-8\nSHELL=/bin/bash\nEDITOR=/bin/texteditor.elf\nPAGER=/bin/less.elf\n" > $(BUILD_DIR)/etc/environment
+	@# ── Shell startup files ──────────────────────────────────────────────
+	@# Two shells read these, so they are split by who can parse what.
+	@#
+	@# /etc/profile and ~/.profile are the plain ones — one `export K=V` per
+	@# line, no quoting, no conditionals, no prompt. The native shell
+	@# (/bin/azami-sh.elf) sources both at startup and its parser splits on
+	@# spaces, so a line like `export PS1="root@azamios:\w\$$ "` came back
+	@# at it as `PS1="root@azamios:\w\$$: command not found`.
+	@#
+	@# ~/.bashrc and ~/.bash_profile are bash's and hold everything bash
+	@# needs but the native shell cannot read: the prompt, history settings,
+	@# and the sourcing that makes a login shell pick up the interactive
+	@# file. bash reads /etc/profile + ~/.bash_profile when it is a login
+	@# shell and ~/.bashrc when it is interactive and not, which is why the
+	@# prompt has to live in ~/.bashrc and be pulled in from the other side.
+	@#
+	@# COMPILER_PATH/LIBRARY_PATH are gone from all of these: they pointed
+	@# into the cross-gcc the image no longer packs (see `toolchain`).
+	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nexport USER=root\nexport HOME=/root\nexport TERM=azami\nexport SHELL=/bin/bash\nexport TMPDIR=/tmp\nexport PAGER=/bin/less.elf\nexport EDITOR=/bin/texteditor.elf\n" > $(BUILD_DIR)/etc/profile
 	@cp $(BUILD_DIR)/etc/profile $(BUILD_DIR)/root/.profile
-	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nexport USER=azami\nexport HOME=/home/azami\nexport TERM=azami\nexport SHELL=/bin/sh.elf\nexport TMPDIR=/tmp\nexport COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec/:/usr/bin:/bin\nexport LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib\nexport PS1=\"azami@azamios:\w\\$$ \"\n" > $(BUILD_DIR)/home/azami/.profile
+	@printf "# root's interactive bash: prompt and history.\nPS1=\"root@azamios:\w\\$$ \"\nHISTFILE=/root/.bash_history\nHISTSIZE=500\nHISTFILESIZE=500\nexport PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\n" > $(BUILD_DIR)/root/.bashrc
+	@printf "[ -f /etc/profile ] && . /etc/profile\n[ -f /root/.bashrc ] && . /root/.bashrc\n" > $(BUILD_DIR)/root/.bash_profile
+	@printf "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\nexport USER=azami\nexport HOME=/home/azami\nexport TERM=azami\nexport SHELL=/bin/bash\nexport TMPDIR=/tmp\nexport PAGER=/bin/less.elf\nexport EDITOR=/bin/texteditor.elf\n" > $(BUILD_DIR)/home/azami/.profile
+	@printf "# azami's interactive bash: prompt and history.\nPS1=\"azami@azamios:\w\\$$ \"\nHISTFILE=/home/azami/.bash_history\nHISTSIZE=500\nHISTFILESIZE=500\nexport PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\n" > $(BUILD_DIR)/home/azami/.bashrc
+	@printf "[ -f /etc/profile ] && . /etc/profile\n[ -f /home/azami/.bashrc ] && . /home/azami/.bashrc\n" > $(BUILD_DIR)/home/azami/.bash_profile
 	@cp $(BUILD_DIR)/etc/terminal.conf $(BUILD_DIR)/root/.config/terminal.conf
 	@printf "[terminal]\ntheme=catppuccin\nfont_size=12\nopacity=95\nscrollback=500\ncursor_blink=1\nhistory_size=100\nprompt=azami@azamios:\w$$ \n" > $(BUILD_DIR)/home/azami/.config/terminal.conf
 	@mkdir -p $(BUILD_DIR)/tmp $(BUILD_DIR)/var/tmp $(BUILD_DIR)/var/log $(BUILD_DIR)/var/run
-	@touch $(BUILD_DIR)/var/run/utmp $(BUILD_DIR)/var/log/wtmp $(BUILD_DIR)/etc/run-userspace-test $(BUILD_DIR)/etc/run-toolchain-selftest 2>/dev/null || true
+	@touch $(BUILD_DIR)/var/run/utmp $(BUILD_DIR)/var/log/wtmp 2>/dev/null || true
+	@rm -f $(BUILD_DIR)/etc/run-userspace-test $(BUILD_DIR)/etc/run-toolchain-selftest $(BUILD_DIR)/etc/run-dynlink-test
+ifeq ($(SELFTESTS),1)
+	@touch $(BUILD_DIR)/etc/run-userspace-test $(BUILD_DIR)/etc/run-toolchain-selftest $(BUILD_DIR)/etc/run-dynlink-test 2>/dev/null || true
+	@echo "  +  Boot self-test suites enabled (SELFTESTS=1)"
+endif
 	@mkdir -p $(BUILD_DIR)/examples
 	@mkdir -p $(BUILD_DIR)/usr/src/examples
 	@mkdir -p $(BUILD_DIR)/usr/src/libc
@@ -521,11 +780,28 @@ echo "Test: gcc hello.c -o hello && ./hello"\n\
 	@cp -r examples/*.c $(BUILD_DIR)/usr/src/examples/ 2>/dev/null || true
 	@cp -r examples/*.c $(BUILD_DIR)/home/azami/ 2>/dev/null || true
 	@cp -r examples/*.c $(BUILD_DIR)/root/ 2>/dev/null || true
-	@printf "=== Native GCC 14.2.0 on AzamiOS ===\n\nExamples included in /examples and /usr/src/examples:\n  • hello.c       - Basic Hello World & argument printer\n  • fib.c         - Fibonacci calculation\n  • mandelbrot.c  - ASCII fractal generator\n  • primes.c      - Sieve of Eratosthenes prime calculator\n  • syscall_test.c- POSIX file I/O, malloc, fork/waitpid\n  • memory_test.c - Dynamic linked list & realloc test\n\nFull Libc Source Code in /usr/src/libc:\n  • All C standard library sources (stdio.c, stdlib.c, string.c, syscall.c, etc.)\n  • Build script: /usr/src/libc/build.sh\n\nHow to compile and run:\n  gcc hello.c -o hello && ./hello\n  gcc fib.c -o fib && ./fib 15\n  gcc mandelbrot.c -o mandelbrot && ./mandelbrot\n  gcc primes.c -o primes && ./primes 100\n  gcc syscall_test.c -o syscall_test && ./syscall_test\n" > $(BUILD_DIR)/home/azami/README_GCC.txt
-	@cp $(BUILD_DIR)/home/azami/README_GCC.txt $(BUILD_DIR)/root/README_GCC.txt
-	@cp $(BUILD_DIR)/home/azami/README_GCC.txt $(BUILD_DIR)/examples/README.txt
+	@printf "=== Building C programs on AzamiOS ===\n\nThe compiler is TinyCC (/usr/bin/tcc, also reachable as cc). Link\nstatically: every native binary on this image is static, and tcc's\ndefault output is dynamic.\n\nExamples in /examples and /usr/src/examples:\n  • hello.c       - Basic Hello World & argument printer\n  • fib.c         - Fibonacci calculation\n  • mandelbrot.c  - ASCII fractal generator\n  • primes.c      - Sieve of Eratosthenes prime calculator\n  • syscall_test.c- POSIX file I/O, malloc, fork/waitpid\n  • memory_test.c - Dynamic linked list & realloc test\n\nFull libc source in /usr/src/libc (build script: build.sh).\n\nCompile and run:\n  cc -static hello.c -o hello && ./hello\n  cc -static fib.c -o fib && ./fib 15\n  cc -static mandelbrot.c -o mandelbrot && ./mandelbrot\n\nGNU Make is a package away if you want a Makefile: pkg install make\nSee /usr/share/doc/azami/TOOLCHAIN.md (pkg install azami-docs).\n" > $(BUILD_DIR)/home/azami/README_BUILDING.txt
+	@cp $(BUILD_DIR)/home/azami/README_BUILDING.txt $(BUILD_DIR)/root/README_BUILDING.txt
+	@cp $(BUILD_DIR)/home/azami/README_BUILDING.txt $(BUILD_DIR)/examples/README.txt
+	@rm -f $(BUILD_DIR)/home/azami/README_GCC.txt $(BUILD_DIR)/root/README_GCC.txt
 	@printf "Welcome to AzamiOS Dynamic Desktop!\n\n• Double-click any icon to launch.\n• Drag icons anywhere to rearrange them.\n• Right-click for context menu (New Notes, Folders, Themes).\n• Open Terminal and type 'config' to view/edit system settings.\n• Try GCC: 'gcc hello.c -o hello && ./hello'\n" > $(BUILD_DIR)/home/azami/Desktop/Welcome_Notes.txt
 	@cp $(BUILD_DIR)/home/azami/Desktop/Welcome_Notes.txt $(BUILD_DIR)/desktop/Welcome_Notes.txt 2>/dev/null || true
+
+azamios-src: skeleton
+	@echo "  ↓  Copying AzamiOS source tree to /usr/src/azamios..."
+	@mkdir -p $(BUILD_DIR)/usr/src/azamios
+	@rsync -a --exclude=build --exclude=userland/build --exclude=tools/linux/dl --exclude=tools/linux/out --exclude=tools/linux/log --exclude=tools/limine --exclude=.git ../ $(BUILD_DIR)/usr/src/azamios/ 2>/dev/null || true
+	@printf "#!/bin/sh\n\
+# AzamiOS self-hosting build script\n\
+# Usage: cd /usr/src/azamios && sh build.sh\n\
+set -e\n\
+cd /usr/src/azamios\n\
+echo \"=== Building AzamiOS natively ===\"\n\
+make CROSS_PREFIX=\"\" -j4\n\
+echo \"=== Build complete! ===\"\n\
+" > $(BUILD_DIR)/usr/src/azamios/build.sh
+	@chmod +x $(BUILD_DIR)/usr/src/azamios/build.sh 2>/dev/null || true
+	@cp $(BUILD_DIR)/usr/src/azamios/build.sh $(BUILD_DIR)/home/azami/build_azamios.sh 2>/dev/null || true
 
 icons: skeleton
 	@for f in apps/*/*.icn; do \
@@ -564,9 +840,12 @@ templates: skeleton
 	@cp templates/* $(BUILD_DIR)/home/azami/Templates/ 2>/dev/null || true
 
 # Sample package repository (/repo on the image) + default /etc/pkg/repos.conf,
-# so `pkg install cowsay` (a native app) and `pkg install busybox` (a stock
-# Linux binary, when `make linux` has been run) work out of the box with no
-# network. See docs/PACKAGES.md.
+# so `pkg install` works out of the box with no network: native app bundles
+# (cowsay, games, devtools, netutils, ...), data packages (docs, examples,
+# extra themes) and, once `make linux` has been run, the stock Linux
+# binaries too. The catalogue lives in scripts/generate_pkg_repo.py; the
+# same directory can be served over HTTP with `make pkgserve`. See
+# docs/PACKAGES.md.
 pkgrepo: apps
 	@echo "  ↓  Building sample package repository..."
 	@python3 ../scripts/generate_pkg_repo.py $(BUILD_DIR) ../tools/linux/out/bin
@@ -599,14 +878,55 @@ SBIN_APPS_SIMPLE := $(filter-out $(SBIN_DIR)/azwm.elf,$(SBIN_APPS))
 # rule's prerequisites are extended by its .d file (see the "Header
 # dependencies" section below), and a stale header now reaches the link the
 # normal way — through an .o that's actually stale.
+# The native shell's source stays at apps/sh/main.c, but its binary is no
+# longer /bin/sh.elf — GNU bash is (see the `apps` target). Only the link
+# needs naming here; $(OBJ_DIR)/sh.o comes from the ordinary object rule
+# below like every other app's.
+$(BIN_DIR)/azami-sh.elf: $(OBJ_DIR)/sh.o libc/libc.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sh.o libc/libc.a -o $@
+
 $(OBJ_DIR)/%.o: apps/%/main.c | skeleton
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(SBIN_APPS_SIMPLE): $(SBIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libc/crt0.o | skeleton
 	$(LD) $(LDFLAGS) libc/crt0.o $< libc/libc.a -o $@
 
-$(BIN_APPS): $(BIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libc/crt0.o | skeleton
+$(BIN_APPS_SIMPLE): $(BIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libc/crt0.o | skeleton
 	$(LD) $(LDFLAGS) libc/crt0.o $< libc/libc.a -o $@
+
+$(GAME_APPS): $(BIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libc/crt0.o libgame/libgame.a | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $< libgame/libgame.a libc/libc.a -o $@
+
+
+# ── settings.elf (Settings Panel) ──────────────────────────────────────────
+$(OBJ_DIR)/settings_main.o: apps/settings/main.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/settings_tab_display.o: apps/settings/tab_display.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/settings_tab_audio.o: apps/settings/tab_audio.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/settings_tab_theme.o: apps/settings/tab_theme.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/settings_tab_time.o: apps/settings/tab_time.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/settings_tab_network.o: apps/settings/tab_network.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/settings_tab_power.o: apps/settings/tab_power.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/settings_tab_disks.o: apps/settings/tab_disks.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/settings_tab_security.o: apps/settings/tab_security.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/settings_tab_system.o: apps/settings/tab_system.c | skeleton
+	$(CC) $(CFLAGS) -c $< -o $@
+
+SETTINGS_OBJS = $(OBJ_DIR)/settings_main.o $(OBJ_DIR)/settings_tab_display.o $(OBJ_DIR)/settings_tab_audio.o \
+                $(OBJ_DIR)/settings_tab_theme.o $(OBJ_DIR)/settings_tab_time.o $(OBJ_DIR)/settings_tab_network.o \
+                $(OBJ_DIR)/settings_tab_power.o $(OBJ_DIR)/settings_tab_disks.o $(OBJ_DIR)/settings_tab_security.o \
+                $(OBJ_DIR)/settings_tab_system.o
+
+$(BIN_DIR)/settings.elf: $(SETTINGS_OBJS) libc/libc.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $(SETTINGS_OBJS) libc/libc.a -o $@
 
 # ── azwm.elf (window manager + compositor + DE extension + desktop) ─────────
 $(OBJ_DIR)/azwm_main.o: apps/azwm/main.c | skeleton
@@ -629,8 +949,9 @@ $(SBIN_DIR)/azwm.elf: $(OBJ_DIR)/azwm_main.o $(OBJ_DIR)/azwm_comp.o $(OBJ_DIR)/a
 # `include` contributes rules, and the first rule make sees sets the default
 # goal — including these any earlier would make a stray .o the default
 # target instead of `apps`/`all`.
-SIMPLE_APP_NAMES := $(notdir $(basename $(SBIN_APPS_SIMPLE) $(BIN_APPS)))
+SIMPLE_APP_NAMES := $(notdir $(basename $(SBIN_APPS_SIMPLE) $(BIN_APPS_SIMPLE)))
 DEPFILES := $(addprefix $(OBJ_DIR)/,$(addsuffix .d,$(SIMPLE_APP_NAMES))) \
+            $(OBJ_DIR)/settings_main.d $(OBJ_DIR)/settings_tab_display.d $(OBJ_DIR)/settings_tab_audio.d $(OBJ_DIR)/settings_tab_theme.d $(OBJ_DIR)/settings_tab_time.d $(OBJ_DIR)/settings_tab_network.d $(OBJ_DIR)/settings_tab_power.d $(OBJ_DIR)/settings_tab_disks.d $(OBJ_DIR)/settings_tab_security.d $(OBJ_DIR)/settings_tab_system.d \
             $(OBJ_DIR)/azwm_main.d $(OBJ_DIR)/azwm_comp.d $(OBJ_DIR)/azwm_de.d $(OBJ_DIR)/azwm_desk.d
 -include $(DEPFILES)
 
@@ -638,4 +959,5 @@ DEPFILES := $(addprefix $(OBJ_DIR)/,$(addsuffix .d,$(SIMPLE_APP_NAMES))) \
 
 clean:
 	$(MAKE) -C libc clean
+	$(MAKE) -C libgame clean
 	rm -rf $(BUILD_DIR)

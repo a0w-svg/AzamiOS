@@ -66,11 +66,18 @@ void vsyslog(int priority, const char *format, va_list ap)
         strcpy(time_str, "Jan 01 00:00:00");
     }
 
+    /* The real, possibly-renamed hostname (sethostname(2) actually changes
+     * it -- kernel/syscall/syscall.c's g_kernel_nodename), not the boot-time
+     * default baked in here as a literal: a syslog line otherwise keeps
+     * claiming "azamios" forever even after a system is renamed. */
+    char hostname[64] = "azamios";
+    gethostname(hostname, sizeof(hostname));
+
     char line[1200];
     if (s_log_opt & LOG_PID) {
-        snprintf(line, sizeof(line), "%s azamios %s[%d]: %s\n", time_str, s_log_ident, getpid(), msg);
+        snprintf(line, sizeof(line), "%s %s %s[%d]: %s\n", time_str, hostname, s_log_ident, getpid(), msg);
     } else {
-        snprintf(line, sizeof(line), "%s azamios %s: %s\n", time_str, s_log_ident, msg);
+        snprintf(line, sizeof(line), "%s %s %s: %s\n", time_str, hostname, s_log_ident, msg);
     }
 
     if (s_log_file) {

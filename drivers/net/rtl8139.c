@@ -291,9 +291,19 @@ static int rtl8139_probe(dm_device_t *dm, const pci_device_id_t *id)
     /* Power on: write 0x00 to Config1 */
     outb(io_base + REG_CONFIG1, 0x00);
 
-    /* Software reset */
+    /* Software reset. Bounded: a card that never clears the reset bit —
+     * wrong BAR, dead device, an I/O port that reads back 0xFF — used to
+     * hang the boot in this loop. Give up and let probing continue without
+     * this NIC instead. */
     outb(io_base + REG_CR, 0x10);
-    while (inb(io_base + REG_CR) & 0x10) cpu_pause();
+    {
+        int timeout = 1000000;
+        while ((inb(io_base + REG_CR) & 0x10) && --timeout > 0) cpu_pause();
+        if (timeout <= 0) {
+            pr_debug("[RTL8139] Software reset timed out; abandoning device\n");
+            return -EIO;
+        }
+    }
 
     /* Read MAC address */
     for (int i = 0; i < 6; i++) {

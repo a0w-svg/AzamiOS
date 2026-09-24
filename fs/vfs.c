@@ -6,6 +6,7 @@
 #define DEBUG 1
 #include <azami/debug.h>
 #include "vfs.h"
+#include "namespace.h"
 #include "../kernel/mm/kmalloc.h"
 #include "../kernel/lib/string.h"
 #include "../arch/x86_64/cpu/spinlock.h"
@@ -232,6 +233,25 @@ dentry_t *dcache_lookup(dentry_t *parent, const char *name)
  * Filesystem Registration & Mounting
  * -------------------------------------------------------------------------- */
 
+/* vfs_format_filesystems() — /proc/filesystems, built from the registry
+ * rather than from a hard-coded list that drifts the moment a filesystem is
+ * added. The leading "nodev" column means the filesystem needs no backing
+ * block device; each filesystem declares that for itself through
+ * FS_REQUIRES_DEV in its file_system_type_t. */
+size_t vfs_format_filesystems(char *buf, size_t max)
+{
+    if (!buf || max == 0) return 0;
+    size_t off = 0;
+    spinlock_lock(&g_vfs_lock);
+    for (file_system_type_t *f = g_fs_types; f && off + 1 < max; f = f->next) {
+        off += (size_t)scnprintf(buf + off, max - off, "%s\t%s\n",
+                                 (f->fs_flags & FS_REQUIRES_DEV) ? "" : "nodev",
+                                 f->name);
+    }
+    spinlock_unlock(&g_vfs_lock);
+    return off;
+}
+
 s64 vfs_register_fs(file_system_type_t *fs)
 {
     spinlock_lock(&g_vfs_lock);
@@ -268,27 +288,67 @@ file_system_type_t *vfs_find_fs(const char *name)
     return NULL;
 }
 
-s64 vfs_mount(const char *source, const char *target, const char *fstype, void *data)
+/* vfs_mount() and vfs_umount() live in fs/namespace.c — attaching a
+ * filesystem is only half the job, and the half that makes umount(2) and
+ * /proc/mounts work needs the mount table that file owns.
+ *
+ * What stays here is the dcache surgery a mount performs.  Covering a
+ * directory has to make every name cached underneath it stop resolving,
+ * without destroying those dentries: umount has to put them back.  Unlinking
+ * the subtree from the hash while leaving the d_subdirs/d_sibling chains
+ * intact does exactly that — dcache_lookup() searches the hash, so an
+ * unhashed dentry is invisible, and the chain is still there to re-hash. */
+
+/* Bounded because the walk recurses: a dentry tree is user-controlled and
+ * deep enough nesting would otherwise run the 16 KB kernel stack into its
+ * guard page. Anything below this depth is already unreachable by name for
+ * the same reason vfs_path_lookup() stops there. */
+#define DCACHE_WALK_MAX_DEPTH  64
+
+static void dcache_subtree_walk(dentry_t *d, bool hash, int depth)
 {
-    file_system_type_t *fs = vfs_find_fs(fstype);
-    if (!fs) return -(s64)ENODEV;
-    if (!fs->mount) return -(s64)EINVAL;
-    
-    return fs->mount(fs, source, target, data);
+    if (depth >= DCACHE_WALK_MAX_DEPTH) return;
+    for (dentry_t *child = d->d_subdirs; child; child = child->d_sibling) {
+        u32 bucket = dcache_hash_fn(child->d_parent, child->d_name);
+        if (hash) {
+            /* Do not double-insert if it is somehow already linked. */
+            bool present = false;
+            for (dentry_t *e = g_dcache_hash[bucket]; e; e = e->d_hash_next) {
+                if (e == child) { present = true; break; }
+            }
+            if (!present && child->d_inode) {
+                child->d_hash_next = g_dcache_hash[bucket];
+                g_dcache_hash[bucket] = child;
+            }
+        } else {
+            dentry_t **hc = &g_dcache_hash[bucket];
+            while (*hc) {
+                if (*hc == child) { *hc = child->d_hash_next; child->d_hash_next = NULL; break; }
+                hc = &(*hc)->d_hash_next;
+            }
+        }
+        dcache_subtree_walk(child, hash, depth + 1);
+    }
 }
 
-s64 vfs_umount(const char *target, int flags)
+/* dcache_unhash_subtree() — make everything cached below @root unreachable
+ * by name, keeping the tree itself intact. @root stays hashed: it is the
+ * mountpoint, and the path to it must keep resolving. */
+void dcache_unhash_subtree(dentry_t *root)
 {
-    (void)flags;
-    if (!target || !target[0]) return -(s64)EINVAL;
-    dentry_t *dentry = NULL;
-    s64 err = vfs_path_lookup(target, &dentry);
-    if (err < 0 || !dentry) return -(s64)ENOENT;
-    if (!dentry->d_inode || !S_ISDIR(dentry->d_inode->i_mode)) return -(s64)ENOTDIR;
-    /* No real detach yet — at least make sure the volume's data is on disk so
-     * a umount followed by poweroff does not lose the last few writes. */
-    vfs_sync_all();
-    return 0;
+    if (!root) return;
+    spinlock_lock(&g_vfs_lock);
+    dcache_subtree_walk(root, false, 0);
+    spinlock_unlock(&g_vfs_lock);
+}
+
+/* dcache_rehash_subtree() — the inverse, for umount. */
+void dcache_rehash_subtree(dentry_t *root)
+{
+    if (!root) return;
+    spinlock_lock(&g_vfs_lock);
+    dcache_subtree_walk(root, true, 0);
+    spinlock_unlock(&g_vfs_lock);
 }
 
 void vfs_sync_all(void)
@@ -384,7 +444,10 @@ void vfs_init(void)
     
     sb->s_root = root_dentry;
     g_vfs_root = root_dentry;
-    
+
+    extern void mnt_init(void);
+    mnt_init();
+
     pr_debug("[VFS] Initialized dummy rootfs.\n");
 }
 
@@ -721,6 +784,14 @@ file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno)
     }
 
     if (err == -(s64)ENOENT && dentry && (flags & O_CREAT)) {
+        /* Creating on a read-only mount is EROFS, not ENOENT — a program
+         * that gets ENOENT back from O_CREAT concludes the *directory* is
+         * missing and goes looking for the wrong problem. */
+        if (dentry->d_parent && inode_is_rdonly(dentry->d_parent->d_inode)) {
+            if (!dentry->d_inode) kfree(dentry);
+            if (out_errno) *out_errno = -(s64)EROFS;
+            return NULL;
+        }
         if (!dentry->d_parent || !dentry->d_parent->d_inode || !dentry->d_parent->d_inode->i_op || !dentry->d_parent->d_inode->i_op->create) {
             if (!dentry->d_inode) kfree(dentry);
             if (out_errno) *out_errno = -(s64)ENOENT;
@@ -749,6 +820,22 @@ file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno)
         if (out_errno) *out_errno = -(s64)EISDIR;
         return NULL;
     }
+    /* MS_RDONLY: opening for write has to fail here rather than at the first
+     * write(2), because that is where every program checks. */
+    if (((flags & 3) == O_WRONLY || (flags & 3) == O_RDWR || (flags & O_TRUNC))
+        && inode_is_rdonly(dentry->d_inode)) {
+        if (out_errno) *out_errno = -(s64)EROFS;
+        return NULL;
+    }
+    /* MS_NODEV: a device node on this mount is just a file — opening it must
+     * not reach the driver. This is the flag that makes a user-supplied
+     * filesystem safe to mount, so it is not optional. */
+    if ((S_ISCHR(dentry->d_inode->i_mode) || S_ISBLK(dentry->d_inode->i_mode))
+        && dentry->d_inode->i_sb
+        && (dentry->d_inode->i_sb->s_flags & (1u << 2) /* MS_NODEV */)) {
+        if (out_errno) *out_errno = -(s64)EACCES;
+        return NULL;
+    }
     
     file_t *f = (file_t *)kzalloc(sizeof(file_t));
     if (!f) { if (out_errno) *out_errno = -(s64)ENOMEM; return NULL; }
@@ -760,6 +847,32 @@ file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno)
     f->f_mode   = mode;
     f->f_pos    = (flags & O_APPEND) ? dentry->d_inode->i_size : 0;
     f->f_count  = 1;
+
+    /* A character or block device node is a reference to a driver, wherever
+     * the node itself is stored. Resolve it through the driver registry:
+     *
+     *  - It gives a node created by mknod(2) on ext2 or tmpfs the driver's
+     *    fops, which its own filesystem's i_fop could never be.
+     *  - It hands the driver the private pointer it registered. Nothing ever
+     *    did that before, so a driver with no ->open of its own — the block
+     *    layer, the UART, the parallel port, the loop devices — read
+     *    filp->private_data and got NULL on every call, which is why
+     *    /dev/sda, /dev/ttyS0, /dev/lp0 and /dev/loopN had never worked
+     *    through their nodes.
+     *
+     * Done before ->open runs, so a driver that wants private_data to be
+     * something else is still free to overwrite it (i2c-dev, fbdev and the
+     * DRM nodes all do). A node whose number no driver claims keeps the
+     * filesystem's own fops and gets no private pointer, which is the
+     * right answer for a dangling /dev entry. */
+    if (S_ISCHR(dentry->d_inode->i_mode) || S_ISBLK(dentry->d_inode->i_mode)) {
+        file_operations_t *dfops = NULL;
+        void *dpriv = NULL;
+        if (devfs_lookup_rdev(dentry->d_inode->i_rdev, &dfops, &dpriv) == 0) {
+            if (dfops) f->f_op = dfops;
+            f->private_data = dpriv;
+        }
+    }
 
     if ((flags & O_TRUNC) && ((flags & 3) == O_WRONLY || (flags & 3) == O_RDWR) && S_ISREG(dentry->d_inode->i_mode)) {
         vfs_truncate(f, 0);
@@ -822,7 +935,11 @@ s64 vfs_read(file_t *file, void *buf, size_t size)
 {
     if (!is_valid_vfs_file(file) || !buf) return -(s64)EBADF;
     if (is_valid_vfs_fop(file->f_op) && file->f_op->read) {
-        return file->f_op->read(file, buf, size, &file->f_pos);
+        s64 ret = file->f_op->read(file, buf, size, &file->f_pos);
+        if (ret > 0) {
+            vfs_notify_event(file->f_inode, 0x00000001 /* FAN_ACCESS */);
+        }
+        return ret;
     }
     return -(s64)EINVAL;
 }
@@ -830,11 +947,16 @@ s64 vfs_read(file_t *file, void *buf, size_t size)
 s64 vfs_write(file_t *file, const void *buf, size_t size)
 {
     if (!is_valid_vfs_file(file) || !buf) return -(s64)EBADF;
+    if (inode_is_rdonly(file->f_inode)) return -(s64)EROFS;
     if (file->f_flags & O_APPEND && file->f_inode) {
         file->f_pos = file->f_inode->i_size;
     }
     if (is_valid_vfs_fop(file->f_op) && file->f_op->write) {
-        return file->f_op->write(file, buf, size, &file->f_pos);
+        s64 ret = file->f_op->write(file, buf, size, &file->f_pos);
+        if (ret > 0) {
+            vfs_notify_event(file->f_inode, 0x00000002 /* FAN_MODIFY */);
+        }
+        return ret;
     }
     return -(s64)EINVAL;
 }
@@ -947,6 +1069,10 @@ s64 vfs_mkdir(const char *path, u32 mode)
     dentry_t *dentry = NULL;
     s64 err = vfs_path_lookup(path, &dentry);
     if (err == -(s64)ENOENT && dentry) {
+        if (dentry->d_parent && inode_is_rdonly(dentry->d_parent->d_inode)) {
+            if (!dentry->d_inode) kfree(dentry);
+            return -(s64)EROFS;
+        }
         if (!dentry->d_parent || !dentry->d_parent->d_inode ||
             !dentry->d_parent->d_inode->i_op || !dentry->d_parent->d_inode->i_op->mkdir) {
             if (!dentry->d_inode) kfree(dentry);
@@ -967,6 +1093,59 @@ s64 vfs_mkdir(const char *path, u32 mode)
     return err;
 }
 
+/* vfs_mknod() — back mknod(2)/mknodat(2) for every node type.
+ *
+ * mknod(2) used to answer -EPERM for anything but a regular file or a FIFO,
+ * because there was no filesystem operation that could make a device node.
+ * With ->mknod in place this creates whatever was asked for; a filesystem
+ * that still has no ->mknod falls back to ->create for the two types that
+ * are indistinguishable from a regular file on disk.
+ */
+s64 vfs_mknod(const char *path, u32 mode, u64 rdev)
+{
+    u32 fmt = mode & S_IFMT;
+    if (fmt == 0) fmt = S_IFREG;
+    if (fmt != S_IFREG && fmt != S_IFCHR && fmt != S_IFBLK &&
+        fmt != S_IFIFO && fmt != S_IFSOCK)
+        return -(s64)EINVAL;
+
+    dentry_t *dentry = NULL;
+    s64 err = vfs_path_lookup_nofollow(path, &dentry);
+    if (err == 0) {
+        return -(s64)EEXIST;
+    }
+    if (err != -(s64)ENOENT || !dentry) {
+        if (dentry && !dentry->d_inode) kfree(dentry);
+        return err;
+    }
+    if (!dentry->d_parent || !dentry->d_parent->d_inode) {
+        kfree(dentry);
+        return -(s64)ENOENT;
+    }
+    if (inode_is_rdonly(dentry->d_parent->d_inode)) {
+        kfree(dentry);
+        return -(s64)EROFS;
+    }
+
+    inode_operations_t *iop = dentry->d_parent->d_inode->i_op;
+    if (iop && iop->mknod) {
+        err = iop->mknod(dentry->d_parent->d_inode, dentry, mode, rdev);
+    } else if (iop && iop->create && (fmt == S_IFREG || fmt == S_IFIFO)) {
+        err = iop->create(dentry->d_parent->d_inode, dentry, mode & 07777);
+        if (err == 0 && dentry->d_inode)
+            dentry->d_inode->i_mode = fmt | (mode & 07777);
+    } else {
+        err = -(s64)EPERM;
+    }
+
+    if (err < 0) {
+        if (!dentry->d_inode) kfree(dentry);
+        return err;
+    }
+    dcache_add(dentry);
+    return 0;
+}
+
 s64 vfs_unlink(const char *path)
 {
     dentry_t *dentry = NULL;
@@ -985,6 +1164,7 @@ s64 vfs_unlink(const char *path)
     if (S_ISDIR(dentry->d_inode->i_mode)) {
         return -(s64)EISDIR;
     }
+    if (inode_is_rdonly(dentry->d_inode)) return -(s64)EROFS;
     if (!dentry->d_parent || !dentry->d_parent->d_inode ||
         !dentry->d_parent->d_inode->i_op || !dentry->d_parent->d_inode->i_op->unlink) {
         return -(s64)EPERM;
@@ -1014,6 +1194,14 @@ s64 vfs_rmdir(const char *path)
     if (!S_ISDIR(dentry->d_inode->i_mode)) {
         return -(s64)ENOTDIR;
     }
+    if (inode_is_rdonly(dentry->d_inode)) return -(s64)EROFS;
+    /* A directory that something is mounted on cannot be removed — the
+     * mount would be left pointing at a name that no longer exists. */
+    {
+        char mp[512];
+        dentry_build_path(dentry, mp, sizeof(mp));
+        if (mnt_find_by_path(mp)) return -(s64)EBUSY;
+    }
     if (!dentry->d_parent || !dentry->d_parent->d_inode ||
         !dentry->d_parent->d_inode->i_op || !dentry->d_parent->d_inode->i_op->rmdir) {
         return -(s64)EPERM;
@@ -1039,7 +1227,13 @@ s64 vfs_rename(const char *oldpath, const char *newpath)
         return err;
     }
     if (!new_dentry) return -(s64)ENOENT;
-    
+
+    if (inode_is_rdonly(old_dentry->d_inode) ||
+        (new_dentry->d_parent && inode_is_rdonly(new_dentry->d_parent->d_inode))) {
+        if (!new_dentry->d_inode) kfree(new_dentry);
+        return -(s64)EROFS;
+    }
+
     if (!old_dentry->d_parent || !old_dentry->d_parent->d_inode ||
         !old_dentry->d_parent->d_inode->i_op || !old_dentry->d_parent->d_inode->i_op->rename ||
         !new_dentry->d_parent || !new_dentry->d_parent->d_inode) {
@@ -1065,6 +1259,7 @@ s64 vfs_rename(const char *oldpath, const char *newpath)
 s64 vfs_truncate(file_t *file, u64 length)
 {
     if (!file || !file->f_inode) return -(s64)EBADF;
+    if (inode_is_rdonly(file->f_inode)) return -(s64)EROFS;
     if (file->f_inode->i_sb && file->f_inode->i_sb->s_magic == 0x01021994) {
         extern s64 tmpfs_truncate(struct inode *inode, u64 length);
         return tmpfs_truncate(file->f_inode, length);
@@ -1087,6 +1282,10 @@ s64 vfs_symlink(const char *target, const char *linkpath)
     dentry_t *dentry = NULL;
     s64 err = vfs_path_lookup(linkpath, &dentry);
     if (err == -(s64)ENOENT && dentry) {
+        if (dentry->d_parent && inode_is_rdonly(dentry->d_parent->d_inode)) {
+            if (!dentry->d_inode) kfree(dentry);
+            return -(s64)EROFS;
+        }
         if (!dentry->d_parent || !dentry->d_parent->d_inode ||
             !dentry->d_parent->d_inode->i_op || !dentry->d_parent->d_inode->i_op->symlink) {
             if (!dentry->d_inode) kfree(dentry);
@@ -1215,6 +1414,7 @@ s64 vfs_chmod(const char *path, u32 mode)
         if (dentry && !dentry->d_inode) kfree(dentry);
         return -(s64)ENOENT;
     }
+    if (inode_is_rdonly(dentry->d_inode)) return -(s64)EROFS;
     dentry->d_inode->i_mode = (dentry->d_inode->i_mode & S_IFMT) | (mode & ~S_IFMT);
     vfs_sync_inode_metadata(dentry->d_inode);
     return 0;
@@ -1223,6 +1423,7 @@ s64 vfs_chmod(const char *path, u32 mode)
 s64 vfs_fchmod(file_t *file, u32 mode)
 {
     if (!file || !file->f_inode) return -(s64)EBADF;
+    if (inode_is_rdonly(file->f_inode)) return -(s64)EROFS;
     file->f_inode->i_mode = (file->f_inode->i_mode & S_IFMT) | (mode & ~S_IFMT);
     vfs_sync_inode_metadata(file->f_inode);
     return 0;
@@ -1236,6 +1437,7 @@ s64 vfs_chown(const char *path, u32 uid, u32 gid)
         if (dentry && !dentry->d_inode) kfree(dentry);
         return -(s64)ENOENT;
     }
+    if (inode_is_rdonly(dentry->d_inode)) return -(s64)EROFS;
     if (uid != (u32)-1) dentry->d_inode->i_uid = uid;
     if (gid != (u32)-1) dentry->d_inode->i_gid = gid;
     vfs_sync_inode_metadata(dentry->d_inode);
@@ -1250,6 +1452,7 @@ s64 vfs_lchown(const char *path, u32 uid, u32 gid)
         if (dentry && !dentry->d_inode) kfree(dentry);
         return -(s64)ENOENT;
     }
+    if (inode_is_rdonly(dentry->d_inode)) return -(s64)EROFS;
     if (uid != (u32)-1) dentry->d_inode->i_uid = uid;
     if (gid != (u32)-1) dentry->d_inode->i_gid = gid;
     vfs_sync_inode_metadata(dentry->d_inode);
@@ -1259,6 +1462,7 @@ s64 vfs_lchown(const char *path, u32 uid, u32 gid)
 s64 vfs_fchown(file_t *file, u32 uid, u32 gid)
 {
     if (!file || !file->f_inode) return -(s64)EBADF;
+    if (inode_is_rdonly(file->f_inode)) return -(s64)EROFS;
     if (uid != (u32)-1) file->f_inode->i_uid = uid;
     if (gid != (u32)-1) file->f_inode->i_gid = gid;
     vfs_sync_inode_metadata(file->f_inode);
@@ -1282,6 +1486,7 @@ s64 vfs_utimes(const char *path, u64 atime, u64 mtime)
         if (dentry && !dentry->d_inode) kfree(dentry);
         return -(s64)ENOENT;
     }
+    if (inode_is_rdonly(dentry->d_inode)) return -(s64)EROFS;
     if (atime != (u64)-1) dentry->d_inode->i_atime = atime;
     if (mtime != (u64)-1) dentry->d_inode->i_mtime = mtime;
     vfs_sync_inode_metadata(dentry->d_inode);
@@ -1291,6 +1496,7 @@ s64 vfs_utimes(const char *path, u64 atime, u64 mtime)
 s64 vfs_futimes(file_t *file, u64 atime, u64 mtime)
 {
     if (!file || !file->f_inode) return -(s64)EBADF;
+    if (inode_is_rdonly(file->f_inode)) return -(s64)EROFS;
     if (atime != (u64)-1) file->f_inode->i_atime = atime;
     if (mtime != (u64)-1) file->f_inode->i_mtime = mtime;
     vfs_sync_inode_metadata(file->f_inode);
@@ -1308,7 +1514,9 @@ s64 vfs_statfs(const char *path, struct statfs *buf)
     }
     super_block_t *sb = dentry->d_sb;
     if (sb->s_op && sb->s_op->statfs) {
-        return sb->s_op->statfs(sb, buf);
+        s64 r = sb->s_op->statfs(sb, buf);
+        if (r == 0) buf->f_flags = sb->s_flags;
+        return r;
     }
     /* Fallback generic stats */
     __builtin_memset(buf, 0, sizeof(struct statfs));
@@ -1321,6 +1529,7 @@ s64 vfs_statfs(const char *path, struct statfs *buf)
     buf->f_ffree = 32768;
     buf->f_namelen = VFS_NAME_MAX;
     buf->f_frsize = buf->f_bsize;
+    buf->f_flags = sb->s_flags;
     return 0;
 }
 
@@ -1330,7 +1539,9 @@ s64 vfs_fstatfs(file_t *file, struct statfs *buf)
     if (!buf) return -(s64)EINVAL;
     super_block_t *sb = file->f_inode->i_sb;
     if (sb->s_op && sb->s_op->statfs) {
-        return sb->s_op->statfs(sb, buf);
+        s64 r = sb->s_op->statfs(sb, buf);
+        if (r == 0) buf->f_flags = sb->s_flags;
+        return r;
     }
     __builtin_memset(buf, 0, sizeof(struct statfs));
     buf->f_type = sb->s_magic;
@@ -1342,6 +1553,7 @@ s64 vfs_fstatfs(file_t *file, struct statfs *buf)
     buf->f_ffree = 32768;
     buf->f_namelen = VFS_NAME_MAX;
     buf->f_frsize = buf->f_bsize;
+    buf->f_flags = sb->s_flags;
     return 0;
 }
 

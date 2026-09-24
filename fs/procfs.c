@@ -13,6 +13,8 @@
 #include "procfs.h"
 #include "../kernel/ipc/sysvipc.h"
 #include "vfs.h"
+#include "namespace.h"
+#include "../drivers/block/block.h"
 #include "../kernel/mm/kmalloc.h"
 #include "../kernel/mm/pmm.h"
 #include "../kernel/mm/vma.h"
@@ -25,6 +27,8 @@
 #include "../include/azami/tcp.h"
 #include "../include/azami/udp.h"
 #include "../arch/x86_64/cpu/smp.h"
+#include "../arch/x86_64/cpu/topology.h"
+#include "../hal/irq.h"
 #include "../arch/x86_64/cpu/cpu.h"
 #include "../userland/libc/include/sys/dirent.h"
 #include "../arch/x86_64/cpu/hwaccel.h"
@@ -101,6 +105,16 @@ typedef enum {
     PROCFS_TYPE_SECURITY,
     PROCFS_TYPE_MCELOG,
     PROCFS_TYPE_SLABINFO,
+    PROCFS_TYPE_BUDDYINFO,
+
+    /* /proc/irq/<n>/ — per-interrupt-line control, the standard place
+     * userspace sets interrupt affinity (irqbalance and every hand-rolled
+     * "pin the NIC to a core" script write smp_affinity). */
+    PROCFS_TYPE_IRQ_DIR,
+    PROCFS_TYPE_IRQ_LINE_DIR,
+    PROCFS_TYPE_IRQ_SMP_AFFINITY,
+    PROCFS_TYPE_IRQ_SMP_AFFINITY_LIST,
+    PROCFS_TYPE_IRQ_EFFECTIVE_AFFINITY,
 
     /* Security sysctl endpoints */
     PROCFS_TYPE_SYS_KERNEL_DMESG_RESTRICT,
@@ -110,6 +124,27 @@ typedef enum {
     PROCFS_TYPE_SYS_KERNEL_YAMA_PTRACE_SCOPE,
     PROCFS_TYPE_SYS_FS_PROTECTED_HARDLINKS,
     PROCFS_TYPE_SYS_FS_PROTECTED_SYMLINKS,
+
+    /* /proc/<pid>/limits and /proc/<pid>/io */
+    PROCFS_TYPE_PID_LIMITS,
+    PROCFS_TYPE_MOUNTINFO,
+    PROCFS_TYPE_PID_IO,
+
+    /* /proc/sys/vm — overcommit and writeback tuning knobs */
+    PROCFS_TYPE_SYS_VM_DIR,
+    PROCFS_TYPE_SYS_VM_OVERCOMMIT_MEMORY,
+    PROCFS_TYPE_SYS_VM_OVERCOMMIT_RATIO,
+    PROCFS_TYPE_SYS_VM_DIRTY_RATIO,
+    PROCFS_TYPE_SYS_VM_DIRTY_BACKGROUND_RATIO,
+    PROCFS_TYPE_SYS_VM_SWAPPINESS,
+    PROCFS_TYPE_SYS_VM_VFS_CACHE_PRESSURE,
+    PROCFS_TYPE_SYS_VM_MIN_FREE_KBYTES,
+    PROCFS_TYPE_SYS_VM_MMAP_MIN_ADDR,
+    PROCFS_TYPE_SYS_VM_PANIC_ON_OOM,
+    PROCFS_TYPE_SYS_VM_NR_HUGEPAGES,
+
+    /* /proc/net/unix */
+    PROCFS_TYPE_NET_UNIX,
 } procfs_node_type_t;
 
 typedef struct {
@@ -251,8 +286,10 @@ static s64 procfs_readlink(struct dentry *dentry, char *buf, size_t bufsiz)
 
 static size_t format_proc_version(char *buf, size_t max)
 {
+    /* Must match /proc/version format Linux programs expect:
+     * "Linux version <release> (<compiler>) <buildinfo>" */
     return (size_t)scnprintf(buf, max,
-        "AzamiOS version 7.0.0-posix (x86_64-elf-gcc) #1 SMP Limine 2026\n");
+        "Linux version 6.1.0-azami (x86_64-elf-gcc) #1 SMP AzamiOS 2026\n");
 }
 
 static size_t format_proc_uptime(char *buf, size_t max)
@@ -293,6 +330,32 @@ static size_t format_proc_meminfo(char *buf, size_t max)
         (unsigned long long)free_kb, (unsigned long long)used_kb,
         (unsigned long long)slab_kb, (unsigned long long)slab_kb,
         (unsigned long long)large_kb);
+}
+
+/* /proc/buddyinfo — free block counts per order, per zone. Same shape as
+ * Linux's: one row per zone, one column per buddy order starting at order 0,
+ * so the usual "is memory fragmented?" read (lots of low orders, nothing high)
+ * works with the tools people already have. This kernel has a single NUMA
+ * node, so the node column is always 0.
+ *
+ * Linux prints MAX_ORDER columns; ours is PMM_MAX_ORDER + 1 = 19, because this
+ * allocator tracks blocks all the way up to a 1 GB huge frame. */
+static size_t format_proc_buddyinfo(char *buf, size_t max)
+{
+    pmm_zone_stat_t zs[PMM_ZONE_COUNT];
+    int n = pmm_zone_stats(zs, PMM_ZONE_COUNT);
+
+    size_t off = 0;
+    for (int i = 0; i < n && off < max; i++) {
+        off += (size_t)scnprintf(buf + off, max - off, "Node 0, zone %8s",
+                                 zs[i].name);
+        for (u32 o = 0; o < PMM_ORDER_COUNT && off < max; o++)
+            off += (size_t)scnprintf(buf + off, max - off, " %6llu",
+                                     (unsigned long long)zs[i].blocks[o]);
+        if (off < max)
+            off += (size_t)scnprintf(buf + off, max - off, "\n");
+    }
+    return off;
 }
 
 /* /proc/slabinfo — one row per kmalloc size class. Close enough to Linux's
@@ -384,11 +447,20 @@ static size_t format_proc_cpuinfo(char *buf, size_t max)
     u32 mhz_frac   = g_cpu_info.tsc_khz ? g_cpu_info.tsc_khz % 1000 : 0;
     u32 cache_kb   = g_cpu_info.cache_l3_kb ? g_cpu_info.cache_l3_kb
                    : g_cpu_info.cache_l2_kb ? g_cpu_info.cache_l2_kb : 4096;
-    u32 siblings   = cpu_count;
-    u32 cores      = g_cpu_info.cores_per_package ? g_cpu_info.cores_per_package : cpu_count;
-    if (cores > cpu_count) cores = cpu_count;
+    /* Topology, from the decoded APIC IDs rather than from CPUID's
+     * per-package maxima. The difference matters: cores_per_package reports
+     * what the silicon can hold, so on a VM given two vCPUs of an eight-core
+     * part it reads 8, and "cpu cores: 8" on a two-CPU machine is what makes
+     * OpenMP and every thread-pool sizing heuristic get it wrong. */
+    u32 nr_pkgs    = topology_nr_packages();
+    u32 nr_cores   = topology_nr_cores();
+    u32 siblings   = nr_pkgs ? (cpu_count / nr_pkgs) : cpu_count;
+    u32 cores      = nr_pkgs ? (nr_cores / nr_pkgs) : nr_cores;
+    if (siblings == 0) siblings = 1;
+    if (cores == 0) cores = 1;
 
     for (u32 i = 0; i < cpu_count; i++) {
+        const cpu_topology_t *topo = topology_of(i);
         off += scnprintf(buf + off, max > off ? max - off : 0,
             "processor       : %u\n"
             "vendor_id       : %s\n"
@@ -398,11 +470,12 @@ static size_t format_proc_cpuinfo(char *buf, size_t max)
             "stepping        : %u\n"
             "cpu MHz         : %u.%03u\n"
             "cache size      : %u KB\n"
-            "physical id     : 0\n"
+            "physical id     : %u\n"
             "siblings        : %u\n"
             "core id         : %u\n"
             "cpu cores       : %u\n"
             "apicid          : %u\n"
+            "initial apicid  : %u\n"
             "fpu             : yes\n"
             "fpu_exception   : yes\n"
             "cpuid level     : %u\n"
@@ -419,7 +492,12 @@ static size_t format_proc_cpuinfo(char *buf, size_t max)
             i, vendor, g_cpu_info.family, g_cpu_info.model,
             model, g_cpu_info.stepping,
             mhz, mhz_frac, cache_kb,
-            siblings, cores ? i % cores : 0, cores, i,
+            topo ? topo->package_id : 0,
+            siblings,
+            topo ? topo->core_id : (cores ? i % cores : 0),
+            cores,
+            topo ? topo->apic_id : smp_cpu_apic_id(i),
+            topo ? topo->apic_id : smp_cpu_apic_id(i),
             g_cpu_info.max_leaf,
             flags_str, bugs_str,
             g_cpu_info.clflush_size, g_cpu_info.clflush_size,
@@ -453,6 +531,12 @@ static size_t format_proc_stat(char *buf, size_t max)
             i, (unsigned long long)sched_get_active_ticks(i),
             (unsigned long long)sched_get_idle_ticks(i));
     }
+
+    /* Real context-switch count (see sched_post_switch() in
+     * kernel/sched/sched.c) -- vmstat.elf used to print a fixed "250" here
+     * instead of reading it. */
+    off += scnprintf(buf + off, max > off ? max - off : 0,
+        "ctxt %llu\n", (unsigned long long)sched_get_context_switches());
     return off;
 }
 
@@ -491,31 +575,45 @@ static size_t format_proc_loadavg(char *buf, size_t max)
         p = p->next;
     }
     sched_unlock();
-    return (size_t)scnprintf(buf, max, "0.12 0.08 0.03 %u/%u 12\n", running_threads, total_threads ? total_threads : 1);
+
+    /* Real 1/5/15-minute averages, sampled every 5s off the scheduler tick
+     * (see sched_sample_load() in kernel/sched/sched.c) -- this used to be a
+     * fixed "0.12 0.08 0.03" that never changed regardless of actual load.
+     * Formatted with plain integer division rather than %f: this kernel
+     * builds with -mno-sse/-mno-sse2 and nothing else here ever passes a
+     * float through kprintf/scnprintf. Q11 fixed-point -> "whole.hundredths"
+     * needs only a divide and a mod. */
+    u32 load_fixed[3];
+    sched_get_loadavg(load_fixed);
+    u32 l1_int  = load_fixed[0] / 2048, l1_frac  = (load_fixed[0] % 2048) * 100 / 2048;
+    u32 l5_int  = load_fixed[1] / 2048, l5_frac  = (load_fixed[1] % 2048) * 100 / 2048;
+    u32 l15_int = load_fixed[2] / 2048, l15_frac = (load_fixed[2] % 2048) * 100 / 2048;
+
+    return (size_t)scnprintf(buf, max, "%u.%02u %u.%02u %u.%02u %u/%u %u\n",
+             l1_int, l1_frac, l5_int, l5_frac, l15_int, l15_frac,
+             running_threads, total_threads ? total_threads : 1,
+             sched_get_last_pid());
 }
 
+/* /proc/mounts, /proc/<pid>/mountinfo and /proc/filesystems all used to be
+ * fixed strings describing the boot-time layout, so anything a program
+ * mounted or unmounted afterwards was invisible to `df`, `mount`, `findmnt`
+ * and every "is this path on its own filesystem" check. All three now come
+ * from the live mount table (fs/namespace.c) and the filesystem registry
+ * (fs/vfs.c). */
 static size_t format_proc_mounts(char *buf, size_t max)
 {
-    return (size_t)scnprintf(buf, max,
-        "/dev/sata0p2 / ext2 rw,relatime 0 0\n"
-        "/dev/sata0p1 /boot ext2 rw,relatime 0 0\n"
-        "proc /proc procfs rw,nosuid,nodev,noexec,relatime 0 0\n"
-        "dev /dev devfs rw,nosuid,relatime 0 0\n"
-        "sys /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
-        "devpts /dev/pts devpts rw,nosuid,noexec,relatime 0 0\n"
-        "tmpfs /tmp tmpfs rw,nosuid,nodev,relatime 0 0\n");
+    return mnt_format_mounts(buf, max);
+}
+
+static size_t format_proc_mountinfo(char *buf, size_t max)
+{
+    return mnt_format_mountinfo(buf, max);
 }
 
 static size_t format_proc_filesystems(char *buf, size_t max)
 {
-    return (size_t)scnprintf(buf, max,
-        "nodev\tdevfs\n"
-        "nodev\tprocfs\n"
-        "nodev\tsysfs\n"
-        "nodev\tdevpts\n"
-        "nodev\ttmpfs\n"
-        "\text2\n"
-        "\tfat32\n");
+    return vfs_format_filesystems(buf, max);
 }
 
 static size_t format_proc_cmdline(char *buf, size_t max)
@@ -564,47 +662,96 @@ static size_t format_proc_devices(char *buf, size_t max)
         " 65 sd\n");
 }
 
+/*
+ * /proc/interrupts — real counts, from hal/irq.c's per-line counters and the
+ * per-CPU IPI counters in cpu_info_t.
+ *
+ * This file used to be a fabrication: eight hard-coded IO-APIC lines whose
+ * "counts" were arithmetic on the tick counter (ticks/10 + 15 for the
+ * keyboard, and so on). It looked exactly like real telemetry, which made it
+ * worse than printing nothing — the numbers moved, so nothing suggested they
+ * were not measurements, and anything reading them to find a stuck or storming
+ * interrupt was being actively misled.
+ *
+ * A line's count is shown in the column of the CPU it is routed to, because
+ * that is where every one of its interrupts was actually taken: a line has one
+ * destination at a time (see hal_irq_set_affinity). The IPI rows below are
+ * genuinely per-CPU.
+ */
+static const char *irq_line_name(u32 irq)
+{
+    /* The fixed ISA assignments. Anything above 15 is a PCI GSI, whose owner
+     * this layer does not record — the device name belongs to the driver that
+     * claimed the vector, and nothing plumbs it down here. */
+    static const char *isa[16] = {
+        "timer", "i8042", "cascade", "ttyS1", "ttyS0", "lpt2", "fd0", "lpt1",
+        "rtc0", "acpi", NULL, NULL, "i8042", "fpu", "ata1", "ata2",
+    };
+    if (irq < 16 && isa[irq]) return isa[irq];
+    return "PCI";
+}
+
 static size_t format_proc_interrupts(char *buf, size_t max)
 {
-    u64 ticks = sched_get_ticks();
     u32 cpu_count = smp_cpu_count();
     if (cpu_count == 0) cpu_count = 1;
+    if (cpu_count > SMP_MAX_CPUS) cpu_count = SMP_MAX_CPUS;
 
     size_t off = 0;
     off += scnprintf(buf + off, max > off ? max - off : 0, "           ");
     for (u32 i = 0; i < cpu_count; i++) {
-        off += scnprintf(buf + off, max > off ? max - off : 0, "CPU%u       ", i);
+        off += scnprintf(buf + off, max > off ? max - off : 0, "CPU%-8u", i);
     }
     off += scnprintf(buf + off, max > off ? max - off : 0, "\n");
 
-    off += scnprintf(buf + off, max > off ? max - off : 0,
-        "  0: %10llu   IO-APIC   2-edge      timer\n"
-        "  1: %10llu   IO-APIC   1-edge      i8042 (keyboard)\n"
-        "  4: %10llu   IO-APIC   4-edge      ttyS0 (serial)\n"
-        "  8: %10llu   IO-APIC   8-edge      rtc0\n"
-        "  9: %10llu   IO-APIC   9-fasteoi   acpi\n"
-        " 11: %10llu   IO-APIC  11-fasteoi   e1000, ac97, snd_hda_intel\n"
-        " 14: %10llu   IO-APIC  14-edge      ata_piix\n"
-        " 15: %10llu   IO-APIC  15-edge      ata_piix\n",
-        (unsigned long long)ticks,
-        (unsigned long long)(ticks / 10 + 15),
-        (unsigned long long)(ticks / 5 + 42),
-        (unsigned long long)(ticks / 100 + 1),
-        (unsigned long long)1,
-        (unsigned long long)(ticks / 8 + 128),
-        (unsigned long long)(ticks / 20 + 3),
-        (unsigned long long)0);
+    for (u32 irq = 0; irq < HAL_NR_IRQS; irq++) {
+        if (!hal_irq_is_routed((u8)irq)) continue;
+
+        u64 count = hal_irq_count((u8)irq);
+        u32 target = hal_irq_get_affinity((u8)irq);
+
+        off += scnprintf(buf + off, max > off ? max - off : 0, "%3u:", irq);
+        for (u32 c = 0; c < cpu_count; c++) {
+            off += scnprintf(buf + off, max > off ? max - off : 0, "%11llu",
+                             (unsigned long long)(c == target ? count : 0));
+        }
+        off += scnprintf(buf + off, max > off ? max - off : 0,
+                         "   IO-APIC  %2u-edge      %s\n", irq, irq_line_name(irq));
+    }
+
+    /* Inter-processor interrupts, named the way Linux names them so the same
+     * eyes and the same scripts read them. */
+    struct { const char *tag, *desc; size_t field; } ipi_rows[] = {
+        { "LOC", "Local timer interrupts",  __builtin_offsetof(cpu_info_t, ticks)        },
+        { "RES", "Rescheduling interrupts", __builtin_offsetof(cpu_info_t, ipis_resched) },
+        { "CAL", "Function call interrupts",__builtin_offsetof(cpu_info_t, ipis_call)    },
+        { "TLB", "TLB shootdowns",          __builtin_offsetof(cpu_info_t, ipis_tlb)     },
+    };
+
+    for (u32 r = 0; r < sizeof(ipi_rows) / sizeof(ipi_rows[0]); r++) {
+        off += scnprintf(buf + off, max > off ? max - off : 0, "%s:", ipi_rows[r].tag);
+        for (u32 c = 0; c < cpu_count; c++) {
+            cpu_info_t *ci = smp_cpu_info(c);
+            u64 v = 0;
+            if (ci) v = *(u64 *)((u8 *)ci + ipi_rows[r].field);
+            off += scnprintf(buf + off, max > off ? max - off : 0, "%11llu",
+                             (unsigned long long)v);
+        }
+        off += scnprintf(buf + off, max > off ? max - off : 0, "   %s\n",
+                         ipi_rows[r].desc);
+    }
+
     return off;
 }
 
+/* /proc/partitions, from the block registry rather than a fixed four-line
+ * fiction. #blocks is in 1 KiB units, the way every parser of this file
+ * (fdisk, parted, blkid, mkfs, lsblk's fallback path) reads it. */
 static size_t format_proc_partitions(char *buf, size_t max)
 {
-    return (size_t)scnprintf(buf, max,
-        "major minor  #blocks  name\n\n"
-        "   8        0    2097152 sda\n"
-        "   8        1    2096128 sda1\n"
-        "   7        0     204800 loop0\n"
-        "   1        0     204800 ram0\n");
+    size_t off = (size_t)scnprintf(buf, max, "major minor  #blocks  name\n\n");
+    off += block_format_proc_partitions(buf + off, max - off);
+    return off;
 }
 
 static size_t format_proc_swaps(char *buf, size_t max)
@@ -635,6 +782,8 @@ static void maps_emit_vma(const vm_area_t *v, void *pv)
     struct maps_ctx *c = (struct maps_ctx *)pv;
     const char *tag = "";
     if (v->flags & VMA_F_STACK)      tag = "[stack]";
+    else if (v->flags & VMA_F_VDSO)  tag = "[vdso]";
+    else if (v->flags & VMA_F_VVAR)  tag = "[vvar]";
     else if (v->flags & VMA_F_FILE)  tag = c->name;
     maps_emit_line(c,
         v->start, v->end,
@@ -808,6 +957,8 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 113, S_IFREG | 0444, PROCFS_TYPE_DEVICES, 0);
         } else if (strcmp(name, "interrupts") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 114, S_IFREG | 0444, PROCFS_TYPE_INTERRUPTS, 0);
+        } else if (strcmp(name, "irq") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 190, S_IFDIR | 0555, PROCFS_TYPE_IRQ_DIR, 0);
         } else if (strcmp(name, "partitions") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 115, S_IFREG | 0444, PROCFS_TYPE_PARTITIONS, 0);
         } else if (strcmp(name, "swaps") == 0) {
@@ -820,8 +971,14 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 123, S_IFREG | 0444, PROCFS_TYPE_MCELOG, 0);
         } else if (strcmp(name, "slabinfo") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 124, S_IFREG | 0444, PROCFS_TYPE_SLABINFO, 0);
+        } else if (strcmp(name, "buddyinfo") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 126, S_IFREG | 0444, PROCFS_TYPE_BUDDYINFO, 0);
         } else if (strcmp(name, "self") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 117, S_IFLNK | 0777, PROCFS_TYPE_SELF_SYMLINK, 0);
+        } else if (strcmp(name, "thread-self") == 0) {
+            /* /proc/thread-self is a symlink to /proc/<pid>/task/<tid>.
+             * We have a single-thread-per-process model, so thread-self == self. */
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 125, S_IFLNK | 0777, PROCFS_TYPE_SELF_SYMLINK, 0);
         } else if (strcmp(name, "sys") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 118, S_IFDIR | 0555, PROCFS_TYPE_SYS_DIR, 0);
         } else if (strcmp(name, "sysvipc") == 0) {
@@ -852,6 +1009,38 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 112, S_IFREG | 0444, PROCFS_TYPE_NET_UDP, 0);
         } else if (strcmp(name, "route") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 106 * 10 + 3, S_IFREG | 0444, PROCFS_TYPE_NET_ROUTE, 0);
+        } else if (strcmp(name, "unix") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 106 * 10 + 4, S_IFREG | 0444, PROCFS_TYPE_NET_UNIX, 0);
+        }
+    } else if (dir_priv->type == PROCFS_TYPE_IRQ_DIR) {
+        /* /proc/irq/<n>. The interrupt number rides in the inode's `pid`
+         * slot, which is just procfs_priv_t's generic per-node index. */
+        if (name[0] >= '0' && name[0] <= '9') {
+            u32 irq = 0;
+            for (const char *p = name; *p; p++) {
+                if (*p < '0' || *p > '9') { irq = HAL_NR_IRQS; break; }
+                irq = irq * 10 + (u32)(*p - '0');
+            }
+            if (irq < HAL_NR_IRQS && hal_irq_is_routed((u8)irq)) {
+                dentry->d_inode = procfs_alloc_inode(dir->i_sb, 1900 + irq,
+                                                     S_IFDIR | 0555,
+                                                     PROCFS_TYPE_IRQ_LINE_DIR, irq);
+            }
+        }
+    } else if (dir_priv->type == PROCFS_TYPE_IRQ_LINE_DIR) {
+        u32 irq = dir_priv->pid;
+        if (strcmp(name, "smp_affinity") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 1900 + irq + 100000,
+                                                 S_IFREG | 0644,
+                                                 PROCFS_TYPE_IRQ_SMP_AFFINITY, irq);
+        } else if (strcmp(name, "smp_affinity_list") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 1900 + irq + 200000,
+                                                 S_IFREG | 0644,
+                                                 PROCFS_TYPE_IRQ_SMP_AFFINITY_LIST, irq);
+        } else if (strcmp(name, "effective_affinity") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 1900 + irq + 300000,
+                                                 S_IFREG | 0444,
+                                                 PROCFS_TYPE_IRQ_EFFECTIVE_AFFINITY, irq);
         }
     } else if (dir_priv->type == PROCFS_TYPE_SYSVIPC_DIR) {
         if (strcmp(name, "shm") == 0) {
@@ -868,6 +1057,8 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 301, S_IFDIR | 0555, PROCFS_TYPE_SYS_FS_DIR, 0);
         } else if (strcmp(name, "net") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 302, S_IFDIR | 0555, PROCFS_TYPE_SYS_NET_DIR, 0);
+        } else if (strcmp(name, "vm") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 303, S_IFDIR | 0555, PROCFS_TYPE_SYS_VM_DIR, 0);
         }
     } else if (dir_priv->type == PROCFS_TYPE_SYS_KERNEL_DIR) {
         if (strcmp(name, "osrelease") == 0) {
@@ -931,6 +1122,29 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
         } else if (strcmp(name, "tcp_fin_timeout") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 333, S_IFREG | 0644, PROCFS_TYPE_SYS_NET_TCP_FIN_TIMEOUT, 0);
         }
+    } else if (dir_priv->type == PROCFS_TYPE_SYS_VM_DIR) {
+        // /proc/sys/vm - virtual memory tuning knobs
+        if (strcmp(name, "overcommit_memory") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 350, S_IFREG | 0644, PROCFS_TYPE_SYS_VM_OVERCOMMIT_MEMORY, 0);
+        } else if (strcmp(name, "overcommit_ratio") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 351, S_IFREG | 0644, PROCFS_TYPE_SYS_VM_OVERCOMMIT_RATIO, 0);
+        } else if (strcmp(name, "dirty_ratio") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 352, S_IFREG | 0644, PROCFS_TYPE_SYS_VM_DIRTY_RATIO, 0);
+        } else if (strcmp(name, "dirty_background_ratio") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 353, S_IFREG | 0644, PROCFS_TYPE_SYS_VM_DIRTY_BACKGROUND_RATIO, 0);
+        } else if (strcmp(name, "swappiness") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 354, S_IFREG | 0644, PROCFS_TYPE_SYS_VM_SWAPPINESS, 0);
+        } else if (strcmp(name, "vfs_cache_pressure") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 355, S_IFREG | 0644, PROCFS_TYPE_SYS_VM_VFS_CACHE_PRESSURE, 0);
+        } else if (strcmp(name, "min_free_kbytes") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 356, S_IFREG | 0644, PROCFS_TYPE_SYS_VM_MIN_FREE_KBYTES, 0);
+        } else if (strcmp(name, "mmap_min_addr") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 357, S_IFREG | 0644, PROCFS_TYPE_SYS_VM_MMAP_MIN_ADDR, 0);
+        } else if (strcmp(name, "panic_on_oom") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 358, S_IFREG | 0644, PROCFS_TYPE_SYS_VM_PANIC_ON_OOM, 0);
+        } else if (strcmp(name, "nr_hugepages") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 359, S_IFREG | 0644, PROCFS_TYPE_SYS_VM_NR_HUGEPAGES, 0);
+        }
     } else if (dir_priv->type == PROCFS_TYPE_PID_DIR) {
         u32 pid = dir_priv->pid;
         if (strcmp(name, "status") == 0) {
@@ -941,6 +1155,18 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2000 + pid * 10 + 3, S_IFREG | 0444, PROCFS_TYPE_PID_STAT, pid);
         } else if (strcmp(name, "maps") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2000 + pid * 10 + 4, S_IFREG | 0444, PROCFS_TYPE_PID_MAPS, pid);
+        } else if (strcmp(name, "limits") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2000 + pid * 10 + 7, S_IFREG | 0444, PROCFS_TYPE_PID_LIMITS, pid);
+        } else if (strcmp(name, "io") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2000 + pid * 10 + 8, S_IFREG | 0444, PROCFS_TYPE_PID_IO, pid);
+        } else if (strcmp(name, "mounts") == 0) {
+            /* Per-process because Linux has per-process mount namespaces.
+             * This kernel has one namespace, so every process sees the same
+             * table — but the *path* has to exist, because that is where
+             * util-linux, glibc's getmntent and every container tool look. */
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2000 + pid * 10 + 9, S_IFREG | 0444, PROCFS_TYPE_MOUNTS, pid);
+        } else if (strcmp(name, "mountinfo") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2100 + pid * 10 + 0, S_IFREG | 0444, PROCFS_TYPE_MOUNTINFO, pid);
         } else if (strcmp(name, "exe") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2000 + pid * 10 + 5, S_IFLNK | 0777, PROCFS_TYPE_PID_EXE_SYMLINK, pid);
         } else if (strcmp(name, "cwd") == 0) {
@@ -1025,9 +1251,32 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
     case PROCFS_TYPE_SLABINFO:
         total_len = format_proc_slabinfo(tmp, PROCFS_TMP_SIZE);
         break;
+    case PROCFS_TYPE_BUDDYINFO:
+        total_len = format_proc_buddyinfo(tmp, PROCFS_TMP_SIZE);
+        break;
     case PROCFS_TYPE_STAT:
         total_len = format_proc_stat(tmp, PROCFS_TMP_SIZE);
         break;
+    case PROCFS_TYPE_IRQ_SMP_AFFINITY:
+    case PROCFS_TYPE_IRQ_EFFECTIVE_AFFINITY: {
+        /* A line has exactly one destination CPU (the IO APIC redirection
+         * entry holds one), so the requested and the effective affinity are
+         * always the same single-bit mask here. Linux distinguishes them
+         * because a requested mask may name several CPUs of which the
+         * hardware picks one; there is nothing to lose by reporting the
+         * truth, which is that the chosen CPU is the whole mask. */
+        u32 cpu = hal_irq_get_affinity((u8)priv->pid);
+        u64 mask = (cpu < 64) ? (1ULL << cpu) : 0;
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "%08x\n",
+                                      (unsigned)(mask & 0xFFFFFFFFULL));
+        break;
+    }
+    case PROCFS_TYPE_IRQ_SMP_AFFINITY_LIST: {
+        u32 cpu = hal_irq_get_affinity((u8)priv->pid);
+        if (cpu == (u32)-1) total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "\n");
+        else total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "%u\n", cpu);
+        break;
+    }
     case PROCFS_TYPE_NET_DEV:
         total_len = format_proc_net_dev(tmp, PROCFS_TMP_SIZE);
         break;
@@ -1036,6 +1285,9 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
         break;
     case PROCFS_TYPE_MOUNTS:
         total_len = format_proc_mounts(tmp, PROCFS_TMP_SIZE);
+        break;
+    case PROCFS_TYPE_MOUNTINFO:
+        total_len = format_proc_mountinfo(tmp, PROCFS_TMP_SIZE);
         break;
     case PROCFS_TYPE_SYSVIPC_SHM:
         total_len = (size_t)sysvipc_proc_shm(tmp, PROCFS_TMP_SIZE);
@@ -1077,16 +1329,18 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
         total_len = format_proc_swaps(tmp, PROCFS_TMP_SIZE);
         break;
     case PROCFS_TYPE_SYS_OSRELEASE:
-        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "7.0.0-posix\n");
+        /* Must match uname().release — "6.1.0-azami" is what we report there. */
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "6.1.0-azami\n");
         break;
     case PROCFS_TYPE_SYS_OSTYPE:
-        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "AzamiOS\n");
+        /* Must match uname().sysname — "Linux" for binary compat. */
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "Linux\n");
         break;
     case PROCFS_TYPE_SYS_HOSTNAME:
         total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "azami\n");
         break;
     case PROCFS_TYPE_SYS_VERSION:
-        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "#1 SMP Limine 2026\n");
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "#1 SMP AzamiOS x86_64\n");
         break;
     case PROCFS_TYPE_SYS_FILEMAX:
         total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "65536\n");
@@ -1114,6 +1368,43 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
         break;
     case PROCFS_TYPE_SYS_NET_TCP_SYNCOOKIES:
         total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "1\n");
+        break;
+    // /proc/sys/vm - virtual memory tuning knobs
+    case PROCFS_TYPE_SYS_VM_OVERCOMMIT_MEMORY:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "0\n"); // heuristic overcommit
+        break;
+    case PROCFS_TYPE_SYS_VM_OVERCOMMIT_RATIO:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "50\n");
+        break;
+    case PROCFS_TYPE_SYS_VM_DIRTY_RATIO:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "20\n");
+        break;
+    case PROCFS_TYPE_SYS_VM_DIRTY_BACKGROUND_RATIO:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "10\n");
+        break;
+    case PROCFS_TYPE_SYS_VM_SWAPPINESS:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "60\n");
+        break;
+    case PROCFS_TYPE_SYS_VM_VFS_CACHE_PRESSURE:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "100\n");
+        break;
+    case PROCFS_TYPE_SYS_VM_MIN_FREE_KBYTES:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "4096\n");
+        break;
+    case PROCFS_TYPE_SYS_VM_MMAP_MIN_ADDR:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "65536\n");
+        break;
+    case PROCFS_TYPE_SYS_VM_PANIC_ON_OOM:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "0\n");
+        break;
+    case PROCFS_TYPE_SYS_VM_NR_HUGEPAGES:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "0\n");
+        break;
+    case PROCFS_TYPE_NET_UNIX:
+        /* /proc/net/unix — Unix-domain socket table. No Unix sockets yet;
+         * return the header row so parsers don't fail on an empty file. */
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE,
+            "Num       RefCount Protocol Flags    Type St Inode Path\n");
         break;
     case PROCFS_TYPE_SYS_NET_TCP_FIN_TIMEOUT:
         total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "60\n");
@@ -1148,6 +1439,45 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
     case PROCFS_TYPE_PID_MAPS:
         total_len = format_pid_maps(priv->pid, tmp, PROCFS_TMP_SIZE);
         break;
+    case PROCFS_TYPE_PID_LIMITS: {
+        /* /proc/<pid>/limits — Linux's prlimit table. Format is:
+         *   Limit                     Soft Limit           Hard Limit           Units
+         * Each resource on its own line. We report sensible defaults matching
+         * what prlimit64() returns so tools like `ulimit -a` work. */
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE,
+            "Limit                     Soft Limit           Hard Limit           Units     \n"
+            "Max cpu time              unlimited            unlimited            seconds   \n"
+            "Max file size             unlimited            unlimited            bytes     \n"
+            "Max data size             unlimited            unlimited            bytes     \n"
+            "Max stack size            8388608              unlimited            bytes     \n"
+            "Max core file size        0                    unlimited            bytes     \n"
+            "Max resident set          unlimited            unlimited            bytes     \n"
+            "Max processes             32768                32768                processes \n"
+            "Max open files            1024                 65536                files     \n"
+            "Max locked memory         65536                65536                bytes     \n"
+            "Max address space         unlimited            unlimited            bytes     \n"
+            "Max file locks            unlimited            unlimited            locks     \n"
+            "Max pending signals       31337                31337                signals   \n"
+            "Max msgqueue size         819200               819200               bytes     \n"
+            "Max nice priority         0                    0                    \n"
+            "Max realtime priority     0                    0                    \n"
+            "Max realtime timeout      unlimited            unlimited            us        \n");
+        break;
+    }
+    case PROCFS_TYPE_PID_IO: {
+        /* /proc/<pid>/io — I/O accounting. Kernel tracks no detailed per-process
+         * I/O stats yet, so report zero for everything. glibc and many tools
+         * open this file but treat parse failures gracefully. */
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE,
+            "rchar: 0\n"
+            "wchar: 0\n"
+            "syscr: 0\n"
+            "syscw: 0\n"
+            "read_bytes: 0\n"
+            "write_bytes: 0\n"
+            "cancelled_write_bytes: 0\n");
+        break;
+    }
     default:
         kfree(tmp);
         return 0;
@@ -1196,6 +1526,51 @@ static s64 procfs_file_write(struct file *filp, const void *buf, size_t len, u64
         i++;
     }
 
+    /* /proc/irq/<n>/smp_affinity is a *hex* cpumask, and smp_affinity_list a
+     * CPU number — neither is the plain decimal the sysctl endpoints below
+     * take, so they are parsed here rather than from `val`. */
+    if (priv->type == PROCFS_TYPE_IRQ_SMP_AFFINITY ||
+        priv->type == PROCFS_TYPE_IRQ_SMP_AFFINITY_LIST) {
+        u64 mask = 0;
+        size_t j = 0;
+        while (kbuf[j] == ' ' || kbuf[j] == '\t') j++;
+
+        if (priv->type == PROCFS_TYPE_IRQ_SMP_AFFINITY) {
+            bool any = false;
+            for (; kbuf[j]; j++) {
+                char c = kbuf[j];
+                int d;
+                if (c >= '0' && c <= '9') d = c - '0';
+                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                else if (c == ',') continue;   /* group separator */
+                else break;
+                mask = (mask << 4) | (u64)d;
+                any = true;
+            }
+            if (!any) return -(s64)EINVAL;
+        } else {
+            u32 cpu = 0;
+            bool any = false;
+            while (kbuf[j] >= '0' && kbuf[j] <= '9') {
+                cpu = cpu * 10 + (u32)(kbuf[j++] - '0');
+                any = true;
+            }
+            if (!any || cpu >= 64) return -(s64)EINVAL;
+            mask = 1ULL << cpu;
+        }
+
+        if (mask == 0) return -(s64)EINVAL;
+
+        /* An IO APIC entry names one destination, so a multi-CPU mask is
+         * honoured by picking its lowest set CPU — the same thing Linux does
+         * on hardware without lowest-priority delivery. */
+        u32 target = hw_ctz64(mask);
+        int rc = hal_irq_set_affinity((u8)priv->pid, target);
+        if (rc < 0) return (s64)rc;
+        return (s64)len;
+    }
+
     switch (priv->type) {
     case PROCFS_TYPE_SYS_KERNEL_DMESG_RESTRICT:
         g_dmesg_restrict = (u32)val;
@@ -1230,8 +1605,8 @@ static s64 procfs_file_write(struct file *filp, const void *buf, size_t len, u64
 static const char *g_static_root_entries[] = {
     "version", "uptime", "meminfo", "cpuinfo", "stat", "dmesg", "net",
     "loadavg", "mounts", "filesystems", "cmdline",
-    "devices", "interrupts", "partitions", "swaps", "self", "sys", "sysvipc",
-    "mqueues", "vulnerabilities", "security", "mcelog", "slabinfo"
+    "devices", "interrupts", "irq", "partitions", "swaps", "self", "sys", "sysvipc",
+    "mqueues", "vulnerabilities", "security", "mcelog", "slabinfo", "buddyinfo"
 };
 #define NUM_ROOT_ENTRIES (sizeof(g_static_root_entries) / sizeof(g_static_root_entries[0]))
 
@@ -1270,7 +1645,8 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
                 name = ".."; dtype = DT_DIR;
             } else if (idx - 2 < NUM_ROOT_ENTRIES) {
                 name = g_static_root_entries[idx - 2];
-                if (strcmp(name, "sys") == 0 || strcmp(name, "net") == 0) dtype = DT_DIR;
+                if (strcmp(name, "sys") == 0 || strcmp(name, "net") == 0 ||
+                    strcmp(name, "irq") == 0 || strcmp(name, "sysvipc") == 0) dtype = DT_DIR;
                 else if (strcmp(name, "self") == 0) dtype = DT_LNK;
                 else dtype = DT_REG;
             } else {
@@ -1302,6 +1678,59 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
         u64 total_entries = 6;
         while (idx < total_entries) {
             const char *name = net_entries[idx];
+            u8 dtype = (idx < 2) ? DT_DIR : DT_REG;
+            size_t nlen = strlen(name);
+            size_t reclen = ALIGN_UP(sizeof(struct linux_dirent64) + nlen + 1, 8);
+            if (written + reclen > len) {
+                if (written == 0) return -(s64)EINVAL;
+                break;
+            }
+            struct linux_dirent64 *d = (struct linux_dirent64 *)(out_ptr + written);
+            d->d_ino = idx + 1;
+            d->d_off = idx + 1;
+            d->d_reclen = (unsigned short)reclen;
+            d->d_type = dtype;
+            memcpy(d->d_name, name, nlen + 1);
+            written += reclen;
+            idx++;
+        }
+    } else if (priv->type == PROCFS_TYPE_IRQ_DIR) {
+        /* One subdirectory per routed line. Names are formatted into a static
+         * table because the dirent loop below keeps the pointers past this
+         * iteration. */
+        static char irq_names[HAL_NR_IRQS][8];
+        const char *irq_entries[HAL_NR_IRQS + 2];
+        u64 total_entries = 0;
+        irq_entries[total_entries++] = ".";
+        irq_entries[total_entries++] = "..";
+        for (u32 i = 0; i < HAL_NR_IRQS; i++) {
+            if (!hal_irq_is_routed((u8)i)) continue;
+            scnprintf(irq_names[i], sizeof(irq_names[i]), "%u", i);
+            irq_entries[total_entries++] = irq_names[i];
+        }
+        while (idx < total_entries) {
+            const char *name = irq_entries[idx];
+            size_t nlen = strlen(name);
+            size_t reclen = ALIGN_UP(sizeof(struct linux_dirent64) + nlen + 1, 8);
+            if (written + reclen > len) {
+                if (written == 0) return -(s64)EINVAL;
+                break;
+            }
+            struct linux_dirent64 *d = (struct linux_dirent64 *)(out_ptr + written);
+            d->d_ino = idx + 1;
+            d->d_off = idx + 1;
+            d->d_reclen = (unsigned short)reclen;
+            d->d_type = DT_DIR;
+            memcpy(d->d_name, name, nlen + 1);
+            written += reclen;
+            idx++;
+        }
+    } else if (priv->type == PROCFS_TYPE_IRQ_LINE_DIR) {
+        const char *irq_files[] = { ".", "..", "smp_affinity",
+                                    "smp_affinity_list", "effective_affinity" };
+        u64 total_entries = 5;
+        while (idx < total_entries) {
+            const char *name = irq_files[idx];
             u8 dtype = (idx < 2) ? DT_DIR : DT_REG;
             size_t nlen = strlen(name);
             size_t reclen = ALIGN_UP(sizeof(struct linux_dirent64) + nlen + 1, 8);
@@ -1361,8 +1790,8 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
             idx++;
         }
     } else if (priv->type == PROCFS_TYPE_SYS_KERNEL_DIR) {
-        const char *kentries[] = { ".", "..", "osrelease", "ostype", "hostname", "version", "pid_max", "random", "dmesg_restrict", "kptr_restrict", "mmap_min_addr", "yama" };
-        u64 total_entries = 12;
+        const char *kentries[] = { ".", "..", "osrelease", "ostype", "hostname", "version", "pid_max", "random", "dmesg_restrict", "kptr_restrict", "mmap_min_addr", "yama", "vm" };
+        u64 total_entries = 13;
         while (idx < total_entries) {
             const char *name = kentries[idx];
             u8 dtype = (idx < 2 || strcmp(name, "random") == 0 || strcmp(name, "yama") == 0) ? DT_DIR : DT_REG;
@@ -1508,8 +1937,8 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
             idx++;
         }
     } else if (priv->type == PROCFS_TYPE_PID_DIR) {
-        const char *pid_entries[] = { ".", "..", "status", "cmdline", "stat", "maps", "exe", "cwd", "fd" };
-        u64 total_entries = 9;
+        const char *pid_entries[] = { ".", "..", "status", "cmdline", "stat", "maps", "exe", "cwd", "fd", "limits", "io", "mounts", "mountinfo" };
+        u64 total_entries = 11;
 
         while (idx < total_entries) {
             const char *name = pid_entries[idx];
@@ -1591,6 +2020,54 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
  * Mount & Init
  * -------------------------------------------------------------------------- */
 
+/* --------------------------------------------------------------------------
+ * Dropping a dead process's /proc/<pid>
+ *
+ * procfs_lookup() only builds a /proc/<pid> directory for a PID that exists,
+ * but the dentry it builds stays in the cache afterwards, and nothing in
+ * this VFS revalidates a cached name. So once anything had looked at
+ * /proc/13 — `ps`, a shell completing a path, the window manager asking
+ * whether a client was still alive — that directory kept existing after the
+ * process was gone: `ls /proc/13` listed stat, status, cmdline, maps and the
+ * rest, and every one of them read back empty, because the generators find
+ * no process and produce zero bytes.
+ *
+ * An empty file is a bad answer to "does this process exist". The exit path
+ * therefore drops the whole subtree from the cache, so the next lookup of
+ * that name fails the way it should.
+ * -------------------------------------------------------------------------- */
+static dentry_t *g_procfs_root = NULL;
+
+static void procfs_drop_subtree(dentry_t *d)
+{
+    if (!d) return;
+
+    /* Children first: dcache_remove() unlinks one dentry from its parent and
+     * from the hash, and a child left behind would keep a dangling parent. */
+    dentry_t *child = d->d_subdirs;
+    while (child) {
+        dentry_t *next = child->d_sibling;
+        procfs_drop_subtree(child);
+        child = next;
+    }
+
+    dcache_remove(d);
+    if (d->d_inode) {
+        d->d_inode = NULL;   /* procfs inodes are cheap and regenerated */
+    }
+}
+
+void procfs_pid_exited(u32 pid)
+{
+    if (!g_procfs_root || pid == 0) return;
+
+    char name[16];
+    scnprintf(name, sizeof(name), "%u", pid);
+
+    dentry_t *d = dcache_lookup(g_procfs_root, name);
+    if (d) procfs_drop_subtree(d);
+}
+
 static s64 procfs_mount(file_system_type_t *fs_type, const char *dev_name, const char *dir_name, void *data)
 {
     (void)fs_type; (void)dev_name; (void)dir_name; (void)data;
@@ -1618,6 +2095,7 @@ static s64 procfs_mount(file_system_type_t *fs_type, const char *dev_name, const
     mountpoint->d_inode = root_inode;
     mountpoint->d_sb = sb;
     sb->s_root = mountpoint;
+    g_procfs_root = mountpoint;
 
     pr_debug("[PROCFS] Mounted procfs on %s successfully.\n", dir_name);
     return 0;

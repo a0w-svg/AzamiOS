@@ -1,0 +1,16 @@
+/* Exported vDSO symbols — the same names and version node as Linux's x86_64
+ * vDSO, which is what musl (__vdso_clock_gettime@LINUX_2.6) and glibc look up. */
+LINUX_2.6 {
+    global:
+        clock_gettime;
+        __vdso_clock_gettime;
+        gettimeofday;
+        __vdso_gettimeofday;
+        getcpu;
+        __vdso_getcpu;
+        time;
+        __vdso_time;
+        clock_getres;
+        __vdso_clock_getres;
+    local: *;
+};

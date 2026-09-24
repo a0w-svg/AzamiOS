@@ -217,14 +217,357 @@ static u32 virtgpu_probe_refresh(u32 scanout_id, u32 width, u32 height)
 
 /* ── Device bring-up ─────────────────────────────────────────────────────── */
 
+/* ── Driver-private ioctl handler ────────────────────────────────────────────
+ *
+ * Nine virtgpu-specific ioctls are defined in include/azami/drm.h. Whether
+ * they do real 3D work follows whether the host actually granted
+ * VIRTIO_GPU_F_VIRGL at feature negotiation (virtio_gpu_init(), checked live
+ * here rather than cached, since GETPARAM is how a client is supposed to
+ * find this out too):
+ *   - CONTEXT_INIT creates a real host Virgl context (CTX_CREATE) and
+ *     remembers it on the file so later ioctls know which context owns
+ *     this fd's resources.
+ *   - RESOURCE_CREATE allocates a system-memory GEM object and, with 3D
+ *     negotiated, also creates the matching host resource
+ *     (RESOURCE_CREATE_3D), attaches its guest pages
+ *     (RESOURCE_ATTACH_BACKING) and, if a context exists on this file,
+ *     attaches the resource to it (CTX_ATTACH_RESOURCE).
+ *   - EXECBUFFER submits a real Gallium/Virgl command stream (SUBMIT_3D).
+ *   - TRANSFER_TO_HOST moves guest-written bytes into the host's copy of a
+ *     3D resource (TRANSFER_TO_HOST_3D) when 3D is live, or falls back to
+ *     the 2D path otherwise.
+ *   - GET_CAPS queries the host's real capset data (GET_CAPSET_INFO +
+ *     GET_CAPSET) when 3D is live, or reports zero bytes otherwise.
+ *   - WAIT is still vacuous: this driver's virtqueue round trips are
+ *     synchronous end to end, so by the time any ioctl here returns, the
+ *     host has already retired the command — there is never an outstanding
+ *     fence for a client to wait on.
+ *   - MAP, RESOURCE_INFO all delegate to existing helpers.
+ *   - GETPARAM reports 3D_FEATURES=1 only when VIRTIO_GPU_F_VIRGL was
+ *     actually granted by the host, never unconditionally.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/* Copy helpers local to this file (same macros as drm_ioctl.c). */
+#include "../../../kernel/uaccess.h"
+#define VGPU_COPY_IN(dst, arg) \
+    do { if (copy_from_user((dst), (void *)(uintptr_t)(arg), sizeof(*(dst))) != 0) \
+             return -(s64)EFAULT; } while (0)
+#define VGPU_COPY_OUT(arg, src) \
+    do { if (copy_to_user((void *)(uintptr_t)(arg), (src), sizeof(*(src))) != 0) \
+             return -(s64)EFAULT; } while (0)
+
+static s64 virtgpu_ioctl(drm_device_t *dev, drm_file_t *file, u32 cmd, u64 arg)
+{
+    switch (cmd) {
+
+    case DRM_IOCTL_VIRTGPU_GETPARAM: {
+        struct drm_virtgpu_getparam p;
+        VGPU_COPY_IN(&p, arg);
+        if (p.param == VIRTGPU_PARAM_3D_FEATURES) {
+            extern virtio_gpu_state_t g_gpu;
+            p.value = (g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_VIRGL)) ? 1 : 0;
+        } else {
+            return -(s64)EINVAL;
+        }
+        VGPU_COPY_OUT(arg, &p);
+        return 0;
+    }
+
+    /* ── DRM_IOCTL_VIRTGPU_CONTEXT_INIT ─────────────────────────────────── */
+    case DRM_IOCTL_VIRTGPU_CONTEXT_INIT: {
+        struct drm_virtgpu_context_init ci;
+        VGPU_COPY_IN(&ci, arg);
+        
+        extern virtio_gpu_state_t g_gpu;
+        if (!(g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_VIRGL))) {
+            return -(s64)ENOTSUP;
+        }
+        
+        if (virtio_gpu_cmd_context_create(ci.ctx_id, "azami_ctx") < 0) {
+            return -(s64)EIO;
+        }
+
+        /* Remember this context on the file: RESOURCE_CREATE below uses it
+         * to auto-attach every 3D resource this file creates from here on,
+         * and TRANSFER_TO_HOST stamps it into the TRANSFER_TO_HOST_3D
+         * command's ctx_id. AzamiOS gives each open DRM fd at most one
+         * Virgl context, so there is no ambiguity about which one "this
+         * file's context" means. */
+        file->virtgpu_ctx_id = ci.ctx_id;
+        file->virtgpu_ctx_valid = true;
+
+        VGPU_COPY_OUT(arg, &ci);
+        return 0;
+    }
+
+    /* ── DRM_IOCTL_VIRTGPU_MAP ────────────────────────────────────────────
+     * Return the mmap() offset for a GEM handle, exactly as MODE_MAP_DUMB
+     * does for dumb buffers.  The offset is assigned at object-creation time
+     * by drm_gem_object_create() and is stable for the object's lifetime. */
+    case DRM_IOCTL_VIRTGPU_MAP: {
+        struct drm_virtgpu_map m;
+        VGPU_COPY_IN(&m, arg);
+        drm_gem_object_t *obj = drm_gem_handle_lookup(file, m.handle);
+        if (!obj) return -(s64)ENOENT;
+        m.offset = obj->mmap_offset;
+        VGPU_COPY_OUT(arg, &m);
+        return 0;
+    }
+
+    /* ── DRM_IOCTL_VIRTGPU_RESOURCE_CREATE ───────────────────────────────
+     * Allocate a GEM buffer object representing a new virtio-gpu resource.
+     * The wire protocol fields (target/format/bind/depth/array_size/…) are
+     * stored for RESOURCE_INFO but otherwise forwarded to the host as-is
+     * in a full 3D implementation; in 2D-only mode we just hand back a
+     * system-memory shadow buffer and a synthetic res_handle. */
+    case DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: {
+        struct drm_virtgpu_resource_create rc;
+        VGPU_COPY_IN(&rc, arg);
+
+        if (rc.width == 0 || rc.height == 0) return -(s64)EINVAL;
+
+        /* stride = width * 4 (BGRA8888); size = stride * height */
+        u32 stride = rc.width * 4;
+        drm_gem_object_t *obj = drm_gem_object_create(dev, rc.width, rc.height,
+                                                      32, stride);
+        if (!obj) return -(s64)ENOMEM;
+
+        u32 handle = drm_gem_handle_create(file, obj);
+        if (!handle) {
+            drm_gem_object_put(dev, obj);
+            return -(s64)ENOMEM;
+        }
+
+        /* If 3D is enabled, create the matching host-side resource, hand it
+         * the guest pages backing this GEM object (individually allocated —
+         * see drm_gem_object_create() — so this is a real scatter-gather
+         * list, not the single-entry shortcut the 2D framebuffer path uses),
+         * and, if this file already has a Virgl context, attach the
+         * resource to it so the context's command stream may reference it. */
+        extern virtio_gpu_state_t g_gpu;
+        if (g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_VIRGL)) {
+            if (virtio_gpu_cmd_resource_create_3d(handle, rc.target, rc.format, rc.bind,
+                                                  rc.width, rc.height, rc.depth, rc.array_size) < 0) {
+                pr_debug("[VIRTIO-GPU-DRM] RESOURCE_CREATE_3D failed for handle %u\n", handle);
+            } else if (virtio_gpu_resource_attach_backing_pages(handle, obj->pages, obj->npages,
+                                                                 PAGE_SIZE) < 0) {
+                pr_debug("[VIRTIO-GPU-DRM] attach_backing failed for resource %u\n", handle);
+            } else if (file->virtgpu_ctx_valid &&
+                      virtio_gpu_cmd_context_attach_resource(file->virtgpu_ctx_id, handle) < 0) {
+                pr_debug("[VIRTIO-GPU-DRM] ctx %u attach resource %u failed\n",
+                         file->virtgpu_ctx_id, handle);
+            }
+        }
+
+        /* drm_gem_handle_create() took a reference; drop the creation ref. */
+        drm_gem_object_put(dev, obj);
+
+        rc.bo_handle  = handle;
+        rc.res_handle = handle;   /* synthetic: 1-to-1 with the GEM handle */
+        rc.size       = (u32)obj->size;
+        rc.stride     = stride;
+        VGPU_COPY_OUT(arg, &rc);
+        return 0;
+    }
+
+    /* ── DRM_IOCTL_VIRTGPU_RESOURCE_INFO ─────────────────────────────────
+     * Return the res_handle, byte size and stride for an existing GEM handle. */
+    case DRM_IOCTL_VIRTGPU_RESOURCE_INFO: {
+        struct drm_virtgpu_resource_info ri;
+        VGPU_COPY_IN(&ri, arg);
+        drm_gem_object_t *obj = drm_gem_handle_lookup(file, ri.bo_handle);
+        if (!obj) return -(s64)ENOENT;
+        ri.res_handle = ri.bo_handle;   /* synthetic: same value */
+        ri.size       = (u32)obj->size;
+        ri.stride     = obj->pitch;
+        VGPU_COPY_OUT(arg, &ri);
+        return 0;
+    }
+
+    /* ── DRM_IOCTL_VIRTGPU_EXECBUFFER ────────────────────────────────────
+     * In a full virglrenderer implementation this submits a Gallium command
+     * stream to a 3D context. */
+    case DRM_IOCTL_VIRTGPU_EXECBUFFER: {
+        struct drm_virtgpu_execbuffer ex;
+        VGPU_COPY_IN(&ex, arg);
+        
+        extern virtio_gpu_state_t g_gpu;
+        if (!(g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_VIRGL))) {
+            return -(s64)ENOTSUP;
+        }
+        
+        void *buf = kmalloc(ex.size);
+        if (!buf) return -(s64)ENOMEM;
+        
+        if (copy_from_user(buf, (void*)(uintptr_t)ex.command, ex.size) != 0) {
+            kfree(buf);
+            return -(s64)EFAULT;
+        }
+        
+        int ret = virtio_gpu_cmd_submit_3d(ex.ring_idx, buf, ex.size);
+        kfree(buf);
+        return ret < 0 ? -(s64)EIO : 0;
+    }
+
+    /* ── DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST ──────────────────────────────
+     * Copy a 3D box from guest backing pages into the host resource.  The
+     * 2D driver only supports flat (z=0, d=1) resources; it maps the box
+     * to a TRANSFER_TO_HOST_2D rectangle, which the existing helper already
+     * implements with the correct offset calculation. */
+    case DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: {
+        struct drm_virtgpu_3d_transfer xfer;
+        VGPU_COPY_IN(&xfer, arg);
+        drm_gem_object_t *obj = drm_gem_handle_lookup(file, xfer.bo_handle);
+        if (!obj) return -(s64)ENOENT;
+
+        /* Derive the resource id: synthetic, equals the GEM handle. */
+        u32 res_id = xfer.bo_handle;
+
+        extern virtio_gpu_state_t g_gpu;
+        if (g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_VIRGL)) {
+            /* Real 3D transfer: the guest pages attached to this resource
+             * (RESOURCE_ATTACH_BACKING, done at RESOURCE_CREATE time above)
+             * get copied into the host's copy of the resource within the
+             * caller's box, at the caller's stride/level. This is what
+             * makes vertex/index/uniform data written into a 3D resource by
+             * the guest actually visible to the host's Gallium driver — the
+             * 2D-only TRANSFER_TO_HOST_2D this used to fall back to has no
+             * concept of a 3D box, level or context and cannot target a
+             * VIRGL resource at all. */
+            u32 ctx_id = file->virtgpu_ctx_valid ? file->virtgpu_ctx_id : 0;
+            int ret = virtio_gpu_cmd_transfer_to_host_3d(
+                          ctx_id, res_id,
+                          xfer.box.x, xfer.box.y, xfer.box.z,
+                          xfer.box.w, xfer.box.h, xfer.box.d,
+                          xfer.offset, xfer.level, xfer.stride, xfer.layer_stride);
+            return ret < 0 ? -(s64)EIO : 0;
+        }
+
+        u64 off = (u64)xfer.box.y * obj->pitch + (u64)xfer.box.x * 4;
+        int ret = virtio_gpu_transfer_to_host_2d_rect(
+                      res_id, xfer.box.x, xfer.box.y,
+                      xfer.box.w, xfer.box.h, off + xfer.offset);
+        return ret < 0 ? -(s64)EIO : 0;
+    }
+
+    /* ── DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST ────────────────────────────
+     * Read the host's copy of a 3D resource back into guest backing pages —
+     * how a render target, a query result or any other host-computed data
+     * actually becomes visible to the guest. The 2D device has no
+     * TRANSFER_FROM_HOST_2D command, so without 3D negotiated this stays a
+     * no-op (the backing pages already hold the last guest-rendered
+     * content, which is the only content a 2D resource ever has). */
+    case DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: {
+        struct drm_virtgpu_3d_transfer xfer;
+        VGPU_COPY_IN(&xfer, arg);
+
+        extern virtio_gpu_state_t g_gpu;
+        if (!(g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_VIRGL)))
+            return 0;
+
+        drm_gem_object_t *obj = drm_gem_handle_lookup(file, xfer.bo_handle);
+        if (!obj) return -(s64)ENOENT;
+
+        u32 ctx_id = file->virtgpu_ctx_valid ? file->virtgpu_ctx_id : 0;
+        int ret = virtio_gpu_cmd_transfer_from_host_3d(
+                      ctx_id, xfer.bo_handle,
+                      xfer.box.x, xfer.box.y, xfer.box.z,
+                      xfer.box.w, xfer.box.h, xfer.box.d,
+                      xfer.offset, xfer.level, xfer.stride, xfer.layer_stride);
+        return ret < 0 ? -(s64)EIO : 0;
+    }
+
+    /* ── DRM_IOCTL_VIRTGPU_WAIT ──────────────────────────────────────────
+     * Wait for an async fence on a resource.  No async engine in 2D mode;
+     * all operations are synchronous, so this is always satisfied. */
+    case DRM_IOCTL_VIRTGPU_WAIT:
+        return 0;
+
+    /* ── DRM_IOCTL_VIRTGPU_GET_CAPS ──────────────────────────────────────
+     * Return a real virglrenderer capability set fetched from the host via
+     * GET_CAPSET_INFO (find the capset index whose id matches what the
+     * client asked for) + GET_CAPSET (fetch its data). With no 3D feature
+     * negotiated there is nothing to query; keep the old zero-fill so a
+     * caller that probes GET_CAPS before checking GETPARAM still gets a
+     * well-defined "no caps" answer instead of an error. */
+    case DRM_IOCTL_VIRTGPU_GET_CAPS: {
+        struct drm_virtgpu_get_caps gc;
+        VGPU_COPY_IN(&gc, arg);
+
+        extern virtio_gpu_state_t g_gpu;
+        if (!(g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_VIRGL))) {
+            if (gc.addr && gc.size) {
+                u32 n = gc.size;
+                if (n > 4096) n = 4096;
+                u8 zero = 0;
+                for (u32 i = 0; i < n; i++)
+                    copy_to_user((void *)(uintptr_t)(gc.addr + i), &zero, 1);
+            }
+            gc.size = 0;
+            VGPU_COPY_OUT(arg, &gc);
+            return 0;
+        }
+
+        /* The host doesn't index capsets by id — GET_CAPSET_INFO enumerates
+         * them 0..num_capsets-1 and each slot reports its own id. Probe a
+         * small bounded range (real hosts report 1-3 capsets: virgl,
+         * virgl2, and sometimes venus/cross-domain) until the id matches or
+         * the host answers capset_id 0 (past the end of its list). */
+        u32 max_version = 0, max_size = 0;
+        bool found = false;
+        for (u32 idx = 0; idx < 8; idx++) {
+            u32 id = 0, ver = 0, sz = 0;
+            if (virtio_gpu_cmd_get_capset_info(idx, &id, &ver, &sz) < 0) break;
+            if (id == 0) break;   /* past the end of the host's capset list */
+            if (id == gc.cap_set_id) {
+                max_version = ver;
+                max_size = sz;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return -(s64)EINVAL;
+
+        u32 want = gc.size;
+        if (want > max_size) want = max_size;
+
+        u32 got = 0;
+        if (want > 0) {
+            u8 *capbuf = kzalloc(want);
+            if (!capbuf) return -(s64)ENOMEM;
+
+            u32 ver = gc.cap_set_ver;
+            if (ver > max_version) ver = max_version;
+
+            if (virtio_gpu_cmd_get_capset(gc.cap_set_id, ver, capbuf, want, &got) < 0) {
+                kfree(capbuf);
+                return -(s64)EIO;
+            }
+            if (gc.addr)
+                copy_to_user((void *)(uintptr_t)gc.addr, capbuf, got);
+            kfree(capbuf);
+        }
+
+        gc.size = got;
+        VGPU_COPY_OUT(arg, &gc);
+        return 0;
+    }
+
+    default:
+        return -(s64)EINVAL;
+    }
+}
+
+/* ── Device bring-up ─────────────────────────────────────────────────────── */
+
 static int virtgpu_load(drm_device_t *dev)
 {
     virtgpu_device_t *vg = (virtgpu_device_t *)dev->dev_private;
 
-    dev->min_width     = vg->outputs[0].width;
-    dev->max_width     = vg->outputs[0].width;
-    dev->min_height    = vg->outputs[0].height;
-    dev->max_height    = vg->outputs[0].height;
+    dev->min_width     = 64;
+    dev->max_width     = 8192;
+    dev->min_height    = 64;
+    dev->max_height    = 8192;
     dev->cursor_width  = VIRTIO_GPU_CURSOR_W;
     dev->cursor_height = VIRTIO_GPU_CURSOR_H;
     dev->prefer_shadow = true;
@@ -273,18 +616,55 @@ static int virtgpu_load(drm_device_t *dev)
 
 static void virtgpu_unload(drm_device_t *dev)
 {
-    if (dev->dev_private) {
-        kfree(dev->dev_private);
-        dev->dev_private = NULL;
+    virtgpu_device_t *vg = (virtgpu_device_t *)dev->dev_private;
+    if (!vg) return;
+
+    /* Tear down every scanout resource on the host so it can reclaim VRAM.
+     * Sequence for each output that was set up:
+     *   1. Detach scanout (SET_SCANOUT with resource_id 0) so the host
+     *      compositor stops compositing from this resource.
+     *   2. Detach guest backing pages (RESOURCE_DETACH_BACKING).
+     *   3. Free the host resource (RESOURCE_UNREF).
+     * Scanout 0's resource is the global framebuffer (g_gpu.resource_id);
+     * it is shared with fbdev.c which is torn down first, so we do not
+     * touch its backing pages — just unref the host resource so the host
+     * knows we're done with it. */
+    for (u32 i = 0; i < vg->num_outputs; i++) {
+        virtgpu_output_t *out = &vg->outputs[i];
+        if (out->resource_id == 0) continue;
+
+        /* Disconnect from the scanout head. */
+        virtio_gpu_set_scanout(out->scanout_id, 0, 0, 0);
+
+        /* For extra scanouts (resource_id > 1) we own the backing allocation
+         * and must detach it before unreffing. Scanout 0's backing is the
+         * global g_gpu framebuffer, managed separately. */
+        if (out->scanout_id != 0)
+            virtio_gpu_resource_detach_backing(out->resource_id);
+
+        virtio_gpu_resource_unref(out->resource_id);
     }
+
+    /* Tear down the shared hardware cursor resource if it was ever used. */
+    extern virtio_gpu_state_t g_gpu;
+    if (g_gpu.cursor_res_id) {
+        virtio_gpu_resource_detach_backing(g_gpu.cursor_res_id);
+        virtio_gpu_resource_unref(g_gpu.cursor_res_id);
+        g_gpu.cursor_res_id = 0;
+        g_gpu.cursor_virt   = NULL;
+        g_gpu.cursor_phys   = 0;
+    }
+
+    kfree(vg);
+    dev->dev_private = NULL;
 }
 
 static const drm_driver_t virtgpu_drm_driver = {
     .name      = "virtio_gpu",
-    .desc      = "VirtIO GPU 2D display",
-    .date      = "20260912",
-    .major     = 0, .minor = 2, .patchlevel = 0,
-    .features  = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER,
+    .desc      = "VirtIO GPU display (2D + Virgl 3D when negotiated)",
+    .date      = "20260914",
+    .major     = 0, .minor = 3, .patchlevel = 0,
+    .features  = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER | DRIVER_ATOMIC,
     .load      = virtgpu_load,
     .unload    = virtgpu_unload,
     .mode_set    = virtgpu_mode_set,
@@ -292,6 +672,7 @@ static const drm_driver_t virtgpu_drm_driver = {
     .dirty_fb    = virtgpu_flush,
     .cursor_set  = virtgpu_cursor_set,
     .cursor_move = virtgpu_cursor_move,
+    .ioctl       = virtgpu_ioctl,
 };
 
 /* ── PCI binding ─────────────────────────────────────────────────────────── */

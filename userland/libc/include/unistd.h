@@ -136,6 +136,17 @@ int lchown(const char *pathname, uid_t owner, gid_t group);
 /* System & Signals */
 unsigned int alarm(unsigned int seconds);
 int pause(void);
+
+/* sysconf() names — values match this libc's own sysconf.c switch, not
+ * glibc's, since nothing here links against glibc. */
+#define _SC_CLK_TCK           1
+#define _SC_PAGESIZE          2
+#define _SC_PAGE_SIZE         2
+#define _SC_NPROCESSORS_CONF  3
+#define _SC_NPROCESSORS_ONLN  4
+#define _SC_OPEN_MAX          5
+#define _SC_PHYS_PAGES        6
+#define _SC_AVPHYS_PAGES      7
 long sysconf(int name);
 long pathconf(const char *path, int name);
 int getpagesize(void);

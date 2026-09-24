@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <sys/sysinfo.h>
 #include <sys/statvfs.h>
+#include "../../libc/include/az/ipc.h"
 
 static void get_cpu_info(char *cpu_name, size_t max_len, int *cores)
 {
@@ -166,7 +167,13 @@ int main(int argc, char **argv)
     } else {
         printf("\033[1;35m /_/_/_/  \\_\\_\\_\\   \033[1;36mProcesses:\033[0m %d active tasks\n", (int)si.procs);
     }
-    printf("                    \033[1;36mDisplay:\033[0m   1280x800x32bpp (azwm v2.0 VSync)\n");
+    az_fb_info_t fb;
+    unsigned int disp_w = 1280, disp_h = 800;
+    if (az_fb_info(&fb) == 0 && fb.width > 0 && fb.height > 0) {
+        disp_w = fb.width;
+        disp_h = fb.height;
+    }
+    printf("                    \033[1;36mDisplay:\033[0m   %ux%ux32bpp (azwm v2.0 VSync)\n", disp_w, disp_h);
     printf("                    \033[1;36mSecurity:\033[0m  SMEP, SMAP, UMIP, Canary, Yama, LinkGuard\n");
     printf("\n");
     printf("                    \033[41m   \033[42m   \033[43m   \033[44m   \033[45m   \033[46m   \033[47m   \033[0m\n");

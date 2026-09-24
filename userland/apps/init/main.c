@@ -531,6 +531,69 @@ static void run_posix_verification_suite(void)
                         "stack canary is randomised per boot");
         }
 
+        /* /proc/buddyinfo — the physical allocator's fragmentation report, one
+         * row per memory zone and one column per buddy order. Reading it is
+         * also the only userspace-visible check that the zoned buddy's
+         * per-order block counters are being maintained at all: a zone whose
+         * columns are all zero while the machine still has free memory would
+         * mean the free lists and their counters have drifted apart. */
+        int bifd = open("/proc/buddyinfo", O_RDONLY);
+        TEST_ASSERT(bifd >= 0, "open(/proc/buddyinfo)");
+        if (bifd >= 0) {
+            static char bi[4096];
+            ssize_t bn = read(bifd, bi, sizeof(bi) - 1);
+            if (bn > 0) bi[bn] = '\0'; else bi[0] = '\0';
+            close(bifd);
+            TEST_ASSERT(bn > 0 && strstr(bi, "Node 0, zone") != NULL,
+                        "/proc/buddyinfo uses the Linux node/zone row format");
+            TEST_ASSERT(strstr(bi, "DMA32") != NULL && strstr(bi, "Normal") != NULL,
+                        "/proc/buddyinfo lists both memory zones");
+
+            /* At least one order of the zone this machine actually boots
+             * from must hold a block: the system is plainly running, so
+             * physical memory is not exhausted. Scan only the columns after
+             * the zone name — "DMA32" has digits of its own. */
+            int any_block = 0;
+            const char *row = strstr(bi, "DMA32");
+            if (row) {
+                for (const char *q = row + 5; *q && *q != '\n'; q++)
+                    if (*q >= '1' && *q <= '9') { any_block = 1; break; }
+            }
+            TEST_ASSERT(any_block, "/proc/buddyinfo reports free blocks per order");
+        }
+
+        /* /proc/slabinfo — the kernel heap's per-size-class accounting. The
+         * free-object count behind <active_objs> is now a running counter
+         * rather than a walk of the free list, so this is also the check that
+         * the counter tracks reality: a bucket owning pages must report
+         * objects, and it can never have more active than it has in total. */
+        int sifd = open("/proc/slabinfo", O_RDONLY);
+        TEST_ASSERT(sifd >= 0, "open(/proc/slabinfo)");
+        if (sifd >= 0) {
+            static char si[8192];
+            ssize_t sn = read(sifd, si, sizeof(si) - 1);
+            if (sn > 0) si[sn] = '\0'; else si[0] = '\0';
+            close(sifd);
+            TEST_ASSERT(sn > 0 && strstr(si, "slabinfo - version: 2.1") != NULL,
+                        "/proc/slabinfo uses the Linux version-2.1 layout");
+
+            /* Parse "kmalloc-<sz> <active> <total> ..." rows and check the
+             * invariant on each one that owns any objects. */
+            int rows = 0, sane = 1, any_objs = 0;
+            for (const char *q = si; (q = strstr(q, "kmalloc-")) != NULL; ) {
+                q += 8;
+                while (*q && *q != ' ') q++;              /* skip size */
+                long active = strtol(q, (char **)&q, 10);
+                long total  = strtol(q, (char **)&q, 10);
+                rows++;
+                if (total > 0) any_objs = 1;
+                if (active < 0 || total < 0 || active > total) sane = 0;
+            }
+            TEST_ASSERT(rows > 0, "/proc/slabinfo lists the kmalloc size classes");
+            TEST_ASSERT(any_objs, "/proc/slabinfo reports objects for live buckets");
+            TEST_ASSERT(sane, "/proc/slabinfo active_objs never exceeds num_objs");
+        }
+
         /* seccomp(2) SECCOMP_MODE_FILTER: a real classic-BPF program, run in
          * a forked child so a wrong verdict can't take the test suite down
          * with it. First child: a filter that returns SECCOMP_RET_ERRNO for
@@ -607,7 +670,7 @@ static void run_posix_verification_suite(void)
         }
     }
 
-    /* 12. Native GCC Toolchain Verification */
+    /* 12. Native C toolchain verification (TinyCC) */
     if (access("/etc/run-toolchain-selftest", F_OK) == 0) {
         run_toolchain_selftest();
     }
@@ -931,7 +994,64 @@ static void run_posix_verification_suite(void)
             memset(&id, 0, sizeof(id));
             TEST_ASSERT(ioctl(fd, EVIOCGID, &id) == 0 && id.bustype != 0,
                         "EVIOCGID returns a bus/vendor identity");
+
+            unsigned char keys[KEY_CNT / 8];
+            memset(keys, 0, sizeof(keys));
+            TEST_ASSERT(ioctl(fd, EVIOCGKEY(sizeof(keys)), keys) >= 0,
+                        "EVIOCGKEY returns the held-key bitmap");
+
+            unsigned int rep[2] = { 0, 0 };
+            TEST_ASSERT(ioctl(fd, EVIOCGREP, rep) == 0 && rep[0] > 0 && rep[1] > 0,
+                        "EVIOCGREP reports a non-zero compiled-in default");
+
+            unsigned int want[2] = { 500, 100 };
+            TEST_ASSERT(ioctl(fd, EVIOCSREP, want) == 0,
+                        "EVIOCSREP accepts a new autorepeat rate");
+            unsigned int got[2] = { 0, 0 };
+            TEST_ASSERT(ioctl(fd, EVIOCGREP, got) == 0 && got[0] == 500 && got[1] == 100,
+                        "EVIOCGREP echoes back exactly what EVIOCSREP applied");
+
+            /* Scancode 0x1E is 'a' on the built-in keymap; remap it to 'z'
+             * and confirm EVIOCGKEYCODE sees the override take effect. */
+            unsigned int ke[2] = { 0x1E, 0 };
+            TEST_ASSERT(ioctl(fd, EVIOCGKEYCODE, ke) == 0 && ke[1] == 'a',
+                        "EVIOCGKEYCODE reports the built-in keymap entry");
+            ke[1] = 'z';
+            TEST_ASSERT(ioctl(fd, EVIOCSKEYCODE, ke) == 0,
+                        "EVIOCSKEYCODE installs a remap");
+            ke[1] = 0;
+            TEST_ASSERT(ioctl(fd, EVIOCGKEYCODE, ke) == 0 && ke[1] == 'z',
+                        "EVIOCGKEYCODE reflects the just-installed remap");
+            ke[1] = 'a';
+            ioctl(fd, EVIOCSKEYCODE, ke); /* restore, so later boot behaves normally */
+
             close(fd);
+        }
+
+        /* write(2) with an EV_LED record is the real Linux way to drive the
+         * keyboard's lock LEDs (as opposed to a bespoke ioctl). */
+        int wfd = open("/dev/input/event0", O_WRONLY);
+        TEST_ASSERT(wfd >= 0, "/dev/input/event0 opens for writing");
+        if (wfd >= 0) {
+            struct input_event ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type  = EV_LED;
+            ev.code  = LED_CAPSL;
+            ev.value = 1;
+            TEST_ASSERT(write(wfd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev),
+                        "writing an EV_LED record succeeds");
+
+            /* Unhandled events (a bogus type here) are accepted and
+             * discarded, matching real evdev's write(2) behavior. */
+            struct input_event junk;
+            memset(&junk, 0, sizeof(junk));
+            junk.type = 0x7F;
+            TEST_ASSERT(write(wfd, &junk, sizeof(junk)) == (ssize_t)sizeof(junk),
+                        "an unhandled event type is accepted, not rejected");
+
+            ev.value = 0;
+            write(wfd, &ev, sizeof(ev)); /* leave the LED as we found it */
+            close(wfd);
         }
     }
 
@@ -1354,157 +1474,124 @@ static void run_posix_verification_suite(void)
     printf("-------------------------------------------------------------------------------\n");
 }
 
+/* ── On-device C toolchain smoke test ───────────────────────────────────────
+ *
+ * The image used to carry the whole x86_64-elf cross-gcc (gcc, cc1,
+ * collect2, as, ld, its internal headers, ~84 MB), and this test drove it:
+ * `as --version`, `gcc -c`, then `ld` by hand, then the direct one-shot
+ * compile. The compiler on the image is now TinyCC — built from upstream
+ * source by tools/linux/ports.mk, ~0.5 MB with its runtime library, and
+ * configured for this filesystem's /usr/include and /usr/lib — so what is
+ * worth checking has changed shape: tcc compiles *and* links in one pass
+ * with no external assembler or linker, so there is no `as` step to test
+ * and no hand-written `ld` invocation to get right.
+ *
+ * Three things are checked, in the order they would break:
+ *   1. the compiler runs at all under the Linux-ABI layer,
+ *   2. it turns a .c file into an ELF this kernel will execute,
+ *   3. the separate compile-then-link path works too (what a Makefile does).
+ */
+static int spawn_and_wait(const char *path, char *const argv[], const char *logfile)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (logfile) {
+            int lfd = open(logfile, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+            if (lfd >= 0) { dup2(lfd, 1); dup2(lfd, 2); close(lfd); }
+        }
+        char *const envp[] = { "PATH=/bin:/usr/bin", "TMPDIR=/tmp", "LC_ALL=C", NULL };
+        execve(path, argv, envp);
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return status;
+}
+
+static void dump_log(const char *tag, const char *logfile)
+{
+    int fd = open(logfile, O_RDONLY);
+    if (fd < 0) return;
+    printf("[%s-START]\n", tag);
+    char buf[512];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) { buf[n] = '\0'; printf("%s", buf); }
+    printf("\n[%s-END]\n", tag);
+    close(fd);
+}
+
 static void run_toolchain_selftest(void)
 {
-    int as_pid = fork();
-    if (as_pid == 0) {
-        int lfd = open("/tmp/as_log.txt", O_CREAT | O_WRONLY | O_TRUNC, 0666);
-        if (lfd >= 0) {
-            dup2(lfd, 1);
-            dup2(lfd, 2);
-            close(lfd);
-        }
-        char *const as_argv[] = {"/usr/bin/as", "--version", NULL};
-        char *const as_envp[] = {"PATH=/bin:/usr/bin", "LC_ALL=C", NULL};
-        execve("/usr/bin/as", as_argv, as_envp);
-        exit(127);
-    }
-    int as_status = 0;
-    waitpid(as_pid, &as_status, 0);
-    printf("[INIT-AS] as --version returned status=0x%x (exit_code=%d)\n", as_status, (as_status >> 8) & 0xFF);
-    int afd = open("/tmp/as_log.txt", O_RDONLY);
-    if (afd >= 0) {
-        printf("[AS-LOG-START]\n");
-        char abuf[512];
-        ssize_t n;
-        while ((n = read(afd, abuf, sizeof(abuf) - 1)) > 0) {
-            abuf[n] = '\0';
-            printf("%s", abuf);
-        }
-        printf("\n[AS-LOG-END]\n");
-        close(afd);
-    }
-    TEST_ASSERT(as_status == 0, "GNU Assembler (as) native execution");
-
-    int gcc_pid = fork();
-    if (gcc_pid == 0) {
-        int lfd = open("/tmp/gcc_log.txt", O_CREAT | O_WRONLY | O_TRUNC, 0666);
-        if (lfd >= 0) {
-            dup2(lfd, 1);
-            dup2(lfd, 2);
-            close(lfd);
-        }
-
-        char *const gcc_argv[] = {"/usr/bin/gcc", "-v", "-c", "/examples/hello.c", "-o", "/tmp/hello.o", NULL};
-
-        char *const gcc_envp[] = {
-            "PATH=/usr/bin:/bin:/usr/libexec/gcc/x86_64-elf/14.2.0",
-            "TMPDIR=/tmp",
-            "COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin",
-            "LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib",
-            NULL
-        };
-        execve("/usr/bin/gcc", gcc_argv, gcc_envp);
-        exit(127);
-    }
-    int gcc_status = 0;
-    waitpid(gcc_pid, &gcc_status, 0);
-    printf("[INIT-GCC] gcc -c /examples/hello.c -> /tmp/hello.o returned status=0x%x (exit_code=%d)\n", gcc_status, (gcc_status >> 8) & 0xFF);
-
-    int rfd = open("/tmp/gcc_log.txt", O_RDONLY);
-    if (rfd >= 0) {
-        printf("[GCC-LOG-START]\n");
-        char lbuf[512];
-        ssize_t n;
-        while ((n = read(rfd, lbuf, sizeof(lbuf) - 1)) > 0) {
-            lbuf[n] = '\0';
-            printf("%s", lbuf);
-        }
-        printf("\n[GCC-LOG-END]\n");
-        close(rfd);
-    }
-    TEST_ASSERT(gcc_status == 0, "GNU GCC 14.2.0 native C compilation (cc1 + as)");
-
-    int ld_status = -1;
-    if (gcc_status == 0) {
-        int ld_pid = fork();
-        if (ld_pid == 0) {
-            char *const ld_argv[] = {"/usr/bin/ld", "-nostdlib", "/usr/lib/crt0.o", "/tmp/hello.o", "/usr/lib/libc.a", "-o", "/tmp/hello", NULL};
-            char *const ld_envp[] = {"PATH=/bin:/usr/bin", NULL};
-            execve("/usr/bin/ld", ld_argv, ld_envp);
-            exit(127);
-        }
-        waitpid(ld_pid, &ld_status, 0);
-        printf("[INIT-LD] ld /tmp/hello.o -> /tmp/hello returned status=0x%x (exit_code=%d)\n", ld_status, (ld_status >> 8) & 0xFF);
-        TEST_ASSERT(ld_status == 0, "GNU Binutils (ld) native ELF linking");
+    if (access("/usr/bin/tcc", F_OK) != 0) {
+        puts("[init] no /usr/bin/tcc on this image — skipping the toolchain self-test");
+        puts("       (build one with `make -C tools/linux ports`, or install it at");
+        puts("        runtime with `pkg install tcc`)");
+        return;
     }
 
-    if (ld_status == 0) {
-        int run_pid = fork();
-        if (run_pid == 0) {
-            char *const hello_argv[] = {"/tmp/hello", "native_test", NULL};
-            char *const hello_envp[] = {NULL};
-            execve("/tmp/hello", hello_argv, hello_envp);
-            exit(127);
-        }
-        int run_status = 0;
-        waitpid(run_pid, &run_status, 0);
-        printf("[INIT-HELLO] /tmp/hello execution returned status=0x%x (exit_code=%d)\n", run_status, (run_status >> 8) & 0xFF);
-        TEST_ASSERT(run_status == 0, "Native compiled binary execution (/tmp/hello)");
+    /* 1. Does the compiler run here at all? */
+    {
+        char *const argv[] = { "/usr/bin/tcc", "-v", NULL };
+        int status = spawn_and_wait("/usr/bin/tcc", argv, "/tmp/tcc_version.txt");
+        printf("[INIT-TCC] tcc -v returned status=0x%x (exit_code=%d)\n",
+               status, (status >> 8) & 0xFF);
+        dump_log("TCC-VERSION", "/tmp/tcc_version.txt");
+        TEST_ASSERT(status == 0, "TinyCC runs natively on AzamiOS");
     }
 
-    /* Test full direct gcc compilation (compile + link in one step) */
-    int direct_gcc_pid = fork();
-    if (direct_gcc_pid == 0) {
-        int lfd = open("/tmp/gcc_direct_log.txt", O_CREAT | O_WRONLY | O_TRUNC, 0666);
-        if (lfd >= 0) {
-            dup2(lfd, 1);
-            dup2(lfd, 2);
-            close(lfd);
-        }
-        char *const dgcc_argv[] = {"/usr/bin/gcc", "-O2", "-std=c11", "/examples/hello.c", "-o", "/tmp/hello_native.elf", NULL};
-        char *const dgcc_envp[] = {
-            "PATH=/usr/bin:/bin:/usr/libexec/gcc/x86_64-elf/14.2.0",
-            "TMPDIR=/tmp",
-            "COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin",
-            "LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib",
-            NULL
-        };
-        execve("/usr/bin/gcc", dgcc_argv, dgcc_envp);
-        exit(127);
+    /* 2. One-shot compile and link, the way anyone actually invokes cc.
+     *
+     * -static is not optional here: every native binary on this image is
+     * statically linked against /usr/lib/libc.a, and tcc's default is a
+     * dynamic executable with a PT_INTERP. */
+    int direct_status;
+    {
+        char *const argv[] = { "/usr/bin/tcc", "-O2", "-static", "/examples/hello.c",
+                               "-o", "/tmp/hello_tcc.elf", NULL };
+        direct_status = spawn_and_wait("/usr/bin/tcc", argv, "/tmp/tcc_build.txt");
+        printf("[INIT-TCC] tcc /examples/hello.c -o /tmp/hello_tcc.elf "
+               "returned status=0x%x (exit_code=%d)\n",
+               direct_status, (direct_status >> 8) & 0xFF);
+        dump_log("TCC-BUILD", "/tmp/tcc_build.txt");
+        TEST_ASSERT(direct_status == 0, "TinyCC compiles and links a C program on-device");
     }
-    int dgcc_status = 0;
-    waitpid(direct_gcc_pid, &dgcc_status, 0);
-    printf("[INIT-GCC-DIRECT] gcc /examples/hello.c -o /tmp/hello_native.elf returned status=0x%x (exit_code=%d)\n",
-           dgcc_status, (dgcc_status >> 8) & 0xFF);
 
-    int dfd = open("/tmp/gcc_direct_log.txt", O_RDONLY);
-    if (dfd >= 0) {
-        printf("[GCC-DIRECT-LOG-START]\n");
-        char lbuf[512];
-        ssize_t n;
-        while ((n = read(dfd, lbuf, sizeof(lbuf) - 1)) > 0) {
-            lbuf[n] = '\0';
-            printf("%s", lbuf);
-        }
-        printf("\n[GCC-DIRECT-LOG-END]\n");
-        close(dfd);
+    if (direct_status == 0) {
+        char *const argv[] = { "/tmp/hello_tcc.elf", "built_on_azamios", NULL };
+        int status = spawn_and_wait("/tmp/hello_tcc.elf", argv, NULL);
+        printf("[INIT-TCC] /tmp/hello_tcc.elf execution returned status=0x%x (exit_code=%d)\n",
+               status, (status >> 8) & 0xFF);
+        TEST_ASSERT(status == 0, "The binary it produced runs");
     }
-    TEST_ASSERT(dgcc_status == 0, "Full GCC end-to-end compile & link (/tmp/hello_native.elf)");
 
-    if (dgcc_status == 0) {
-        int run_pid2 = fork();
-        if (run_pid2 == 0) {
-            char *const hello_argv[] = {"/tmp/hello_native.elf", "full_gcc_test", NULL};
-            char *const hello_envp[] = {NULL};
-            execve("/tmp/hello_native.elf", hello_argv, hello_envp);
-            exit(127);
+    /* 3. Separate compile and link steps — what a Makefile drives. */
+    {
+        char *const cc_argv[] = { "/usr/bin/tcc", "-c", "/examples/hello.c",
+                                  "-o", "/tmp/hello.o", NULL };
+        int cc_status = spawn_and_wait("/usr/bin/tcc", cc_argv, "/tmp/tcc_compile.txt");
+        printf("[INIT-TCC] tcc -c returned status=0x%x (exit_code=%d)\n",
+               cc_status, (cc_status >> 8) & 0xFF);
+        dump_log("TCC-COMPILE", "/tmp/tcc_compile.txt");
+        TEST_ASSERT(cc_status == 0, "TinyCC compiles to an object file");
+
+        if (cc_status == 0) {
+            char *const ld_argv[] = { "/usr/bin/tcc", "-static", "/tmp/hello.o",
+                                      "-o", "/tmp/hello_linked.elf", NULL };
+            int ld_status = spawn_and_wait("/usr/bin/tcc", ld_argv, "/tmp/tcc_link.txt");
+            printf("[INIT-TCC] tcc /tmp/hello.o -o /tmp/hello_linked.elf "
+                   "returned status=0x%x (exit_code=%d)\n",
+                   ld_status, (ld_status >> 8) & 0xFF);
+            dump_log("TCC-LINK", "/tmp/tcc_link.txt");
+            TEST_ASSERT(ld_status == 0, "TinyCC links an object file into an executable");
+
+            if (ld_status == 0) {
+                char *const run_argv[] = { "/tmp/hello_linked.elf", NULL };
+                int run_status = spawn_and_wait("/tmp/hello_linked.elf", run_argv, NULL);
+                printf("[INIT-TCC] /tmp/hello_linked.elf execution returned "
+                       "status=0x%x (exit_code=%d)\n", run_status, (run_status >> 8) & 0xFF);
+                TEST_ASSERT(run_status == 0, "The separately linked binary runs");
+            }
         }
-        int run_status2 = 0;
-        waitpid(run_pid2, &run_status2, 0);
-        printf("[INIT-HELLO-DIRECT] /tmp/hello_native.elf execution returned status=0x%x (exit_code=%d)\n",
-               run_status2, (run_status2 >> 8) & 0xFF);
-        TEST_ASSERT(run_status2 == 0, "Native direct binary execution (/tmp/hello_native.elf)");
     }
 }
 
@@ -1528,11 +1615,11 @@ int main(int argc, char **argv)
 
     if (access("/etc/run-toolchain-selftest", F_OK) == 0) {
         puts("-------------------------------------------------------------------------------");
-        puts("      Running Native GCC Toolchain Smoke Test Suite (/usr/bin/gcc)");
+        puts("      Running On-Device C Toolchain Smoke Test (TinyCC, /usr/bin/tcc)");
         puts("-------------------------------------------------------------------------------");
         run_toolchain_selftest();
     } else {
-        puts("[INIT] Skipping native GCC/binutils smoke test "
+        puts("[INIT] Skipping on-device C toolchain smoke test "
              "(touch /etc/run-toolchain-selftest to re-enable)");
     }
 
@@ -1587,8 +1674,8 @@ int main(int argc, char **argv)
 
         p = fork();
         if (p == 0) {
-            char *const args[] = { "/bin/sh.elf", "-c", "export TEST_VAR=AzamiUserspace; echo 'SHELL TEST: TEST_VAR='$TEST_VAR 'USER='$USER 'HOME='$HOME 'PWD='$PWD 'EXIT='$?", NULL };
-            execve("/bin/sh.elf", args, NULL);
+            char *const args[] = { "/bin/sh", "-c", "export TEST_VAR=AzamiUserspace; echo 'SHELL TEST: TEST_VAR='$TEST_VAR 'USER='$USER 'HOME='$HOME 'PWD='$PWD 'EXIT='$? 'SHELL='$(/bin/sh --version 2>/dev/null | head -1)", NULL };
+            execve("/bin/sh", args, NULL);
             _exit(1);
         } else if (p > 0) {
             int status = 0;
@@ -1657,6 +1744,146 @@ int main(int argc, char **argv)
         puts("-------------------------------------------------------------------------------");
     }
 
+    /* Marker-file-gated dynamic linking smoke test (userland/ldso/ldso.c,
+     * userland/libc/dlfcn.c, userland/libc/crt0_dyn.asm, userland/libc/
+     * libc.so) — same on/off convention as /etc/run-userspace-test above.
+     * Each binary run here prints its own PASS/FAIL to this same console, so
+     * a real regression is visible directly in the boot log without needing
+     * an interactive shell. */
+    if (access("/etc/run-dynlink-test", F_OK) == 0) {
+        puts("-------------------------------------------------------------------------------");
+        puts("      Running Dynamic Linking Test Suite (/etc/run-dynlink-test)");
+        puts("-------------------------------------------------------------------------------");
+
+        /* Eager DT_NEEDED + per-segment relocation + combined static TLS
+         * bootstrap (ld-azami.so relocates dltest_app.elf against
+         * dltest_lib.so before jumping to its entry point at all). */
+        pid_t p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/dltest_app.elf", NULL };
+            execve("/bin/dltest_app.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+            printf("[dynlink-test] dltest_app.elf exit status=%d\n", (status >> 8) & 0xFF);
+        }
+
+        /* Runtime dlopen()/dlsym()/dlclose() through libc.so's dlfcn.c,
+         * itself dynamically linked against libc.so. */
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/dlopen_demo.elf", NULL };
+            execve("/bin/dlopen_demo.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+            printf("[dynlink-test] dlopen_demo.elf exit status=%d\n", (status >> 8) & 0xFF);
+        }
+
+        /* fetch.elf (static) vs fetch_dyn.elf (PIE + libc.so): side-by-side
+         * output comparison, same source, two different link strategies. */
+        puts("[dynlink-test] --- fetch.elf (static) ---");
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/fetch.elf", NULL };
+            execve("/bin/fetch.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+        }
+        puts("[dynlink-test] --- fetch_dyn.elf (PIE + libc.so) ---");
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/fetch_dyn.elf", NULL };
+            execve("/bin/fetch_dyn.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+            printf("[dynlink-test] fetch_dyn.elf exit status=%d\n", (status >> 8) & 0xFF);
+        }
+
+        /* thread_tls_test.elf (static) vs thread_tls_test_dyn.elf (PIE +
+         * libc.so, pthread_create() + ld-azami.so's combined static TLS) —
+         * same source, both must report ALL PASS with no cross-thread bleed
+         * of errno/pthread TSD. */
+        puts("[dynlink-test] --- thread_tls_test.elf (static) ---");
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/thread_tls_test.elf", NULL };
+            execve("/bin/thread_tls_test.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+            printf("[dynlink-test] thread_tls_test.elf exit status=%d\n", (status >> 8) & 0xFF);
+        }
+        puts("[dynlink-test] --- thread_tls_test_dyn.elf (PIE + libc.so) ---");
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/thread_tls_test_dyn.elf", NULL };
+            execve("/bin/thread_tls_test_dyn.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+            printf("[dynlink-test] thread_tls_test_dyn.elf exit status=%d\n", (status >> 8) & 0xFF);
+        }
+
+        puts("-------------------------------------------------------------------------------");
+    } else {
+        puts("[INIT] Skipping dynamic linking test suite "
+             "(touch /etc/run-dynlink-test to re-enable)");
+    }
+
+    /* Marker-file-gated VirtIO-GPU/Virgl 3D pipeline test (userland/apps/
+     * 3d_test), same convention as the other /etc/run-*-test hooks. Absent
+     * by default, so an ordinary boot never spends time probing for GPU 3D
+     * support; set with `touch /etc/run-gpu3d-test` (or built in by a QEMU
+     * invocation that wants to verify the hardware-accelerated pipeline). */
+    if (access("/etc/run-gpu3d-test", F_OK) == 0) {
+        puts("-------------------------------------------------------------------------------");
+        puts("      Running VirtIO-GPU/Virgl 3D pipeline test (/etc/run-gpu3d-test)");
+        puts("-------------------------------------------------------------------------------");
+        pid_t p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/3d_test.elf", NULL };
+            execve("/bin/3d_test.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+            printf("[init] 3d_test.elf exit status=%d\n", (status >> 8) & 0xFF);
+        }
+        puts("-------------------------------------------------------------------------------");
+    }
+
+    /* Marker-file-gated kexec smoke test (kernel/kexec.c), same convention as
+     * the /etc/run-userspace-test suite above. Absent by default, so an
+     * ordinary boot never runs it: on success this call never returns at all
+     * (the whole system, init included, is replaced by a freshly booting
+     * kernel instance), which would make it a very surprising thing to run
+     * unconditionally. */
+    if (access("/etc/run-kexec-test", F_OK) == 0) {
+        puts("-------------------------------------------------------------------------------");
+        puts("      Running kexec smoke test (/etc/run-kexec-test)");
+        puts("-------------------------------------------------------------------------------");
+        pid_t p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/kexec_test.elf", NULL };
+            execve("/bin/kexec_test.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+            puts("[init] kexec smoke test returned control -- kexec did NOT happen "
+                 "(see its output above for why); continuing normal boot.");
+        }
+    }
+
     /* Spawn Network DHCP Daemon */
     az_spawn("/sbin/dhcpcd.elf");
 
@@ -1675,7 +1902,23 @@ int main(int argc, char **argv)
     }
 
     /* ── PID 1 Idle & Zombie Reaper Loop ─────────────────────────────────── */
+    /*
+     * The reaping half of this loop's name was missing: it only slept.
+     * Every orphan the system produced — a background job whose shell had
+     * exited, an app whose launcher was gone — was reparented here and
+     * then stayed a zombie forever, holding its PID and its process-table
+     * slot, and looking alive to anything that asked kill(pid, 0). The
+     * compositor's dead-client cleanup was one such asker: it kept
+     * windows of long-dead programs on screen because their PIDs never
+     * went away.
+     *
+     * waitpid(-1, WNOHANG) drains whatever has exited since the last
+     * pass, and returns 0 when children exist but none have exited, which
+     * is what ends the inner loop on an ordinary tick.
+     */
     for (;;) {
+        int status;
+        while (waitpid(-1, &status, WNOHANG) > 0) { }
         sleep(1);
     }
 

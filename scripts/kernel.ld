@@ -66,6 +66,23 @@ SECTIONS {
 
     . = ALIGN(4096);
 
+    /* ── Write-once data (see include/azami/sections.h) ───────────────────── *
+     * Everything marked __ro_after_init: tables that are filled in during
+     * boot and never legitimately written again — the syscall dispatch table
+     * above all. It has to be loaded writable, so it lives in the RW segment
+     * next to .data, but it is page-aligned and bracketed by its own symbols
+     * so kprotect_seal() can drop the write permission once boot is over.
+     * KEEP() because --gc-sections cannot see that the compiler's stack of
+     * indirect calls through these tables is a use. */
+    .data..ro_after_init : {
+        _ro_after_init_start = .;
+        KEEP(*(.data..ro_after_init .data..ro_after_init.*))
+        . = ALIGN(4096);
+        _ro_after_init_end = .;
+    } :data
+
+    . = ALIGN(4096);
+
     /* ── Initialised data ─────────────────────────────────────────────────── */
     .data : {
         _data_start = .;

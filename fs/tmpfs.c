@@ -51,6 +51,7 @@ typedef struct tmpfs_node {
     u32     mode;       /* S_IFDIR / S_IFREG / S_IFLNK | permissions */
     u32     uid, gid;
     u64     ino;
+    u64     rdev;       /* device number for S_IFCHR / S_IFBLK nodes */
     u64     atime, mtime, ctime;
     u64     size;       /* file: bytes used; dir: 0; symlink: link len */
 
@@ -94,10 +95,13 @@ static void     tmpfs_write_inode(inode_t *inode);
 static void     tmpfs_put_super(super_block_t *sb);
 static s64      tmpfs_statfs_op(super_block_t *sb, struct statfs *buf);
 static s64      tmpfs_sync_fs(super_block_t *sb);
+static export_operations_t s_tmpfs_export_ops;
+static inode_t *tmpfs_make_inode(super_block_t *sb, struct tmpfs_node *node);
 
 static struct dentry *tmpfs_lookup(inode_t *dir, dentry_t *dentry);
 static s64      tmpfs_create(inode_t *dir, dentry_t *dentry, u32 mode);
 static s64      tmpfs_mkdir(inode_t *dir, dentry_t *dentry, u32 mode);
+static s64      tmpfs_mknod(inode_t *dir, dentry_t *dentry, u32 mode, u64 rdev);
 static s64      tmpfs_unlink(inode_t *dir, dentry_t *dentry);
 static s64      tmpfs_rmdir(inode_t *dir, dentry_t *dentry);
 static s64      tmpfs_rename(inode_t *old_dir, dentry_t *old_dentry,
@@ -141,6 +145,7 @@ static inode_operations_t s_tmpfs_dir_iops = {
     .symlink  = tmpfs_symlink,
     .readlink = NULL,
     .link     = tmpfs_link,
+    .mknod    = tmpfs_mknod,
 };
 
 static inode_operations_t s_tmpfs_file_iops = {
@@ -191,6 +196,71 @@ static file_operations_t s_tmpfs_dir_fops = {
     .poll    = tmpfs_file_poll,
 };
 
+/* ── Export operations (name_to_handle_at / open_by_handle_at) ────────────
+ *
+ * tmpfs has no on-disk identity, but it does hand out a monotonically
+ * increasing inode number that is never reused for the life of the mount,
+ * which is exactly the property a file handle needs. The handle is that
+ * number; resolving one is a walk of the node tree looking for it.
+ */
+struct tmpfs_fid {
+    u64 ino;
+};
+
+static tmpfs_node_t *tmpfs_find_by_ino(tmpfs_node_t *dir, u64 ino)
+{
+    if (!dir) return NULL;
+    if (dir->ino == ino) return dir;
+    for (tmpfs_node_t *c = dir->children; c; c = c->next) {
+        tmpfs_node_t *hit = tmpfs_find_by_ino(c, ino);
+        if (hit) return hit;
+    }
+    return NULL;
+}
+
+static s64 tmpfs_encode_fh(struct inode *inode, u32 *fh, int *max_len, struct inode *parent)
+{
+    (void)parent;
+    if (!inode || !fh || !max_len) return -(s64)EINVAL;
+    if (*max_len < (int)(sizeof(struct tmpfs_fid) / sizeof(u32))) {
+        *max_len = (int)(sizeof(struct tmpfs_fid) / sizeof(u32));
+        return -(s64)EOVERFLOW;
+    }
+    struct tmpfs_fid fid = { .ino = inode->i_ino };
+    memcpy(fh, &fid, sizeof(fid));
+    *max_len = (int)(sizeof(fid) / sizeof(u32));
+    return 0x81;   /* private handle type; tmpfs has no standard one */
+}
+
+static struct dentry *tmpfs_fh_to_dentry(struct super_block *sb, struct file_handle *handle)
+{
+    if (!sb || !handle) return NULL;
+    if (handle->handle_bytes < sizeof(struct tmpfs_fid)) return NULL;
+    tmpfs_sb_t *priv = (tmpfs_sb_t *)sb->s_fs_info;
+    if (!priv) return NULL;
+
+    struct tmpfs_fid fid;
+    memcpy(&fid, handle->f_handle, sizeof(fid));
+
+    tmpfs_node_t *node = tmpfs_find_by_ino(priv->root, fid.ino);
+    if (!node) return NULL;
+    if (node->target) node = node->target;   /* follow a hard link to its node */
+
+    inode_t *ino = node->inode ? node->inode : tmpfs_make_inode(sb, node);
+    if (!ino) return NULL;
+
+    dentry_t *d = dcache_alloc(NULL, node->name);
+    if (!d) return NULL;
+    d->d_inode = ino;
+    d->d_sb    = sb;
+    return d;
+}
+
+static export_operations_t s_tmpfs_export_ops = {
+    .encode_fh    = tmpfs_encode_fh,
+    .fh_to_dentry = tmpfs_fh_to_dentry,
+};
+
 static file_system_type_t s_tmpfs_type = {
     .name  = "tmpfs",
     .mount = tmpfs_mount,
@@ -213,6 +283,14 @@ static tmpfs_node_t *tmpfs_new_node(const char *name, u32 mode)
     n->mode = mode;
     n->ino      = s_next_ino++;
     n->refcount = 1;
+
+    /* Owned by whoever actually created it, not left at zero (root) -- see
+     * the matching comment in fs/ext2/ext2.c's ext2_create() for why this
+     * now matters: open() enforces permission bits/ACLs against real
+     * ownership. */
+    process_t *creator = sched_current_process();
+    n->uid = creator ? creator->fsuid : 0;
+    n->gid = creator ? creator->fsgid : 0;
 
     /* Record creation time as zero — we have no clock here but timestamps
      * will be refreshed by the VFS on each write anyway. */
@@ -317,6 +395,7 @@ static inode_t *tmpfs_make_inode(super_block_t *sb, tmpfs_node_t *node)
 
     ino->i_ino     = node->ino;
     ino->i_mode    = node->mode;
+    ino->i_rdev    = node->rdev;
     ino->i_uid     = node->uid;
     ino->i_gid     = node->gid;
     ino->i_size    = (s64)node->size;
@@ -470,6 +549,33 @@ static s64 tmpfs_create(inode_t *dir, dentry_t *dentry, u32 mode)
 
     inode_t *ino = tmpfs_make_inode(dir->i_sb, node);
     if (!ino) { tmpfs_free_node(node); return -12; }
+
+    tmpfs_dir_add(parent, node);
+    dentry->d_inode = ino;
+    return 0;
+}
+
+/* mknod(2) on tmpfs. This is what makes a tmpfs mounted at /dev usable as a
+ * real /dev: without it every device node creation failed and the mount was
+ * an empty directory. */
+static s64 tmpfs_mknod(inode_t *dir, dentry_t *dentry, u32 mode, u64 rdev)
+{
+    tmpfs_node_t *parent = (tmpfs_node_t *)dir->i_private;
+    if (!parent) return -(s64)EINVAL;
+    if (tmpfs_dir_find(parent, dentry->d_name)) return -(s64)EEXIST;
+
+    u32 fmt = mode & S_IFMT;
+    if (fmt == 0) fmt = S_IFREG;
+    if (fmt != S_IFREG && fmt != S_IFCHR && fmt != S_IFBLK &&
+        fmt != S_IFIFO && fmt != S_IFSOCK)
+        return -(s64)EINVAL;
+
+    tmpfs_node_t *node = tmpfs_new_node(dentry->d_name, fmt | (mode & 07777));
+    if (!node) return -(s64)ENOMEM;
+    if (fmt == S_IFCHR || fmt == S_IFBLK) node->rdev = rdev;
+
+    inode_t *ino = tmpfs_make_inode(dir->i_sb, node);
+    if (!ino) { tmpfs_free_node(node); return -(s64)ENOMEM; }
 
     tmpfs_dir_add(parent, node);
     dentry->d_inode = ino;
@@ -971,6 +1077,7 @@ static s64 tmpfs_mount(file_system_type_t *fs_type, const char *dev,
     sb->s_blocksize = 4096;
     sb->s_type      = fs_type;
     sb->s_op        = &s_tmpfs_super_ops;
+    sb->s_export_op = &s_tmpfs_export_ops;
 
     /* Allocate private superblock data */
     tmpfs_sb_t *priv = (tmpfs_sb_t *)kmalloc(sizeof(tmpfs_sb_t));

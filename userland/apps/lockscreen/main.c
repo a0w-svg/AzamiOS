@@ -110,6 +110,15 @@ static void sha256_update_ctx(sha256_t *ctx, const uint8_t *data, size_t len)
 
 static void sha256_final_ctx(sha256_t *ctx, uint8_t hash[32])
 {
+    /* The message length SHA-256 appends is the length of the *message*,
+     * not of the padded block, so it has to be captured before the padding
+     * below pushes ctx->count past it. Reading ctx->count afterwards (as
+     * this did) encodes 8*(len + 1 + zeros) instead of 8*len and produces a
+     * digest that is self-consistent but is not SHA-256: sha256sum.elf,
+     * the SHA-256 in every other implementation, and the real
+     * SHA-256 constants already sitting in the /etc/shadow this image
+     * ships all disagreed with it. */
+    uint64_t message_bits = ctx->count;
     uint8_t pad = 0x80;
     sha256_update_ctx(ctx, &pad, 1);
     while ((ctx->count >> 3) % 64 != 56) {
@@ -118,7 +127,7 @@ static void sha256_final_ctx(sha256_t *ctx, uint8_t hash[32])
     }
     uint8_t len_bytes[8];
     for (int i = 0; i < 8; i++) {
-        len_bytes[i] = (uint8_t)(ctx->count >> (56 - i * 8));
+        len_bytes[i] = (uint8_t)(message_bits >> (56 - i * 8));
     }
     sha256_update_ctx(ctx, len_bytes, 8);
     for (int i = 0; i < 8; i++) {

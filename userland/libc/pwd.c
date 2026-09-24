@@ -100,7 +100,7 @@ struct passwd *getpwnam(const char *name)
         s_pw_buf.pw_gid    = 0;
         s_pw_buf.pw_gecos  = "root";
         s_pw_buf.pw_dir    = "/root";
-        s_pw_buf.pw_shell  = "/bin/sh.elf";
+        s_pw_buf.pw_shell  = "/bin/bash";
         return &s_pw_buf;
     }
     return NULL;
@@ -126,7 +126,7 @@ struct passwd *getpwuid(uid_t uid)
         s_pw_buf.pw_gid    = 0;
         s_pw_buf.pw_gecos  = "root";
         s_pw_buf.pw_dir    = "/root";
-        s_pw_buf.pw_shell  = "/bin/sh.elf";
+        s_pw_buf.pw_shell  = "/bin/bash";
         return &s_pw_buf;
     }
     return NULL;

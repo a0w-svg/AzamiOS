@@ -59,7 +59,16 @@ int main(int argc, char **argv)
     int max_lines = 10;
     int start = 1;
 
-    if (argc > 2 && strcmp(argv[1], "-n") == 0) {
+    /* The obsolescent "-NUM" form (head -3, tail -20). POSIX lists it and
+     * every other implementation accepts it; without it the line came out
+     * as a filename and the tool said "cannot open '-3'", which is a
+     * confusing way to spell "I do not support that spelling". */
+    if (argc > 1 && argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
+        max_lines = atoi(argv[1] + 1);
+        if (max_lines < 0) max_lines = 0;
+        if (max_lines > MAX_RING) max_lines = MAX_RING;
+        start = 2;
+    } else if (argc > 2 && strcmp(argv[1], "-n") == 0) {
         max_lines = atoi(argv[2]);
         if (max_lines < 0) max_lines = 0;
         if (max_lines > MAX_RING) max_lines = MAX_RING;

@@ -9,6 +9,23 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+/* Counts the "cpuN" lines /proc/stat reports (one per real online CPU,
+ * alongside the aggregate "cpu " line) -- used for the banner's core count
+ * instead of a hardcoded number. */
+static int count_proc_stat_cpus(const char *buf)
+{
+    int count = 0;
+    char tmp[1024];
+    strncpy(tmp, buf, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    char *line = strtok(tmp, "\n");
+    while (line) {
+        if (strncmp(line, "cpu", 3) == 0 && line[3] >= '0' && line[3] <= '9') count++;
+        line = strtok(NULL, "\n");
+    }
+    return count > 0 ? count : 1;
+}
+
 static void print_cpu_stat(void)
 {
     int fd = open("/proc/stat", O_RDONLY);
@@ -75,7 +92,19 @@ int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
-    printf("AzamiOS 7.0.0-posix (x86_64)\t2026\t_x86_64_\t(4 CPU)\n\n");
+    int ncpus = 1;
+    int fd = open("/proc/stat", O_RDONLY);
+    if (fd >= 0) {
+        char buf[1024];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = '\0';
+            ncpus = count_proc_stat_cpus(buf);
+        }
+    }
+
+    printf("AzamiOS 7.0.0-posix (x86_64)\t2026\t_x86_64_\t(%d CPU)\n\n", ncpus);
     print_cpu_stat();
     print_device_stat();
 

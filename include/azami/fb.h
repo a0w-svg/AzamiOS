@@ -34,6 +34,16 @@
  * A no-op (harmless) on a direct-scanout backend. */
 #define FBIOAZ_DAMAGE         0x4683   /* arg: struct fb_az_rect *          */
 
+/* FBIOAZ_DAMAGE_LIST — report several disjoint rectangles in one call.
+ * A compositor's frame is rarely one box: a clock ticking bottom-right and a
+ * caret blinking top-left share a bounding box of the whole screen, so
+ * reporting them as one rectangle throws away everything FBIOAZ_DAMAGE was
+ * for. Each rectangle is transferred to the host separately. Rectangles
+ * beyond FB_AZ_DAMAGE_MAX, or beyond what the driver can hold, are folded
+ * into the ones already queued rather than dropped — damage may over-report
+ * (costing a redundant copy) but must never under-report. */
+#define FBIOAZ_DAMAGE_LIST    0x4687   /* arg: struct fb_az_damage_list *   */
+
 /* ── Hardware 2D Acceleration & Capabilities ──────────────────────────────── */
 #define FBIOAZ_ACCEL_FILL     0x4684   /* arg: struct fb_az_fill *          */
 #define FBIOAZ_ACCEL_COPY     0x4685   /* arg: struct fb_az_copy *          */
@@ -78,6 +88,13 @@ struct fb_az_rect {
     u32 y;
     u32 w;
     u32 h;
+};
+
+#define FB_AZ_DAMAGE_MAX 16
+
+struct fb_az_damage_list {
+    u32 count;                                 /* rectangles in `rects`  */
+    struct fb_az_rect rects[FB_AZ_DAMAGE_MAX];
 };
 
 #define FB_AZ_HWCURSOR_MAX 64          /* image is at most 64x64, BGRA8888  */

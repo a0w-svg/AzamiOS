@@ -147,6 +147,7 @@ static file_operations_t sqfs_dir_fops = {
 static file_system_type_t sqfs_fs_type = {
     .name  = "squashfs",
     .mount = sqfs_mount,
+    .fs_flags = FS_REQUIRES_DEV,
     .next  = NULL,
 };
 

@@ -107,6 +107,8 @@ static s64 drm_dmabuf_release(inode_t *inode, file_t *filp)
     filp->private_data = NULL;
     return 0;
 }
+extern file_t *syscall_fget(process_t *proc, int fd);
+extern void    syscall_fput(file_t *file);
 
 static file_operations_t g_dmabuf_fops = {
     .release = drm_dmabuf_release,
@@ -131,6 +133,11 @@ int drm_prime_export_fd(drm_device_t *dev, drm_gem_object_t *obj)
     filp->f_flags      = O_RDWR;
     filp->f_count      = 1;
 
+    /* Take the GEM reference BEFORE the fd is committed. If a racing thread
+     * closes the newly published fd before this thread wakes up, it will
+     * double-drop the object reference and cause a Use-After-Free. */
+    drm_gem_object_get(obj);
+
     /* Install through the syscall layer's helper rather than scanning
      * handle_table[] and assigning into it directly. That open-coded version
      * ran without g_fd_lock, so two threads exporting at once picked the same
@@ -139,14 +146,12 @@ int drm_prime_export_fd(drm_device_t *dev, drm_gem_object_t *obj)
      * occupant underneath it. */
     s64 fd = syscall_install_fd(proc, filp, 0);
     if (fd < 0) {
+        drm_gem_object_put(dev, obj);
         kfree(filp);
         kfree(db);
         return (int)fd;
     }
 
-    /* Take the GEM reference only once the fd is committed — an early
-     * reference on the -EMFILE path was never dropped. */
-    drm_gem_object_get(obj);
     return (int)fd;
 }
 
@@ -155,13 +160,26 @@ drm_gem_object_t *drm_prime_import_fd(drm_device_t *dev, int fd)
     process_t *proc = sched_current_process();
     if (!proc || fd < 0 || fd >= PROC_MAX_FDS) return NULL;
 
-    file_t *filp = (file_t *)proc->handle_table[fd];
-    if (!filp || filp->f_op != &g_dmabuf_fops || !filp->private_data) return NULL;
+    file_t *filp = syscall_fget(proc, fd);
+    if (!filp) return NULL;
+
+    if (filp->f_op != &g_dmabuf_fops || !filp->private_data) {
+        syscall_fput(filp);
+        return NULL;
+    }
 
     drm_dmabuf_t *db = (drm_dmabuf_t *)filp->private_data;
     /* Importing across cards would need a real dma-buf attachment layer. */
-    if (db->dev != dev) return NULL;
-    return db->obj;
+    if (db->dev != dev) {
+        syscall_fput(filp);
+        return NULL;
+    }
+    
+    drm_gem_object_t *obj = db->obj;
+    drm_gem_object_get(obj);
+    syscall_fput(filp);
+    
+    return obj;
 }
 
 /* ── File operations ─────────────────────────────────────────────────────── */
@@ -176,6 +194,7 @@ static s64 drm_open(inode_t *inode, file_t *filp)
 
     drm_device_t *dev = minor->dev;
     file->dev            = dev;
+    file->file_lock      = (spinlock_t)SPINLOCK_INIT;
     file->is_render_node = minor->is_render;
     file->next_handle    = 1;
 

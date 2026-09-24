@@ -22,6 +22,10 @@
 #include "../azwm/de_font.h"
 #include "../shared/gfx_pipeline.h"
 #include "../shared/ui_kit.h"
+#include "../../libc/include/fcntl.h"
+#include "../../libc/include/time.h"
+#include "../../libc/include/errno.h"
+#include "../../libc/include/sys/socket.h"
 
 #define SERVER_CHAN 1
 #define WIN_W       680
@@ -274,14 +278,120 @@ static void draw_tab_cursors(void)
     }
 }
 
-/* ── Auto-Accept Lab Tab ─────────────────────────────────────────────────── */
+/* ── Auto-Accept Lab Tab ─────────────────────────────────────────────────────
+ *
+ * The four switches here are the four keys in /etc/security.conf — the same
+ * ones Settings > Security writes — read at startup and written back when
+ * flipped. They used to be private booleans that started at true and went
+ * nowhere: the panel showed a policy that was not the system's, and
+ * changing it changed nothing.
+ *
+ * The button below used to be "Simulate Action", and it printed
+ * "Action AUTO-ACCEPTED! Executed seamlessly with zero interactive prompts
+ * (0.08ms)" — a result, and a duration, for an action that was never
+ * attempted. It now runs two real privileged operations and reports what
+ * the kernel actually said, timed with the monotonic clock. */
 static bool g_aa_ipc = true;
 static bool g_aa_admin = true;
 static bool g_aa_dhcp = true;
 static bool g_aa_trace = true;
 static int  g_sim_events = 0;
-static const char *g_sim_status = "Standby. Click 'Simulate Action' to test execution gate.";
+static char g_sim_status[160] = "Idle. Click 'Run Capability Probe' to test privileged operations.";
 static unsigned int g_sim_status_col = UK_SUBTEXT0;
+
+#define SECURITY_CONF "/etc/security.conf"
+
+static bool conf_flag(const char *buf, const char *key, bool dflt)
+{
+    const char *p = strstr(buf, key);
+    if (!p) return dflt;
+    p += strlen(key);
+    return (*p == '1');
+}
+
+static void security_conf_load(void)
+{
+    char buf[512];
+    int fd = open(SECURITY_CONF, O_RDONLY, 0);
+    if (fd < 0) return;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = '\0';
+
+    g_aa_ipc   = conf_flag(buf, "ipc_autoaccept=",   g_aa_ipc);
+    g_aa_admin = conf_flag(buf, "admin_autoaccept=", g_aa_admin);
+    g_aa_dhcp  = conf_flag(buf, "dhcp_autoaccept=",  g_aa_dhcp);
+    g_aa_trace = conf_flag(buf, "trace_autoaccept=", g_aa_trace);
+}
+
+static void security_conf_save(void)
+{
+    char out[256];
+    int len = snprintf(out, sizeof(out),
+                       "# AzamiOS Security & Auto-Accept Configuration\n"
+                       "ipc_autoaccept=%d\n"
+                       "admin_autoaccept=%d\n"
+                       "dhcp_autoaccept=%d\n"
+                       "trace_autoaccept=%d\n",
+                       g_aa_ipc ? 1 : 0, g_aa_admin ? 1 : 0,
+                       g_aa_dhcp ? 1 : 0, g_aa_trace ? 1 : 0);
+    int fd = open(SECURITY_CONF, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    write(fd, out, (size_t)len);
+    close(fd);
+}
+
+/* Two operations the kernel only allows a privileged process, run for real
+ * and reported as they came back. */
+static void run_capability_probe(void)
+{
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    int raw_fd = socket(AF_INET, SOCK_RAW, 1 /* IPPROTO_ICMP */);
+    int raw_errno = (raw_fd < 0) ? errno : 0;
+    if (raw_fd >= 0) close(raw_fd);
+
+    int sysctl_ok = 0, sysctl_errno = 0;
+    int sfd = open("/proc/sys/kernel/dmesg_restrict", O_WRONLY, 0);
+    if (sfd < 0) {
+        sysctl_errno = errno;
+    } else {
+        /* Write back the value it already has: a real privileged write with
+         * no change in behaviour. */
+        char cur[8] = "1\n";
+        int rfd = open("/proc/sys/kernel/dmesg_restrict", O_RDONLY, 0);
+        if (rfd >= 0) {
+            ssize_t rn = read(rfd, cur, sizeof(cur) - 1);
+            if (rn > 0) cur[rn] = '\0';
+            close(rfd);
+        }
+        sysctl_ok = (write(sfd, cur, strlen(cur)) >= 0);
+        if (!sysctl_ok) sysctl_errno = errno;
+        close(sfd);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long long us = (t1.tv_sec - t0.tv_sec) * 1000000LL + (t1.tv_nsec - t0.tv_nsec) / 1000;
+
+    g_sim_events++;
+    if (raw_fd >= 0 && sysctl_ok) {
+        snprintf(g_sim_status, sizeof(g_sim_status),
+                 "Probe OK: raw socket granted, sysctl write accepted (%lld.%03lld ms).",
+                 us / 1000, us % 1000);
+        g_sim_status_col = UK_GREEN;
+    } else {
+        snprintf(g_sim_status, sizeof(g_sim_status),
+                 "Probe: raw socket %s%s, sysctl write %s%s (%lld.%03lld ms).",
+                 raw_fd >= 0 ? "granted" : "denied errno=",
+                 raw_fd >= 0 ? "" : (raw_errno == EPERM ? "EPERM" : "?"),
+                 sysctl_ok ? "accepted" : "denied errno=",
+                 sysctl_ok ? "" : (sysctl_errno == EPERM ? "EPERM" : "?"),
+                 us / 1000, us % 1000);
+        g_sim_status_col = UK_PEACH;
+    }
+}
 
 static void draw_tab_autoaccept(void)
 {
@@ -312,7 +422,7 @@ static void draw_tab_autoaccept(void)
     int btn_x = 36, btn_y = 280, btn_w = 200, btn_h = 32;
     uk_btn_state_t bst = (g_mx >= btn_x && g_mx <= btn_x + btn_w && g_my >= btn_y && g_my <= btn_y + btn_h)
                          ? (g_mouse_down ? UK_BTN_PRESSED : UK_BTN_HOVER) : UK_BTN_NORMAL;
-    uk_draw_button(&g_win, btn_x, btn_y, btn_w, btn_h, "Simulate Action", bst);
+    uk_draw_button(&g_win, btn_x, btn_y, btn_w, btn_h, "Run Capability Probe", bst);
 
     /* Badge & status */
     if (g_aa_admin) {
@@ -505,37 +615,34 @@ static void handle_click(int mx, int my)
         /* Toggle 1: IPC (280, 118) */
         if (mx >= 280 && mx <= 324 && my >= 118 && my <= 140) {
             g_aa_ipc = !g_aa_ipc;
+            security_conf_save();
             render_studio();
             return;
         }
         /* Toggle 2: Admin (280, 152) */
         if (mx >= 280 && mx <= 324 && my >= 152 && my <= 174) {
             g_aa_admin = !g_aa_admin;
+            security_conf_save();
             render_studio();
             return;
         }
         /* Toggle 3: DHCP (590, 118) */
         if (mx >= 590 && mx <= 634 && my >= 118 && my <= 140) {
             g_aa_dhcp = !g_aa_dhcp;
+            security_conf_save();
             render_studio();
             return;
         }
         /* Toggle 4: Trace (590, 152) */
         if (mx >= 590 && mx <= 634 && my >= 152 && my <= 174) {
             g_aa_trace = !g_aa_trace;
+            security_conf_save();
             render_studio();
             return;
         }
-        /* Simulate Action Button (36, 280, w=200, h=32) */
+        /* Capability probe button (36, 280, w=200, h=32) */
         if (mx >= 36 && mx <= 236 && my >= 280 && my <= 312) {
-            g_sim_events++;
-            if (g_aa_admin) {
-                g_sim_status = "Action AUTO-ACCEPTED! Executed seamlessly with zero interactive prompts (0.08ms).";
-                g_sim_status_col = UK_GREEN;
-            } else {
-                g_sim_status = "Action BLOCKED: Interactive confirmation required (Policy unaccepted).";
-                g_sim_status_col = UK_PEACH;
-            }
+            run_capability_probe();
             render_studio();
             return;
         }
@@ -553,6 +660,7 @@ int main(int argc, char **argv)
         return -1;
     }
 
+    security_conf_load();
     render_studio();
 
     int loop_counter = 0;

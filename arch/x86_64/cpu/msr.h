@@ -152,6 +152,17 @@ static __attribute__((always_inline)) inline u64 rdtsc(void) {
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((u64)hi << 32) | lo;
 }
+/* RDTSC is not a serializing instruction: the CPU is free to execute it out
+ * of order with respect to the loads and stores around it, so a naive
+ * "read, do work, read again" can measure a window that does not contain the
+ * work. An LFENCE in front pins the read to the point in program order where
+ * it is written, which is what every timing measurement in this kernel — the
+ * LAPIC/TSC calibration in lapic.c above all — actually wants. */
+static __attribute__((always_inline)) inline u64 rdtsc_ordered(void) {
+    u32 lo, hi;
+    __asm__ volatile("lfence\n\trdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((u64)hi << 32) | lo;
+}
 static __attribute__((always_inline)) inline u64 rdtscp(u32 *aux) {
     u32 lo, hi, a;
     __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(a));

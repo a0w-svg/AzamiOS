@@ -71,7 +71,27 @@ u32 crc32c(u32 crc, const void *buf, size_t len);
  */
 void hw_clear_page(void *va);
 
-/** hw_clear_pages(va, npages) — hw_clear_page() over a contiguous run. */
+/**
+ * hw_clear_page_hot(va) — zero one page that the caller is about to write.
+ *
+ * The counterpart to hw_clear_page(), and the right choice whenever the page
+ * is being cleared only as a prelude to filling it in — a page table is the
+ * archetype. hw_clear_page()'s non-temporal paths deliberately leave the page
+ * out of the cache, which is free when nothing reads it back soon and pure
+ * waste when the very next thing to run writes every line of it: the fill pays
+ * a read-for-ownership per line to undo what the clear just did. This one uses
+ * cached stores, so the fill starts with the lines already owned in L1.
+ */
+void hw_clear_page_hot(void *va);
+
+/**
+ * hw_clear_pages(va, npages) — zero a contiguous run of pages.
+ *
+ * Not a loop over hw_clear_page(): the run is issued as one operation and
+ * ordered once at the end. On the ERMS path that is a single `rep stosb` for
+ * the whole region rather than one per page, and on the non-temporal paths it
+ * is one SFENCE rather than @npages of them.
+ */
 void hw_clear_pages(void *va, size_t npages);
 
 /**
@@ -82,6 +102,17 @@ void hw_clear_pages(void *va, size_t npages);
  * working set of whatever thread is about to be resumed.
  */
 void hw_copy_page(void *dst, const void *src);
+
+/**
+ * hw_copy_pages(dst, src, npages) — copy a contiguous run of pages.
+ *
+ * The bulk form of hw_copy_page(), with the same single-issue, single-fence
+ * treatment as hw_clear_pages(). This is the primitive for copying a huge page
+ * (a 2 MB or 1 GB COW fork), where a plain memcpy() would pull the entire
+ * region through the cache hierarchy and evict everything the resumed thread
+ * was about to touch.
+ */
+void hw_copy_pages(void *dst, const void *src, size_t npages);
 
 /* ── Video Memory / Aperture Acceleration ────────────────────────────────── */
 
@@ -99,6 +130,22 @@ void hw_copy_to_vram(void *dst, const void *src, size_t len);
  * Fills @count 32-bit pixels with @val using 64-bit packed stores.
  */
 void hw_fill_vram(void *dst, u32 val, size_t count);
+
+/**
+ * hw_fill_vram_color24(dst, r, g, b, count) — inline helper for BGR24 solid fills.
+ *
+ * For adapters like Bochs or older SVGA modes that use 24-bit depths instead of
+ * 32-bit. Fills @count pixels, writing 3 bytes per pixel.
+ */
+static inline void hw_fill_vram_color24(void *dst, u8 r, u8 g, u8 b, size_t count)
+{
+    u8 *d = (u8 *)dst;
+    for (size_t i = 0; i < count; i++) {
+        d[i * 3 + 0] = b;
+        d[i * 3 + 1] = g;
+        d[i * 3 + 2] = r;
+    }
+}
 
 /* ── Bit scanning & manipulation ─────────────────────────────────────────── */
 
@@ -490,3 +537,106 @@ static inline bool hw_rdseed64(u64 *val)
  */
 void hw_spin_wait(u32 spins);
 
+/* ── GPU Write-Combining helpers ─────────────────────────────────────────────
+ *
+ * GPU framebuffer apertures are configured as Write-Combining (WC) by the
+ * firmware.  WC stores coalesce in the CPU's WC buffer and drain as 64-byte
+ * PCIe burst writes.  The correct discipline is:
+ *
+ *   1. Write pixels with MOVNTI (non-temporal) or plain stores.
+ *   2. After the last pixel store, call hw_sfence() before any device
+ *      doorbell write (SVGA_REG_SYNC, virtqueue kick, BGA Y_OFFSET) so the
+ *      WC buffer is fully drained before the device fetches the pixels.
+ *   3. Never CLFLUSH a WC aperture — it's a no-op at best.
+ *
+ * All helpers below are GPR-operand or no-register instructions — safe in a
+ * kernel built -mno-sse.  They are deliberately inlines so the compiler can
+ * hoist the spill/fill overhead out of tight inner loops.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * hw_nt_store32(p, val) — non-temporal 32-bit store.
+ *
+ * Writes @val to the address @p using MOVNTI, bypassing the cache and
+ * writing directly into the WC buffer.  The WC buffer coalesces adjacent
+ * stores into 64-byte bursts before sending them to the device.
+ *
+ * For contiguous pixel fills use hw_fill_vram(), which is faster because it
+ * issues 64-bit MOVNTI pairs and processes cache-line-sized blocks.  Use
+ * this helper only for sparse or misaligned word-sized writes (e.g. writing
+ * individual GPU control-struct fields into MMIO space).
+ */
+static inline void hw_nt_store32(void *p, u32 val)
+{
+    __asm__ volatile("movnti %1, %0" : "=m"(*(u32 *)p) : "r"(val) : "memory");
+}
+
+/**
+ * hw_nt_store64(p, val) — non-temporal 64-bit store.
+ *
+ * Same as hw_nt_store32() but writes two pixels (or one 64-bit control word)
+ * at once.  Prefer this over two back-to-back hw_nt_store32() calls; it
+ * halves the MOVNTI count and gives the WC buffer a better chance to coalesce
+ * into a full 64-byte burst.
+ *
+ * @p must be 8-byte aligned for the MOVNTI to stay within one WC buffer slot
+ * on processors that track WC buffer entries at 8-byte granularity.
+ */
+static inline void hw_nt_store64(void *p, u64 val)
+{
+    __asm__ volatile("movnti %1, %0" : "=m"(*(u64 *)p) : "r"(val) : "memory");
+}
+
+/**
+ * hw_prefetch_read(p) — software prefetch hint: load @p into cache for reading.
+ *
+ * Issues PREFETCHNTA ("non-temporal, allocate to L1/L2 but not L3"), which
+ * minimises the pollution of the last-level cache while still pulling the line
+ * into the hierarchy before the blit loop reaches it.  Use this two or three
+ * cache lines ahead of the current read position.
+ *
+ * Do NOT call this for WC VRAM destination addresses — the CPU never reads
+ * back from WC, and a prefetch of a WC line would be a wasted bus transaction.
+ * This is for prefetching the *source* shadow buffer before copying it out.
+ */
+static inline void hw_prefetch_read(const void *p)
+{
+    __asm__ volatile("prefetchnta %0" : : "m"(*(const char *)p) : "memory");
+}
+
+/**
+ * hw_prefetch_write(p) — software prefetch hint: load @p into L1 for writing.
+ *
+ * Issues PREFETCHT0 ("temporal, allocate into all cache levels"), which is
+ * the appropriate hint when the CPU is about to do a read-modify-write on a
+ * cached region (e.g. alpha-blending into a shadow buffer).  It has higher
+ * cache pollution than PREFETCHNTA, so use it only when the data will be read
+ * back soon.
+ *
+ * For pure write-only VRAM fills use hw_fill_vram() instead: its MOVNTI path
+ * produces zero read-for-ownership traffic, making it strictly cheaper.
+ */
+static inline void hw_prefetch_write(const void *p)
+{
+    __asm__ volatile("prefetcht0 %0" : : "m"(*(const char *)p) : "memory");
+}
+
+/**
+ * hw_movnti_u32_loop(dst, src, count) — copy @count u32 values to a WC
+ * destination using MOVNTI, with an SFENCE at the end.
+ *
+ * This is the word-at-a-time equivalent of hw_copy_to_vram() for callers
+ * that have a scatter-source (e.g. palette lookups, indexed colour expansion)
+ * rather than a byte-contiguous buffer.  The SFENCE at the end makes it safe
+ * to write a device doorbell immediately after the call.
+ *
+ * For a plain contiguous buffer-to-VRAM copy, prefer hw_copy_to_vram() which
+ * may use ERMS instead of MOVNTI when that is faster on the detected CPU.
+ */
+static inline void hw_movnti_u32_loop(void *dst, const u32 *src, size_t count)
+{
+    u32 *d = (u32 *)dst;
+    for (size_t i = 0; i < count; i++)
+        __asm__ volatile("movnti %1, %0" : "=m"(d[i]) : "r"(src[i]) : "memory");
+    __asm__ volatile("sfence" ::: "memory");
+}

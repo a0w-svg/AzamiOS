@@ -36,6 +36,8 @@
 static volatile u8 *g_hpet_base;
 static u64  g_period_fs;      /* counter period in femtoseconds (10^-15 s) */
 static u64  g_start_count;    /* counter value captured at hpet_init()     */
+static u64  g_counter_mask;   /* all-ones over the counter's real width    */
+static u64  g_phys_base;      /* physical MMIO base (for the vDSO mapping) */
 static bool g_hpet_ok;
 
 static inline u64 hpet_rd(u32 off)
@@ -80,9 +82,15 @@ void hpet_init(void)
         return;
     }
 
+    /* A 32-bit main counter reads back with the upper half zero and wraps
+     * at 2^32 (~43 s at QEMU's 100 MHz): every delta must be taken modulo
+     * its real width, not modulo 2^64. */
+    g_counter_mask = (cap & HPET_CAP_64BIT) ? ~0ULL : 0xFFFFFFFFULL;
+    g_phys_base    = phys;
+
     /* Enable the main counter (leave interrupts/comparators untouched). */
     hpet_wr(HPET_REG_CONFIG, hpet_rd(HPET_REG_CONFIG) | HPET_CFG_ENABLE);
-    g_start_count = hpet_rd(HPET_REG_COUNTER);
+    g_start_count = hpet_rd(HPET_REG_COUNTER) & g_counter_mask;
     g_hpet_ok = true;
 
     u64 freq_hz = 1000000000000000ULL / g_period_fs;
@@ -102,7 +110,10 @@ bool hpet_available(void)
 u64 hpet_now_ns(void)
 {
     if (!g_hpet_ok) return 0;
-    u64 delta = hpet_rd(HPET_REG_COUNTER) - g_start_count;   /* wraps correctly */
+    /* Wraps correctly for either counter width. A 32-bit counter still
+     * wraps this value every ~43 s at 100 MHz; long-running callers should
+     * use the timekeeper (kernel/time/timekeeping.h), which accumulates. */
+    u64 delta = (hpet_rd(HPET_REG_COUNTER) - g_start_count) & g_counter_mask;
 
     /* ns = delta * period_fs / 1e6, computed without a 128-bit divide (no
      * libgcc in a freestanding kernel). Splitting keeps every product < 2^64
@@ -117,4 +128,24 @@ u64 hpet_resolution_ns(void)
     if (!g_hpet_ok) return 0;
     u64 ns = g_period_fs / 1000000ULL;
     return ns ? ns : 1;
+}
+
+u64 hpet_read_counter(void)
+{
+    return g_hpet_ok ? (hpet_rd(HPET_REG_COUNTER) & g_counter_mask) : 0;
+}
+
+u64 hpet_counter_mask(void)
+{
+    return g_counter_mask;
+}
+
+u64 hpet_frequency_hz(void)
+{
+    return g_hpet_ok ? 1000000000000000ULL / g_period_fs : 0;
+}
+
+phys_addr_t hpet_counter_phys(void)
+{
+    return g_hpet_ok ? (phys_addr_t)(g_phys_base + HPET_REG_COUNTER) : 0;
 }

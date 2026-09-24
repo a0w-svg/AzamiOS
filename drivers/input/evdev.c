@@ -41,6 +41,7 @@ extern u64 sched_get_ticks(void);
 #define EV_KEY          0x01
 #define EV_REL          0x02
 #define EV_MSC          0x04
+#define EV_LED          0x11
 #define EV_CNT          0x20
 
 #define SYN_REPORT      0
@@ -48,6 +49,11 @@ extern u64 sched_get_ticks(void);
 #define REL_Y           0x01
 #define REL_WHEEL       0x08
 #define MSC_SCAN        0x04
+
+/* Lock LEDs, in Linux's own numbering (input-event-codes.h). */
+#define LED_NUML        0x00
+#define LED_CAPSL       0x01
+#define LED_SCROLLL     0x02
 
 #define BTN_LEFT        0x110
 #define BTN_RIGHT       0x111
@@ -61,11 +67,21 @@ extern u64 sched_get_ticks(void);
 #define EVIOCGVERSION   0x80044501
 #define EVIOCGID        0x80084502
 #define EVIOCGRAB       0x40044590
-/* EVIOCGNAME/EVIOCGBIT encode a length in the request, so they are matched on
- * their direction/type/number and the size is read back out of the request. */
+/* Fixed-size ioctls beyond the original four: _IOC(dir, 'E', nr, size) with
+ * nr=0x03 (REP), 0x04 (KEYCODE V1), both an unsigned int[2] (8 bytes), same
+ * scheme EVIOCGVERSION/EVIOCGID above already use — see EVIOC_NR/EVIOC_SIZE
+ * below for the general form the length-carrying ioctls need. */
+#define EVIOCGREP       0x80084503
+#define EVIOCSREP       0x40084503
+#define EVIOCGKEYCODE   0x80084504
+#define EVIOCSKEYCODE   0x40084504
+/* EVIOCGNAME/EVIOCGBIT/EVIOCGKEY encode a length in the request, so they are
+ * matched on their direction/type/number and the size is read back out of
+ * the request. */
 #define EVIOC_NR(cmd)   ((cmd) & 0xFF)
 #define EVIOC_SIZE(cmd) (((cmd) >> 16) & 0x3FFF)
 #define EVDEV_IS_E_REQUEST(cmd) ((((cmd) >> 8) & 0xFF) == 0x45)
+#define EVIOCGKEY_NR    0x18
 #define EVIOCGNAME_NR   0x06
 #define EVIOCGPHYS_NR   0x07
 #define EVIOCGUNIQ_NR   0x08
@@ -91,6 +107,7 @@ struct evdev_event {
 #define EVDEV_RING_SIZE 256   /* records buffered per open descriptor */
 
 typedef struct evdev_client {
+    spinlock_t lock;
     struct evdev_event ring[EVDEV_RING_SIZE];
     u32   head, tail;
     bool  used;
@@ -98,14 +115,14 @@ typedef struct evdev_client {
 
 #define EVDEV_MAX_CLIENTS 8
 static evdev_client_t g_clients[EVDEV_MAX_CLIENTS];
-static spinlock_t     g_evdev_lock = SPINLOCK_INIT;
+static spinlock_t     g_clients_lock = SPINLOCK_INIT;
 
 /* Last reported button state, so a change can be turned into a press/release. */
 static u8 g_last_buttons;
 
 /* ── Event fan-out ───────────────────────────────────────────────────────── */
 
-/* Append one record to every open descriptor.  Caller holds g_evdev_lock. */
+/* Append one record to every open descriptor.  Caller holds NO lock. */
 static void evdev_emit(u16 type, u16 code, s32 value)
 {
     u64 ticks = sched_get_ticks();
@@ -118,14 +135,14 @@ static void evdev_emit(u16 type, u16 code, s32 value)
 
     for (u32 i = 0; i < EVDEV_MAX_CLIENTS; i++) {
         evdev_client_t *c = &g_clients[i];
-        if (!c->used) continue;
+        if (!__atomic_load_n(&c->used, __ATOMIC_RELAXED)) continue;
 
+        irqflags_t f = spinlock_lock_irqsave(&c->lock);
         u32 next = (c->head + 1) % EVDEV_RING_SIZE;
-        /* A client that stopped reading loses its oldest records rather than
-         * blocking the input path. */
         if (next == c->tail) c->tail = (c->tail + 1) % EVDEV_RING_SIZE;
         c->ring[c->head] = ev;
         c->head = next;
+        spinlock_unlock_irqrestore(&c->lock, f);
     }
 }
 
@@ -136,7 +153,6 @@ static void evdev_emit(u16 type, u16 code, s32 value)
  */
 static void evdev_observe(const input_event_t *evt)
 {
-    irqflags_t flags = spinlock_lock_irqsave(&g_evdev_lock);
 
     bool any = false;
 
@@ -173,7 +189,6 @@ static void evdev_observe(const input_event_t *evt)
     /* Every logical update ends with a synchronisation record. */
     if (any) evdev_emit(EV_SYN, SYN_REPORT, 0);
 
-    spinlock_unlock_irqrestore(&g_evdev_lock, flags);
 }
 
 /* ── File operations ─────────────────────────────────────────────────────── */
@@ -182,16 +197,15 @@ static s64 evdev_open(inode_t *inode, file_t *filp)
 {
     (void)inode;
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_evdev_lock);
     evdev_client_t *c = NULL;
     for (u32 i = 0; i < EVDEV_MAX_CLIENTS; i++) {
         if (!g_clients[i].used) { c = &g_clients[i]; break; }
     }
     if (c) {
-        c->used = true;
+        c->lock = (spinlock_t)SPINLOCK_INIT;
         c->head = c->tail = 0;
+        __atomic_store_n(&c->used, true, __ATOMIC_RELEASE);
     }
-    spinlock_unlock_irqrestore(&g_evdev_lock, flags);
 
     if (!c) return -(s64)EBUSY;
     filp->private_data = c;
@@ -204,10 +218,8 @@ static s64 evdev_release(inode_t *inode, file_t *filp)
     evdev_client_t *c = filp ? (evdev_client_t *)filp->private_data : NULL;
     if (!c) return 0;
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_evdev_lock);
     c->used = false;
     c->head = c->tail = 0;
-    spinlock_unlock_irqrestore(&g_evdev_lock, flags);
 
     filp->private_data = NULL;
     return 0;
@@ -224,14 +236,12 @@ static s64 evdev_read(file_t *filp, void *buf, size_t len, u64 *offset)
     struct evdev_event staging[32];
     u32 count = 0;
 
-    irqflags_t flags = spinlock_lock_irqsave(&g_evdev_lock);
     while (count < ARRAY_SIZE(staging) &&
            (count + 1) * sizeof(struct evdev_event) <= len &&
            c->tail != c->head) {
         staging[count++] = c->ring[c->tail];
         c->tail = (c->tail + 1) % EVDEV_RING_SIZE;
     }
-    spinlock_unlock_irqrestore(&g_evdev_lock, flags);
 
     if (count == 0) return (filp->f_flags & O_NONBLOCK) ? -(s64)EAGAIN : 0;
 
@@ -246,6 +256,43 @@ static int evdev_poll(file_t *filp)
     evdev_client_t *c = filp ? (evdev_client_t *)filp->private_data : NULL;
     if (!c) return POLLNVAL;
     return (c->tail != c->head) ? (POLLIN | POLLRDNORM) : 0;
+}
+
+/*
+ * evdev_write() — the real Linux way to drive the lock LEDs: a client writes
+ * an EV_LED record instead of using an ioctl. `buf` is a kernel pointer (see
+ * the buffer contract in fs/vfs.h), so this is a plain memcpy, not
+ * copy_from_user().
+ *
+ * Real evdev nodes silently accept and discard any record they don't handle
+ * — a client writing EV_SYN/SYN_REPORT to frame its LED writes, or an event
+ * type this device has no business receiving — rather than erroring the
+ * whole write, so a partial or mixed batch never trips a well-behaved
+ * client. This does the same.
+ */
+static s64 evdev_write(file_t *filp, const void *buf, size_t len, u64 *offset)
+{
+    (void)filp; (void)offset;
+    if (!buf) return -(s64)EINVAL;
+    if (len < sizeof(struct evdev_event)) return -(s64)EINVAL;
+
+    const struct evdev_event *evs = (const struct evdev_event *)buf;
+    size_t count = len / sizeof(struct evdev_event);
+
+    for (size_t i = 0; i < count; i++) {
+        if (evs[i].type != EV_LED) continue;
+
+        u32 led = 0;
+        switch (evs[i].code) {
+        case LED_CAPSL:   led = INPUT_LED_CAPSLOCK;   break;
+        case LED_NUML:    led = INPUT_LED_NUMLOCK;    break;
+        case LED_SCROLLL: led = INPUT_LED_SCROLLLOCK; break;
+        default: continue; /* LED_COMPOSE etc. — no such lock here */
+        }
+        input_set_led(led, evs[i].value != 0);
+    }
+
+    return (s64)(count * sizeof(struct evdev_event));
 }
 
 /* Set bit @n in a little-endian bitmap of @len bytes. */
@@ -276,6 +323,35 @@ static s64 evdev_ioctl(file_t *filp, u32 cmd, u64 arg)
         /* Grabbing is exclusive access; every client here already sees the
          * same stream, so there is nothing to take away from anyone. */
         return 0;
+    case EVIOCGREP: {
+        u32 rep[2];
+        input_get_keyboard_repeat(&rep[0], &rep[1]);
+        return copy_to_user(uarg, rep, sizeof(rep)) == 0 ? 0 : -(s64)EFAULT;
+    }
+    case EVIOCSREP: {
+        u32 rep[2];
+        if (copy_from_user(rep, uarg, sizeof(rep)) != 0) return -(s64)EFAULT;
+        /* A keyboard that never ACKs 0xF3 (no PS/2 keyboard attached, e.g. a
+         * pure virtio-input session) leaves the compiled-in default in
+         * place rather than reporting success for nothing. */
+        return input_set_keyboard_repeat(rep[0], rep[1]) ? 0 : -(s64)EIO;
+    }
+    case EVIOCGKEYCODE: {
+        /* V1 form: {scancode, keycode}. The caller fills in scancode; we
+         * overwrite keycode and hand the whole pair back, exactly like real
+         * evdev's EVIOCGKEYCODE. */
+        u32 ke[2];
+        if (copy_from_user(ke, uarg, sizeof(ke)) != 0) return -(s64)EFAULT;
+        ke[1] = input_get_scancode_keymap((u16)ke[0]);
+        return copy_to_user(uarg, ke, sizeof(ke)) == 0 ? 0 : -(s64)EFAULT;
+    }
+    case EVIOCSKEYCODE: {
+        u32 ke[2];
+        if (copy_from_user(ke, uarg, sizeof(ke)) != 0) return -(s64)EFAULT;
+        if (ke[0] >= 256) return -(s64)EINVAL;
+        input_set_scancode_keymap((u16)ke[0], (u16)ke[1]);
+        return 0;
+    }
     default:
         break;
     }
@@ -295,6 +371,18 @@ static s64 evdev_ioctl(file_t *filp, u32 cmd, u64 arg)
         return (s64)l;
     }
 
+    if (nr == EVIOCGKEY_NR) {
+        u8 map[KEY_CNT / 8];
+        size_t maplen = size;
+        if (maplen > sizeof(map)) maplen = sizeof(map);
+        /* input_get_key_state() is the single source of truth for "is this
+         * key/button currently held" — see its doc comment in input.h — so
+         * there is no separate bitmap to maintain here. */
+        input_get_key_state(map, maplen);
+        if (maplen && copy_to_user(uarg, map, maplen) != 0) return -(s64)EFAULT;
+        return (s64)maplen;
+    }
+
     if (nr >= EVIOCGBIT_BASE && nr < EVIOCGBIT_BASE + EV_CNT) {
         u32 ev = nr - EVIOCGBIT_BASE;
         u8  map[KEY_CNT / 8];
@@ -308,6 +396,7 @@ static s64 evdev_ioctl(file_t *filp, u32 cmd, u64 arg)
             bitmap_set(map, maplen, EV_KEY);
             bitmap_set(map, maplen, EV_REL);
             bitmap_set(map, maplen, EV_MSC);
+            bitmap_set(map, maplen, EV_LED);
         } else if (ev == EV_KEY) {
             /* The whole AT set-1 block, plus the mouse buttons. */
             for (u32 k = 1; k <= 88; k++) bitmap_set(map, maplen, k);
@@ -322,6 +411,10 @@ static s64 evdev_ioctl(file_t *filp, u32 cmd, u64 arg)
             bitmap_set(map, maplen, REL_WHEEL);
         } else if (ev == EV_MSC) {
             bitmap_set(map, maplen, MSC_SCAN);
+        } else if (ev == EV_LED) {
+            bitmap_set(map, maplen, LED_NUML);
+            bitmap_set(map, maplen, LED_CAPSL);
+            bitmap_set(map, maplen, LED_SCROLLL);
         }
 
         if (maplen && copy_to_user(uarg, map, maplen) != 0) return -(s64)EFAULT;
@@ -333,6 +426,7 @@ static s64 evdev_ioctl(file_t *filp, u32 cmd, u64 arg)
 
 static file_operations_t g_evdev_fops = {
     .read    = evdev_read,
+    .write   = evdev_write,
     .ioctl   = evdev_ioctl,
     .open    = evdev_open,
     .release = evdev_release,

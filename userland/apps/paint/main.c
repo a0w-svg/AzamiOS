@@ -25,8 +25,15 @@
 #define WIN_H          500
 #define MAP_ADDR       ((void *)0x64000000)
 
-#define CANVAS_X       16
-#define CANVAS_Y       56
+/* The canvas is the document: a fixed 648x400 image, like any paint
+ * program's canvas, not something that stretches with the window. What
+ * follows the window is where it sits — canvas_origin() centres it under
+ * the toolbar — and the blit is clipped to what the window can actually
+ * show. Before this the canvas was blitted at a fixed (16,56) with no
+ * clipping and no resize handling at all: maximizing left it in the
+ * corner of an unpainted window, and making the window smaller than the
+ * canvas wrote past the end of each row of the window's pixel buffer. */
+#define CANVAS_MIN_Y    56      /* first row below the toolbar */
 #define CANVAS_W       648
 #define CANVAS_H       400
 
@@ -194,6 +201,25 @@ static void flood_fill(int start_x, int start_y, unsigned int target_col, unsign
     }
 }
 
+/* Top-left corner of the canvas inside the window: centred horizontally,
+ * just under the toolbar, and never negative (a window narrower than the
+ * canvas shows its left-hand part rather than scrolling). */
+static void canvas_origin(int *ox, int *oy)
+{
+    int w = (int)g_win.width;
+    int h = (int)g_win.height;
+
+    int x = (w - CANVAS_W) / 2;
+    if (x < 16) x = 16;
+
+    int avail_h = h - CANVAS_MIN_Y - 10;
+    int y = CANVAS_MIN_Y + (avail_h - CANVAS_H) / 2;
+    if (y < CANVAS_MIN_Y) y = CANVAS_MIN_Y;
+
+    *ox = x;
+    *oy = y;
+}
+
 static void render_paint_ui(void)
 {
     unsigned int w = g_win.width;
@@ -239,13 +265,27 @@ static void render_paint_ui(void)
     }
 
     /* ── Canvas Border ─────────────────────────────────────────────────────── */
-    uk_fill_rect(&g_win, CANVAS_X - 2, CANVAS_Y - 2, CANVAS_W + 4, CANVAS_H + 4, UK_SURFACE1);
+    int cox, coy;
+    canvas_origin(&cox, &coy);
+    uk_fill_rect(&g_win, cox - 2, coy - 2, CANVAS_W + 4, CANVAS_H + 4, UK_SURFACE1);
 
-    /* Fast Canvas Scanline Blit */
-    for (int cy = 0; cy < CANVAS_H; cy++) {
-        unsigned int *dst = &g_win.pixels[(CANVAS_Y + cy) * g_win.width + CANVAS_X];
+    /* Fast Canvas Scanline Blit, clipped to the window.
+     *
+     * The clip is not decoration: without it a window smaller than the
+     * canvas made each memcpy run past the end of its row and into the
+     * next one — and past the end of the buffer entirely on the last
+     * rows. */
+    int vis_w = (int)g_win.width - cox;
+    if (vis_w > CANVAS_W) vis_w = CANVAS_W;
+    int vis_h = (int)g_win.height - coy;
+    if (vis_h > CANVAS_H) vis_h = CANVAS_H;
+
+    for (int cy = 0; cy < vis_h; cy++) {
+        if (coy + cy < 0) continue;
+        if (vis_w <= 0) break;
+        unsigned int *dst = &g_win.pixels[(unsigned int)(coy + cy) * g_win.width + (unsigned int)cox];
         const unsigned int *src = &g_canvas[cy * CANVAS_W];
-        memcpy(dst, src, CANVAS_W * sizeof(unsigned int));
+        memcpy(dst, src, (size_t)vis_w * sizeof(unsigned int));
     }
 
     /* ── Status Bar ────────────────────────────────────────────────────────── */
@@ -256,12 +296,25 @@ static void render_paint_ui(void)
     char stat_l[80];
     snprintf(stat_l, sizeof(stat_l), "Tool: %s | Size: %dpx | Canvas: %dx%d",
              tools[g_tool_mode], g_brush_size, CANVAS_W, CANVAS_H);
-    uk_draw_text(&g_win, 12, sby + 3, stat_l, UK_OVERLAY0);
-
     char stat_r[32];
     snprintf(stat_r, sizeof(stat_r), "Pos: %d,%d",
              (g_prev_mx >= 0) ? g_prev_mx : 0, (g_prev_my >= 0) ? g_prev_my : 0);
-    uk_draw_text(&g_win, (int)w - (int)strlen(stat_r) * 8 - 12, sby + 3, stat_r, UK_SUBTEXT0);
+
+    /* Two strings, one bar: the right-hand one is placed first and the
+     * left one is clipped to whatever space is left, so a narrow window
+     * truncates the tool description instead of printing the two on top of
+     * each other. */
+    int right_x = (int)w - (int)strlen(stat_r) * 8 - 12;
+    if (right_x > 12) {
+        uk_push_clip(&g_win, 12, sby, right_x - 20, 18);
+        uk_draw_text(&g_win, 12, sby + 3, stat_l, UK_OVERLAY0);
+        uk_pop_clip(&g_win);
+        uk_draw_text(&g_win, right_x, sby + 3, stat_r, UK_SUBTEXT0);
+    } else {
+        uk_push_clip(&g_win, 12, sby, (int)w - 24, 18);
+        uk_draw_text(&g_win, 12, sby + 3, stat_l, UK_OVERLAY0);
+        uk_pop_clip(&g_win);
+    }
 
     uk_invalidate(&g_win);
 }
@@ -332,6 +385,12 @@ int main(int argc, char **argv)
         if (r < 0) break;
         if (r != 0) continue;
 
+        if (msg.type == AZ_WM_WINDOW_RESIZED) {
+            if (!uk_handle_resize(&g_win, &msg)) break;
+            render_paint_ui();
+            continue;
+        }
+
         if (msg.type == AZ_WM_DESTROY_WINDOW) break;
 
         if (msg.type == AZ_WM_KEY_EVENT) {
@@ -352,17 +411,20 @@ int main(int argc, char **argv)
             int my = msg.mouse.abs_y;
             int btn = msg.mouse.buttons;
 
+            int cox, coy;
+            canvas_origin(&cox, &coy);
+
             if (btn & 1) {
                 if (!g_mouse_down) {
                     save_undo();
                     g_mouse_down = 1;
-                    g_drag_start_x = mx - CANVAS_X;
-                    g_drag_start_y = my - CANVAS_Y;
+                    g_drag_start_x = mx - cox;
+                    g_drag_start_y = my - coy;
                     handle_click(mx, my);
                 }
 
-                int cx = mx - CANVAS_X;
-                int cy = my - CANVAS_Y;
+                int cx = mx - cox;
+                int cy = my - coy;
 
                 if (cx >= 0 && cx < CANVAS_W && cy >= 0 && cy < CANVAS_H) {
                     g_prev_mx = cx;
@@ -406,8 +468,8 @@ int main(int argc, char **argv)
             } else {
                 if (g_mouse_down) {
                     /* On mouse release for geometric shapes */
-                    int cx = mx - CANVAS_X;
-                    int cy = my - CANVAS_Y;
+                    int cx = mx - cox;
+                    int cy = my - coy;
                     if (g_tool_mode == 3 && g_drag_start_x >= 0) { /* Line */
                         memcpy(g_canvas, g_undo_buf, sizeof(g_canvas));
                         draw_canvas_line(g_drag_start_x, g_drag_start_y, cx, cy, g_brush_color, g_brush_size);

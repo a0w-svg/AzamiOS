@@ -7,6 +7,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Matches the Linux x86_64 struct statfs field for field — which is what the
+ * kernel fills in. f_fsid is fsid_t: two 32-bit words, 8 bytes total. It was
+ * declared uint64_t[2] here, so f_namelen, f_frsize and f_flags were all read
+ * 8 bytes past where the kernel wrote them. */
 struct statfs {
     uint64_t f_type;
     uint64_t f_bsize;
@@ -15,7 +19,7 @@ struct statfs {
     uint64_t f_bavail;
     uint64_t f_files;
     uint64_t f_ffree;
-    uint64_t f_fsid[2];
+    uint32_t f_fsid[2];
     uint64_t f_namelen;
     uint64_t f_frsize;
     uint64_t f_flags;

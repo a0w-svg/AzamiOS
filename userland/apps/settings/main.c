@@ -39,27 +39,28 @@
 #endif
 #include "../shared/ui_kit.h"
 #include "../shared/sys_config.h"
+#include "settings.h"
 
 #define SERVER_CHAN  1
 #define WIN_W       720
+uk_window_t g_win;
 #define WIN_H       510
 #define MAP_ADDR    ((void *)0x69000000)
 
-static uk_window_t g_win;
 
 /* ── Tabs ────────────────────────────────────────────────────────────────────── */
 #define NTABS  9
 static const char *g_tab_labels[NTABS] = {
     "Display", "Audio", "Theme", "Time", "Network", "Power", "Disks", "Security", "System"
 };
-static int g_active_tab = 0; /* Standard default: Display tab */
+int g_active_tab = 0; /* Standard default: Display tab */
 
 /* ── Audio state ─────────────────────────────────────────────────────────────── */
-static int g_volume_pct = 75; /* 0..100 */
+int g_volume_pct = 75; /* 0..100 */
 
 #define SOUND_PCM_WRITE_VOLUME 0x40045004
 
-static void apply_volume(int pct)
+void apply_volume(int pct)
 {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
@@ -73,7 +74,7 @@ static void apply_volume(int pct)
     }
 }
 
-static void play_test_chime(void)
+void play_test_chime(void)
 {
     int fd = sys_open("/dev/dsp", 0, 0);
     if (fd < 0) return;
@@ -104,19 +105,40 @@ static void play_test_chime(void)
  * the same theme files under /usr/share/themes through az_theme_get(), so this
  * app automatically picks up any theme dropped onto disk instead of only
  * ever offering the 5 it was compiled with. */
-static int g_theme_selected = 0;
+int g_theme_selected = 0;
 
 /* A *.theme file has no "short description" field — themes are arbitrary,
  * user-droppable data now, not a fixed enum. Derive one from the base
  * color's luma instead of hand-authoring a caption per theme. */
-static const char *theme_brightness_label(const az_theme_t *t)
+const char *theme_brightness_label(const az_theme_t *t)
 {
     unsigned int r = (t->base >> 16) & 0xFF, g = (t->base >> 8) & 0xFF, b = t->base & 0xFF;
     unsigned int luma = (r * 299 + g * 587 + b * 114) / 1000;
     return luma >= 128 ? "Light Theme" : "Dark Theme";
 }
 
-static void apply_theme(int theme_id)
+/* Writes /etc/desktop.conf from the current in-memory settings state
+ * (theme + display toggles). Used both when the theme changes and when a
+ * display toggle changes on its own, so neither write ever clobbers the
+ * other's fields with a guessed value -- this used to hardcode
+ * "vsync=1\ncompositing=1\ncursor_aa=1" on every theme change, silently
+ * discarding whatever the Display tab had actually been set to. */
+static void save_desktop_config(void)
+{
+    int fd = sys_open("/etc/desktop.conf", 0x42 /* O_CREAT|O_WRONLY */, 0644);
+    if (fd < 0) return;
+    char buf[320];
+    snprintf(buf, sizeof(buf),
+             "[theme]\ntheme_id=%d\nname=%s\nwallpaper=/usr/share/wallpapers/default.raw\n\n"
+             "[display]\nvsync=%d\ncompositing=%d\ncursor_aa=%d\nfps=60\n\n"
+             "[panel]\nposition=bottom\nheight=32\nautohide=0\nshow_clock=1\n",
+             g_theme_selected, az_theme_get(g_theme_selected)->name,
+             g_vsync, g_composit, g_cursor_aa);
+    sys_write(fd, buf, strlen(buf));
+    sys_close(fd);
+}
+
+void apply_theme(int theme_id)
 {
     int count = az_theme_count();
     if (theme_id < 0 || theme_id >= count) return;
@@ -129,16 +151,8 @@ static void apply_theme(int theme_id)
     AZ_WM_MSG_THEME(&tmsg)->theme_id = (unsigned int)theme_id;
     az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&tmsg);
 
-    /* Persist to /etc/desktop.conf */
-    int fd = sys_open("/etc/desktop.conf", 0x42 /* O_CREAT|O_WRONLY */, 0644);
-    if (fd >= 0) {
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "[theme]\ntheme_id=%d\nname=%s\nwallpaper=/usr/share/wallpapers/default.raw\n\n[display]\nvsync=1\ncompositing=1\ncursor_aa=1\nfps=60\n\n[panel]\nposition=bottom\nheight=32\nautohide=0\nshow_clock=1\n",
-                 theme_id, az_theme_get(theme_id)->name);
-        sys_write(fd, buf, strlen(buf));
-        sys_close(fd);
-    }
+    save_desktop_config();
+
     /* Legacy /etc/theme.conf support */
     int lfd = sys_open("/etc/theme.conf", 0x42, 0644);
     if (lfd >= 0) {
@@ -149,12 +163,21 @@ static void apply_theme(int theme_id)
     }
 }
 
-static void load_desktop_config(void)
+/* Persists a Display-tab toggle (VSync/Compositor/Cursor AA) the moment it
+ * changes, instead of only ever being saved as a side effect of switching
+ * themes -- otherwise a toggle flipped without also changing the theme was
+ * pure UI state that vanished on the next apply_theme() call or restart. */
+void save_display_settings(void)
+{
+    save_desktop_config();
+}
+
+void load_desktop_config(void)
 {
     int fd = sys_open("/etc/desktop.conf", 0, 0);
     if (fd < 0) fd = sys_open("/etc/theme.conf", 0, 0);
     if (fd >= 0) {
-        char buf[256];
+        char buf[512];
         ssize_t n = sys_read(fd, buf, sizeof(buf) - 1);
         sys_close(fd);
         if (n > 0) {
@@ -168,16 +191,22 @@ static void load_desktop_config(void)
                 int id = atoi(buf);
                 if (id >= 0 && id < count) g_theme_selected = id;
             }
+            char *v = strstr(buf, "vsync=");
+            if (v) g_vsync = (atoi(v + 6) != 0);
+            char *c = strstr(buf, "compositing=");
+            if (c) g_composit = (atoi(c + 12) != 0);
+            char *a = strstr(buf, "cursor_aa=");
+            if (a) g_cursor_aa = (atoi(a + 10) != 0);
         }
     }
 }
 
 /* ── Toggle switches ─────────────────────────────────────────────────────────── */
-static int g_vsync    = 1;
-static int g_composit = 1;
-static int g_cursor_aa= 1;
+int g_vsync    = 1;
+int g_composit = 1;
+int g_cursor_aa= 1;
 
-static void draw_toggle(int x, int y, int on, const char *label)
+void draw_toggle(int x, int y, int on, const char *label)
 {
     unsigned int track_col = on ? UK_MAUVE : UK_SURFACE1;
     uk_fill_rounded_rect(&g_win, x, y, 40, 20, 10, track_col);
@@ -186,12 +215,12 @@ static void draw_toggle(int x, int y, int on, const char *label)
     uk_draw_text(&g_win, x + 48, y + 2, label, UK_TEXT);
 }
 
-static int hit_toggle(int tx, int ty, int mx, int my)
+int hit_toggle(int tx, int ty, int mx, int my)
 {
     return (mx >= tx && mx < tx + 340 && my >= ty && my < ty + 24);
 }
 
-static int hit_toggle_wide(int tx, int ty, int mx, int my, int width)
+int hit_toggle_wide(int tx, int ty, int mx, int my, int width)
 {
     return (mx >= tx && mx < tx + width && my >= ty && my < ty + 24);
 }
@@ -204,86 +233,6 @@ static int hit_toggle_wide(int tx, int ty, int mx, int my, int width)
 #define DISP_TOG2_Y   244
 #define DISP_TOG3_Y   280
 
-static void draw_display_tab(void)
-{
-    int px = 20;
-    unsigned int w = g_win.width;
-
-    uk_draw_section_header(&g_win, px, DISP_SEC1_Y, (int)w - 40, "Framebuffer Display", UK_BLUE);
-
-    az_fb_info_t fb;
-    char res[64];
-    if (az_fb_info(&fb) == 0 && fb.width > 0 && fb.height > 0) {
-        snprintf(res, sizeof(res), "%ux%u @ 32 bpp (Bochs BGA)", fb.width, fb.height);
-    } else {
-        snprintf(res, sizeof(res), "1280x800 @ 32 bpp (Bochs BGA)");
-    }
-
-    uk_draw_panel(&g_win, px, DISP_PANEL_Y, (int)w - 40, 42, UK_SURFACE0);
-    uk_draw_text(&g_win, px + 12, DISP_PANEL_Y + 6,  "Hardware Resolution", UK_SUBTEXT0);
-    uk_draw_text(&g_win, px + 12, DISP_PANEL_Y + 22, res, UK_TEXT);
-
-    uk_draw_section_header(&g_win, px, DISP_SEC2_Y, (int)w - 40, "Compositor & Rendering", UK_MAUVE);
-
-    draw_toggle(px, DISP_TOG1_Y, g_vsync,     "VSync Double Page Flipping");
-    draw_toggle(px, DISP_TOG2_Y, g_composit,  "Compositor Alpha Blending");
-    draw_toggle(px, DISP_TOG3_Y, g_cursor_aa, "Hardware Cursor Anti-Aliasing");
-
-    /* Font Subsystem Section */
-    #define FONT_SEC_Y     312
-    #define FONT_GRID_Y    340
-    #define FONT_CARD_W    216
-    #define FONT_CARD_H    54
-    #define FONT_CARD_GAP  16
-
-    static az_font_info_t s_font_list[16];
-    static int s_font_count = -1;
-    static char s_active_font_path[128] = {0};
-
-    if (s_font_count < 0) {
-        s_font_count = az_font_scan_dirs(s_font_list, 16);
-        az_font_t *cur = az_font_load_default();
-        if (cur) {
-            strncpy(s_active_font_path, cur->path, sizeof(s_active_font_path) - 1);
-            az_font_free(cur);
-        }
-    }
-
-    uk_draw_section_header(&g_win, px, FONT_SEC_Y, (int)w - 40, "Typography & Fonts (/usr/share/fonts, /hdd/fonts)", UK_SAPPHIRE);
-
-    int max_disp = (s_font_count > 6) ? 6 : s_font_count;
-    for (int i = 0; i < max_disp; i++) {
-        int col = i % 3;
-        int row = i / 3;
-        int card_x = px + col * (FONT_CARD_W + FONT_CARD_GAP);
-        int card_y = FONT_GRID_Y + row * (FONT_CARD_H + 10);
-
-        bool is_sel = (strcmp(s_font_list[i].path, s_active_font_path) == 0 ||
-                       strstr(s_active_font_path, s_font_list[i].name) != NULL);
-        unsigned int border_col = is_sel ? UK_SAPPHIRE : UK_SURFACE1;
-
-        uk_fill_rounded_rect(&g_win, card_x, card_y, FONT_CARD_W, FONT_CARD_H, 6, UK_SURFACE0);
-        uk_draw_rounded_rect_outline(&g_win, card_x, card_y, FONT_CARD_W, FONT_CARD_H, 6, border_col);
-
-        if (is_sel) {
-            uk_fill_rounded_rect(&g_win, card_x + 2, card_y + 2, 4, FONT_CARD_H - 4, 2, UK_SAPPHIRE);
-        }
-
-        char title_buf[32];
-        snprintf(title_buf, sizeof(title_buf), "%s %s", s_font_list[i].name, s_font_list[i].style);
-        uk_draw_text(&g_win, card_x + 10, card_y + 8, title_buf, is_sel ? UK_TEXT : UK_SUBTEXT1);
-
-        char size_buf[32];
-        snprintf(size_buf, sizeof(size_buf), "%dx%d %s", s_font_list[i].glyph_w, s_font_list[i].glyph_h,
-                 strstr(s_font_list[i].path, "/hdd/") ? "[HDD]" : "[SYS]");
-        uk_draw_text_small(&g_win, card_x + 10, card_y + 28, size_buf, UK_OVERLAY0);
-
-        if (is_sel) {
-            uk_draw_badge(&g_win, card_x + FONT_CARD_W - 54, card_y + 14, "Active", UK_SURFACE1, UK_SAPPHIRE);
-        }
-    }
-}
-
 /* ── Audio Tab ─────────────────────────────────────────────────────────────── */
 #define AUDIO_SEC1_Y    90
 #define AUDIO_DEV_Y     122
@@ -292,40 +241,6 @@ static void draw_display_tab(void)
 #define AUDIO_SLIDER_Y  256
 #define AUDIO_BTN_Y     298
 
-static void draw_audio_tab(void)
-{
-    int px = 20;
-    unsigned int w = g_win.width;
-
-    uk_draw_section_header(&g_win, px, AUDIO_SEC1_Y, (int)w - 40, "Sound Hardware", UK_GREEN);
-
-    uk_draw_panel(&g_win, px, AUDIO_DEV_Y, (int)w - 40, 40, UK_SURFACE0);
-    uk_draw_text(&g_win, px + 12, AUDIO_DEV_Y + 5,  "Active Audio Controller", UK_SUBTEXT0);
-    uk_draw_text(&g_win, px + 12, AUDIO_DEV_Y + 21, "Intel 82801AA AC97 Audio Device (/dev/dsp)", UK_TEXT);
-
-    uk_draw_panel(&g_win, px, AUDIO_FMT_Y, (int)w - 40, 40, UK_SURFACE0);
-    uk_draw_text(&g_win, px + 12, AUDIO_FMT_Y + 5,  "Sample Format", UK_SUBTEXT0);
-    uk_draw_text(&g_win, px + 12, AUDIO_FMT_Y + 21, "44,100 Hz, 16-bit Stereo PCM (Dual-channel)", UK_TEXT);
-
-    uk_draw_section_header(&g_win, px, AUDIO_SEC2_Y, (int)w - 40, "Master Volume Control", UK_YELLOW);
-
-    /* Volume Slider Track */
-    int slider_w = (int)w - 180;
-    uk_fill_rounded_rect(&g_win, px, AUDIO_SLIDER_Y + 4, slider_w, 12, 6, UK_SURFACE1);
-    int fill_w = (slider_w * g_volume_pct) / 100;
-    if (fill_w > 0) {
-        uk_fill_rounded_rect(&g_win, px, AUDIO_SLIDER_Y + 4, fill_w, 12, 6, UK_GREEN);
-    }
-    uk_fill_circle(&g_win, px + fill_w, AUDIO_SLIDER_Y + 10, 9, UK_TEXT);
-
-    char vol_str[16];
-    snprintf(vol_str, sizeof(vol_str), "%d%%", g_volume_pct);
-    uk_draw_text(&g_win, px + slider_w + 16, AUDIO_SLIDER_Y + 2, vol_str, UK_TEXT);
-
-    /* Test Chime button */
-    uk_draw_button(&g_win, px, AUDIO_BTN_Y, 130, 28, "Play Chime", UK_BTN_NORMAL);
-}
-
 /* ── Theme Tab ─────────────────────────────────────────────────────────────── */
 #define THEME_SEC_Y    90
 #define THEME_GRID_Y   122
@@ -333,54 +248,10 @@ static void draw_audio_tab(void)
 #define THEME_CARD_H   60
 #define THEME_CARD_GAP 16
 
-static void draw_theme_tab(void)
-{
-    int px = 20;
-    unsigned int w = g_win.width;
-
-    uk_draw_section_header(&g_win, px, THEME_SEC_Y, (int)w - 40, "Desktop Themes & Color Palettes", UK_MAUVE);
-
-    int theme_count = az_theme_count();
-    for (int i = 0; i < theme_count; i++) {
-        const az_theme_t *th = az_theme_get(i);
-        int col = i % 2;
-        int row = i / 2;
-        int card_x = px + col * (THEME_CARD_W + THEME_CARD_GAP);
-        int card_y = THEME_GRID_Y + row * (THEME_CARD_H + THEME_CARD_GAP);
-
-        bool is_sel = (i == g_theme_selected);
-        unsigned int border_col = is_sel ? UK_MAUVE : UK_SURFACE1;
-
-        uk_fill_rounded_rect(&g_win, card_x, card_y, THEME_CARD_W, THEME_CARD_H, 8, th->base);
-        uk_draw_rounded_rect_outline(&g_win, card_x, card_y, THEME_CARD_W, THEME_CARD_H, 8, border_col);
-
-        if (is_sel) {
-            uk_fill_rounded_rect(&g_win, card_x + 2, card_y + 2, 4, THEME_CARD_H - 4, 2, UK_MAUVE);
-        }
-
-        /* Swatch dots */
-        uk_fill_circle(&g_win, card_x + 22, card_y + 24, 8, th->accent);
-        uk_fill_circle(&g_win, card_x + 42, card_y + 24, 8, th->text);
-        uk_fill_circle(&g_win, card_x + 62, card_y + 24, 8, th->base);
-
-        /* Title & Desc */
-        uk_draw_text(&g_win, card_x + 82, card_y + 14, th->name, is_sel ? UK_TEXT : UK_SUBTEXT1);
-        uk_draw_text(&g_win, card_x + 82, card_y + 32, theme_brightness_label(th), UK_OVERLAY0);
-
-        if (is_sel) {
-            uk_draw_badge(&g_win, card_x + THEME_CARD_W - 54, card_y + 18, "Active", UK_SURFACE1, UK_MAUVE);
-        }
-    }
-}
-
 /* ── Time & Date Tab ───────────────────────────────────────────────────────── */
-typedef struct {
-    const char *label;
-    const char *tz_id;
-    const char *offset_desc;
-} tz_setting_item_t;
 
-static const tz_setting_item_t g_tz_settings_list[8] = {
+
+const tz_setting_item_t g_tz_settings_list[8] = {
     { "Universal Time",       "UTC",                 "UTC+00:00 (Standard)" },
     { "London / Dublin",      "Europe/London",       "GMT/BST (UTC+01:00)" },
     { "Warsaw / Central EU",  "Europe/Warsaw",       "CET/CEST (UTC+02:00)" },
@@ -391,9 +262,9 @@ static const tz_setting_item_t g_tz_settings_list[8] = {
     { "Tokyo / Seoul",        "Asia/Tokyo",          "JST/KST (UTC+09:00)" }
 };
 
-static int g_selected_tz_idx = 2; /* Default: Europe/Warsaw / Central EU */
+int g_selected_tz_idx = 2; /* Default: Europe/Warsaw / Central EU */
 
-static void init_timezone_setting(void)
+void init_timezone_setting(void)
 {
     char buf[64] = "";
     if (az_config_read("timezone", buf, sizeof(buf)) > 0) {
@@ -408,7 +279,7 @@ static void init_timezone_setting(void)
     }
 }
 
-static void apply_timezone(int idx)
+void apply_timezone(int idx)
 {
     if (idx < 0 || idx >= 8) return;
     g_selected_tz_idx = idx;
@@ -426,61 +297,15 @@ static void apply_timezone(int idx)
 #define TIME_CARD_H    44
 #define TIME_CARD_GAP   8
 
-static void draw_time_tab(void)
-{
-    int px = 20;
-    unsigned int w = g_win.width;
-
-    uk_draw_section_header(&g_win, px, TIME_SEC1_Y, (int)w - 40, "Live System Time & Calendar", UK_PEACH);
-
-    time_t t = time(NULL);
-    struct tm tm_info;
-    localtime_r(&t, &tm_info);
-
-    char date_str[64];
-    strftime(date_str, sizeof(date_str), "%A, %B %e, %Y  •  %T  %Z", &tm_info);
-
-    uk_draw_panel(&g_win, px, TIME_PREV_Y, (int)w - 40, 44, UK_SURFACE0);
-    uk_draw_text(&g_win, px + 12, TIME_PREV_Y + 6,  "Current Local Time & Date", UK_SUBTEXT0);
-    uk_draw_text(&g_win, px + 12, TIME_PREV_Y + 24, date_str, UK_GREEN);
-
-    uk_draw_section_header(&g_win, px, TIME_SEC2_Y, (int)w - 40, "Select System Timezone (/etc/timezone)", UK_MAUVE);
-
-    for (int i = 0; i < 8; i++) {
-        int col = i % 2;
-        int row = i / 2;
-        int card_x = px + col * (TIME_CARD_W + TIME_CARD_GAP + 12);
-        int card_y = TIME_GRID_Y + row * (TIME_CARD_H + TIME_CARD_GAP);
-
-        bool is_sel = (i == g_selected_tz_idx);
-        unsigned int bg_col = is_sel ? UK_SURFACE1 : UK_SURFACE0;
-        unsigned int border_col = is_sel ? UK_PEACH : UK_SURFACE1;
-
-        uk_fill_rounded_rect(&g_win, card_x, card_y, TIME_CARD_W, TIME_CARD_H, 6, bg_col);
-        uk_draw_rounded_rect_outline(&g_win, card_x, card_y, TIME_CARD_W, TIME_CARD_H, 6, border_col);
-
-        if (is_sel) {
-            uk_fill_rounded_rect(&g_win, card_x + 2, card_y + 2, 3, TIME_CARD_H - 4, 2, UK_PEACH);
-        }
-
-        uk_draw_text(&g_win, card_x + 12, card_y + 6, g_tz_settings_list[i].label, is_sel ? UK_TEXT : UK_SUBTEXT0);
-        uk_draw_text(&g_win, card_x + 12, card_y + 24, g_tz_settings_list[i].offset_desc, UK_OVERLAY0);
-
-        if (is_sel) {
-            uk_draw_badge(&g_win, card_x + TIME_CARD_W - 46, card_y + 12, "Set", UK_SURFACE2, UK_PEACH);
-        }
-    }
-}
-
 /* ── Network Tab State & Static Configuration ──────────────────────────────── */
-static int  g_net_dhcp = 1; /* 1 = DHCP (Automatic), 0 = Static Configuration */
-static char g_net_ip[32]      = "10.0.2.15";
-static char g_net_netmask[32] = "255.255.255.0";
-static char g_net_gateway[32] = "10.0.2.2";
-static char g_net_dns[32]     = "10.0.2.3";
-static int  g_net_focus = -1; /* -1 = none, 0 = IP, 1 = Subnet, 2 = GW, 3 = DNS */
-static char g_net_status_msg[96] = "";
-static unsigned int g_net_status_col = UK_GREEN;
+int g_net_dhcp = 1; /* 1 = DHCP (Automatic), 0 = Static Configuration */
+char g_net_ip[32]      = "10.0.2.15";
+char g_net_netmask[32] = "255.255.255.0";
+char g_net_gateway[32] = "10.0.2.2";
+char g_net_dns[32]     = "10.0.2.3";
+int g_net_focus = -1; /* -1 = none, 0 = IP, 1 = Subnet, 2 = GW, 3 = DNS */
+char g_net_status_msg[128] = "";
+unsigned int g_net_status_col = UK_GREEN;
 
 static int parse_net_ipv4(const char *s, unsigned char out[4])
 {
@@ -494,7 +319,7 @@ static int parse_net_ipv4(const char *s, unsigned char out[4])
     return 0;
 }
 
-static void apply_static_network(void)
+void apply_static_network(void)
 {
     unsigned char ip[4], nm[4], gw[4], dns[4];
     if (parse_net_ipv4(g_net_ip, ip) != 0) {
@@ -550,8 +375,7 @@ static void apply_static_network(void)
         char rbuf[256];
         int len = snprintf(rbuf, sizeof(rbuf),
             "# Generated by AzamiOS Network Settings\n"
-            "nameserver %s\n"
-            "nameserver 8.8.8.8\n",
+            "nameserver %s\n",
             g_net_dns);
         write(rfd, rbuf, (size_t)len);
         close(rfd);
@@ -562,7 +386,7 @@ static void apply_static_network(void)
     g_net_status_col = UK_GREEN;
 }
 
-static void apply_dhcp_network(void)
+void apply_dhcp_network(void)
 {
     int fd = open("/dev/net0", O_RDWR, 0);
     if (fd >= 0) {
@@ -591,7 +415,7 @@ static void apply_dhcp_network(void)
     g_net_status_col = UK_GREEN;
 }
 
-static void init_network_settings(void)
+void init_network_settings(void)
 {
     int fd = open("/dev/net0", O_RDWR, 0);
     if (fd >= 0) {
@@ -632,7 +456,7 @@ static void init_network_settings(void)
     }
 }
 
-static void draw_input_box(int x, int y, int w, int h, const char *text, int focused)
+void draw_input_box(int x, int y, int w, int h, const char *text, int focused)
 {
     unsigned int bg_col = focused ? UK_MANTLE : UK_SURFACE0;
     unsigned int border_col = focused ? UK_MAUVE : UK_SURFACE1;
@@ -646,141 +470,6 @@ static void draw_input_box(int x, int y, int w, int h, const char *text, int foc
         snprintf(disp, sizeof(disp), "%s", text);
     }
     uk_draw_text(&g_win, x + 8, y + 4, disp, focused ? UK_TEXT : UK_SUBTEXT1);
-}
-
-static void draw_network_tab(void)
-{
-    int px = 20;
-    unsigned int w = g_win.width;
-
-    uk_draw_section_header(&g_win, px, 86, (int)w - 40, "IPv4 Network Configuration & Adapter", UK_TEAL);
-
-    /* Mode selector pills */
-    /* DHCP Pill */
-    if (g_net_dhcp == 1) {
-        uk_fill_rounded_rect(&g_win, px, 112, 190, 26, 6, UK_TEAL);
-        uk_draw_text(&g_win, px + 14, 117, "[*] DHCP (Automatic)", UK_CRUST);
-    } else {
-        uk_fill_rounded_rect(&g_win, px, 112, 190, 26, 6, UK_SURFACE1);
-        uk_fill_rounded_rect(&g_win, px + 1, 113, 188, 24, 5, UK_SURFACE0);
-        uk_draw_text(&g_win, px + 14, 117, "[ ] DHCP (Automatic)", UK_SUBTEXT0);
-    }
-
-    /* Static Pill */
-    if (g_net_dhcp == 0) {
-        uk_fill_rounded_rect(&g_win, px + 205, 112, 220, 26, 6, UK_MAUVE);
-        uk_draw_text(&g_win, px + 219, 117, "[*] Static Configuration", UK_CRUST);
-    } else {
-        uk_fill_rounded_rect(&g_win, px + 205, 112, 220, 26, 6, UK_SURFACE1);
-        uk_fill_rounded_rect(&g_win, px + 206, 113, 218, 24, 5, UK_SURFACE0);
-        uk_draw_text(&g_win, px + 219, 117, "[ ] Static Configuration", UK_SUBTEXT0);
-    }
-
-    /* Telemetry strings */
-    char rx_info[64] = "RX: 128 packets (14.2 KB)";
-    char tx_info[64] = "TX: 64 packets (8.4 KB)";
-    int nfd = open("/proc/net/dev", O_RDONLY, 0);
-    if (nfd >= 0) {
-        char nbuf[512];
-        ssize_t n = read(nfd, nbuf, sizeof(nbuf) - 1);
-        close(nfd);
-        if (n > 0) {
-            nbuf[n] = '\0';
-            char *line = strstr(nbuf, "net0");
-            if (!line) line = strstr(nbuf, "eth0");
-            if (line) {
-                unsigned long long rx_b = 0, rx_p = 0, tx_b = 0, tx_p = 0;
-                char dev[16];
-                if (sscanf(line, "%15s %llu %llu %*u %*u %*u %*u %*u %*u %llu %llu",
-                           dev, &rx_b, &rx_p, &tx_b, &tx_p) >= 5) {
-                    snprintf(rx_info, sizeof(rx_info), "RX: %llu pkts (%llu KB)", rx_p, rx_b / 1024);
-                    snprintf(tx_info, sizeof(tx_info), "TX: %llu pkts (%llu KB)", tx_p, tx_b / 1024);
-                }
-            }
-        }
-    }
-
-    if (g_net_dhcp == 1) {
-        /* DHCP View */
-        uk_draw_panel(&g_win, px, 146, (int)w - 40, 102, UK_SURFACE0);
-        uk_draw_text(&g_win, px + 14, 156, "Adapter:", UK_SUBTEXT0);
-        uk_draw_text(&g_win, px + 100, 156, "Intel 82540EM / virtio-net (PCI 00:02.0)", UK_TEXT);
-        uk_draw_badge(&g_win, (int)w - 145, 154, "Connected (DHCP)", UK_SURFACE1, UK_GREEN);
-
-        char ip_line[80];
-        snprintf(ip_line, sizeof(ip_line), "%s (net0)", g_net_ip);
-        uk_draw_text(&g_win, px + 14, 178, "IP Address:", UK_SUBTEXT0);
-        uk_draw_text(&g_win, px + 100, 178, ip_line, UK_GREEN);
-
-        uk_draw_text(&g_win, px + 14, 200, "Subnet Mask:", UK_SUBTEXT0);
-        uk_draw_text(&g_win, px + 100, 200, g_net_netmask, UK_TEXT);
-
-        char gw_dns[80];
-        snprintf(gw_dns, sizeof(gw_dns), "Gateway: %s   •   DNS: %s", g_net_gateway, g_net_dns);
-        uk_draw_text(&g_win, px + 14, 222, "Routing:", UK_SUBTEXT0);
-        uk_draw_text(&g_win, px + 100, 222, gw_dns, UK_SUBTEXT1);
-
-        uk_draw_button(&g_win, px, 256, 170, 26, "Renew DHCP Lease", UK_BTN_NORMAL);
-        uk_draw_button(&g_win, px + 185, 256, 180, 26, "Configure Static IP", UK_BTN_NORMAL);
-
-        uk_draw_section_header(&g_win, px, 292, (int)w - 40, "Live Network Statistics (/proc/net)", UK_BLUE);
-        uk_draw_panel(&g_win, px, 316, (int)w - 40, 64, UK_SURFACE0);
-        uk_draw_text(&g_win, px + 14, 326, "Traffic Flow:", UK_SUBTEXT0);
-        uk_draw_text(&g_win, px + 120, 326, rx_info, UK_TEXT);
-        uk_draw_text(&g_win, px + 360, 326, tx_info, UK_TEXT);
-        uk_draw_text(&g_win, px + 14, 350, "Link Quality:", UK_SUBTEXT0);
-        uk_draw_text(&g_win, px + 120, 350, "1000 Mbps Full Duplex • 0 drops • 0 errors", UK_GREEN);
-
-        if (g_net_status_msg[0]) {
-            uk_draw_text(&g_win, px + 4, 390, g_net_status_msg, g_net_status_col);
-        }
-    } else {
-        /* Static Configuration View */
-        uk_draw_panel(&g_win, px, 146, (int)w - 40, 188, UK_SURFACE0);
-        uk_draw_text(&g_win, px + 14, 154, "Static IPv4 Parameters", UK_PEACH);
-        uk_draw_badge(&g_win, (int)w - 130, 152, "Static Mode", UK_SURFACE1, UK_PEACH);
-
-        /* Row 0: IP Address */
-        uk_draw_text(&g_win, px + 14, 178, "IP Address:", UK_SUBTEXT0);
-        draw_input_box(px + 130, 174, 200, 24, g_net_ip, g_net_focus == 0);
-        uk_draw_button(&g_win, px + 340, 174, 130, 24, "Use 10.0.2.15", UK_BTN_NORMAL);
-        uk_draw_button(&g_win, px + 480, 174, 140, 24, "Use 192.168.1.50", UK_BTN_NORMAL);
-
-        /* Row 1: Subnet Mask */
-        uk_draw_text(&g_win, px + 14, 206, "Subnet Mask:", UK_SUBTEXT0);
-        draw_input_box(px + 130, 202, 200, 24, g_net_netmask, g_net_focus == 1);
-        uk_draw_button(&g_win, px + 340, 202, 160, 24, "/24 (255.255.255.0)", UK_BTN_NORMAL);
-        uk_draw_button(&g_win, px + 510, 202, 110, 24, "/16 Netmask", UK_BTN_NORMAL);
-
-        /* Row 2: Default Gateway */
-        uk_draw_text(&g_win, px + 14, 234, "Default Gateway:", UK_SUBTEXT0);
-        draw_input_box(px + 130, 230, 200, 24, g_net_gateway, g_net_focus == 2);
-        uk_draw_button(&g_win, px + 340, 230, 130, 24, "Use 10.0.2.2", UK_BTN_NORMAL);
-        uk_draw_button(&g_win, px + 480, 230, 140, 24, "Use 192.168.1.1", UK_BTN_NORMAL);
-
-        /* Row 3: Primary DNS */
-        uk_draw_text(&g_win, px + 14, 262, "Primary DNS:", UK_SUBTEXT0);
-        draw_input_box(px + 130, 258, 200, 24, g_net_dns, g_net_focus == 3);
-        uk_draw_button(&g_win, px + 340, 258, 130, 24, "8.8.8.8 (Google)", UK_BTN_NORMAL);
-        uk_draw_button(&g_win, px + 480, 258, 140, 24, "1.1.1.1 (Cloudflare)", UK_BTN_NORMAL);
-
-        uk_draw_text(&g_win, px + 14, 298, "Click field to type. Tab moves next, Enter applies.", UK_SUBTEXT1);
-
-        /* Action Buttons */
-        uk_draw_button(&g_win, px, 344, 210, 28, "Apply Static Config", UK_BTN_NORMAL);
-        uk_draw_button(&g_win, px + 225, 344, 150, 28, "Revert to DHCP", UK_BTN_NORMAL);
-
-        if (g_net_status_msg[0]) {
-            uk_draw_text(&g_win, px + 4, 384, g_net_status_msg, g_net_status_col);
-        } else {
-            uk_draw_text(&g_win, px + 4, 384, "Static settings take effect immediately on net0 and /etc/network.conf", UK_SUBTEXT0);
-        }
-
-        /* Compact stats row */
-        char stats_line[128];
-        snprintf(stats_line, sizeof(stats_line), "Telemetry: %s  •  %s  •  1000 Mbps", rx_info, tx_info);
-        uk_draw_text(&g_win, px + 4, 408, stats_line, UK_BLUE);
-    }
 }
 
 static int read_proc_val(const char *path, int def_val)
@@ -798,7 +487,7 @@ static int read_proc_val(const char *path, int def_val)
     return def_val;
 }
 
-static void write_proc_val(const char *path, int val)
+void write_proc_val(const char *path, int val)
 {
     int fd = open(path, 1 /* O_WRONLY */, 0);
     if (fd >= 0) {
@@ -810,11 +499,11 @@ static void write_proc_val(const char *path, int val)
 }
 
 /* ── Power & Performance Tab ─────────────────────────────────────────────────── */
-static int g_power_profile = 1; /* 0: Performance, 1: Balanced, 2: Power Saver */
-static int g_screen_timeout = 15; /* 5, 15, 30, 0 (Never) */
-static char g_power_status_msg[64] = "ACPI PIIX4 Power Management active.";
+int g_power_profile = 1; /* 0: Performance, 1: Balanced, 2: Power Saver */
+int g_screen_timeout = 15; /* 5, 15, 30, 0 (Never) */
+char g_power_status_msg[128] = "ACPI PIIX4 Power Management active.";
 
-static void load_power_config(void)
+void load_power_config(void)
 {
     int fd = open("/etc/power.conf", 0, 0);
     if (fd >= 0) {
@@ -844,7 +533,7 @@ static void save_power_config(void)
     }
 }
 
-static void apply_power_profile(int profile)
+void apply_power_profile(int profile)
 {
     if (profile < 0 || profile > 2) return;
     g_power_profile = profile;
@@ -858,7 +547,7 @@ static void apply_power_profile(int profile)
     }
 }
 
-static void apply_screen_timeout(int mins)
+void apply_screen_timeout(int mins)
 {
     g_screen_timeout = mins;
     save_power_config();
@@ -869,72 +558,10 @@ static void apply_screen_timeout(int mins)
     }
 }
 
-static void draw_power_tab(void)
-{
-    int px = 20;
-    unsigned int w = g_win.width;
-
-    uk_draw_section_header(&g_win, px, 86, (int)w - 40, "System Power & Energy Profiles", UK_YELLOW);
-
-    /* 3 Profile Cards */
-    const char *pnames[3] = { "Performance", "Balanced", "Power Saver" };
-    const char *pdescs[3] = { "Max clock & I/O speed", "Adaptive energy balance", "Max battery conservation" };
-    int card_w = ((int)w - 40 - 24) / 3;
-    for (int i = 0; i < 3; i++) {
-        int cx = px + i * (card_w + 12);
-        int cy = 114;
-        bool is_sel = (g_power_profile == i);
-        unsigned int bg_col = is_sel ? UK_SURFACE1 : UK_SURFACE0;
-        unsigned int border_col = is_sel ? UK_YELLOW : UK_SURFACE1;
-
-        uk_fill_rounded_rect(&g_win, cx, cy, card_w, 48, 6, bg_col);
-        uk_draw_rounded_rect_outline(&g_win, cx, cy, card_w, 48, 6, border_col);
-        if (is_sel) {
-            uk_fill_rounded_rect(&g_win, cx + 2, cy + 2, 4, 44, 2, UK_YELLOW);
-            uk_draw_badge(&g_win, cx + card_w - 56, cy + 8, "Active", UK_SURFACE0, UK_YELLOW);
-        }
-        uk_draw_text(&g_win, cx + 12, cy + 8, pnames[i], is_sel ? UK_TEXT : UK_SUBTEXT1);
-        uk_draw_text(&g_win, cx + 12, cy + 26, pdescs[i], UK_OVERLAY0);
-    }
-
-    uk_draw_section_header(&g_win, px, 172, (int)w - 40, "Display Sleep & Inactivity Timeout", UK_BLUE);
-
-    int timeouts[4] = { 5, 15, 30, 0 };
-    const char *tlabels[4] = { "5 Minutes", "15 Minutes", "30 Minutes", "Never" };
-    int pill_w = ((int)w - 40 - 36) / 4;
-    for (int i = 0; i < 4; i++) {
-        int tx = px + i * (pill_w + 12);
-        int ty = 200;
-        bool is_sel = (g_screen_timeout == timeouts[i]);
-        unsigned int bg_col = is_sel ? UK_MAUVE : UK_SURFACE0;
-        unsigned int fg_col = is_sel ? UK_BASE : UK_TEXT;
-
-        uk_fill_rounded_rect(&g_win, tx, ty, pill_w, 26, 4, bg_col);
-        uk_draw_rounded_rect_outline(&g_win, tx, ty, pill_w, 26, 4, is_sel ? UK_MAUVE : UK_SURFACE1);
-        int slen = uk_strlen(tlabels[i]);
-        uk_draw_text(&g_win, tx + (pill_w - slen * 8) / 2, ty + 5, tlabels[i], fg_col);
-    }
-
-    uk_draw_section_header(&g_win, px, 236, (int)w - 40, "ACPI Hardware & Subsystem Telemetry", UK_GREEN);
-    uk_draw_panel(&g_win, px, 264, (int)w - 40, 56, UK_SURFACE0);
-    uk_draw_text(&g_win, px + 12, 270, "ACPI Controller: Intel PIIX4 Power Management Interface (I/O 0xB000)", UK_TEXT);
-    uk_draw_text(&g_win, px + 12, 286, "PM Timer Clock : 3.579545 MHz High-Precision 24-bit Counter (Fixed Rate)", UK_SUBTEXT0);
-    uk_draw_text(&g_win, px + 12, 302, "System Power   : AC Mains Online (100% Standby Ready, S0/S3/S4/S5)", UK_GREEN);
-
-    uk_draw_section_header(&g_win, px, 330, (int)w - 40, "System Power Actions", UK_PEACH);
-
-    uk_draw_button(&g_win, px, 358, 140, 30, "Sleep / Standby", UK_BTN_NORMAL);
-    uk_draw_button(&g_win, px + 152, 358, 140, 30, "Restart System", UK_BTN_NORMAL);
-    uk_draw_button(&g_win, px + 304, 358, 140, 30, "Power Off", UK_BTN_NORMAL);
-
-    uk_draw_panel(&g_win, px, 400, (int)w - 40, 26, UK_SURFACE0);
-    uk_draw_text(&g_win, px + 10, 405, g_power_status_msg, UK_TEXT);
-}
-
 /* ── Disks & Storage Tab ────────────────────────────────────────────────────── */
-static char g_disk_status_msg[64] = "All filesystem mounts operating nominally.";
+char g_disk_status_msg[128] = "All filesystem mounts operating nominally.";
 
-static void clean_temp_files(void)
+void clean_temp_files(void)
 {
     DIR *d = opendir("/tmp");
     if (d) {
@@ -951,7 +578,7 @@ static void clean_temp_files(void)
     snprintf(g_disk_status_msg, sizeof(g_disk_status_msg), "Temporary scratch space cleaned and VFS buffers synced.");
 }
 
-static void draw_storage_card(int x, int y, int w, int h,
+void draw_storage_card(int x, int y, int w, int h,
                               const char *title, const char *mount_point, const char *fs_type,
                               const char *path)
 {
@@ -1008,41 +635,21 @@ static void draw_storage_card(int x, int y, int w, int h,
     }
 }
 
-static void draw_disks_tab(void)
-{
-    int px = 20;
-    unsigned int w = g_win.width;
-
-    uk_draw_section_header(&g_win, px, 86, (int)w - 40, "Storage Partitions & Mounted Filesystems", UK_TEAL);
-
-    draw_storage_card(px, 114, (int)w - 40, 62, "Root Partition (sata0p2)", "/", "SATA Rootfs Ext2", "/");
-    draw_storage_card(px, 186, (int)w - 40, 62, "Boot Partition (sata0p1)", "/boot", "SATA Boot Ext2", "/boot");
-    draw_storage_card(px, 258, (int)w - 40, 62, "RAM Scratchpad", "/tmp", "tmpfs Volatile RAM", "/tmp");
-
-    uk_draw_section_header(&g_win, px, 330, (int)w - 40, "Storage Maintenance & Cache Flush", UK_SAPPHIRE);
-
-    uk_draw_button(&g_win, px, 358, 190, 30, "Clean Temporary Files", UK_BTN_NORMAL);
-    uk_draw_text(&g_win, px + 205, 365, "Purges /tmp scratch files and synchronizes VFS block cache.", UK_SUBTEXT0);
-
-    uk_draw_panel(&g_win, px, 400, (int)w - 40, 26, UK_SURFACE0);
-    uk_draw_text(&g_win, px + 10, 405, g_disk_status_msg, UK_TEXT);
-}
-
 /* ── Security & Auto-Accept Tab ────────────────────────────────────────────── */
-static int g_sec_dmesg = 1;
-static int g_sec_kptr  = 1;
-static int g_sec_mmap  = 1;
-static int g_sec_yama  = 1;
-static int g_sec_hlinks= 1;
-static int g_sec_slinks= 1;
+int g_sec_dmesg = 1;
+int g_sec_kptr  = 1;
+int g_sec_mmap  = 1;
+int g_sec_yama  = 1;
+int g_sec_hlinks= 1;
+int g_sec_slinks= 1;
 
 /* Auto-Accept & Unattended Policies */
-static int g_sec_auto_ipc   = 1; /* Auto-Accept SCM_RIGHTS IPC transfers */
-static int g_sec_auto_admin = 1; /* Auto-Approve Console Admin Escalations */
-static int g_sec_auto_dhcp  = 1; /* Auto-Accept Network DHCP Renewals */
-static int g_sec_auto_trace = 1; /* Auto-Accept Debug & Tracing Telemetry */
+int g_sec_auto_ipc   = 1; /* Auto-Accept SCM_RIGHTS IPC transfers */
+int g_sec_auto_admin = 1; /* Auto-Approve Console Admin Escalations */
+int g_sec_auto_dhcp  = 1; /* Auto-Accept Network DHCP Renewals */
+int g_sec_auto_trace = 1; /* Auto-Accept Debug & Tracing Telemetry */
 
-static void load_security_config(void)
+void load_security_config(void)
 {
     int fd = open("/etc/security.conf", 0, 0);
     if (fd >= 0) {
@@ -1063,7 +670,7 @@ static void load_security_config(void)
     }
 }
 
-static void save_security_config(void)
+void save_security_config(void)
 {
     int fd = open("/etc/security.conf", 0x42 /* O_CREAT|O_WRONLY */, 0644);
     if (fd >= 0) {
@@ -1080,7 +687,7 @@ static void save_security_config(void)
     }
 }
 
-static void init_security_settings(void)
+void init_security_settings(void)
 {
     g_sec_dmesg  = read_proc_val("/proc/sys/kernel/dmesg_restrict", 1) > 0 ? 1 : 0;
     g_sec_kptr   = read_proc_val("/proc/sys/kernel/kptr_restrict", 1) > 0 ? 1 : 0;
@@ -1105,85 +712,11 @@ static void init_security_settings(void)
 #define SEC_AUTO4_Y    324
 #define SEC_FOOTER_Y   362
 
-static void draw_security_tab(void)
-{
-    int px = 20;
-    unsigned int w = g_win.width;
-
-    uk_draw_section_header(&g_win, px, SEC_HEADER_Y, (int)w - 40, "Kernel Runtime Hardening & Sysctl Mitigations", UK_RED);
-
-    draw_toggle(SEC_LCOL_X, SEC_ROW1_Y, g_sec_dmesg,  "dmesg_restrict (Ring buffer guard)");
-    draw_toggle(SEC_LCOL_X, SEC_ROW2_Y, g_sec_kptr,   "kptr_restrict (Mask kernel ptrs)");
-    draw_toggle(SEC_LCOL_X, SEC_ROW3_Y, g_sec_mmap,   "mmap_min_addr (NULL deref guard)");
-
-    draw_toggle(SEC_RCOL_X, SEC_ROW1_Y, g_sec_yama,   "yama.ptrace_scope (YAMA security)");
-    draw_toggle(SEC_RCOL_X, SEC_ROW2_Y, g_sec_hlinks, "protected_hardlinks (Link guard)");
-    draw_toggle(SEC_RCOL_X, SEC_ROW3_Y, g_sec_slinks, "protected_symlinks (Traversal guard)");
-
-    uk_draw_section_header(&g_win, px, SEC_AUTO_HDR_Y, (int)w - 40, "Auto-Accept & Unattended Policies", UK_MAUVE);
-
-    draw_toggle(px, SEC_AUTO1_Y, g_sec_auto_ipc,   "Auto-Accept IPC Capability Transfers (SCM_RIGHTS & Channels)");
-    draw_toggle(px, SEC_AUTO2_Y, g_sec_auto_admin, "Auto-Approve Desktop Administrative Tasks (Unattended Admin)");
-    draw_toggle(px, SEC_AUTO3_Y, g_sec_auto_dhcp,  "Auto-Accept Network DHCP Lease Transitions (Zero Disruption)");
-    draw_toggle(px, SEC_AUTO4_Y, g_sec_auto_trace, "Auto-Accept System Tracing & Telemetry (ptrace / ktrace hooks)");
-
-    uk_draw_panel(&g_win, px, SEC_FOOTER_Y, (int)w - 40, 48, UK_SURFACE0);
-    int all_auto = g_sec_auto_ipc && g_sec_auto_admin && g_sec_auto_dhcp && g_sec_auto_trace;
-    if (all_auto) {
-        uk_draw_badge(&g_win, px + 10, SEC_FOOTER_Y + 8, "Auto-Accept: ACTIVE", UK_SURFACE1, UK_GREEN);
-        uk_draw_text(&g_win, px + 175, SEC_FOOTER_Y + 10, "Automated execution enabled for IPC, admin, DHCP, and telemetry.", UK_TEXT);
-    } else {
-        uk_draw_badge(&g_win, px + 10, SEC_FOOTER_Y + 8, "Auto-Accept: CUSTOM", UK_SURFACE1, UK_YELLOW);
-        uk_draw_text(&g_win, px + 175, SEC_FOOTER_Y + 10, "Custom policy active. Selected operations prompt for confirmation.", UK_SUBTEXT0);
-    }
-    uk_draw_text(&g_win, px + 10, SEC_FOOTER_Y + 28, "Security policies persist to /etc/security.conf and apply immediately.", UK_OVERLAY0);
-}
-
 /* ── System Tab ────────────────────────────────────────────────────────────── */
 #define SYS_SEC_Y  90
 #define SYS_GRID_Y 122
 
-static void draw_system_tab(void)
-{
-    int px = 20;
-    unsigned int w = g_win.width;
-
-    uk_draw_section_header(&g_win, px, SYS_SEC_Y, (int)w - 40, "Kernel & System Architecture", UK_TEAL);
-
-    struct sysinfo si;
-    sysinfo(&si);
-    unsigned long total_mb = (si.totalram * si.mem_unit) / (1024 * 1024);
-    unsigned long free_mb  = (si.freeram * si.mem_unit) / (1024 * 1024);
-
-    char mem_buf[64];
-    snprintf(mem_buf, sizeof(mem_buf), "%lu MB Total (%lu MB Free)", total_mb, free_mb);
-
-    static const char *sys_info[][2] = {
-        { "Operating System", "AzamiOS v7.0.0 (x86_64 Microkernel)" },
-        { "SMP CPU Cores",    "4 Cores (Preemptive CFS Scheduling)" },
-        { "Memory Model",     "Buddy PMM + 4-Level VMM (PML4)" },
-        { "System Memory",    "" },
-        { "Storage System",   "Persistent SATA AHCI (/hdd) + Ext2" },
-        { "Window Server",    "azwm Compositor (Zero-Copy SHMEM)" },
-        { "Audio Controller", "Intel AC97 PCI (/dev/dsp)" },
-        { "Power Management", "Intel PIIX4 ACPI PM (I/O 0xB000)" },
-        { "Security Engine",  "LSM + YAMA + Auto-Accept Policy" },
-    };
-
-    int py = SYS_GRID_Y;
-    for (int i = 0; i < 9; i++) {
-        uk_draw_panel(&g_win, px, py, (int)w - 40, 24, UK_SURFACE0);
-        uk_draw_text(&g_win, px + 10, py + 4, sys_info[i][0], UK_SUBTEXT0);
-        if (i == 3) {
-            uk_draw_text(&g_win, px + 180, py + 4, mem_buf, UK_GREEN);
-        } else {
-            uk_draw_text(&g_win, px + 180, py + 4, sys_info[i][1], UK_TEXT);
-        }
-        py += 28;
-    }
-}
-
-static void draw_settings(void)
+void draw_settings(void)
 {
     unsigned int w = g_win.width;
     unsigned int h = g_win.height;
@@ -1322,324 +855,15 @@ int main(int argc, char **argv)
                 }
 
                 /* Display tab toggles and font selection */
-                if (g_active_tab == 0) {
-                    if (hit_toggle(20, DISP_TOG1_Y, mx, my)) { g_vsync    ^= 1; draw_settings(); continue; }
-                    if (hit_toggle(20, DISP_TOG2_Y, mx, my)) { g_composit ^= 1; draw_settings(); continue; }
-                    if (hit_toggle(20, DISP_TOG3_Y, mx, my)) { g_cursor_aa^= 1; draw_settings(); continue; }
-
-                    /* Font card clicks */
-                    az_font_info_t flist[16];
-                    int fcnt = az_font_scan_dirs(flist, 16);
-                    int max_d = (fcnt > 6) ? 6 : fcnt;
-                    for (int i = 0; i < max_d; i++) {
-                        int col = i % 3;
-                        int row = i / 3;
-                        int card_x = 20 + col * (216 + 16);
-                        int card_y = 340 + row * (54 + 10);
-                        if (mx >= card_x && mx < card_x + 216 &&
-                            my >= card_y && my < card_y + 54) {
-                            az_font_set_default_font(flist[i].path);
-                            draw_settings();
-                            break;
-                        }
-                    }
-                }
-
-                /* Audio tab */
-                if (g_active_tab == 1) {
-                    int slider_w = (int)w - 180;
-                    if (mx >= 20 && mx <= 20 + slider_w && my >= AUDIO_SLIDER_Y - 6 && my <= AUDIO_SLIDER_Y + 24) {
-                        int pct = ((mx - 20) * 100) / slider_w;
-                        apply_volume(pct);
-                        draw_settings();
-                        continue;
-                    }
-                    /* Play chime button */
-                    if (mx >= 20 && mx <= 150 && my >= AUDIO_BTN_Y && my <= AUDIO_BTN_Y + 28) {
-                        play_test_chime();
-                        continue;
-                    }
-                }
-
-                /* Theme tab card clicks */
-                if (g_active_tab == 2) {
-                    int theme_count = az_theme_count();
-                    for (int i = 0; i < theme_count; i++) {
-                        int col = i % 2;
-                        int row = i / 2;
-                        int card_x = 20 + col * (THEME_CARD_W + THEME_CARD_GAP);
-                        int card_y = THEME_GRID_Y + row * (THEME_CARD_H + THEME_CARD_GAP);
-                        if (mx >= card_x && mx < card_x + THEME_CARD_W &&
-                            my >= card_y && my < card_y + THEME_CARD_H) {
-                            apply_theme(i);
-                            draw_settings();
-                            break;
-                        }
-                    }
-                }
-
-                /* Time & Date tab timezone clicks */
-                if (g_active_tab == 3) {
-                    for (int i = 0; i < 8; i++) {
-                        int col = i % 2;
-                        int row = i / 2;
-                        int card_x = 20 + col * (TIME_CARD_W + TIME_CARD_GAP + 12);
-                        int card_y = TIME_GRID_Y + row * (TIME_CARD_H + TIME_CARD_GAP);
-                        if (mx >= card_x && mx < card_x + TIME_CARD_W &&
-                            my >= card_y && my < card_y + TIME_CARD_H) {
-                            apply_timezone(i);
-                            draw_settings();
-                            break;
-                        }
-                    }
-                }
-
-                /* Network tab */
-                if (g_active_tab == 4) {
-                    /* Mode toggle pills */
-                    if (mx >= 20 && mx <= 210 && my >= 112 && my <= 138) {
-                        apply_dhcp_network();
-                        draw_settings();
-                        continue;
-                    }
-                    if (mx >= 225 && mx <= 445 && my >= 112 && my <= 138) {
-                        g_net_dhcp = 0;
-                        draw_settings();
-                        continue;
-                    }
-
-                    if (g_net_dhcp == 1) {
-                        /* "Renew DHCP Lease" button */
-                        if (mx >= 20 && mx <= 190 && my >= 256 && my <= 282) {
-                            apply_dhcp_network();
-                            draw_settings();
-                            continue;
-                        }
-                        /* "Configure Static IP" button */
-                        if (mx >= 205 && mx <= 385 && my >= 256 && my <= 282) {
-                            g_net_dhcp = 0;
-                            draw_settings();
-                            continue;
-                        }
-                    } else {
-                        /* Row 0: IP field and presets */
-                        if (mx >= 150 && mx <= 350 && my >= 174 && my <= 198) {
-                            g_net_focus = 0;
-                            draw_settings();
-                            continue;
-                        }
-                        if (mx >= 360 && mx <= 490 && my >= 174 && my <= 198) {
-                            snprintf(g_net_ip, sizeof(g_net_ip), "10.0.2.15");
-                            g_net_focus = 0;
-                            draw_settings();
-                            continue;
-                        }
-                        if (mx >= 500 && mx <= 640 && my >= 174 && my <= 198) {
-                            snprintf(g_net_ip, sizeof(g_net_ip), "192.168.1.50");
-                            g_net_focus = 0;
-                            draw_settings();
-                            continue;
-                        }
-
-                        /* Row 1: Subnet mask field and presets */
-                        if (mx >= 150 && mx <= 350 && my >= 202 && my <= 226) {
-                            g_net_focus = 1;
-                            draw_settings();
-                            continue;
-                        }
-                        if (mx >= 360 && mx <= 520 && my >= 202 && my <= 226) {
-                            snprintf(g_net_netmask, sizeof(g_net_netmask), "255.255.255.0");
-                            g_net_focus = 1;
-                            draw_settings();
-                            continue;
-                        }
-                        if (mx >= 530 && mx <= 640 && my >= 202 && my <= 226) {
-                            snprintf(g_net_netmask, sizeof(g_net_netmask), "255.255.0.0");
-                            g_net_focus = 1;
-                            draw_settings();
-                            continue;
-                        }
-
-                        /* Row 2: Default gateway field and presets */
-                        if (mx >= 150 && mx <= 350 && my >= 230 && my <= 254) {
-                            g_net_focus = 2;
-                            draw_settings();
-                            continue;
-                        }
-                        if (mx >= 360 && mx <= 490 && my >= 230 && my <= 254) {
-                            snprintf(g_net_gateway, sizeof(g_net_gateway), "10.0.2.2");
-                            g_net_focus = 2;
-                            draw_settings();
-                            continue;
-                        }
-                        if (mx >= 500 && mx <= 640 && my >= 230 && my <= 254) {
-                            snprintf(g_net_gateway, sizeof(g_net_gateway), "192.168.1.1");
-                            g_net_focus = 2;
-                            draw_settings();
-                            continue;
-                        }
-
-                        /* Row 3: Primary DNS field and presets */
-                        if (mx >= 150 && mx <= 350 && my >= 258 && my <= 282) {
-                            g_net_focus = 3;
-                            draw_settings();
-                            continue;
-                        }
-                        if (mx >= 360 && mx <= 490 && my >= 258 && my <= 282) {
-                            snprintf(g_net_dns, sizeof(g_net_dns), "8.8.8.8");
-                            g_net_focus = 3;
-                            draw_settings();
-                            continue;
-                        }
-                        if (mx >= 500 && mx <= 640 && my >= 258 && my <= 282) {
-                            snprintf(g_net_dns, sizeof(g_net_dns), "1.1.1.1");
-                            g_net_focus = 3;
-                            draw_settings();
-                            continue;
-                        }
-
-                        /* "Apply Static Config" button */
-                        if (mx >= 20 && mx <= 230 && my >= 344 && my <= 372) {
-                            apply_static_network();
-                            draw_settings();
-                            continue;
-                        }
-                        /* "Revert to DHCP" button */
-                        if (mx >= 245 && mx <= 395 && my >= 344 && my <= 372) {
-                            apply_dhcp_network();
-                            draw_settings();
-                            continue;
-                        }
-                    }
-                }
-
-                /* Power tab */
-                if (g_active_tab == 5) {
-                    /* Profile cards (y: 114..162) */
-                    int card_w = ((int)w - 40 - 24) / 3;
-                    if (my >= 114 && my <= 162) {
-                        for (int i = 0; i < 3; i++) {
-                            int cx = 20 + i * (card_w + 12);
-                            if (mx >= cx && mx <= cx + card_w) {
-                                apply_power_profile(i);
-                                draw_settings();
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    /* Timeout pills (y: 200..226) */
-                    int timeouts[4] = { 5, 15, 30, 0 };
-                    int pill_w = ((int)w - 40 - 36) / 4;
-                    if (my >= 200 && my <= 226) {
-                        for (int i = 0; i < 4; i++) {
-                            int tx = 20 + i * (pill_w + 12);
-                            if (mx >= tx && mx <= tx + pill_w) {
-                                apply_screen_timeout(timeouts[i]);
-                                draw_settings();
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    /* Power buttons (y: 358..388) */
-                    if (my >= 358 && my <= 388) {
-                        if (mx >= 20 && mx <= 160) {
-                            snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Entering ACPI S3 Standby state...");
-                            draw_settings();
-                            continue;
-                        }
-                        if (mx >= 172 && mx <= 312) {
-                            snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Initiating system reboot...");
-                            draw_settings();
-                            reboot(RB_AUTOBOOT);
-                            continue;
-                        }
-                        if (mx >= 324 && mx <= 464) {
-                            snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Initiating ACPI poweroff...");
-                            draw_settings();
-                            reboot(RB_POWER_OFF);
-                            continue;
-                        }
-                    }
-                }
-
-                /* Disks tab */
-                if (g_active_tab == 6) {
-                    /* Clean Temporary Files button (y: 358..388, x: 20..210) */
-                    if (mx >= 20 && mx <= 210 && my >= 358 && my <= 388) {
-                        clean_temp_files();
-                        draw_settings();
-                        continue;
-                    }
-                }
-
-                /* Security & Auto-Accept tab */
-                if (g_active_tab == 7) {
-                    /* Left col sysctl */
-                    if (hit_toggle(SEC_LCOL_X, SEC_ROW1_Y, mx, my)) {
-                        g_sec_dmesg ^= 1;
-                        write_proc_val("/proc/sys/kernel/dmesg_restrict", g_sec_dmesg);
-                        draw_settings();
-                        continue;
-                    }
-                    if (hit_toggle(SEC_LCOL_X, SEC_ROW2_Y, mx, my)) {
-                        g_sec_kptr ^= 1;
-                        write_proc_val("/proc/sys/kernel/kptr_restrict", g_sec_kptr);
-                        draw_settings();
-                        continue;
-                    }
-                    if (hit_toggle(SEC_LCOL_X, SEC_ROW3_Y, mx, my)) {
-                        g_sec_mmap ^= 1;
-                        write_proc_val("/proc/sys/kernel/mmap_min_addr", g_sec_mmap ? 65536 : 0);
-                        draw_settings();
-                        continue;
-                    }
-                    /* Right col sysctl */
-                    if (hit_toggle(SEC_RCOL_X, SEC_ROW1_Y, mx, my)) {
-                        g_sec_yama ^= 1;
-                        write_proc_val("/proc/sys/kernel/yama/ptrace_scope", g_sec_yama);
-                        draw_settings();
-                        continue;
-                    }
-                    if (hit_toggle(SEC_RCOL_X, SEC_ROW2_Y, mx, my)) {
-                        g_sec_hlinks ^= 1;
-                        write_proc_val("/proc/sys/fs/protected_hardlinks", g_sec_hlinks);
-                        draw_settings();
-                        continue;
-                    }
-                    if (hit_toggle(SEC_RCOL_X, SEC_ROW3_Y, mx, my)) {
-                        g_sec_slinks ^= 1;
-                        write_proc_val("/proc/sys/fs/protected_symlinks", g_sec_slinks);
-                        draw_settings();
-                        continue;
-                    }
-                    /* Auto-Accept toggles */
-                    if (hit_toggle_wide(20, SEC_AUTO1_Y, mx, my, 650)) {
-                        g_sec_auto_ipc ^= 1;
-                        save_security_config();
-                        draw_settings();
-                        continue;
-                    }
-                    if (hit_toggle_wide(20, SEC_AUTO2_Y, mx, my, 650)) {
-                        g_sec_auto_admin ^= 1;
-                        save_security_config();
-                        draw_settings();
-                        continue;
-                    }
-                    if (hit_toggle_wide(20, SEC_AUTO3_Y, mx, my, 650)) {
-                        g_sec_auto_dhcp ^= 1;
-                        save_security_config();
-                        draw_settings();
-                        continue;
-                    }
-                    if (hit_toggle_wide(20, SEC_AUTO4_Y, mx, my, 650)) {
-                        g_sec_auto_trace ^= 1;
-                        save_security_config();
-                        draw_settings();
-                        continue;
-                    }
-                }
+                if (g_active_tab == 0) handle_display_mouse(mx, my);
+                else if (g_active_tab == 1) handle_audio_mouse(mx, my);
+                else if (g_active_tab == 2) handle_theme_mouse(mx, my);
+                else if (g_active_tab == 3) handle_time_mouse(mx, my);
+                else if (g_active_tab == 4) handle_network_mouse(mx, my);
+                else if (g_active_tab == 5) handle_power_mouse(mx, my);
+                else if (g_active_tab == 6) handle_disks_mouse(mx, my);
+                else if (g_active_tab == 7) handle_security_mouse(mx, my);
+                else if (g_active_tab == 8) handle_system_mouse(mx, my);
 
                 /* Footer Close button */
                 unsigned int h = g_win.height;

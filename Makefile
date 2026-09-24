@@ -67,7 +67,12 @@ else
   # to link time, which is a large blast radius for a freestanding kernel
   # full of inline asm, naked ISR entry points and sections placed by
   # scripts/kernel.ld — worth having for a release build, not worth being
-  # the default while it hasn't seen wide testing. `make LTO=1` opts in;
+  # the default while it hasn't seen wide testing. It has been built and
+  # booted to a working desktop since, including with the
+  # .data..ro_after_init section and kprotect_seal(), so it is known to work
+  # rather than merely believed to; what is still missing is a measurement
+  # showing it is *faster*, which is what the default should turn on.
+  # `make LTO=1` opts in;
   # it switches the final link from raw `ld` to the `gcc` driver (see
   # $(KERNEL_ELF) below) so the LTO plugin actually runs instead of being
   # silently skipped.
@@ -166,8 +171,11 @@ ARCH_C_SRCS := \
     arch/x86_64/cpu/pic.c \
     arch/x86_64/cpu/lapic.c \
     arch/x86_64/cpu/smp.c \
+    arch/x86_64/cpu/topology.c \
     arch/x86_64/mm/vmm.c \
-    arch/x86_64/mm/tlb.c
+    arch/x86_64/mm/tlb.c \
+    arch/x86_64/mm/kprotect.c \
+    arch/x86_64/vdso/vdso.c
 
 # Architecture ASM sources
 ARCH_ASM_SRCS := \
@@ -175,8 +183,10 @@ ARCH_ASM_SRCS := \
     arch/x86_64/cpu/isr.asm \
     arch/x86_64/cpu/hwprobe.asm \
     arch/x86_64/cpu/switch_to.asm \
+    arch/x86_64/cpu/kexec_trampoline.asm \
     arch/x86_64/syscall/syscall_entry.asm \
-    arch/x86_64/lib/uaccess.asm
+    arch/x86_64/lib/uaccess.asm \
+    arch/x86_64/vdso/vdso_image.asm
 
 # Kernel C sources
 KERNEL_C_SRCS := \
@@ -184,12 +194,19 @@ KERNEL_C_SRCS := \
     kernel/panic.c \
     kernel/signal.c \
     kernel/ptrace.c \
+    kernel/kexec.c \
     kernel/perf/perf.c \
     kernel/perf/ktrace.c \
     kernel/lib/string.c \
     kernel/lib/random.c \
+    kernel/lib/rbtree.c \
+    kernel/bpf/bpf_map.c \
+    kernel/bpf/bpf_verifier.c \
+    kernel/bpf/bpf_jit_x64.c \
+    kernel/bpf/syscall.c \
     kernel/mm/pmm.c \
     kernel/mm/kmalloc.c \
+    kernel/mm/kmodmem.c \
     kernel/mm/vma.c \
     kernel/syscall/syscall.c \
     kernel/sched/sched.c \
@@ -199,10 +216,13 @@ KERNEL_C_SRCS := \
     kernel/ipc/mqueue.c \
     kernel/ipc/posix_sem.c \
     kernel/ktimer.c \
+    kernel/time/timekeeping.c \
     kernel/security/security.c \
     kernel/security/seccomp.c \
     kernel/object/object.c \
     fs/vfs.c \
+    fs/namespace.c \
+    fs/aio.c \
     fs/devfs.c \
     fs/ext2/ext2.c \
     hal/hal.c \
@@ -221,6 +241,7 @@ KERNEL_C_SRCS := \
     drivers/char/console.c \
     drivers/char/lpt.c \
     drivers/misc/bga.c \
+    drivers/misc/vboxguest.c \
     drivers/misc/rtc.c \
     drivers/misc/hpet.c \
     drivers/acpi/acpi.c \
@@ -280,6 +301,8 @@ KERNEL_C_SRCS := \
     fs/fat32.c \
     fs/procfs.c \
     fs/tmpfs.c \
+    fs/userfaultfd.c \
+    fs/fanotify.c \
     kernel/security/acl.c \
     drivers/misc/virtio_rng.c \
     drivers/net/pcnet.c \
@@ -335,7 +358,7 @@ UTIL_TARGETS := $(foreach u,$(UTIL_LIST),userland/apps/$(u)/$(u))
 
 # ── Primary targets ───────────────────────────────────────────────────────────
 .PHONY: all run run-debug gdb iso clean userspace doc \
-        linux linux-install linux-test linux-clean
+        linux linux-install linux-test linux-clean pkgserve
 
 # `doc` regenerates docs/*.md from source comments; it is not a build input, so
 # it is no longer a prerequisite of `all` (run `make doc` to refresh it).
@@ -375,6 +398,43 @@ $(OBJ_DIR)/%.o: %.c
 $(OBJ_DIR)/%.o: %.asm
 	@mkdir -p $(dir $@)
 	$(NASM) $(NASM_FLAGS) $< -o $@
+
+# ── vDSO (linux-vdso.so.1) ────────────────────────────────────────────────────
+# A user-mode shared object, so none of the kernel's CFLAGS apply: it is PIC,
+# has no stack protector (there is no canary contract with the caller's TLS),
+# uses general registers only, and keeps its unwind tables so debuggers can
+# backtrace through a clock_gettime() call. The link must produce zero dynamic
+# relocations — the kernel maps the image verbatim into every process — and
+# the build fails if it does not.
+VDSO_DIR    := $(BUILD_DIR)/vdso
+VDSO_SRC    := arch/x86_64/vdso
+VDSO_CFLAGS := -std=c11 -O2 -fPIC -ffreestanding -fno-builtin -nostdlib \
+               -fno-stack-protector -mgeneral-regs-only -fno-common \
+               -fasynchronous-unwind-tables -fno-omit-frame-pointer \
+               -Wall -Wextra -g
+VDSO_LDFLAGS := -shared -soname=linux-vdso.so.1 --hash-style=both \
+                --eh-frame-hdr -z max-page-size=4096 -z noexecstack \
+                --no-undefined -Bsymbolic --build-id=none \
+                -T $(VDSO_SRC)/vdso.lds --version-script=$(VDSO_SRC)/vdso.map
+
+$(VDSO_DIR)/vclock.o: $(VDSO_SRC)/vclock.c include/azami/vdso.h
+	@mkdir -p $(dir $@)
+	$(CC) $(VDSO_CFLAGS) -c $< -o $@
+
+$(VDSO_DIR)/note.o: $(VDSO_SRC)/note.S
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@
+
+$(VDSO_DIR)/vdso.so.dbg: $(VDSO_DIR)/vclock.o $(VDSO_DIR)/note.o $(VDSO_SRC)/vdso.lds $(VDSO_SRC)/vdso.map
+	$(LD) $(VDSO_LDFLAGS) $(VDSO_DIR)/vclock.o $(VDSO_DIR)/note.o -o $@
+	@if $(CROSS_PREFIX)readelf -r $@ | grep -q "R_X86_64"; then \
+	    echo "  ✗  vDSO has dynamic relocations:"; $(CROSS_PREFIX)readelf -r $@; \
+	    rm -f $@; exit 1; fi
+
+$(VDSO_DIR)/vdso.so: $(VDSO_DIR)/vdso.so.dbg
+	$(CROSS_PREFIX)objcopy -S $< $@
+
+$(OBJ_DIR)/arch/x86_64/vdso/vdso_image.o: $(VDSO_DIR)/vdso.so
 
 # ── QEMU run targets ──────────────────────────────────────────────────────────
 QEMU := qemu-system-x86_64
@@ -536,6 +596,47 @@ hdd.img: $(KERNEL_ELF) | tools/limine
 	@$(MAKE) -C userland ARCH=x86_64
 	@python3 scripts/create_disk.py
 
+vbox: hdd.img
+	@echo "  ↓  Converting hdd.img to VirtualBox VDI image..."
+	@rm -f azamios.vdi
+	@qemu-img convert -O vdi hdd.img azamios.vdi
+	@echo "  ✓  VirtualBox disk image ready: azamios.vdi"
+
+run-vbox: vbox
+	@echo "  ↓  Launching AzamiOS in VirtualBox (Windows host)..."
+	@"/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe" controlvm "AzamiOS" poweroff 2>/dev/null || true
+	@"/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe" unregistervm "AzamiOS" --delete 2>/dev/null || true
+	@WIN_PROFILE=$$(cmd.exe /c "echo %USERPROFILE%" 2>/dev/null | tr -d '\r\n'); \
+	 WSL_PROFILE=$$(wslpath -u "$$WIN_PROFILE"); \
+	 rm -rf "$$WSL_PROFILE/VirtualBox VMs/AzamiOS" 2>/dev/null || true; \
+	 cp azamios.vdi "$$WSL_PROFILE/azamios.vdi"
+	@"/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe" createvm --name "AzamiOS" --ostype "Linux_64" --register >/dev/null
+	@WIN_PROFILE=$$(cmd.exe /c "echo %USERPROFILE%" 2>/dev/null | tr -d '\r\n'); \
+	 "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe" modifyvm "AzamiOS" --memory 2048 --vram 128 --ioapic on --rtcuseutc on --graphicscontroller vboxvga \
+		--uart1 0x3F8 4 --uartmode1 file "$$WIN_PROFILE\\azamios_serial.log" >/dev/null
+	@"/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe" storagectl "AzamiOS" --name "SATA" --add sata --controller IntelAhci >/dev/null
+	@WIN_PROFILE=$$(cmd.exe /c "echo %USERPROFILE%" 2>/dev/null | tr -d '\r\n'); \
+	 "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe" storageattach "AzamiOS" --storagectl "SATA" --port 0 --device 0 --type hdd --medium "$$WIN_PROFILE\\azamios.vdi" >/dev/null
+	@"/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe" startvm "AzamiOS" >/dev/null
+	@echo "  ✓  VirtualBox launched on Windows host."
+
+# ── Package repository over HTTP ─────────────────────────────────────────────
+#
+# The image already carries the sample repository at /repo, so `pkg install`
+# works offline. This target serves that same directory from the build host
+# instead, which is how the http:// side of pkg.elf gets exercised: inside
+# QEMU's user-mode network the host is 10.0.2.2, so from a booted guest
+#
+#     pkg repo add http://10.0.2.2:$(PKG_PORT)
+#     pkg install games
+#
+# fetches over TCP rather than off the local disk. Runs in the foreground
+# and logs each request; Ctrl-C to stop. See docs/PACKAGES.md.
+PKG_PORT ?= 8080
+
+pkgserve:
+	@python3 scripts/serve_pkg_repo.py --port $(PKG_PORT)
+
 # ── Userspace (pass-through to original targets) ─────────────────────────────
 userland/libc/libc.a:
 	$(MAKE) -C userland/libc ARCH=x86_64
@@ -545,7 +646,7 @@ userspace:
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
-	rm -rf $(BUILD_DIR) kernel.log hdd.img
+	rm -rf $(BUILD_DIR) kernel.log hdd.img azamios.vdi
 	@echo "  ✓  Build directory cleaned"
 
 # ── Header dependencies (must stay last; see DEPFILES above) ─────────────────

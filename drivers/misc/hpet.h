@@ -23,3 +23,16 @@ u64 hpet_now_ns(void);
 
 /** hpet_resolution_ns() — Counter period in nanoseconds (rounded up, min 1). */
 u64 hpet_resolution_ns(void);
+
+/** hpet_read_counter() — Raw main-counter value, masked to its real width. */
+u64 hpet_read_counter(void);
+
+/** hpet_counter_mask() — ~0 for a 64-bit counter, 0xFFFFFFFF for 32-bit. */
+u64 hpet_counter_mask(void);
+
+/** hpet_frequency_hz() — Main-counter frequency, 0 if unavailable. */
+u64 hpet_frequency_hz(void);
+
+/** hpet_counter_phys() — Physical address of the main-counter register, so
+ *  the vDSO can map its page read-only into user space. 0 if unavailable. */
+phys_addr_t hpet_counter_phys(void);

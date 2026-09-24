@@ -71,6 +71,7 @@ typedef struct dm_driver {
     void              (*remove)(dm_device_t *dev);
     void              (*shutdown)(dm_device_t *dev);
     u32                 nbound;     /* devices currently bound to this driver */
+    bool                probe_async; /* Run probe in a separate thread */
     struct dm_driver   *bus_next;
 } dm_driver_t;
 
@@ -108,6 +109,9 @@ typedef struct dm_class {
 
 /** driver_core_init() — bring up the driver model; call before any bus. */
 void driver_core_init(void);
+
+extern int g_async_probes_pending;
+void wait_for_device_probe(void);
 
 /* ── Buses ───────────────────────────────────────────────────────────────── */
 int        dm_bus_register(dm_bus_t *bus);

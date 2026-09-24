@@ -259,7 +259,7 @@ static const template_def_t g_templates[] = {
         "# AzamiOS Workspace Automation Script\n"
         "echo \"=== Starting Studio Build Task ===\"\n"
         "date\n"
-        "echo \"Compiler: $(gcc --version 2>/dev/null | head -n 1)\"\n"
+        "echo \"Compiler: $(tcc -v 2>&1 | head -n 1)\"\n"
         "echo \"Directory: $(pwd)\"\n"
         "echo \"Task complete.\"\n"
     },
@@ -297,11 +297,12 @@ static const template_def_t g_templates[] = {
         "Automated build targets with flags & clean rules",
         "Makefile",
         "# AzamiOS Project Makefile\n"
-        "CC = gcc\n"
-        "CFLAGS = -O2 -std=c11 -Wall -Wextra\n\n"
+        "CC = tcc\n"
+        "CFLAGS = -O2 -std=c11 -Wall -Wextra\n"
+        "LDFLAGS = -static\n\n"
         "all: app.elf\n\n"
         "app.elf: main.c\n"
-        "\t$(CC) $(CFLAGS) main.c -o app.elf\n\n"
+        "\t$(CC) $(CFLAGS) $(LDFLAGS) main.c -o app.elf\n\n"
         "clean:\n"
         "\trm -f app.elf *.o\n"
     }
@@ -792,9 +793,12 @@ static void run_build_task(void)
     tab_t *tab = &g_tabs[g_active_tab];
     if (!tab->active) return;
 
-    if (tab->dirty) {
-        tab_save_file(tab);
-    }
+    /* Save first, always — not just when the buffer is marked dirty.
+     * A tab opened from a template starts clean but has never been
+     * written, so the compiler was handed a path with no file behind it
+     * ("tcc: error: file '/home/azami/main.c' not found") while the code
+     * sat on screen in front of you. */
+    tab_save_file(tab);
 
     g_console_mode = CONSOLE_BUILD;
     char msg[128];
@@ -803,8 +807,25 @@ static void run_build_task(void)
 
     const char *ext = strrchr(tab->filename, '.');
     if (ext && strcmp(ext, ".c") == 0) {
+        /* The compiler on this image is TinyCC (docs/TOOLCHAIN.md); the
+         * cross-gcc this used to invoke is no longer packed into the
+         * rootfs, so every build failed with "gcc: not found". -static
+         * matters: tcc's default output is dynamically linked and nothing
+         * here can run it. */
+        const char *cc = access("/usr/bin/tcc", 1 /* X_OK */) == 0 ? "/usr/bin/tcc"
+                       : access("/bin/cc", 1) == 0                 ? "/bin/cc"
+                       : (const char *)0;
+        if (!cc) {
+            build_append("✗ No C compiler on this system.");
+            build_append("  Install one with:  pkg install tcc");
+            snprintf(g_status_msg, sizeof(g_status_msg), "No compiler");
+            g_status_color = CLR_RED;
+            return;
+        }
+
         char cmd[512];
-        snprintf(cmd, sizeof(cmd), "gcc -O2 -std=c11 \"%s\" -o /tmp/studio_app.elf 2>&1", tab->filepath);
+        snprintf(cmd, sizeof(cmd), "%s -O2 -std=c11 -static \"%s\" -o /tmp/studio_app.elf 2>&1",
+                 cc, tab->filepath);
         snprintf(msg, sizeof(msg), "$ %s", cmd);
         build_append(msg);
 
@@ -842,10 +863,12 @@ static void run_build_task(void)
                 g_status_color = CLR_RED;
             }
         } else {
-            build_append("Note: Running syntax validation check.");
-            build_append("✓ Syntax OK (100% compliant C11 code).");
-            snprintf(g_status_msg, sizeof(g_status_msg), "Validation OK");
-            g_status_color = CLR_GREEN;
+            /* popen() failed, so the compiler never ran. This used to
+             * print "✓ Syntax OK (100% compliant C11 code)" here, which
+             * was a pass reported for a build that had not happened. */
+            build_append("✗ Could not start the compiler (pipe failed).");
+            snprintf(g_status_msg, sizeof(g_status_msg), "Build Error");
+            g_status_color = CLR_RED;
         }
     } else if (ext && strcmp(ext, ".sh") == 0) {
         char cmd[512];
@@ -904,7 +927,7 @@ static void execute_runner_command(void)
         runner_append("  stats            Switch to project metrics & LOC tab");
         runner_append("  open <file>      Open file in a new workspace editor tab");
         runner_append("  cd <dir>         Change workspace active directory");
-        runner_append("  Any shell cmd    Run external POSIX utility (ls, cat, gcc, etc.)");
+        runner_append("  Any shell cmd    Run external POSIX utility (ls, cat, tcc, etc.)");
     } else if (strcmp(g_runner_input, "build") == 0 || strcmp(g_runner_input, "run") == 0) {
         run_build_task();
     } else if (strcmp(g_runner_input, "stats") == 0) {

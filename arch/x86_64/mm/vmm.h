@@ -148,6 +148,42 @@ phys_addr_t vmm_translate(vmm_space_t space, virt_addr_t virt);
 u64 vmm_query_flags(vmm_space_t space, virt_addr_t virt);
 
 /**
+ * vmm_protect_range(space, start, end, set, clear, allow_split) — add and
+ * remove attribute bits across [start, end).
+ *
+ * The complement of vmm_set_flags(): that one replaces a leaf's attributes
+ * outright, this one edits selected bits and leaves the rest (caching, PAT,
+ * protection key, GLOBAL) exactly as it found them. It also works at the
+ * granularity each mapping already uses, so blanketing the multi-gigabyte
+ * HHDM with VMM_F_NX touches a handful of 1 GiB entries instead of a million
+ * PTEs, and keeps the TLB reach those large pages exist for.
+ *
+ * @clear is masked against the address bits and VMM_F_HUGE, which are never a
+ * protection change. @prot_flags is a combination of:
+ *
+ *   VMM_PROT_SPLIT     a huge entry only partly covered by the range is split
+ *                      down a level so the boundary can be expressed exactly;
+ *                      without it such an entry is skipped untouched.
+ *   VMM_PROT_NOFLUSH   do not broadcast the TLB shootdown; the caller is
+ *                      making several edits and will call vmm_protect_flush()
+ *                      once when they are all done.
+ *
+ * Returns the number of entries modified, or -1 if a split ran out of memory.
+ */
+#define VMM_PROT_SPLIT    (1u << 0)
+#define VMM_PROT_NOFLUSH  (1u << 1)
+
+s64 vmm_protect_range(vmm_space_t space, virt_addr_t start, virt_addr_t end,
+                      u64 set, u64 clear, u32 prot_flags);
+
+/**
+ * vmm_protect_flush() — publish page-table edits made with VMM_PROT_NOFLUSH.
+ * Drops every translation on this CPU, globals included, and makes every
+ * other CPU do the same before returning.
+ */
+void vmm_protect_flush(void);
+
+/**
  * vmm_create_space() — Allocate a new page table and copy the kernel half.
  *
  * PML4 indices 256–511 (kernel half) are shared with the kernel's PML4.
@@ -195,6 +231,10 @@ static inline void vmm_switch(vmm_space_t space)
      * lives in PCID 0 and whose pages are global anyway. */
     __asm__ volatile("mov %0, %%cr3" : : "r"((u64)space & VMM_PHYS_MASK) : "memory");
 }
+
+/* One past the top physical address the firmware memory map covers, and so
+ * the length of the HHDM window at HHDM_BASE. Set by vmm_init(). */
+extern u64 g_hhdm_phys_top;
 
 extern u8 g_pcid_enabled;   /* cpu.c — CR4.PCIDE is live */
 

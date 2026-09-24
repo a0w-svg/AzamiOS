@@ -23,57 +23,10 @@
 #include "../../../kernel/lib/string.h"
 #include "../../../arch/x86_64/mm/vmm.h"
 
-/* ── I/O port offsets from the BAR0 base ─────────────────────────────────── */
-#define SVGA_INDEX_PORT          0
-#define SVGA_VALUE_PORT          1
-
-/* ── Registers ───────────────────────────────────────────────────────────── */
-#define SVGA_REG_ID              0
-#define SVGA_REG_ENABLE          1
-#define SVGA_REG_WIDTH           2
-#define SVGA_REG_HEIGHT          3
-#define SVGA_REG_MAX_WIDTH       4
-#define SVGA_REG_MAX_HEIGHT      5
-#define SVGA_REG_DEPTH           6
-#define SVGA_REG_BITS_PER_PIXEL  7
-#define SVGA_REG_BYTES_PER_LINE  12
-#define SVGA_REG_FB_START        13
-#define SVGA_REG_FB_OFFSET       14
-#define SVGA_REG_VRAM_SIZE       15
-#define SVGA_REG_FB_SIZE         16
-#define SVGA_REG_CAPABILITIES    17
-#define SVGA_REG_MEM_START       18   /* FIFO base   */
-#define SVGA_REG_MEM_SIZE        19   /* FIFO length */
-#define SVGA_REG_CONFIG_DONE     20
-#define SVGA_REG_SYNC            21
-#define SVGA_REG_BUSY            22
-
-/* Version handshake: write the newest ID the driver speaks and read it back. */
-#define SVGA_MAGIC               0x900000UL
-#define SVGA_MAKE_ID(ver)        ((u32)((SVGA_MAGIC << 8) | (ver)))
-#define SVGA_ID_0                SVGA_MAKE_ID(0)
-#define SVGA_ID_1                SVGA_MAKE_ID(1)
-#define SVGA_ID_2                SVGA_MAKE_ID(2)
-
-/* ── FIFO ────────────────────────────────────────────────────────────────── */
-#define SVGA_FIFO_MIN            0    /* u32 indices into the FIFO mapping */
-#define SVGA_FIFO_MAX            1
-#define SVGA_FIFO_NEXT_CMD       2
-#define SVGA_FIFO_STOP           3
-#define SVGA_FIFO_NUM_REGS       4
-
-#define SVGA_REG_CURSOR_ON       27
-#define SVGA_REG_CURSOR_X        28
-#define SVGA_REG_CURSOR_Y        29
-#define SVGA_REG_CURSOR_ID       30
-
-#define SVGA_CMD_UPDATE          1
-#define SVGA_CMD_RECT_FILL       2
-#define SVGA_CMD_RECT_COPY       3
-#define SVGA_CMD_DEFINE_ALPHA_CURSOR 22
-
+#include "../gpu_isa.h"
 typedef struct vmwgfx_device {
     u16    io_base;
+    u32    caps;                /* Cached SVGA_REG_CAPABILITIES */
     void  *fb;                  /* mapped linear framebuffer   */
     size_t fb_size;
     volatile u32 *fifo;         /* mapped command FIFO         */
@@ -146,6 +99,32 @@ static void svga_update_rect(vmwgfx_device_t *sv, u32 x, u32 y, u32 w, u32 h)
     svga_fifo_write(sv, SVGA_CMD_UPDATE);
     svga_fifo_write(sv, x);
     svga_fifo_write(sv, y);
+    svga_fifo_write(sv, w);
+    svga_fifo_write(sv, h);
+    svga_sync(sv);
+}
+
+static void svga_rect_fill(vmwgfx_device_t *sv, u32 color, u32 x, u32 y, u32 w, u32 h)
+{
+    if (!(sv->caps & SVGA_CAP_RECT_FILL)) return;
+    svga_fifo_write(sv, SVGA_CMD_RECT_FILL);
+    svga_fifo_write(sv, color);
+    svga_fifo_write(sv, x);
+    svga_fifo_write(sv, y);
+    svga_fifo_write(sv, w);
+    svga_fifo_write(sv, h);
+    svga_sync(sv);
+}
+
+static void svga_rect_copy(vmwgfx_device_t *sv, u32 src_x, u32 src_y,
+                           u32 dst_x, u32 dst_y, u32 w, u32 h)
+{
+    if (!(sv->caps & SVGA_CAP_RECT_COPY)) return;
+    svga_fifo_write(sv, SVGA_CMD_RECT_COPY);
+    svga_fifo_write(sv, src_x);
+    svga_fifo_write(sv, src_y);
+    svga_fifo_write(sv, dst_x);
+    svga_fifo_write(sv, dst_y);
     svga_fifo_write(sv, w);
     svga_fifo_write(sv, h);
     svga_sync(sv);
@@ -235,6 +214,15 @@ static int vmwgfx_load(drm_device_t *dev)
     drm_plane_create(dev, DRM_PLANE_TYPE_PRIMARY, 1U << crtc->index,
                      formats, ARRAY_SIZE(formats));
 
+    /* The device has a hardware alpha-cursor (SVGA_CMD_DEFINE_ALPHA_CURSOR +
+     * SVGA_REG_CURSOR_ON/X/Y).  Advertise a cursor plane so that universal-
+     * plane and atomic clients see it — without this, atomic modesetting of
+     * the cursor has no plane to target and falls back incorrectly to a
+     * software cursor path. */
+    static const u32 cursor_formats[] = { DRM_FORMAT_ARGB8888 };
+    drm_plane_create(dev, DRM_PLANE_TYPE_CURSOR, 1U << crtc->index,
+                     cursor_formats, ARRAY_SIZE(cursor_formats));
+
     drm_mode_simple(&crtc->mode, sv->width, sv->height, 60);
     crtc->mode_valid = true;
     crtc->enabled    = true;
@@ -267,6 +255,10 @@ static int vmwgfx_cursor_set(drm_crtc_t *crtc, drm_gem_object_t *bo, u32 w, u32 
     if (!bo) {
         svga_write(sv, SVGA_REG_CURSOR_ON, 0);
         return 0;
+    }
+
+    if (!(sv->caps & SVGA_CAP_ALPHA_CURSOR)) {
+        return -EINVAL; /* Software fallback if hardware doesn't support alpha cursors */
     }
 
     if (w > 64 || h > 64) return -EINVAL;
@@ -307,9 +299,9 @@ static int vmwgfx_cursor_move(drm_crtc_t *crtc, s32 x, s32 y)
 static const drm_driver_t vmwgfx_drm_driver = {
     .name        = "vmwgfx",
     .desc        = "VMware SVGA II display adapter",
-    .date        = "20260831",
-    .major       = 2, .minor = 0, .patchlevel = 0,
-    .features    = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER,
+    .date        = "20260914",
+    .major       = 2, .minor = 1, .patchlevel = 0,
+    .features    = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER | DRIVER_ATOMIC,
     .load        = vmwgfx_load,
     .unload      = vmwgfx_unload,
     .mode_set    = vmwgfx_mode_set,
@@ -347,6 +339,7 @@ static int vmwgfx_pci_probe(dm_device_t *dm, const pci_device_id_t *id)
 
     sv->max_width  = svga_read(sv, SVGA_REG_MAX_WIDTH);
     sv->max_height = svga_read(sv, SVGA_REG_MAX_HEIGHT);
+    sv->caps       = svga_read(sv, SVGA_REG_CAPABILITIES);
     if (sv->max_width == 0 || sv->max_height == 0) {
         sv->max_width  = 1920;
         sv->max_height = 1200;

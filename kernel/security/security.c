@@ -14,6 +14,8 @@
 #include "../../include/azami/defs.h"
 #include "../lib/random.h"
 #include "../syscall/syscall.h"
+#include "../../arch/x86_64/mm/kprotect.h"
+#include "../mm/kmodmem.h"
 
 
 /* Global stack canary guard value. The compile-time value is a placeholder
@@ -113,6 +115,15 @@ size_t security_format_status(char *buf, size_t max)
         g_cpu_info.has_shstk ? "supported, not enabled" : "unsupported");
     ROW("cet_ibt",
         g_cpu_info.has_ibt   ? "supported, not enabled" : "unsupported");
+
+    /* Kernel self-protection, reported by what the page tables actually say
+     * rather than by what the boot path intended — see kprotect.c. */
+    ROW("kernel_wx",      kprotect_is_sealed() ? "sealed (W^X, HHDM NX)"
+                                               : "NOT SEALED");
+    ROW("ro_after_init",  kprotect_is_sealed() ? "read-only" : "writable");
+    off += scnprintf(buf + off, max > off ? max - off : 0,
+                     "%-22s %llu KiB\n", "jit_exec_mem:",
+                     (unsigned long long)(kmod_exec_bytes() >> 10));
 
     off += scnprintf(buf + off, max > off ? max - off : 0,
                      "%-22s 0x%016llx\n", "cr4_pinned:",

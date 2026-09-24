@@ -32,6 +32,9 @@
 #define E1000_TDLEN     0x3808  /* TX Descriptor Length */
 #define E1000_TDH       0x3810  /* TX Descriptor Head */
 #define E1000_TDT       0x3818  /* TX Descriptor Tail */
+#define E1000_ITR       0x00C4  /* Interrupt Throttling Rate           */
+#define E1000_RDTR      0x2820  /* RX Delay Timer                       */
+#define E1000_RADV      0x282C  /* RX Absolute Interrupt Delay Timer    */
 #define E1000_MTA       0x5200  /* Multicast Table Array */
 #define E1000_RAL       0x5400  /* Receive Address Low */
 #define E1000_RAH       0x5404  /* Receive Address High */
@@ -39,6 +42,31 @@
 /* ── Control Register Bits ───────────────────────────────────────────────── */
 #define E1000_CTRL_SLU   (1 << 6)   /* Set Link Up */
 #define E1000_CTRL_RST   (1 << 26)  /* Device Reset */
+
+/* ── Interrupt moderation ─────────────────────────────────────────────────
+ *
+ * ITR, RDTR and RADV are all counted in 1.024 us units.
+ *
+ * ITR caps how often the NIC may raise an interrupt at all. Without it every
+ * received frame interrupts, so a saturated link turns into ~1.5M interrupts
+ * a second, each one an IDT dispatch and an ICR read that mostly finds one
+ * packet waiting. Capping the rate lets e1000_poll_rx()'s existing
+ * "drain while DD is set" loop pick up a batch per interrupt instead, which
+ * is the same NAPI-ish shape Linux's e1000 uses.
+ *
+ * 250 units ~= 256 us, i.e. at most ~3900 interrupts/s. RDTR delays an RX
+ * interrupt briefly so a burst coalesces; RADV bounds how long the first
+ * packet of a burst can be held so latency stays predictable. */
+/* How long e1000_send_packet() will wait for a TX descriptor to be retired
+ * before reporting the ring full. Each iteration is one PAUSE, so this is on
+ * the order of tens of microseconds — far longer than a healthy controller
+ * needs at line rate, and short enough that a wedged one cannot hold a CPU
+ * with interrupts disabled. */
+#define E1000_TX_WAIT_SPINS 200000u
+
+#define E1000_ITR_USECS   250    /* ~256 us  => <= ~3900 IRQ/s */
+#define E1000_RDTR_USECS   16    /* ~16 us packet delay        */
+#define E1000_RADV_USECS   64    /* ~66 us absolute cap        */
 
 /* ── Receive Control Bits ────────────────────────────────────────────────── */
 #define E1000_RCTL_EN    (1 << 1)   /* Receiver Enable */

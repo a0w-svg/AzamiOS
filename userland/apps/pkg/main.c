@@ -2,7 +2,9 @@
  * AzamiOS Userspace — Package Manager (pkg.elf)
  * File: userland/apps/pkg/main.c
  *
- * `pkg install <name>` / `pkg remove <name>` / `pkg list [--available]`.
+ * `pkg install [--force] <name>...` / `pkg remove <name>...` /
+ * `pkg list [--available]` / `pkg search <term>` / `pkg info <name>` /
+ * `pkg repo list|add|remove`.
  *
  * A package is a plain ustar archive (the same format tar.elf reads and
  * writes) whose first entry is named "PKGINFO" — a small key=value
@@ -16,10 +18,21 @@
  *
  * A repository is a directory — local (file:///path) or served over plain
  * HTTP (http://host[:port]/path) — holding an index.txt (one
- * "name version type file description..." line per package, whitespace-
- * separated for the first four fields, description running to end of
- * line) and the package archives it names. /etc/pkg/repos.conf lists one
- * repository URL per line, checked in order until a package name matches.
+ * "name version type file size sha256 description..." line per package,
+ * whitespace-separated for the first six fields, description running to
+ * end of line) and the package archives it names. The size and digest
+ * columns are optional: an index whose fifth field is not a byte count
+ * followed by a 64-hex-digit digest is read as the original four-field
+ * format, with the description starting right after the filename — so a
+ * repository published before those columns existed still installs, just
+ * without the integrity check. /etc/pkg/repos.conf lists one repository
+ * URL per line, checked in order until a package name matches; `pkg repo
+ * add/remove` edit that file rather than making you do it by hand.
+ *
+ * Anything fetched from a repository that *does* carry a digest is hashed
+ * before a single byte of it is unpacked — a package archive arriving over
+ * http:// crosses a network this OS does not control, and "extract first,
+ * notice later" is not a thing a package manager should do.
  *
  * Installed-package state lives under /var/pkg/db/<name>: the manifest
  * again, then a "FILES:" line, then one installed path per line — exactly
@@ -39,6 +52,9 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <signal.h>
+#include <stdint.h>
+#include <ctype.h>
+#include <sha256.h>
 
 #define REPOS_CONF   "/etc/pkg/repos.conf"
 #define DB_DIR       "/var/pkg/db"
@@ -113,10 +129,30 @@ static void manifest_parse_buf(struct manifest *m, char *buf, size_t len)
     }
 }
 
-/* Ensures a single path component's parent exists (mkdir is not recursive
- * here, matching tar.elf — every package this tool ships targets
- * directories the base image already has, bin/sbin/usr/bin/usr/sbin, so a
- * full mkdir -p is more machinery than v1 needs). */
+/* mkdir -p: creates every missing component of `path` itself (not its
+ * parent). Existing components are left alone — EEXIST is the expected
+ * case, not an error.
+ *
+ * This used to be a single non-recursive mkdir of the parent, which was
+ * enough only while every package installed into bin/ or sbin/, directories
+ * the base image already has. Packages now ship into paths several levels
+ * deep that the image has never seen (usr/share/doc/azami/,
+ * usr/share/examples/), where one mkdir of the leaf parent fails with
+ * ENOENT and every file in the package then silently fails to open. */
+static void mkdir_p(const char *path)
+{
+    char buf[300];
+    snprintf(buf, sizeof(buf), "%s", path);
+    for (char *q = buf + 1; *q; q++) {
+        if (*q != '/') continue;
+        *q = '\0';
+        mkdir(buf, 0755);
+        *q = '/';
+    }
+    mkdir(buf, 0755);
+}
+
+/* Ensures the directory holding `path` exists, creating the whole chain. */
 static void ensure_parent_dir(const char *path)
 {
     char buf[300];
@@ -124,7 +160,7 @@ static void ensure_parent_dir(const char *path)
     char *slash = strrchr(buf, '/');
     if (!slash || slash == buf) return;
     *slash = '\0';
-    mkdir(buf, 0755);
+    mkdir_p(buf);
 }
 
 /* Extracts a package tar at `tarpath` into the root filesystem, splitting
@@ -165,7 +201,29 @@ static int extract_package(const char *tarpath, struct manifest *m, FILE *files_
         }
 
         if (h.typeflag == '5' || (h.name[strlen(h.name) - 1] == '/')) {
-            mkdir(h.name, 0755);
+            mkdir_p(h.name);
+            continue;
+        }
+
+        /* Symlink entry: no data blocks follow it, only the header's
+         * linkname. This is what lets a toolbox package (busybox, toybox)
+         * ship one binary plus the several hundred applet names that
+         * dispatch to it — without this, each of those entries became an
+         * empty regular file and `grep` on the PATH was a zero-byte
+         * nothing. An existing name is replaced, same as a regular file
+         * would be. */
+        if (h.typeflag == '2') {
+            char target[101];
+            memcpy(target, h.linkname, sizeof(h.linkname));
+            target[sizeof(h.linkname)] = '\0';
+            ensure_parent_dir(h.name);
+            unlink(h.name);
+            if (symlink(target, h.name) != 0) {
+                fprintf(stderr, "pkg: cannot link %s -> %s: %s\n",
+                        h.name, target, strerror(errno));
+                continue;
+            }
+            if (files_out) fprintf(files_out, "%s\n", h.name);
             continue;
         }
 
@@ -288,11 +346,13 @@ struct repo {
     char host[128];
     int port;
     char path[256];   /* for http://: the URL path prefix. for file://: the local dir. */
+    char url[256];    /* the line from repos.conf, verbatim, for messages */
 };
 
 static int parse_repo_url(const char *url, struct repo *r)
 {
     memset(r, 0, sizeof(*r));
+    snprintf(r->url, sizeof(r->url), "%s", url);
     if (strncmp(url, "file://", 7) == 0) {
         r->is_http = 0;
         snprintf(r->path, sizeof(r->path), "%s", url + 7);
@@ -312,9 +372,14 @@ static int parse_repo_url(const char *url, struct repo *r)
         memcpy(r->host, p, hostlen);
         r->host[hostlen] = '\0';
         if (colon && (!slash || colon < slash)) r->port = atoi(colon + 1);
-        snprintf(r->path, sizeof(r->path), "%s", slash ? slash : "/");
+        snprintf(r->path, sizeof(r->path), "%s", slash ? slash : "");
         size_t l = strlen(r->path);
-        while (l > 1 && r->path[l - 1] == '/') { r->path[--l] = '\0'; }
+        while (l > 0 && r->path[l - 1] == '/') { r->path[--l] = '\0'; }
+        /* The prefix is stored without its trailing slash, including for a
+         * bare "http://host" (path ""), because repo_fetch() builds
+         * "<prefix>/<file>" itself -- leaving the "/" on would ask for
+         * "//index.txt". Lenient servers normalize that away; not every
+         * server is lenient. */
         return 0;
     }
     return -1;
@@ -339,18 +404,14 @@ static int repo_fetch(const struct repo *repo, const char *name, const char *des
         return 0;
     }
 
-    /* KNOWN ISSUE: a `pkg install` needs two HTTP fetches — the repo's
-     * index, then the package archive — and in testing, only the *first*
-     * TCP connection a boot ever makes reliably completes; a second one
-     * (same process, a forked child, doesn't matter) blocks in the kernel
-     * with no SYN ever reaching the wire (confirmed via a packet capture:
-     * zero further traffic after the first connection's close). This
-     * looks like a real, pre-existing bug somewhere below tcp_connect() —
-     * not something fixed here — so `pkg install`/`pkg list --available`
-     * against an http:// repo is exercised and correct in isolation (one
-     * fetch, one boot) but not yet reliable back-to-back. file:// repos
-     * are unaffected (no sockets involved) and are what the bundled
-     * sample repository uses by default; see docs/PACKAGES.md. */
+    /* A `pkg install` needs two HTTP fetches — the repo's index, then the
+     * package archive — and for a while only the *first* TCP connection a
+     * boot made completed; a second one hung in the kernel with no SYN on
+     * the wire. That was a locking bug in tcp_connect()/tcp_input() (see
+     * kernel/net/tcp.c), not anything about this tool, and is fixed:
+     * back-to-back fetches within one boot work. See docs/PACKAGES.md for
+     * how to serve a repository over http:// (scripts/serve_pkg_repo.py,
+     * `make pkgserve`). */
     char urlpath[512];
     snprintf(urlpath, sizeof(urlpath), "%s/%s", repo->path, name);
     int out_fd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -377,40 +438,157 @@ static int load_repos(struct repo repos[MAX_REPOS])
     return n;
 }
 
-/* One index.txt line: "name version type file description...". The first
- * four fields are whitespace-separated; the description is everything
- * after the fourth field, taken verbatim (so it may itself contain
- * spaces). */
+/* One index.txt line:
+ *
+ *     name version type file size sha256 description...
+ *
+ * The first six fields are whitespace-separated; the description is
+ * everything after them, taken verbatim (so it may itself contain spaces).
+ *
+ * `size` and `sha256` are optional. A repository generated before those
+ * columns existed writes only four fields and starts the description at
+ * the fifth, so they are recognised by shape rather than by position: the
+ * fifth field counts as a size only if it is all digits *and* the sixth is
+ * exactly 64 hex characters. A description beginning with a number
+ * therefore still parses as a description, because no plausible next word
+ * is a 64-character hex string. */
 struct index_entry {
     char name[64], version[32], type[16], file[128], description[192];
+    unsigned long size;    /* archive size in bytes, 0 if the index omits it */
+    char sha256[65];       /* archive digest, "" if the index omits it */
 };
+
+static int field_is_digits(const char *p, size_t n)
+{
+    if (n == 0 || n > 20) return 0;
+    for (size_t i = 0; i < n; i++) if (p[i] < '0' || p[i] > '9') return 0;
+    return 1;
+}
+
+static int field_is_hex64(const char *p, size_t n)
+{
+    if (n != 64) return 0;
+    for (size_t i = 0; i < 64; i++) if (!isxdigit((unsigned char)p[i])) return 0;
+    return 1;
+}
+
+static void field_copy(char *dst, size_t dstsz, const char *src, size_t n)
+{
+    if (n >= dstsz) n = dstsz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
 
 static int parse_index_line(const char *line, struct index_entry *e)
 {
     memset(e, 0, sizeof(*e));
-    int n = sscanf(line, "%63s %31s %15s %127s", e->name, e->version, e->type, e->file);
-    if (n < 4) return -1;
-    /* Description: skip past the four fields already consumed. */
+
+    const char *tok[6];
+    size_t toklen[6];
+    const char *after[6];   /* where each token ends, for the description */
+    int nt = 0;
     const char *p = line;
-    for (int i = 0; i < 4 && p; i++) {
+    while (nt < 6) {
         while (*p == ' ' || *p == '\t') p++;
-        p = strpbrk(p, " \t");
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        tok[nt] = start;
+        toklen[nt] = (size_t)(p - start);
+        after[nt] = p;
+        nt++;
     }
-    if (p) { while (*p == ' ' || *p == '\t') p++; snprintf(e->description, sizeof(e->description), "%s", p); }
+    if (nt < 4) return -1;
+
+    field_copy(e->name,    sizeof(e->name),    tok[0], toklen[0]);
+    field_copy(e->version, sizeof(e->version), tok[1], toklen[1]);
+    field_copy(e->type,    sizeof(e->type),    tok[2], toklen[2]);
+    field_copy(e->file,    sizeof(e->file),    tok[3], toklen[3]);
+
+    const char *rest = after[3];
+    if (nt == 6 && field_is_digits(tok[4], toklen[4]) && field_is_hex64(tok[5], toklen[5])) {
+        char sizebuf[24];
+        field_copy(sizebuf, sizeof(sizebuf), tok[4], toklen[4]);
+        e->size = strtoul(sizebuf, NULL, 10);
+        field_copy(e->sha256, sizeof(e->sha256), tok[5], toklen[5]);
+        for (char *h = e->sha256; *h; h++) *h = (char)tolower((unsigned char)*h);
+        rest = after[5];
+    }
+
+    while (*rest == ' ' || *rest == '\t') rest++;
+    snprintf(e->description, sizeof(e->description), "%s", rest);
     return 0;
 }
 
-/* Searches every configured repo's index for `name`; on a match, fills
- * `entry` and `*found_repo` and returns 0. */
-static int find_in_repos(const char *name, struct repo repos[MAX_REPOS], int nrepos,
-                          struct index_entry *entry, struct repo *found_repo)
+/* "1.1M", "94K", "812B" — a size column narrow enough to sit in `pkg list
+ * --available` without pushing the description off an 80-column serial
+ * console. */
+static void human_size(unsigned long bytes, char *out, size_t outsz)
 {
-    for (int i = 0; i < nrepos; i++) {
+    if (bytes == 0)            snprintf(out, outsz, "-");
+    else if (bytes < 1024)     snprintf(out, outsz, "%luB", bytes);
+    else if (bytes < 1024UL * 1024) snprintf(out, outsz, "%luK", (bytes + 512) / 1024);
+    else                       snprintf(out, outsz, "%lu.%luM", bytes / (1024UL * 1024),
+                                        ((bytes % (1024UL * 1024)) * 10) / (1024UL * 1024));
+}
+
+/* Checks a fetched archive against the index's size and digest before
+ * anything is unpacked from it. Returns 0 if it matches or if the index
+ * carries no digest to match against (the old four-field format), -1 on a
+ * mismatch — in which case the caller must not install it. */
+static int verify_archive(const char *path, const struct index_entry *e)
+{
+    if (!e->sha256[0]) return 0;
+
+    if (e->size) {
+        struct stat st;
+        if (stat(path, &st) == 0 && (unsigned long)st.st_size != e->size) {
+            fprintf(stderr, "pkg: %s is %lu bytes, index says %lu — refusing to install\n",
+                    e->file, (unsigned long)st.st_size, e->size);
+            return -1;
+        }
+    }
+
+    char got[65];
+    if (sha256_hash_file(path, got) != 0) {
+        fprintf(stderr, "pkg: cannot hash %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (strcmp(got, e->sha256) != 0) {
+        fprintf(stderr, "pkg: checksum mismatch for %s — refusing to install\n", e->file);
+        fprintf(stderr, "pkg:   expected %s\n", e->sha256);
+        fprintf(stderr, "pkg:   got      %s\n", got);
+        return -1;
+    }
+    return 0;
+}
+
+/* Walks every configured repository's index, handing each parsed entry to
+ * `cb` along with the repository it came from. A callback returning
+ * non-zero stops the walk immediately (that is how a lookup short-circuits
+ * once it has its match, instead of downloading the remaining indexes for
+ * nothing); the walk's return value is that value, or 0 if it ran to the
+ * end.
+ *
+ * install/list/search/info all differ only in what they do per entry, and
+ * each used to carry its own copy of "mkstemp, fetch index.txt, fgets,
+ * strip CR/LF, skip blanks and #comments, parse, unlink" — four copies of
+ * the same twenty lines, of which two had already drifted apart. */
+typedef int (*index_cb)(const struct index_entry *e, const struct repo *repo, void *ctx);
+
+static int for_each_index_entry(struct repo repos[MAX_REPOS], int nrepos, index_cb cb, void *ctx)
+{
+    int rc = 0;
+    for (int i = 0; i < nrepos && rc == 0; i++) {
         char idx_path[] = "/tmp/pkg-index-XXXXXX";
         int fd = mkstemp(idx_path);
         if (fd < 0) continue;
         close(fd);
-        if (repo_fetch(&repos[i], "index.txt", idx_path) != 0) { unlink(idx_path); continue; }
+        if (repo_fetch(&repos[i], "index.txt", idx_path) != 0) {
+            fprintf(stderr, "pkg: warning: cannot read index of %s\n", repos[i].url);
+            unlink(idx_path);
+            continue;
+        }
 
         FILE *f = fopen(idx_path, "r");
         if (f) {
@@ -420,27 +598,58 @@ static int find_in_repos(const char *name, struct repo repos[MAX_REPOS], int nre
                 while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = '\0';
                 if (l == 0 || line[0] == '#') continue;
                 struct index_entry e;
-                if (parse_index_line(line, &e) == 0 && strcmp(e.name, name) == 0) {
-                    *entry = e;
-                    *found_repo = repos[i];
-                    fclose(f);
-                    unlink(idx_path);
-                    return 0;
-                }
+                if (parse_index_line(line, &e) != 0) continue;
+                rc = cb(&e, &repos[i], ctx);
+                if (rc != 0) break;
             }
             fclose(f);
         }
         unlink(idx_path);
     }
-    return -1;
+    return rc;
+}
+
+struct find_ctx {
+    const char *name;
+    struct index_entry entry;
+    struct repo repo;
+};
+
+static int find_cb(const struct index_entry *e, const struct repo *repo, void *ctx)
+{
+    struct find_ctx *fc = (struct find_ctx *)ctx;
+    if (strcmp(e->name, fc->name) != 0) return 0;
+    fc->entry = *e;
+    fc->repo  = *repo;
+    return 1;   /* stop: first repository to offer the name wins */
+}
+
+/* Searches every configured repo's index for `name`; on a match, fills
+ * `entry` and `*found_repo` and returns 0. */
+static int find_in_repos(const char *name, struct repo repos[MAX_REPOS], int nrepos,
+                          struct index_entry *entry, struct repo *found_repo)
+{
+    struct find_ctx fc;
+    memset(&fc, 0, sizeof(fc));
+    fc.name = name;
+    if (for_each_index_entry(repos, nrepos, find_cb, &fc) != 1) return -1;
+    *entry = fc.entry;
+    *found_repo = fc.repo;
+    return 0;
+}
+
+static int is_installed(const char *name)
+{
+    char dbpath[256];
+    snprintf(dbpath, sizeof(dbpath), "%s/%s", DB_DIR, name);
+    struct stat st;
+    return stat(dbpath, &st) == 0;
 }
 
 /* ── Installed-package database (/var/pkg/db/<name>) ────────────────── */
 static int db_write(const struct manifest *m, const char *files_tmp_path)
 {
-    mkdir("/var", 0755);
-    mkdir("/var/pkg", 0755);
-    mkdir(DB_DIR, 0755);
+    mkdir_p(DB_DIR);
     char dbpath[256];
     snprintf(dbpath, sizeof(dbpath), "%s/%s", DB_DIR, m->name);
     FILE *out = fopen(dbpath, "w");
@@ -491,13 +700,47 @@ static int db_read(const char *name, struct manifest *m, char ***files_out, int 
 }
 
 /* ── Commands ─────────────────────────────────────────────────────────── */
-static int cmd_install(const char *name)
+
+/* Reads a newline-separated file (the just-installed file list) into a
+ * malloc'd array of malloc'd strings. Returns NULL on failure. */
+static char **read_lines(const char *path, int *count_out)
 {
-    char dbpath[256];
-    snprintf(dbpath, sizeof(dbpath), "%s/%s", DB_DIR, name);
-    struct stat st;
-    if (stat(dbpath, &st) == 0) {
-        printf("pkg: '%s' is already installed\n", name);
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    char **v = NULL;
+    int n = 0, cap = 0;
+    char line[300];
+    while (fgets(line, sizeof(line), f)) {
+        size_t l = strlen(line);
+        while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = '\0';
+        if (l == 0) continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 8;
+            v = (char **)realloc(v, (size_t)cap * sizeof(char *));
+        }
+        v[n++] = strdup(line);
+    }
+    fclose(f);
+    *count_out = n;
+    return v;
+}
+
+static void free_lines(char **v, int n)
+{
+    for (int i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
+
+static int in_list(char **v, int n, const char *s)
+{
+    for (int i = 0; i < n; i++) if (strcmp(v[i], s) == 0) return 1;
+    return 0;
+}
+
+static int cmd_install(const char *name, int force)
+{
+    if (is_installed(name) && !force) {
+        printf("pkg: '%s' is already installed (pkg install --force %s to reinstall)\n", name, name);
         return 0;
     }
 
@@ -515,18 +758,47 @@ static int cmd_install(const char *name)
         return 1;
     }
 
-    mkdir("/var", 0755); mkdir("/var/pkg", 0755); mkdir(CACHE_DIR, 0755);
+    mkdir_p(CACHE_DIR);
     char pkg_path[300];
     snprintf(pkg_path, sizeof(pkg_path), "%s/%s", CACHE_DIR, entry.file);
-    printf("pkg: fetching %s (%s %s)...\n", entry.file, entry.name, entry.version);
+    char sizebuf[16];
+    human_size(entry.size, sizebuf, sizeof(sizebuf));
+    printf("pkg: fetching %s (%s %s, %s) from %s...\n",
+           entry.file, entry.name, entry.version, sizebuf, repo.url);
     if (repo_fetch(&repo, entry.file, pkg_path) != 0) {
         fprintf(stderr, "pkg: failed to fetch %s\n", entry.file);
         return 1;
     }
 
+    /* Verify before unpacking, never after: a mismatch here means the
+     * archive is truncated, corrupted in the cache, or not the file the
+     * index describes, and in none of those cases should its contents
+     * reach the filesystem. The bad copy goes too, so the next attempt
+     * re-fetches instead of re-reading the same broken cache entry. */
+    if (verify_archive(pkg_path, &entry) != 0) {
+        unlink(pkg_path);
+        return 1;
+    }
+    if (entry.sha256[0]) printf("pkg: checksum ok (sha256 %.16s...)\n", entry.sha256);
+
+    /* On a reinstall/upgrade, remember what the previous version owned so
+     * files it had and the new one does not can be cleaned up afterwards —
+     * otherwise every install-over leaves the old version's orphans behind
+     * with nothing recording that they exist. */
+    char **old_files = NULL;
+    int n_old = 0;
+    if (is_installed(name)) {
+        struct manifest om;
+        db_read(name, &om, &old_files, &n_old);
+    }
+
     char files_tmp[] = "/tmp/pkg-files-XXXXXX";
     int ffd = mkstemp(files_tmp);
-    if (ffd < 0) { fprintf(stderr, "pkg: mkstemp failed: %s\n", strerror(errno)); return 1; }
+    if (ffd < 0) {
+        fprintf(stderr, "pkg: mkstemp failed: %s\n", strerror(errno));
+        free_lines(old_files, n_old);
+        return 1;
+    }
     FILE *files_out = fdopen(ffd, "w");
 
     struct manifest m;
@@ -537,10 +809,21 @@ static int cmd_install(const char *name)
     if (rc == 0) {
         if (!m.name[0]) snprintf(m.name, sizeof(m.name), "%s", entry.name);
         db_write(&m, files_tmp);
+
+        int n_new = 0;
+        char **new_files = read_lines(files_tmp, &n_new);
+        for (int i = 0; i < n_old; i++) {
+            if (new_files && in_list(new_files, n_new, old_files[i])) continue;
+            if (unlink(old_files[i]) == 0)
+                printf("pkg: removed stale %s\n", old_files[i]);
+        }
+        free_lines(new_files, n_new);
+
         printf("pkg: installed %s %s — %s\n", m.name, m.version, m.description);
     } else {
         fprintf(stderr, "pkg: install of '%s' failed\n", name);
     }
+    free_lines(old_files, n_old);
     unlink(files_tmp);
     return rc == 0 ? 0 : 1;
 }
@@ -566,6 +849,40 @@ static int cmd_remove(const char *name)
     return 0;
 }
 
+/* One row of `pkg list --available` / `pkg search`: an "i" in the first
+ * column for what is already installed, then name, version, type, archive
+ * size and description. */
+static void print_catalog_row(const struct index_entry *e)
+{
+    char sizebuf[16];
+    human_size(e->size, sizebuf, sizeof(sizebuf));
+    printf("%s %-16s %-10s %-7s %-6s %s\n",
+           is_installed(e->name) ? "i" : " ",
+           e->name, e->version, e->type, sizebuf, e->description);
+}
+
+static void print_catalog_header(void)
+{
+    printf("  %-16s %-10s %-7s %-6s %s\n", "NAME", "VERSION", "TYPE", "SIZE", "DESCRIPTION");
+}
+
+struct catalog_ctx {
+    const char *term;   /* NULL for "list everything" */
+    int matches;
+};
+
+static int catalog_cb(const struct index_entry *e, const struct repo *repo, void *ctx)
+{
+    (void)repo;
+    struct catalog_ctx *cc = (struct catalog_ctx *)ctx;
+    if (cc->term && !strcasestr(e->name, cc->term) && !strcasestr(e->description, cc->term))
+        return 0;
+    if (cc->matches == 0) print_catalog_header();
+    cc->matches++;
+    print_catalog_row(e);
+    return 0;
+}
+
 static int cmd_list(int available)
 {
     if (!available) {
@@ -577,6 +894,7 @@ static int cmd_list(int available)
             if (de->d_name[0] == '.') continue;
             struct manifest m;
             if (db_read(de->d_name, &m, NULL, NULL) == 0) {
+                if (count == 0) printf("%-16s %-10s %-8s %s\n", "NAME", "VERSION", "TYPE", "DESCRIPTION");
                 printf("%-16s %-10s %-8s %s\n", m.name, m.version, m.type, m.description);
                 count++;
             }
@@ -590,36 +908,188 @@ static int cmd_list(int available)
     int nrepos = load_repos(repos);
     if (nrepos == 0) { fprintf(stderr, "pkg: no repositories configured (%s)\n", REPOS_CONF); return 1; }
 
-    for (int i = 0; i < nrepos; i++) {
-        char idx_path[] = "/tmp/pkg-index-XXXXXX";
-        int fd = mkstemp(idx_path);
-        if (fd < 0) continue;
-        close(fd);
-        if (repo_fetch(&repos[i], "index.txt", idx_path) != 0) { unlink(idx_path); continue; }
-        FILE *f = fopen(idx_path, "r");
-        if (f) {
-            char line[MAX_LINE];
-            while (fgets(line, sizeof(line), f)) {
-                size_t l = strlen(line);
-                while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = '\0';
-                if (l == 0 || line[0] == '#') continue;
-                struct index_entry e;
-                if (parse_index_line(line, &e) == 0)
-                    printf("%-16s %-10s %-8s %s\n", e.name, e.version, e.type, e.description);
-            }
-            fclose(f);
-        }
-        unlink(idx_path);
+    struct catalog_ctx cc = { NULL, 0 };
+    for_each_index_entry(repos, nrepos, catalog_cb, &cc);
+    if (cc.matches == 0) printf("(no packages available)\n");
+    return 0;
+}
+
+static int cmd_search(const char *term)
+{
+    struct repo repos[MAX_REPOS];
+    int nrepos = load_repos(repos);
+    if (nrepos == 0) { fprintf(stderr, "pkg: no repositories configured (%s)\n", REPOS_CONF); return 1; }
+
+    struct catalog_ctx cc = { term, 0 };
+    for_each_index_entry(repos, nrepos, catalog_cb, &cc);
+    if (cc.matches == 0) {
+        printf("pkg: nothing matching '%s'\n", term);
+        return 1;
     }
     return 0;
+}
+
+/* `pkg info <name>`: whatever is known about a package from both sides —
+ * the installed database (what it put where) and the repositories (what
+ * they currently offer). Either half alone is enough to print something
+ * useful; a name neither side knows is the only failure. */
+static int cmd_info(const char *name)
+{
+    int found = 0;
+
+    struct manifest m;
+    char **files = NULL;
+    int nfiles = 0;
+    if (db_read(name, &m, &files, &nfiles) == 0) {
+        found = 1;
+        printf("Installed:   yes\n");
+        printf("Name:        %s\n", m.name[0] ? m.name : name);
+        printf("Version:     %s\n", m.version);
+        printf("Type:        %s\n", m.type);
+        printf("Description: %s\n", m.description);
+        printf("Files:       %d\n", nfiles);
+        for (int i = 0; i < nfiles; i++) {
+            printf("  /%s\n", files[i]);
+            free(files[i]);
+        }
+        free(files);
+    } else {
+        printf("Installed:   no\n");
+    }
+
+    struct repo repos[MAX_REPOS];
+    int nrepos = load_repos(repos);
+    struct index_entry e;
+    struct repo repo;
+    if (nrepos > 0 && find_in_repos(name, repos, nrepos, &e, &repo) == 0) {
+        found = 1;
+        char sizebuf[16];
+        human_size(e.size, sizebuf, sizeof(sizebuf));
+        printf("Available:   %s %s (%s) from %s\n", e.name, e.version, e.type, repo.url);
+        printf("Archive:     %s (%s)\n", e.file, sizebuf);
+        if (e.sha256[0]) printf("SHA256:      %s\n", e.sha256);
+        if (!is_installed(name)) printf("Summary:     %s\n", e.description);
+    } else {
+        printf("Available:   no (not in any configured repository)\n");
+    }
+
+    if (!found) {
+        fprintf(stderr, "pkg: nothing known about '%s'\n", name);
+        return 1;
+    }
+    return 0;
+}
+
+/* ── Repository configuration (/etc/pkg/repos.conf) ──────────────────── */
+static int cmd_repo_list(void)
+{
+    struct repo repos[MAX_REPOS];
+    int n = load_repos(repos);
+    if (n == 0) {
+        printf("(no repositories configured — %s is missing or empty)\n", REPOS_CONF);
+        return 0;
+    }
+    for (int i = 0; i < n; i++)
+        printf("%d. %-44s [%s]\n", i + 1, repos[i].url, repos[i].is_http ? "http" : "local");
+    return 0;
+}
+
+static int cmd_repo_add(const char *url)
+{
+    struct repo probe;
+    if (parse_repo_url(url, &probe) != 0) {
+        fprintf(stderr, "pkg: '%s' is not a repository URL "
+                        "(expected file:///path or http://host[:port]/path)\n", url);
+        return 1;
+    }
+
+    struct repo repos[MAX_REPOS];
+    int n = load_repos(repos);
+    for (int i = 0; i < n; i++) {
+        if (strcmp(repos[i].url, url) == 0) {
+            printf("pkg: %s is already configured\n", url);
+            return 0;
+        }
+    }
+    if (n >= MAX_REPOS) {
+        fprintf(stderr, "pkg: already at the %d-repository limit\n", MAX_REPOS);
+        return 1;
+    }
+
+    mkdir_p("/etc/pkg");
+    FILE *f = fopen(REPOS_CONF, "a");
+    if (!f) {
+        fprintf(stderr, "pkg: cannot write %s: %s\n", REPOS_CONF, strerror(errno));
+        return 1;
+    }
+    fprintf(f, "%s\n", url);
+    fclose(f);
+    printf("pkg: added %s\n", url);
+    return 0;
+}
+
+/* Rewrites repos.conf without `url`, keeping every other line — comments
+ * included — as it found them, so a hand-written config survives being
+ * edited by this tool. (Blank lines are the one thing not preserved: the
+ * line reader drops them, and a repository list is not whitespace.) */
+static int cmd_repo_remove(const char *url)
+{
+    int n_lines = 0;
+    char **lines = read_lines(REPOS_CONF, &n_lines);
+    if (!lines) {
+        /* No lines can mean either "unreadable" or "there but empty", and
+         * only the first is an error worth a strerror(). */
+        struct stat st;
+        if (stat(REPOS_CONF, &st) != 0) {
+            fprintf(stderr, "pkg: cannot read %s: %s\n", REPOS_CONF, strerror(errno));
+            return 1;
+        }
+    }
+
+    int removed = 0;
+    FILE *f = fopen(REPOS_CONF, "w");
+    if (!f) {
+        fprintf(stderr, "pkg: cannot write %s: %s\n", REPOS_CONF, strerror(errno));
+        free_lines(lines, n_lines);
+        return 1;
+    }
+    for (int i = 0; i < n_lines; i++) {
+        if (lines[i][0] != '#' && strcmp(lines[i], url) == 0) { removed++; continue; }
+        fprintf(f, "%s\n", lines[i]);
+    }
+    fclose(f);
+    free_lines(lines, n_lines);
+
+    if (!removed) {
+        fprintf(stderr, "pkg: %s is not configured\n", url);
+        return 1;
+    }
+    printf("pkg: removed %s\n", url);
+    return 0;
+}
+
+static int cmd_repo(int argc, char **argv)
+{
+    /* argv[1] == "repo" */
+    const char *sub = argc > 2 ? argv[2] : "list";
+    if (strcmp(sub, "list") == 0) return cmd_repo_list();
+    if (strcmp(sub, "add") == 0 && argc > 3) return cmd_repo_add(argv[3]);
+    if (strcmp(sub, "remove") == 0 && argc > 3) return cmd_repo_remove(argv[3]);
+    fprintf(stderr, "Usage: pkg repo list\n"
+                    "       pkg repo add <url>\n"
+                    "       pkg repo remove <url>\n");
+    return 1;
 }
 
 static void usage(void)
 {
     fprintf(stderr,
-        "Usage: pkg install <name>\n"
-        "       pkg remove <name>\n"
-        "       pkg list [--available]\n");
+        "Usage: pkg install [--force] <name>...\n"
+        "       pkg remove <name>...\n"
+        "       pkg list [--available]\n"
+        "       pkg search <term>\n"
+        "       pkg info <name>\n"
+        "       pkg repo list | add <url> | remove <url>\n");
 }
 
 int main(int argc, char **argv)
@@ -627,15 +1097,38 @@ int main(int argc, char **argv)
     if (argc < 2) { usage(); return 1; }
 
     if (strcmp(argv[1], "install") == 0) {
-        if (argc < 3) { usage(); return 1; }
-        return cmd_install(argv[2]);
+        int force = 0, names = 0, rc = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0) { force = 1; continue; }
+        }
+        for (int i = 2; i < argc; i++) {
+            if (argv[i][0] == '-') continue;
+            names++;
+            if (cmd_install(argv[i], force) != 0) rc = 1;
+        }
+        if (names == 0) { usage(); return 1; }
+        return rc;
     }
     if (strcmp(argv[1], "remove") == 0 || strcmp(argv[1], "uninstall") == 0) {
         if (argc < 3) { usage(); return 1; }
-        return cmd_remove(argv[2]);
+        int rc = 0;
+        for (int i = 2; i < argc; i++)
+            if (cmd_remove(argv[i]) != 0) rc = 1;
+        return rc;
     }
     if (strcmp(argv[1], "list") == 0) {
         return cmd_list(argc > 2 && strcmp(argv[2], "--available") == 0);
+    }
+    if (strcmp(argv[1], "search") == 0) {
+        if (argc < 3) { usage(); return 1; }
+        return cmd_search(argv[2]);
+    }
+    if (strcmp(argv[1], "info") == 0) {
+        if (argc < 3) { usage(); return 1; }
+        return cmd_info(argv[2]);
+    }
+    if (strcmp(argv[1], "repo") == 0) {
+        return cmd_repo(argc, argv);
     }
 
     usage();

@@ -7,6 +7,8 @@
 #include "../../include/azami/types.h"
 #include "../../arch/x86_64/cpu/cpu.h"
 #include "../../arch/x86_64/cpu/idt.h" /* pt_regs_t */
+#include "../../arch/x86_64/cpu/spinlock.h"
+#include "../lib/rbtree.h"
 
 /* Thread states */
 typedef enum {
@@ -54,7 +56,17 @@ typedef struct thread {
     bool            unblock_pending; /* Signal from sched_unblock during context switch */
     bool            stopped;         /* Parked in a job-control / ptrace stop  */
     u64             vruntime;        /* Completely Fair Scheduler virtual runtime */
-    u32             priority;        /* Thread priority (weight modifier for CFS) */
+    u32             priority;        /* CFS load weight — Linux's sched_prio_to_weight[]
+                                      * value for the thread's nice level. Bigger means
+                                      * a *larger* share: vruntime advances by
+                                      * NICE_0_WEIGHT * SCHED_VTIME_UNIT / priority per
+                                      * tick, so a heavy thread's virtual clock runs
+                                      * slow and the leftmost-first tree picks it more
+                                      * often. Never 0. */
+    u32             rt_priority;     /* SCHED_FIFO/RR priority 1..99; 0 = not real-time.
+                                      * Any non-zero value outranks every CFS thread. */
+    u32             rr_ticks_left;   /* SCHED_RR: ticks remaining in this slice */
+    struct thread  *rt_next;         /* Link on a CPU's real-time run queue */
     u32             cpu_id;          /* Currently assigned logical CPU */
     pt_regs_t      *user_regs;       /* Saved user frame during syscalls/interrupts */
     u64             sleep_end_ticks; /* Ticks when sleeping should end */
@@ -67,10 +79,39 @@ typedef struct thread {
     u64             clear_child_tid; /* CLONE_CHILD_CLEARTID / set_tid_address(2) futex */
     u64             affinity_mask;   /* CPU affinity bitmask (bit k = CPU k allowed) */
     fpu_state_t     fpu_state;       /* XSAVE/FXSAVE area */
-    struct thread  *next;            /* Ready queue / list pointer */
+    u32             rq_cpu;          /* Run queue this thread is linked on, or
+                                      * (u32)-1 when it is not queued. Lets
+                                      * rq_remove_thread_locked() go straight to
+                                      * the one queue instead of taking every
+                                      * CPU's run-queue lock in turn. */
+    /* Per-CPU ready-queue red-black tree links (kernel/sched/rq_tree.h).
+     * The ready queue is a tree, not a list: insertion, removal of a
+     * specific thread, and the work-stealing walk were all O(n) over a
+     * sorted list with the run-queue lock held. */
+    struct thread  *rb_left;
+    struct thread  *rb_right;
+    struct thread  *rb_parent;
+    unsigned char   rb_color;
+
+    struct thread  *next;            /* Sleep queue / generic list pointer */
     struct thread  *proc_next;       /* Next thread in the same process */
     struct thread  *sem_next;        /* POSIX semaphore wait queue link */
+    void           *vmacache[4];     /* Per-thread VMA cache */
+    u32             vmacache_seqnum; /* VMA cache sequence number */
+    /* Precise CPU-time accounting (CLOCK_THREAD_CPUTIME_ID): CLOCK_MONOTONIC
+     * nanoseconds this thread has run, charged at every context switch by
+     * sched_post_switch(), and the moment its current run began (0 while
+     * it is not on a CPU). */
+    u64             sum_exec_ns;
+    u64             exec_start_ns;
+    u32             magic;           /* THREAD_MAGIC while live, 0 once retired.
+                                      * Valid to read on a retired thread_t
+                                      * because the allocator never hands the
+                                      * memory back — see thread_alloc(). */
 } thread_t;
+
+/* "THRD". Stamped by thread_alloc(), cleared by thread_free(). */
+#define THREAD_MAGIC  0x54485244u
 
 /* ── POSIX Signals ────────────────────────────────────────────────────────── */
 #define SIGHUP     1
@@ -174,6 +215,10 @@ typedef struct process {
     virt_addr_t     heap_end;              /* Current break address for brk */
     virt_addr_t     mmap_current;          /* Current bump pointer for anonymous mmap */
     void           *vma_list;              /* Sorted vm_area_t list (kernel/mm/vma.c) */
+    struct rb_root  vma_tree;              /* Red-Black tree for O(log N) VMA lookups */
+    spinlock_t      vma_lock;              /* Per-process lock for VMA modifications */
+    spinlock_t      fd_lock;               /* Per-process lock for FD table modifications */
+    u32             vmacache_seqnum;       /* Bumped on VMA modifications to flush caches */
     int             exit_code;             /* exit() status (0..255), valid when term_signal == 0 */
     int             term_signal;           /* Signal that terminated the process, or 0 for normal exit */
     u32             pgid;                  /* POSIX process group ID (job control) */
@@ -356,6 +401,24 @@ typedef struct process {
      * mempolicy above). */
     krlimit_t       rlimits[RLIMIT_NLIMITS];
     u64             affinity_mask;     /* CPU affinity bitmask inherited by new threads */
+    void           *uffd_ctx;              /* Userfaultfd context */
+
+    /* ioperm(2): TSS_IOPB_BYTES-byte I/O permission bitmap (1 bit/port, set =
+     * denied), lazily allocated on the first ioperm() call. NULL means no
+     * ports are granted (the CPU denies everything when the TSS carries an
+     * all-ones bitmap, which is what gdt_set_iopb(core, NULL) installs).
+     * Installed into the running core's TSS on every context switch onto this
+     * process (see gdt_set_iopb() call sites in sched.c) since the IOPB is
+     * per-CPU hardware state, not per-process. Inherited by fork()/clone()
+     * (proc_clone_attrs) and preserved across execve(2), matching Linux. */
+    u8             *io_bitmap;
+
+    /* Nanosecond CPU time of all this process's threads, charged when each
+     * run ends; add the in-flight runs (thread_t::exec_start_ns) for the
+     * precise figure. Backs CLOCK_PROCESS_CPUTIME_ID. Updated atomically by
+     * sched_post_switch() — several of the process's threads can be
+     * switching out on different CPUs at once. */
+    u64             sum_exec_ns;
 } process_t;
 
 /* wait4(2) option bits this kernel honours. */
@@ -395,6 +458,12 @@ s64 sched_waitpid(s32 target_pid, int *status, int options);
 /** sched_unblock(t) — Mark a blocked/sleeping thread as READY. */
 void sched_unblock(thread_t *t);
 
+/** sched_wake_proc_waiters(p) — wake every waiting thread of @p, atomically
+ *  with respect to the thread list. Use this instead of walking p->threads
+ *  and calling sched_unblock() per thread: that walk needs the scheduler lock
+ *  which sched_unblock() takes itself. */
+void sched_wake_proc_waiters(process_t *p);
+
 /** sched_current_thread() — Return pointer to current thread on calling CPU. */
 thread_t *sched_current_thread(void);
 
@@ -416,11 +485,42 @@ thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool
 /** sched_enqueue_thread(t) — Add a prepared thread to the CFS ready queue. */
 void sched_enqueue_thread(thread_t *t);
 
-/** sched_weight_for(proc) — CFS weight implied by proc's policy + nice. */
+/** sched_weight_for(proc) — CFS load weight implied by proc's nice level.
+ *  This is Linux's sched_prio_to_weight[] value: 1024 at nice 0, 88761 at
+ *  nice -20, 15 at nice +19. */
 u32 sched_weight_for(const process_t *proc);
 
-/** sched_apply_weight(proc) — push that weight onto all of proc's threads. */
+/** sched_rt_prio_for(proc) — real-time priority implied by proc's policy:
+ *  1..99 for SCHED_FIFO/SCHED_RR, 0 for everything CFS handles. */
+u32 sched_rt_prio_for(const process_t *proc);
+
+/** sched_apply_weight(proc) — push the weight, real-time priority and policy
+ *  onto all of proc's threads, moving any that are queued to the run queue
+ *  their new class belongs on. */
 void sched_apply_weight(process_t *proc);
+
+/* ── Scheduling policies (values match Linux's SCHED_* ABI) ──────────────── */
+#define SCHED_OTHER   0
+#define SCHED_FIFO    1
+#define SCHED_RR      2
+#define SCHED_BATCH   3
+#define SCHED_IDLE    5
+
+/** sched_rr_interval_ns() — the SCHED_RR time slice, in nanoseconds.
+ *  What sched_rr_get_interval(2) reports. */
+u64 sched_rr_interval_ns(void);
+
+/** sched_proc_cpu_mask(p) — bit k set for every CPU currently running, or
+ *  holding queued, a thread of process @p. Used by membarrier(2) to reach
+ *  exactly the cores that need a barrier. */
+u64 sched_proc_cpu_mask(process_t *p);
+
+/** sched_nr_running(cpu) — runnable threads queued on a CPU (CFS + RT),
+ *  excluding the one currently on it. (u32)-1 for an invalid CPU. */
+u32 sched_nr_running(u32 cpu);
+
+/** sched_cpu_of(t) — the CPU a thread last ran on. */
+u32 sched_cpu_of(const thread_t *t);
 
 /** sched_collect_pids(out, max, which, who) — snapshot pids matching a
  *  setpriority(2) selector (0=PRIO_PROCESS pid, 1=PRIO_PGRP pgid, 2=PRIO_USER
@@ -501,6 +601,16 @@ s64 sched_kill_process(u32 pid, int sig);
 
 /** sched_get_process_list() — Return head of global process list. */
 process_t *sched_get_process_list(void);
+
+/** sched_get_loadavg(out) — 1/5/15-minute load average in Q11 fixed-point
+ *  (out[i] / 2048.0 gives the real value); sampled every 5s off sched_tick(). */
+void sched_get_loadavg(u32 out[3]);
+
+/** sched_get_last_pid() — the most recently allocated PID. */
+u32 sched_get_last_pid(void);
+
+/** sched_get_context_switches() — total switch_to_asm() count since boot. */
+u64 sched_get_context_switches(void);
 
 /** Identity/credentials/address-space snapshot of a process, copied out
  * atomically under the scheduler lock. Lets a caller act on another process

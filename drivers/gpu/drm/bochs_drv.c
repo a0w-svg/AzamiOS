@@ -188,8 +188,30 @@ static int bochs_load(drm_device_t *dev)
     dev->cursor_width  = 0;
     dev->cursor_height = 0;
     dev->prefer_shadow = false;
-    dev->max_width     = 1920;
-    dev->max_height    = 1200;
+
+    /* dev->max_width/max_height is the *only* bound drm_ioctl.c's SETCRTC
+     * checks a requested mode against (see drm_mode_crtc_ioctl()) --
+     * bga_set_video_mode() itself performs no VRAM check. Advertising a
+     * fixed 2560x1600 regardless of what bga_get_vram_size() actually found
+     * would let a client request a mode that doesn't fit the real
+     * framebuffer aperture and scan out past it. Pick the largest mode from
+     * a standard list whose 32bpp frame actually fits the detected VRAM
+     * instead of assuming it always does. */
+    static const struct { u32 w, h; } std_modes[] = {
+        { 2560, 1600 }, { 1920, 1200 }, { 1920, 1080 }, { 1600, 1200 },
+        { 1280, 1024 }, { 1280, 800 },  { 1024, 768 },  { 800, 600 },
+        { 640, 480 },
+    };
+    dev->max_width  = 640;
+    dev->max_height = 480;
+    for (size_t i = 0; i < ARRAY_SIZE(std_modes); i++) {
+        u64 frame_bytes = (u64)std_modes[i].w * std_modes[i].h * 4;
+        if (frame_bytes <= bochs->vram_size) {
+            dev->max_width  = std_modes[i].w;
+            dev->max_height = std_modes[i].h;
+            break;
+        }
+    }
 
     drm_crtc_t    *crtc = drm_crtc_create(dev);
     if (!crtc) return -ENOMEM;
@@ -236,9 +258,9 @@ static void bochs_unload(drm_device_t *dev)
 static const drm_driver_t bochs_drm_driver = {
     .name        = "bochs-drm",
     .desc        = "Bochs/QEMU VBE display adapter",
-    .date        = "20260831",
+    .date        = "20260914",
     .major       = 1, .minor = 0, .patchlevel = 0,
-    .features    = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER,
+    .features    = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER | DRIVER_ATOMIC,
     .load        = bochs_load,
     .unload      = bochs_unload,
     .gem_place   = bochs_gem_place,

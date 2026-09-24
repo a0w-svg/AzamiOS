@@ -478,7 +478,15 @@ static s64 drm_ioctl_addfb(drm_device_t *dev, drm_file_t *file, u64 arg)
     if (req.pitch == 0 || req.height == 0) return -(s64)EINVAL;
     if ((size_t)req.pitch * req.height > obj->size) return -(s64)EINVAL;
 
-    u32 format = (req.depth == 32) ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888;
+    u32 format;
+    if (req.bpp == 16 && req.depth == 15) {
+        format = DRM_FORMAT_XRGB1555;
+    } else if (req.bpp == 16 && req.depth == 16) {
+        format = DRM_FORMAT_RGB565;
+    } else {
+        format = (req.depth == 32) ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888;
+    }
+
     drm_framebuffer_t *fb = drm_framebuffer_create(dev, obj, req.width, req.height,
                                                    req.pitch, req.bpp, req.depth, format);
     if (!fb) return -(s64)ENOMEM;
@@ -499,11 +507,27 @@ static s64 drm_ioctl_addfb2(drm_device_t *dev, drm_file_t *file, u64 arg)
     drm_gem_object_t *obj = drm_gem_handle_lookup(file, req.handles[0]);
     if (!obj) return -(s64)ENOENT;
 
+    /* Reject opaque tiling modifiers: all AzamiOS GPU backends use linear
+     * layout only.  A sentinel (MOD_INVALID = 0xFFFFFFFF_FFFFFFFF, meaning
+     * "client does not supply a modifier") and the linear modifier itself
+     * (0) are both acceptable and mean the same thing here.  Any other value
+     * (ARM AFBC, Intel X-tiled, Broadcom UIF, …) cannot be honoured and
+     * must not be silently ignored — the scanout would be garbage. */
+    for (int _mi = 0; _mi < 4; _mi++) {
+        u64 mod = req.modifier[_mi];
+        if (mod != DRM_FORMAT_MOD_INVALID && mod != DRM_FORMAT_MOD_LINEAR) {
+            pr_debug("[DRM] ADDFB2: rejecting unsupported modifier[%d]=0x%llx\n",
+                     _mi, (unsigned long long)mod);
+            return -(s64)EINVAL;
+        }
+    }
+
     u32 bpp, depth;
     switch (req.pixel_format) {
     case DRM_FORMAT_XRGB8888: bpp = 32; depth = 24; break;
     case DRM_FORMAT_ARGB8888: bpp = 32; depth = 32; break;
     case DRM_FORMAT_RGB565:   bpp = 16; depth = 16; break;
+    case DRM_FORMAT_XRGB1555: bpp = 16; depth = 15; break;
     default:                  return -(s64)EINVAL;
     }
 
@@ -721,11 +745,16 @@ static s64 drm_ioctl_gem_open(drm_device_t *dev, drm_file_t *file, u64 arg)
     if (!obj) return -(s64)ENOENT;
 
     u32 handle = drm_gem_handle_create(file, obj);
-    drm_gem_object_put(dev, obj);
-    if (!handle) return -(s64)EMFILE;
+    if (!handle) {
+        drm_gem_object_put(dev, obj);
+        return -(s64)EMFILE;
+    }
 
     req.handle = handle;
     req.size   = obj->size;
+    /* Drop the lookup reference after reading obj->size to avoid UAF */
+    drm_gem_object_put(dev, obj);
+    
     DRM_COPY_OUT(arg, &req);
     return 0;
 }
@@ -757,6 +786,9 @@ static s64 drm_ioctl_prime_fd_to_handle(drm_device_t *dev, drm_file_t *file, u64
     if (!obj) return -(s64)EBADF;
 
     u32 handle = drm_gem_handle_create(file, obj);
+    /* drm_prime_import_fd() returns a new reference; drm_gem_handle_create()
+     * takes its own. Drop the import reference to avoid leaking the object. */
+    drm_gem_object_put(dev, obj);
     if (!handle) return -(s64)EMFILE;
 
     req.handle = handle;

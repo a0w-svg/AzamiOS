@@ -447,3 +447,46 @@ float fmaf(float x, float y, float z)
 {
     return x * y + z;
 }
+
+float asinf(float x)
+{
+    return (float)asin((double)x);
+}
+
+float acosf(float x)
+{
+    return (float)acos((double)x);
+}
+
+float atanf(float x)
+{
+    return (float)atan((double)x);
+}
+
+double fmin(double x, double y)
+{
+    if (isnan(x)) return y;
+    if (isnan(y)) return x;
+    return (x < y) ? x : y;
+}
+
+double fmax(double x, double y)
+{
+    if (isnan(x)) return y;
+    if (isnan(y)) return x;
+    return (x > y) ? x : y;
+}
+
+float fminf(float x, float y)
+{
+    if (isnan(x)) return y;
+    if (isnan(y)) return x;
+    return (x < y) ? x : y;
+}
+
+float fmaxf(float x, float y)
+{
+    if (isnan(x)) return y;
+    if (isnan(y)) return x;
+    return (x > y) ? x : y;
+}

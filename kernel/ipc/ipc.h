@@ -35,15 +35,21 @@ typedef struct ipc_channel {
     bool        closed;
     thread_t   *send_wait;
     thread_t   *recv_wait;
+    /* Chain in the channel-id hash (kernel/ipc/ipc.c). Lookup by id is on
+     * every send and every receive, so it cannot be a scan of the registry. */
+    struct ipc_channel *hash_next;
 } ipc_channel_t;
 
 #define IPC_SHMEM_MAX_PAGES 1024
 
-typedef struct {
+typedef struct ipc_shmem {
     u32         shmem_id;
     phys_addr_t *phys_pages;    /* C-05: dynamically allocated, page_count entries */
     size_t      page_count;
     u32         refcount;
+    /* Chain in the shmem-id hash (kernel/ipc/ipc.c), mirroring the channel
+     * hash above so a lookup is a bucket probe, not a registry scan. */
+    struct ipc_shmem *hash_next;
 } ipc_shmem_t;
 
 /** ipc_init() — Initialize the IPC subsystem. */

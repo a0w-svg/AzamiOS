@@ -45,14 +45,52 @@ static int g_hist_count = 0;
 /* Button layout (6 rows × 4 cols) */
 #define NCOLS  4
 #define NROWS  6
-#define BTN_W  74
-#define BTN_H  44
+#define BTN_W_MAX 120   /* buttons grow to fill the window, up to this */
+#define BTN_H_MAX  70
 #define BTN_GAP 6
 #define BTN_OX 10
 #define BTN_OY 130
 
 static uk_window_t g_win;
 static int g_hovered = -1;
+
+/* Button grid geometry for the window's current size.
+ *
+ * The grid used to be fixed at 74x44 buttons starting at (10,130), so
+ * maximizing the window left a small pad in the top-left corner of a
+ * mostly empty screen. It now divides whatever space is below the display
+ * between the 4 columns and 6 rows, up to a comfortable maximum, and
+ * centres the result — the same numbers are used by the drawing and the
+ * hit test, so a click always lands where the button is drawn. */
+typedef struct { int ox, oy, bw, bh; } calc_grid_t;
+
+static calc_grid_t calc_grid(void)
+{
+    calc_grid_t g;
+    int w = (int)g_win.width;
+    int h = (int)g_win.height;
+
+    int avail_w = w - 2 * BTN_OX;
+    int avail_h = h - BTN_OY - 10;
+    if (avail_w < NCOLS * 24) avail_w = NCOLS * 24;
+    if (avail_h < NROWS * 18) avail_h = NROWS * 18;
+
+    g.bw = (avail_w - (NCOLS - 1) * BTN_GAP) / NCOLS;
+    g.bh = (avail_h - (NROWS - 1) * BTN_GAP) / NROWS;
+    if (g.bw > BTN_W_MAX) g.bw = BTN_W_MAX;
+    if (g.bh > BTN_H_MAX) g.bh = BTN_H_MAX;
+    if (g.bw < 24) g.bw = 24;
+    if (g.bh < 18) g.bh = 18;
+
+    int grid_w = NCOLS * g.bw + (NCOLS - 1) * BTN_GAP;
+    int grid_h = NROWS * g.bh + (NROWS - 1) * BTN_GAP;
+    g.ox = (w - grid_w) / 2;
+    if (g.ox < BTN_OX) g.ox = BTN_OX;
+    g.oy = BTN_OY + (h - BTN_OY - 10 - grid_h) / 2;
+    if (g.oy < BTN_OY) g.oy = BTN_OY;
+    return g;
+}
+
 
 typedef struct {
     const char *label;
@@ -249,28 +287,29 @@ static void draw_calc(void)
     uk_draw_text_2x(&g_win, dx, 68, g_display, UK_TEXT);
 
     /* ── Button Grid (6x4) ───────────────────────────────────────────────── */
+    calc_grid_t gr = calc_grid();
     for (int i = 0; i < 24; i++) {
         int col = i % NCOLS;
         int row = i / NCOLS;
 
         if (row == 5 && col == 3) continue; /* merged with col 2 */
 
-        int bx = BTN_OX + col * (BTN_W + BTN_GAP);
-        int by = BTN_OY + row * (BTN_H + BTN_GAP);
-        int bw = (row == 5 && col == 2) ? (BTN_W * 2 + BTN_GAP) : BTN_W;
+        int bx = gr.ox + col * (gr.bw + BTN_GAP);
+        int by = gr.oy + row * (gr.bh + BTN_GAP);
+        int bw = (row == 5 && col == 2) ? (gr.bw * 2 + BTN_GAP) : gr.bw;
 
         unsigned int bg = g_buttons[i].accent;
         if (g_hovered == i) bg = UK_SURFACE2;
 
-        uk_fill_rounded_rect(&g_win, bx, by, bw, BTN_H, 6, bg);
+        uk_fill_rounded_rect(&g_win, bx, by, bw, gr.bh, 6, bg);
         uk_hline(&g_win, bx + 2, by, bw - 4, UK_SURFACE2);
-        uk_hline(&g_win, bx + 2, by + BTN_H - 1, bw - 4, UK_CRUST);
+        uk_hline(&g_win, bx + 2, by + gr.bh - 1, bw - 4, UK_CRUST);
 
         unsigned int fg = (g_buttons[i].accent == UK_MAUVE || g_buttons[i].accent == UK_PEACH) ? UK_BASE : UK_TEXT;
         if (g_hovered == i) fg = UK_TEXT;
 
         int tlen = uk_strlen(g_buttons[i].label);
-        uk_draw_text(&g_win, bx + (bw - tlen * 8) / 2, by + (BTN_H - 16) / 2, g_buttons[i].label, fg);
+        uk_draw_text(&g_win, bx + (bw - tlen * 8) / 2, by + (gr.bh - 16) / 2, g_buttons[i].label, fg);
     }
 
     uk_invalidate(&g_win);
@@ -278,16 +317,17 @@ static void draw_calc(void)
 
 static int hit_button(int mx, int my)
 {
+    calc_grid_t gr = calc_grid();
     for (int i = 0; i < 24; i++) {
         int col = i % NCOLS;
         int row = i / NCOLS;
         if (row == 5 && col == 3) continue;
 
-        int bx = BTN_OX + col * (BTN_W + BTN_GAP);
-        int by = BTN_OY + row * (BTN_H + BTN_GAP);
-        int bw = (row == 5 && col == 2) ? (BTN_W * 2 + BTN_GAP) : BTN_W;
+        int bx = gr.ox + col * (gr.bw + BTN_GAP);
+        int by = gr.oy + row * (gr.bh + BTN_GAP);
+        int bw = (row == 5 && col == 2) ? (gr.bw * 2 + BTN_GAP) : gr.bw;
 
-        if (mx >= bx && mx < bx + bw && my >= by && my < by + BTN_H) return i;
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + gr.bh) return i;
     }
     return -1;
 }

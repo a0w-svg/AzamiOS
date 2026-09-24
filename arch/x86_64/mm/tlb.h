@@ -56,6 +56,41 @@ void tlb_shootdown_all(void);
 void tlb_shootdown_space(phys_addr_t space);
 
 /**
+ * tlb_shootdown_user(space, start, npages) — like tlb_shootdown_space(), but
+ * for a change confined to the *user* half of a *user* address space, which is
+ * the overwhelming majority of them: every mmap, munmap, mprotect and
+ * copy-on-write break.
+ *
+ * The other cores then drop that one address space's translations instead of
+ * every translation they hold. Concretely, a core running some other process
+ * loses nothing at all, and every core keeps its global kernel entries — which
+ * is most of what a full flush was throwing away and then faulting back in one
+ * page at a time, on work that had nothing to do with the mapping that changed.
+ *
+ * Why one PCID is enough, and why it has to be a user range in a user space:
+ *
+ *   - A user address space reaches CR3 only through vmm_switch_proc(), tagged
+ *     with its process's PCID. vmm_switch(), the bare PCID-0 load, is only ever
+ *     called with the kernel space (arch/x86_64/cpu/smp.c). So every cached
+ *     translation for a user VA in @space carries that one tag, and INVPCID's
+ *     single-context form removes all of them — on any core, whatever it
+ *     happens to be running, without disturbing its CR3.
+ *
+ *   - VMM_F_GLOBAL is set only by VMM_KERNEL_RX/RW (see vmm.h). User mappings
+ *     are never global, so none of them survives a single-context invalidation.
+ *     A *kernel* VA would, which is why a range that leaves the user half
+ *     degrades to the full flush.
+ *
+ * Recycling a PCID across processes can only over-invalidate, which is safe.
+ * Anything this cannot answer precisely — a kernel VA, a space that is not the
+ * caller's own, no PCID or no INVPCID on this CPU, two different spaces merged
+ * into one request — falls back to exactly what tlb_shootdown_space() does.
+ *
+ * @start must be page-aligned.
+ */
+void tlb_shootdown_user(phys_addr_t space, virt_addr_t start, size_t npages);
+
+/**
  * tlb_shootdown_ipi() — vector-251 handler. Flushes this CPU and publishes the
  * acknowledgement. Takes no locks, so it can always make progress.
  */

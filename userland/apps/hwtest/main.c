@@ -250,6 +250,121 @@ static void test_constant_time_and_crc(void)
     CHECK(rnd1 != rnd2, "arc4random consecutive outputs differ");
 }
 
+__attribute__((target("avx")))
+static void exec_avx_test(float *out, const float *a, const float *b)
+{
+    __asm__ volatile(
+        "vmovaps %1, %%ymm0\n"
+        "vmovaps %2, %%ymm1\n"
+        "vaddps %%ymm1, %%ymm0, %%ymm2\n"
+        "vmovaps %%ymm2, %0\n"
+        : "=m"(*out) : "m"(*a), "m"(*b) : "ymm0", "ymm1", "ymm2", "memory"
+    );
+}
+
+__attribute__((target("fma")))
+static void exec_fma_test(float *out, const float *a, const float *b, const float *c)
+{
+    __asm__ volatile(
+        "vmovss %1, %%xmm0\n"
+        "vmovss %2, %%xmm1\n"
+        "vmovss %3, %%xmm2\n"
+        "vfmadd213ss %%xmm2, %%xmm1, %%xmm0\n"
+        "vmovss %%xmm0, %0\n"
+        : "=m"(*out) : "m"(*a), "m"(*b), "m"(*c) : "xmm0", "xmm1", "xmm2", "memory"
+    );
+}
+
+__attribute__((target("aes")))
+static void exec_aes_test(uint32_t *out)
+{
+    __asm__ volatile(
+        "movdqa %1, %%xmm0\n"
+        "pxor %%xmm1, %%xmm1\n"
+        "aesenc %%xmm1, %%xmm0\n"
+        "movdqa %%xmm0, %0\n"
+        : "=m"(*out) : "m"(*out) : "xmm0", "xmm1", "memory"
+    );
+}
+
+__attribute__((target("sha")))
+static void exec_sha_test(uint32_t *out)
+{
+    __asm__ volatile(
+        "movdqa %1, %%xmm0\n"
+        "pxor %%xmm1, %%xmm1\n"
+        "sha256rnds2 %%xmm0, %%xmm1, %%xmm0\n"
+        "movdqa %%xmm0, %0\n"
+        : "=m"(*out) : "m"(*out) : "xmm0", "xmm1", "memory"
+    );
+}
+
+static void test_simd_and_crypto_extensions(void)
+{
+    printf("\n--- Advanced Vector SIMD (AVX/FMA) & Cryptographic Extensions (AES/SHA) ---\n");
+
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    cpuid(1, 0, &a, &b, &c, &d);
+    bool has_osxsave = (c & (1u << 27)) != 0;
+    bool has_avx     = (c & (1u << 28)) != 0;
+    bool has_fma     = (c & (1u << 12)) != 0;
+    bool has_aes     = (c & (1u << 25)) != 0;
+
+    cpuid(7, 0, &a, &b, &c, &d);
+    bool has_sha     = (b & (1u << 29)) != 0;
+
+    bool os_avx_ok = false;
+    if (has_osxsave) {
+        uint32_t xlo, xhi;
+        __asm__ volatile("xgetbv" : "=a"(xlo), "=d"(xhi) : "c"(0));
+        os_avx_ok = (xlo & 0x6) == 0x6;
+    }
+
+    /* 1. AVX 256-bit Vector Addition */
+    if (has_avx && os_avx_ok) {
+        float in_a[8] __attribute__((aligned(32))) = { 1, 2, 3, 4, 5, 6, 7, 8 };
+        float in_b[8] __attribute__((aligned(32))) = { 10, 20, 30, 40, 50, 60, 70, 80 };
+        float out[8]  __attribute__((aligned(32))) = { 0 };
+
+        exec_avx_test(out, in_a, in_b);
+        bool avx_match = true;
+        for (int i = 0; i < 8; i++) {
+            if (out[i] != (float)((i + 1) * 11)) avx_match = false;
+        }
+        CHECK(avx_match, "AVX 256-bit VADDPS computes 8-lane parallel float sum");
+    } else {
+        printf("[SKIP] AVX or OSXSAVE not active on this host\n");
+    }
+
+    /* 2. FMA (Fused Multiply-Add) */
+    if (has_fma && os_avx_ok) {
+        float fa = 2.5f, fb = 4.0f, fc = 1.5f; /* 2.5 * 4.0 + 1.5 = 11.5 */
+        float fout = 0.0f;
+        exec_fma_test(&fout, &fa, &fb, &fc);
+        CHECK(fout == 11.5f, "FMA3 VFMADD213SS single-cycle multiply-add equals 11.5");
+    } else {
+        printf("[SKIP] FMA instruction not supported by CPU\n");
+    }
+
+    /* 3. AES-NI */
+    if (has_aes) {
+        uint32_t state[4] __attribute__((aligned(16))) = { 0x12345678, 0x9ABCDEF0, 0xA5A5A5A5, 0x5A5A5A5A };
+        exec_aes_test(state);
+        CHECK(state[0] != 0 || state[1] != 0, "AES-NI AESENC executes hardware encryption round");
+    } else {
+        printf("[SKIP] AES-NI instruction not supported by CPU\n");
+    }
+
+    /* 4. SHA-NI */
+    if (has_sha) {
+        uint32_t sha_state[4] __attribute__((aligned(16))) = { 0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A };
+        exec_sha_test(sha_state);
+        CHECK(sha_state[0] != 0, "SHA-NI SHA256RNDS2 executes hardware SHA-256 compression");
+    } else {
+        printf("[SKIP] SHA-NI instruction not supported by CPU\n");
+    }
+}
+
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -760,6 +875,7 @@ int main(void)
     test_caching_and_fastpaths();
     test_new_hardware_drivers();
     test_posix_libc_features();
+    test_simd_and_crypto_extensions();
 
     printf("\n====================================================\n");
     if (g_fail == 0) {

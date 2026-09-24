@@ -55,6 +55,8 @@
 #include "../fs/vfs.h"
 #include "../fs/ext2/ext2.h"
 #include "../fs/tmpfs.h"
+#include "../arch/x86_64/mm/kprotect.h"
+#include "mm/kmodmem.h"
 #include "../drivers/block/block.h"
 #include "security/security.h"
 #include "object/object.h"
@@ -95,182 +97,9 @@ extern volatile struct limine_base_revision g_limine_base_rev;
  * canary if that instruction ever actually executes. Exempting kernel_main
  * costs nothing: every function it calls keeps its own, independently
  * correct, canary. */
-void kernel_main(void) __attribute__((no_stack_protector));
-void kernel_main(void)
+static void kernel_init_thread(void *arg)
 {
-    /* ── Step 1: Early console (UART COM1) ──────────────────────────────── */
-    console_init_early();
-    print_banner();
-    pr_debug("[BOOT] AzamiOS kernel starting...\n");
-
-    /* ── Verify Limine base revision ─────────────────────────────────────── */
-    if (LIMINE_BASE_REVISION_SUPPORTED) {
-        pr_debug("[BOOT] Limine base revision: supported\n");
-    } else {
-        pr_debug("[BOOT] WARNING: Limine base revision mismatch — some features may be unavailable\n");
-    }
-
-    /* ── Step 2: PIC remap ───────────────────────────────────────────────── */
-    pic_init(0x20, 0x28);   /* Remap: IRQ0→vec32 … IRQ15→vec47 */
-    pic_mask_all();          /* Mask all IRQs; we use LAPIC after init */
-    pr_debug("[BOOT] PIC remapped and masked\n");
-
-    /* ── Step 3: GDT / TSS (BSP) ────────────────────────────────────────── */
-    gdt_init_bsp();
-    pr_debug("[BOOT] GDT + TSS initialised for BSP\n");
-
-    /* ── Step 4: IDT ─────────────────────────────────────────────────────── */
-    idt_init();
-    pr_debug("[BOOT] IDT loaded (256 entries)\n");
-
-    /* ── Step 5: PMM (buddy allocator) ──────────────────────────────────── */
-    struct limine_memmap_response *memmap = az_boot_memmap();
-    if (!memmap) PANIC("Limine did not provide a memory map!");
-    pmm_init(memmap);
-    pr_debug("[BOOT] PMM: buddy allocator ready\n");
-
-    /* ── Step 6: VMM (4-level PML4 + HHDM + SMEP/SMAP + NXE) ──────────── */
-    u64 hhdm_base  = az_boot_hhdm_base();
-    if (!hhdm_base) PANIC("Limine did not provide HHDM base!");
-
-    /* Get kernel load addresses from Limine */
-    u64 kern_phys = 0, kern_virt = 0;
-    if (g_limine_kaddr_req.response) {
-        kern_phys = g_limine_kaddr_req.response->physical_base;
-        kern_virt = g_limine_kaddr_req.response->virtual_base;
-    }
-
-    vmm_init(hhdm_base, kern_phys, kern_virt, memmap);
-    pr_debug("[BOOT] VMM: 4-level paging active, HHDM=0x%016llx\n",
-            (unsigned long long)hhdm_base);
-
-    /* ── Step 6.5: ACPI Initialization ───────────────────────────────────── */
-    acpi_init();
-    ioapic_init();
-
-    /* HPET: nanosecond monotonic time source (optional; needs VMM up) */
-    extern void hpet_init(void);
-    hpet_init();
-
-    /* ── Step 7: Framebuffer console ─────────────────────────────────────── */
-    struct limine_framebuffer *fb = az_boot_framebuffer();
-    if (fb) {
-        console_init_fb((void *)(uintptr_t)fb->address,
-                        (u32)fb->width, (u32)fb->height,
-                        (u32)fb->pitch, (u8)fb->bpp);
-        pr_debug("[BOOT] Framebuffer console: %ux%u %ubpp\n",
-                (u32)fb->width, (u32)fb->height, (u8)fb->bpp);
-    } else {
-        pr_debug("[BOOT] No framebuffer available — UART only\n");
-    }
-
-    /* ── Step 8: SYSCALL / SYSRET ABI ────────────────────────────────────── */
-    syscall_abi_init();
-    syscall_init();
-    pr_debug("[BOOT] SYSCALL/SYSRET ABI configured (STAR/LSTAR MSRs written)\n");
-
-    /* ── Step 9: Kernel Dynamic Heap Allocator (kmalloc) ─────────────────── */
-    kmalloc_init();
-
-    /* ── Kernel CSPRNG (ChaCha20) — backs getrandom(2), /dev/[u]random,
-     *    stack canaries and AT_RANDOM ──────────────────────────────────── */
-    extern void krandom_init(void);
-    krandom_init();
-    pr_debug("[BOOT] CSPRNG seeded\n");
-
-    /* ── Step 10: Security & Stack Canaries ──────────────────────────────── */
-    security_init();
-
-    /* ── Step 11: SMP & Local APIC ───────────────────────────────────────── */
-    smp_init();
-
-    /* Every core now has a valid GS base, so kmalloc()/kfree() can move their
-     * bucket fast path onto per-CPU magazines and stop serialising small
-     * allocations on the shared bucket locks. */
-    kmalloc_enable_percpu();
-
-    /* ── Performance counters ────────────────────────────────────────────
-     * After smp_init(), because programming a counter is per-logical-processor
-     * and pmu_sync_local() needs this core's id from the per-CPU block. */
-    extern void pmu_init(void);
-    extern void perf_init(void);
-    extern void ktrace_init(void);
-    pmu_init();
-    perf_init();
-    ktrace_init();
-
-    /* ── Step 12: CFS Scheduler & Process/Thread Manager ─────────────────── */
-    sched_init();
-
-    /* Heap reaper: hands fully-free slab pages back to the PMM on a timer.
-     * Needs the scheduler — it runs as a kernel thread. */
-    kmalloc_start_reaper();
-
-    /* ── Step 13: Inter-Process Communication (IPC) ──────────────────────── */
-    ipc_init();
-
-    /* System V IPC (XSI shared memory, semaphores, message queues) and the
-     * POSIX per-process timer engine.  The timer engine needs the scheduler,
-     * which is up by now, because it runs as a kernel thread. */
-    sysvipc_init();
-    /* POSIX message queues are independent of the System V table above; they
-     * only need the fd layer, which the scheduler has already brought up. */
-    mqueue_init();
-    extern void posix_sem_init(void);
-    posix_sem_init();
-    ktimer_init();
-
-    /* ── Step 13b: Input Subsystem (PS/2 Keyboard + Mouse) ────────────────── */
-    input_init();
-
-    /* Linux input UAPI on top of it (/dev/input/event0). */
-    extern void evdev_init(void);
-    evdev_init();
-
-    /* ── Step 14: Virtual File System (VFS) & Block Device Layer ─────────── */
-    vfs_init();
-    block_dev_init();
-
-    /* Register character devices */
-    uart_register_devfs();
-    rtc_register_devfs();
-    lpt_register_devfs();
-
-    extern void devfs_init(void);
-    devfs_init();
-
-    extern void fat32_init(void);
-    fat32_init();
-
-    extern void memdevs_init(void);
-    memdevs_init();
-
-    extern void procfs_init(void);
-    procfs_init();
-
-    extern void sysfs_init(void);
-    sysfs_init();
-
-    extern void pty_init(void);
-    pty_init();
-
-    extern void devpts_init(void);
-    devpts_init();
-
-    /* ── tmpfs: RAM-backed volatile filesystem ("/tmp") ──────────────────── */
-    tmpfs_init();
-
-    ext2_init();
-
-    /* ── squashfs: read-only compressed filesystem ────────────────────────── */
-    extern void squashfs_init(void);
-    squashfs_init();
-
-    /* ── Step 15: NT-Style Object Manager Namespace ──────────────────────── */
-    az_object_manager_init();
-
-    extern void acl_init(void);
-    acl_init();
+    (void)arg;
 
     /* ── Step 16: Hardware Abstraction Layer (Device Tree + PCI) ──────────── */
     driver_core_init();
@@ -377,6 +206,9 @@ void kernel_main(void)
 
     extern void bga_init(void);
     bga_init();
+
+    extern void vboxguest_init(void);
+    vboxguest_init();
     /* virtgpu_drm's own probe() brings up the virtio-gpu transport (see the
      * long comment above), so this is what actually drives virtio-gpu now —
      * fbdev_init() below reads g_gpu's fields, hence the reordering. */
@@ -401,6 +233,10 @@ void kernel_main(void)
 
     /* Hardware monitoring: CPU digital thermal sensor */
     coretemp_init();
+
+    /* Wait for all async PCI driver probes to finish */
+    extern void wait_for_device_probe(void);
+    wait_for_device_probe();
 
     /* ── Mount Root Filesystem (Partitioned Disk or Initrd Fallback) ────── */
     bool root_mounted = false;
@@ -491,6 +327,32 @@ void kernel_main(void)
         pr_debug("[STORAGE] Mounted secondary SATA drive to /hdd\n");
     }
 
+    /*
+     * Everything that registers a handler, a driver or a table has now done
+     * so, and nothing has entered ring 3 yet. This is the only moment where
+     * "written during boot" and "never written again" are the same statement,
+     * so it is where the kernel's own image stops being writable: .text loses
+     * WRITE, .rodata and every __ro_after_init table lose it too, .data and
+     * .bss lose execute, and the HHDM — which aliases all of physical memory,
+     * kernel image included — loses execute across the whole window. See
+     * arch/x86_64/mm/kprotect.c.
+     *
+     * Deliberately after the filesystem mounts and before sched_spawn_user():
+     * a mount can still allocate and populate driver state, and PID 1 is the
+     * first thing in the system that is not trusted.
+     */
+    /* Build and seal a tiny generated function *before* the seal, so all of
+     * the test's page-table work (and the TLB shootdowns that go with it) is
+     * done and settled by the time kprotect_seal() issues its own. */
+    kmod_selftest_prepare();
+
+    kprotect_seal();
+
+    /* Now prove the one thing kprotect_seal() could plausibly have broken:
+     * that code generated at runtime still runs, from its own mapping, with
+     * the direct map non-executable everywhere. */
+    kmod_selftest_verify();
+
     pr_debug("\n[BOOT] All core microkernel subsystems initialized successfully.\n");
 
     /* Launch ring-3 userspace init process */
@@ -499,8 +361,15 @@ void kernel_main(void)
     if (!init_proc) {
         init_proc = sched_spawn_user("/init.elf");
     }
+    /* No init: fall back to a bare shell so the machine is still usable.
+     * /bin/sh is GNU bash on this image and /bin/azami-sh.elf is the small
+     * native shell that ships alongside it; try both rather than one, since
+     * this path exists precisely for an image that is already incomplete. */
     if (!init_proc) {
-        init_proc = sched_spawn_user("/bin/sh.elf");
+        init_proc = sched_spawn_user("/bin/sh");
+    }
+    if (!init_proc) {
+        init_proc = sched_spawn_user("/bin/azami-sh.elf");
     }
     if (!init_proc) {
         init_proc = sched_spawn_user("/sh.elf");
@@ -508,10 +377,223 @@ void kernel_main(void)
     if (init_proc) {
         pr_debug("[BOOT] Initial user process spawned successfully (PID %u).\n", init_proc->pid);
     } else {
-        pr_debug("[BOOT] Warning: Could not launch /sbin/init.elf or /bin/sh.elf\n");
+        pr_debug("[BOOT] Warning: Could not launch /sbin/init.elf or a shell\n");
     }
 
+}
+
+void kernel_main(void) __attribute__((no_stack_protector));
+void kernel_main(void)
+{
+    /* ── Step 1: Early console (UART COM1) ──────────────────────────────── */
+    console_init_early();
+    print_banner();
+    pr_debug("[BOOT] AzamiOS kernel starting...\n");
+
+    /* ── Verify Limine base revision ─────────────────────────────────────── */
+    if (LIMINE_BASE_REVISION_SUPPORTED) {
+        pr_debug("[BOOT] Limine base revision: supported\n");
+    } else {
+        pr_debug("[BOOT] WARNING: Limine base revision mismatch — some features may be unavailable\n");
+    }
+
+    /* ── Step 2: PIC remap ───────────────────────────────────────────────── */
+    pic_init(0x20, 0x28);   /* Remap: IRQ0→vec32 … IRQ15→vec47 */
+    pic_mask_all();          /* Mask all IRQs; we use LAPIC after init */
+    pr_debug("[BOOT] PIC remapped and masked\n");
+
+    /* ── Step 3: GDT / TSS (BSP) ────────────────────────────────────────── */
+    gdt_init_bsp();
+    pr_debug("[BOOT] GDT + TSS initialised for BSP\n");
+
+    /* ── Step 4: IDT ─────────────────────────────────────────────────────── */
+    idt_init();
+    pr_debug("[BOOT] IDT loaded (256 entries)\n");
+
+    /* ── Step 5: PMM (buddy allocator) ──────────────────────────────────── */
+    struct limine_memmap_response *memmap = az_boot_memmap();
+    if (!memmap) PANIC("Limine did not provide a memory map!");
+    pmm_init(memmap);
+    pr_debug("[BOOT] PMM: buddy allocator ready\n");
+
+    /* ── Step 6: VMM (4-level PML4 + HHDM + SMEP/SMAP + NXE) ──────────── */
+    u64 hhdm_base  = az_boot_hhdm_base();
+    if (!hhdm_base) PANIC("Limine did not provide HHDM base!");
+
+    /* Get kernel load addresses from Limine */
+    u64 kern_phys = 0, kern_virt = 0;
+    if (g_limine_kaddr_req.response) {
+        kern_phys = g_limine_kaddr_req.response->physical_base;
+        kern_virt = g_limine_kaddr_req.response->virtual_base;
+    }
+
+    vmm_init(hhdm_base, kern_phys, kern_virt, memmap);
+    pr_debug("[BOOT] VMM: 4-level paging active, HHDM=0x%016llx\n",
+            (unsigned long long)hhdm_base);
+
+    /* ── Step 6.5: ACPI Initialization ───────────────────────────────────── */
+    acpi_init();
+    ioapic_init();
+
+    /* HPET: nanosecond monotonic time source (optional; needs VMM up) */
+    extern void hpet_init(void);
+    hpet_init();
+
+    /* ── Step 7: Framebuffer console ─────────────────────────────────────── */
+    struct limine_framebuffer *fb = az_boot_framebuffer();
+    if (fb) {
+        console_init_fb((void *)(uintptr_t)fb->address,
+                        (u32)fb->width, (u32)fb->height,
+                        (u32)fb->pitch, (u8)fb->bpp);
+        pr_debug("[BOOT] Framebuffer console: %ux%u %ubpp\n",
+                (u32)fb->width, (u32)fb->height, (u8)fb->bpp);
+    } else {
+        pr_debug("[BOOT] No framebuffer available — UART only\n");
+    }
+
+    /* ── Step 8: SYSCALL / SYSRET ABI ────────────────────────────────────── */
+    syscall_abi_init();
+    syscall_init();
+    pr_debug("[BOOT] SYSCALL/SYSRET ABI configured (STAR/LSTAR MSRs written)\n");
+
+    /* ── Step 9: Kernel Dynamic Heap Allocator (kmalloc) ─────────────────── */
+    kmalloc_init();
+
+    /* ── Kernel CSPRNG (ChaCha20) — backs getrandom(2), /dev/[u]random,
+     *    stack canaries and AT_RANDOM ──────────────────────────────────── */
+    extern void krandom_init(void);
+    krandom_init();
+    pr_debug("[BOOT] CSPRNG seeded\n");
+
+    /* ── Step 10: Security & Stack Canaries ──────────────────────────────── */
+    security_init();
+
+    /* ── Step 11: SMP & Local APIC ───────────────────────────────────────── */
+    smp_init();
+
+    /* Every core now has a valid GS base, so the allocators can move their
+     * fast paths onto per-CPU structures and stop serialising on shared locks:
+     * the PMM caches order-0 frames per (CPU, zone), and kmalloc()/kfree()
+     * cache bucket objects per (CPU, size class). Order matters only in that
+     * both must come after smp_init(); before it the BSP is single-threaded
+     * and both allocate straight from their shared pools. */
+    pmm_enable_percpu();
+    kmalloc_enable_percpu();
+
+    /* ── Timekeeping & vDSO ──────────────────────────────────────────────
+     * After smp_init(): the TSC frequency is calibrated against the HPET
+     * there, and every AP has programmed IA32_TSC_AUX for the vDSO's
+     * getcpu(). Before anything reads the wall clock (the VFS stamps
+     * inode times from it below). */
+    extern void timekeeping_init(void);
+    extern void vdso_init(void);
+    timekeeping_init();
+    vdso_init();
+
+    /* ── Performance counters ────────────────────────────────────────────
+     * After smp_init(), because programming a counter is per-logical-processor
+     * and pmu_sync_local() needs this core's id from the per-CPU block. */
+    extern void pmu_init(void);
+    extern void perf_init(void);
+    extern void ktrace_init(void);
+    pmu_init();
+    perf_init();
+    ktrace_init();
+
+    /* ── Step 12: CFS Scheduler & Process/Thread Manager ─────────────────── */
+    sched_init();
+
+    /* Heap reaper: hands fully-free slab pages back to the PMM on a timer.
+     * Needs the scheduler — it runs as a kernel thread. */
+    kmalloc_start_reaper();
+
+    /* ── Step 13: Inter-Process Communication (IPC) ──────────────────────── */
+    ipc_init();
+
+    /* System V IPC (XSI shared memory, semaphores, message queues) and the
+     * POSIX per-process timer engine.  The timer engine needs the scheduler,
+     * which is up by now, because it runs as a kernel thread. */
+    sysvipc_init();
+    /* POSIX message queues are independent of the System V table above; they
+     * only need the fd layer, which the scheduler has already brought up. */
+    mqueue_init();
+    extern void posix_sem_init(void);
+    posix_sem_init();
+    ktimer_init();
+
+    /* ── Step 13b: Input Subsystem (PS/2 Keyboard + Mouse) ────────────────── */
+    input_init();
+
+    /* Linux input UAPI on top of it (/dev/input/event0). */
+    extern void evdev_init(void);
+    evdev_init();
+
+    /* ── Step 14: Virtual File System (VFS) & Block Device Layer ─────────── */
+    vfs_init();
+    block_dev_init();
+
+    /* Register character devices */
+    uart_register_devfs();
+    rtc_register_devfs();
+    lpt_register_devfs();
+
+    extern void devfs_init(void);
+    devfs_init();
+
+    extern void fat32_init(void);
+    fat32_init();
+
+    extern void memdevs_init(void);
+    memdevs_init();
+
+    extern void procfs_init(void);
+    procfs_init();
+
+    extern void sysfs_init(void);
+    sysfs_init();
+
+    extern void pty_init(void);
+    pty_init();
+
+    extern void devpts_init(void);
+    devpts_init();
+
+    /* ── tmpfs: RAM-backed volatile filesystem ("/tmp") ──────────────────── */
+    tmpfs_init();
+
+    ext2_init();
+
+    /* ── squashfs: read-only compressed filesystem ────────────────────────── */
+    extern void squashfs_init(void);
+    squashfs_init();
+
+    /* ── Step 15: NT-Style Object Manager Namespace ──────────────────────── */
+    az_object_manager_init();
+
+    extern void acl_init(void);
+    acl_init();
+
+    thread_create(sched_kernel_process(), (uintptr_t)kernel_init_thread, 0, true);
+
     pr_debug("[BOOT] Starting preemptive CFS scheduling loop across all cores...\n\n");
+
+    /* Release the W^X self-test page. Deferred to here on purpose — see
+     * kmod_selftest_verify(): unmapping it costs a global TLB shootdown, and
+     * doing that immediately behind kprotect_seal()'s own measurably cost
+     * half a second of boot. */
+    kmod_selftest_release();
+
+    /*
+     * Spread device interrupts across the cores that came up.
+     *
+     * Every driver probed above ran on the BSP, and hal_irq_enable() routes
+     * an interrupt to a CPU chosen at the moment it is called — which, while
+     * the APs were still parked, could only be the BSP. Now that they are
+     * online, redistribute: a busy NIC or AHCI controller otherwise delivers
+     * every completion to the same core that runs the timekeeping tick.
+     */
+    extern void hal_irq_rebalance(void);
+    hal_irq_rebalance();
 
     /* Enable Local APIC periodic timer for scheduler preemption (vec 48) */
     lapic_timer_start(100); /* 100 Hz = 10 ms tick */

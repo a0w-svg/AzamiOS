@@ -429,15 +429,12 @@ static void drm_vblank_advance(drm_device_t *dev, drm_crtc_t *crtc, u64 now)
     /* Claim the pending work before doing any of it: the copy below can take
      * milliseconds and must not run under the device lock. */
     spinlock_lock(&dev->lock);
-    drm_framebuffer_t *fb        = crtc->flip_pending ? crtc->flip_fb : NULL;
-    drm_file_t        *file      = crtc->flip_file;
-    u64                user_data = crtc->flip_user_data;
-    bool               want_ev   = crtc->flip_event;
-
-    crtc->flip_pending   = false;
-    crtc->flip_fb        = NULL;
-    crtc->flip_file      = NULL;
-    crtc->flip_event     = false;
+    drm_framebuffer_t *fb = crtc->flip_pending ? crtc->flip_fb : NULL;
+    
+    /* Do NOT clear flip_pending or flip_file yet! By leaving flip_pending = true,
+     * we lock out new flips from being queued concurrently (they will return -EBUSY).
+     * By leaving flip_file intact, drm_vblank_file_closed() can safely NULL it
+     * if the client dies while drm_present() is running outside the lock. */
 
     drm_rect_t rects[DRM_MAX_DAMAGE];
     bool dmg_full;
@@ -457,6 +454,17 @@ static void drm_vblank_advance(drm_device_t *dev, drm_crtc_t *crtc, u64 now)
         __atomic_add_fetch(&crtc->vblank_count, elapsed, __ATOMIC_RELEASE);
         dev->vblank_count += elapsed;
 
+        spinlock_lock(&dev->lock);
+        drm_file_t *file      = crtc->flip_file;
+        u64         user_data = crtc->flip_user_data;
+        bool        want_ev   = crtc->flip_event;
+        
+        crtc->flip_pending = false;
+        crtc->flip_fb      = NULL;
+        crtc->flip_file    = NULL;
+        crtc->flip_event   = false;
+        spinlock_unlock(&dev->lock);
+
         if (ret == 0) {
             drm_flip_complete(dev, crtc, fb, file, user_data, want_ev,
                               crtc->last_vblank_ns);
@@ -474,8 +482,11 @@ static void drm_vblank_advance(drm_device_t *dev, drm_crtc_t *crtc, u64 now)
          * owes, so a client that only ever calls DIRTYFB still gets its
          * updates at a frame boundary instead of mid-scanout. */
         if ((dmg_full || dmg_n) && cur && dev->driver->dirty_fb) {
-            drm_present(crtc, cur, dev->driver->dirty_fb,
-                        rects, dmg_n, dmg_full, false);
+            /* If the object is already in VRAM, it doesn't need a blit to scanout. */
+            if (!cur->obj->in_vram) {
+                drm_present(crtc, cur, dev->driver->dirty_fb,
+                            rects, dmg_n, dmg_full, false);
+            }
         }
         __atomic_add_fetch(&crtc->vblank_count, elapsed, __ATOMIC_RELEASE);
         dev->vblank_count += elapsed;

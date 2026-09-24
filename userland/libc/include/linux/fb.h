@@ -125,12 +125,23 @@ struct fb_cmap {
  * the host instead of the whole scanout. Rectangles union until the next
  * flush. No-op on a direct-scanout backend. */
 #define FBIOAZ_DAMAGE         0x4683
+#define FBIOAZ_DAMAGE_LIST    0x4687
 
 struct fb_az_rect {
     uint32_t x;
     uint32_t y;
     uint32_t w;
     uint32_t h;
+};
+
+/* FBIOAZ_DAMAGE_LIST — several disjoint damaged rectangles in one call, so a
+ * compositor does not have to collapse them into a bounding box that covers
+ * most of the screen. Each is transferred to the host separately. */
+#define FB_AZ_DAMAGE_MAX 16
+
+struct fb_az_damage_list {
+    uint32_t count;                            /* rectangles in `rects`  */
+    struct fb_az_rect rects[FB_AZ_DAMAGE_MAX];
 };
 
 #define FB_AZ_HWCURSOR_MAX 64        /* overlay is at most 64x64 BGRA8888 */

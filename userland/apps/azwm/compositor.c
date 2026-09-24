@@ -109,8 +109,9 @@ void compositor_init(az_compositor_t *comp,
     comp->vram_buf[0]  = frontbuf;
     comp->vram_buf[1]  = frontbuf;
     comp->active_vram_buf = 0;
-    comp->pending[0].valid = 0;
-    comp->pending[1].valid = 0;
+    region_clear(&comp->pending[0]);
+    region_clear(&comp->pending[1]);
+    region_clear(&comp->damage);
     comp->cursor_rect[0].valid = 0;
     comp->cursor_rect[1].valid = 0;
     comp->frame_count          = 0;
@@ -148,27 +149,12 @@ void compositor_damage(az_compositor_t *comp, int x, int y, int w, int h)
     if (y1 > (int)comp->fb_height) y1 = (int)comp->fb_height;
     if (x >= x1 || y >= y1) return;
 
-    if (!comp->has_damage) {
-        comp->dirty_min_x = x;
-        comp->dirty_min_y = y;
-        comp->dirty_max_x = x1;
-        comp->dirty_max_y = y1;
-        comp->has_damage = 1;
-    } else {
-        if (x < comp->dirty_min_x) comp->dirty_min_x = x;
-        if (y < comp->dirty_min_y) comp->dirty_min_y = y;
-        if (x1 > comp->dirty_max_x) comp->dirty_max_x = x1;
-        if (y1 > comp->dirty_max_y) comp->dirty_max_y = y1;
-    }
+    region_add(&comp->damage, x, y, x1, y1);
 }
 
 void compositor_damage_all(az_compositor_t *comp)
 {
-    comp->dirty_min_x = 0;
-    comp->dirty_min_y = 0;
-    comp->dirty_max_x = (int)comp->fb_width;
-    comp->dirty_max_y = (int)comp->fb_height;
-    comp->has_damage = 1;
+    region_set(&comp->damage, 0, 0, (int)comp->fb_width, (int)comp->fb_height);
 }
 
 /* ── Linked List Helpers ─────────────────────────────────────────────────── */
@@ -512,11 +498,22 @@ static inline unsigned int alpha_blend(unsigned int dst, unsigned int src, unsig
     if (alpha >= 255) return src;
     unsigned int a = alpha;
     unsigned int inv_a = 255 - a;
-    unsigned int rb = (unsigned int)((((unsigned long long)(src & 0x00FF00FF) * a +
-                                       (unsigned long long)(dst & 0x00FF00FF) * inv_a) >> 8) & 0x00FF00FFU);
-    unsigned int g  = (unsigned int)((((unsigned long long)(src & 0x0000FF00) * a +
-                                       (unsigned long long)(dst & 0x0000FF00) * inv_a) >> 8) & 0x0000FF00U);
-    return 0xFF000000 | rb | g;
+
+    /* Exact /255, not >>8. Shifting divides by 256, which darkens every
+     * blended pixel by up to a full level and — worse, in the SIMD paths
+     * below, which cannot take their all-opaque shortcut on a block that
+     * mixes alphas — dims pixels that are fully opaque. The
+     * (v + 0x80 + ((v + 0x80) >> 8)) >> 8 form is the usual exact
+     * round-to-nearest divide by 255 and costs one add and one shift.
+     * R and B are computed together in the spare high bits; the products
+     * peak at 255*255 per channel, so nothing overflows 32 bits. */
+    unsigned int rb = (src & 0x00FF00FFU) * a + (dst & 0x00FF00FFU) * inv_a + 0x00800080U;
+    rb = ((rb + ((rb >> 8) & 0x00FF00FFU)) >> 8) & 0x00FF00FFU;
+
+    unsigned int g = ((src >> 8) & 0xFFU) * a + ((dst >> 8) & 0xFFU) * inv_a + 0x80U;
+    g = ((g + (g >> 8)) >> 8) & 0xFFU;
+
+    return 0xFF000000U | rb | (g << 8);
 }
 
 /* Highly-optimized shading for black drop-shadows (avoids src arithmetic) */
@@ -525,9 +522,33 @@ static inline unsigned int alpha_shade_black(unsigned int dst, unsigned int alph
     if (alpha == 0) return dst;
     if (alpha >= 255) return 0xFF000000;
     unsigned int inv_a = 255 - alpha;
-    unsigned int rb = (((dst & 0x00FF00FF) * inv_a) >> 8) & 0x00FF00FFU;
-    unsigned int g  = (((dst & 0x0000FF00) * inv_a) >> 8) & 0x0000FF00U;
-    return 0xFF000000 | rb | g;
+
+    /* Exact /255 — see alpha_blend() above for why >>8 is not good enough. */
+    unsigned int rb = (dst & 0x00FF00FFU) * inv_a + 0x00800080U;
+    rb = ((rb + ((rb >> 8) & 0x00FF00FFU)) >> 8) & 0x00FF00FFU;
+
+    unsigned int g = ((dst >> 8) & 0xFFU) * inv_a + 0x80U;
+    g = ((g + (g >> 8)) >> 8) & 0xFFU;
+
+    return 0xFF000000U | rb | (g << 8);
+}
+
+/*
+ * Exact round-to-nearest /255 on 16-bit lanes, the vector twin of the scalar
+ * form in alpha_blend(). Inputs are channel sums up to 255*255, so
+ * v + 0x80 + ((v + 0x80) >> 8) stays inside 16 bits and no lane saturates.
+ */
+static inline __m128i div255_epu16_sse2(__m128i v)
+{
+    v = _mm_add_epi16(v, _mm_set1_epi16((short)0x0080));
+    return _mm_srli_epi16(_mm_add_epi16(v, _mm_srli_epi16(v, 8)), 8);
+}
+
+__attribute__((target("avx2")))
+static inline __m256i div255_epu16_avx2(__m256i v)
+{
+    v = _mm256_add_epi16(v, _mm256_set1_epi16((short)0x0080));
+    return _mm256_srli_epi16(_mm256_add_epi16(v, _mm256_srli_epi16(v, 8)), 8);
 }
 
 /* One 4-pixel step of alpha_shade_black_span's translucent case. Factored out
@@ -540,8 +561,8 @@ static inline void alpha_shade_black_block4_sse2(unsigned int *dst, __m128i inv_
     __m128i d_lo = _mm_unpacklo_epi8(d, zero);
     __m128i d_hi = _mm_unpackhi_epi8(d, zero);
 
-    __m128i res_lo = _mm_srli_epi16(_mm_mullo_epi16(d_lo, inv_a_vec), 8);
-    __m128i res_hi = _mm_srli_epi16(_mm_mullo_epi16(d_hi, inv_a_vec), 8);
+    __m128i res_lo = div255_epu16_sse2(_mm_mullo_epi16(d_lo, inv_a_vec));
+    __m128i res_hi = div255_epu16_sse2(_mm_mullo_epi16(d_hi, inv_a_vec));
 
     __m128i res = _mm_packus_epi16(res_lo, res_hi);
     res = _mm_or_si128(res, alpha_mask);
@@ -562,8 +583,8 @@ static void alpha_shade_black_span_avx2(unsigned int *dst, unsigned int alpha, i
         __m256i d_lo = _mm256_unpacklo_epi8(d, zero);
         __m256i d_hi = _mm256_unpackhi_epi8(d, zero);
 
-        __m256i res_lo = _mm256_srli_epi16(_mm256_mullo_epi16(d_lo, inv_a_vec), 8);
-        __m256i res_hi = _mm256_srli_epi16(_mm256_mullo_epi16(d_hi, inv_a_vec), 8);
+        __m256i res_lo = div255_epu16_avx2(_mm256_mullo_epi16(d_lo, inv_a_vec));
+        __m256i res_hi = div255_epu16_avx2(_mm256_mullo_epi16(d_hi, inv_a_vec));
 
         __m256i res = _mm256_packus_epi16(res_lo, res_hi);
         res = _mm256_or_si256(res, alpha_mask);
@@ -660,7 +681,7 @@ static inline void composite_blend_block4_sse2(unsigned int *dst, const unsigned
     a0 = _mm_shufflehi_epi16(a0, _MM_SHUFFLE(3, 3, 3, 3));
     __m128i inv_a0 = _mm_sub_epi16(_mm_set1_epi16(255), a0);
     __m128i out_lo = _mm_add_epi16(_mm_mullo_epi16(s_lo, a0), _mm_mullo_epi16(d_lo, inv_a0));
-    out_lo = _mm_srli_epi16(out_lo, 8);
+    out_lo = div255_epu16_sse2(out_lo);
 
     __m128i s_hi = _mm_unpackhi_epi8(s, zero);
     __m128i d_hi = _mm_unpackhi_epi8(d, zero);
@@ -668,7 +689,7 @@ static inline void composite_blend_block4_sse2(unsigned int *dst, const unsigned
     a1 = _mm_shufflehi_epi16(a1, _MM_SHUFFLE(3, 3, 3, 3));
     __m128i inv_a1 = _mm_sub_epi16(_mm_set1_epi16(255), a1);
     __m128i out_hi = _mm_add_epi16(_mm_mullo_epi16(s_hi, a1), _mm_mullo_epi16(d_hi, inv_a1));
-    out_hi = _mm_srli_epi16(out_hi, 8);
+    out_hi = div255_epu16_sse2(out_hi);
 
     __m128i out = _mm_packus_epi16(out_lo, out_hi);
     out = _mm_or_si128(out, alpha_mask);
@@ -704,7 +725,7 @@ static void composite_blend_span_avx2(unsigned int *dst, const unsigned int *src
         a0 = _mm256_shufflehi_epi16(a0, _MM_SHUFFLE(3, 3, 3, 3));
         __m256i inv_a0 = _mm256_sub_epi16(_mm256_set1_epi16(255), a0);
         __m256i out_lo = _mm256_add_epi16(_mm256_mullo_epi16(s_lo, a0), _mm256_mullo_epi16(d_lo, inv_a0));
-        out_lo = _mm256_srli_epi16(out_lo, 8);
+        out_lo = div255_epu16_avx2(out_lo);
 
         __m256i s_hi = _mm256_unpackhi_epi8(s, zero);
         __m256i d_hi = _mm256_unpackhi_epi8(d, zero);
@@ -712,7 +733,7 @@ static void composite_blend_span_avx2(unsigned int *dst, const unsigned int *src
         a1 = _mm256_shufflehi_epi16(a1, _MM_SHUFFLE(3, 3, 3, 3));
         __m256i inv_a1 = _mm256_sub_epi16(_mm256_set1_epi16(255), a1);
         __m256i out_hi = _mm256_add_epi16(_mm256_mullo_epi16(s_hi, a1), _mm256_mullo_epi16(d_hi, inv_a1));
-        out_hi = _mm256_srli_epi16(out_hi, 8);
+        out_hi = div255_epu16_avx2(out_hi);
 
         __m256i out = _mm256_packus_epi16(out_lo, out_hi);
         out = _mm256_or_si256(out, alpha_mask);
@@ -1216,15 +1237,16 @@ static void blur_backdrop_region(az_compositor_t *comp, int x0, int y0, int x1, 
 }
 
 /*
- * @clip_x0/y0/x1/y1 bound the region compositor_present() is actually going
- * to copy out this frame (compose_screen derives it from the damage box, or
- * the full screen when nothing narrowed it). Only the client-area blit below
+ * @clip_x0/y0/x1/y1 bound one of the damage rectangles compositor_present()
+ * is actually going to copy out this frame (compose_screen walks the damage
+ * region and calls in once per rectangle, or once for the full screen when
+ * nothing narrowed it). Only the client-area blit below
  * is clipped to it — that SIMD alpha blend is the costliest part of drawing
  * a window and the part damage most often shrinks to almost nothing (a text
  * caret in an otherwise static, maximized terminal), so narrowing just that
  * loop turns the expensive part from O(window area) into O(damage area)
  * without changing a single pixel that would reach the screen: anything
- * outside the clip is, under the same has_damage contract compositor_present()
+ * outside the clip is, under the same damage contract compositor_present()
  * already relies on, unchanged from the backbuf's last correct composite of
  * it. The frame chrome (border, titlebar, buttons, shadow) stays unclipped
  * since it is cheap and callers already skip this whole function when a
@@ -1772,25 +1794,6 @@ static void draw_fps_hud(az_compositor_t *comp, int clip_x0, int clip_y0, int cl
 
 /* ── Presentation ────────────────────────────────────────────────────────── */
 
-static void rect_union(azwm_rect_t *dst, int x0, int y0, int x1, int y1)
-{
-    if (x0 >= x1 || y0 >= y1) return;
-    if (!dst->valid) {
-        dst->x0 = x0; dst->y0 = y0; dst->x1 = x1; dst->y1 = y1;
-        dst->valid = 1;
-        return;
-    }
-    if (x0 < dst->x0) dst->x0 = x0;
-    if (y0 < dst->y0) dst->y0 = y0;
-    if (x1 > dst->x1) dst->x1 = x1;
-    if (y1 > dst->y1) dst->y1 = y1;
-}
-
-static void rect_union_rect(azwm_rect_t *dst, const azwm_rect_t *src)
-{
-    if (src->valid) rect_union(dst, src->x0, src->y0, src->x1, src->y1);
-}
-
 /* The pointer sprite plus the hotspot margins used across cursor types. */
 static azwm_rect_t cursor_bounds(const az_compositor_t *comp, int cx, int cy)
 {
@@ -1898,9 +1901,8 @@ void compositor_enable_page_flip(az_compositor_t *comp, int fb_fd,
     comp->hw_page_flip    = 1;
 
     /* Neither buffer holds anything yet. */
-    comp->pending[0].valid = comp->pending[1].valid = 0;
-    rect_union(&comp->pending[0], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
-    rect_union(&comp->pending[1], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+    region_set(&comp->pending[0], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+    region_set(&comp->pending[1], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
     comp->cursor_rect[0].valid = comp->cursor_rect[1].valid = 0;
 }
 
@@ -1973,17 +1975,13 @@ static void compositor_present_internal(az_compositor_t *comp, bool recomposited
      * would leave the previous frame's damage unpaid in it.
      */
     if (recomposited) {
-        if (comp->has_damage) {
-            int x0 = comp->dirty_min_x < 0 ? 0 : comp->dirty_min_x;
-            int y0 = comp->dirty_min_y < 0 ? 0 : comp->dirty_min_y;
-            int x1 = comp->dirty_max_x > (int)comp->fb_width  ? (int)comp->fb_width  : comp->dirty_max_x;
-            int y1 = comp->dirty_max_y > (int)comp->fb_height ? (int)comp->fb_height : comp->dirty_max_y;
-            rect_union(&comp->pending[0], x0, y0, x1, y1);
-            rect_union(&comp->pending[1], x0, y0, x1, y1);
+        if (!region_empty(&comp->damage)) {
+            region_union(&comp->pending[0], &comp->damage);
+            region_union(&comp->pending[1], &comp->damage);
         } else {
             /* Nothing said what changed, so assume all of it did. */
-            rect_union(&comp->pending[0], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
-            rect_union(&comp->pending[1], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+            region_set(&comp->pending[0], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+            region_set(&comp->pending[1], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
         }
     }
 
@@ -1999,18 +1997,20 @@ static void compositor_present_internal(az_compositor_t *comp, bool recomposited
 
         /* What this buffer is owed, plus the pointer left in it two frames
          * ago — copying over that is what erases it. */
-        azwm_rect_t area = comp->pending[next];
+        azwm_region_t area = comp->pending[next];
         if (!comp->hw_cursor) {
-            rect_union_rect(&area, &comp->cursor_rect[next]);
-            rect_union_rect(&area, &new_cursor);
+            region_add_rect(&area, &comp->cursor_rect[next]);
+            region_add_rect(&area, &new_cursor);
         }
+        region_clip(&area, (int)comp->fb_width, (int)comp->fb_height);
 
-        copy_rect(comp, dst, &area);
+        for (int i = 0; i < area.count; i++)
+            copy_rect(comp, dst, &area.r[i]);
         if (!comp->hw_cursor)
             desktop_draw_cursor(dst, comp->fb_width, comp->fb_height, pitch_px,
                                 comp->cursor_x, comp->cursor_y, comp->current_cursor_type);
 
-        comp->pending[next].valid = 0;
+        region_clear(&comp->pending[next]);
         comp->cursor_rect[next]   = new_cursor;
 
         if (display_pan(comp, next) == 0) {
@@ -2021,44 +2021,49 @@ static void compositor_present_internal(az_compositor_t *comp, bool recomposited
              * up on flipping rather than showing a stale half of the screen. */
             comp->hw_page_flip = 0;
             comp->frontbuf     = comp->vram_buf[comp->active_vram_buf];
-            rect_union(&comp->pending[0], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
-            rect_union(&comp->pending[1], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+            region_set(&comp->pending[0], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+            region_set(&comp->pending[1], 0, 0, (int)comp->fb_width, (int)comp->fb_height);
         }
     } else {
         /* Single-buffered: copy the damage straight to the live scanout. */
-        azwm_rect_t area = comp->pending[0];
+        azwm_region_t area = comp->pending[0];
         if (!comp->hw_cursor) {
-            rect_union_rect(&area, &comp->cursor_rect[0]);
-            rect_union_rect(&area, &new_cursor);
+            region_add_rect(&area, &comp->cursor_rect[0]);
+            region_add_rect(&area, &new_cursor);
         }
+        region_clip(&area, (int)comp->fb_width, (int)comp->fb_height);
 
-        copy_rect(comp, comp->frontbuf, &area);
+        for (int i = 0; i < area.count; i++)
+            copy_rect(comp, comp->frontbuf, &area.r[i]);
         if (!comp->hw_cursor)
             desktop_draw_cursor(comp->frontbuf, comp->fb_width, comp->fb_height, pitch_px,
                                 comp->cursor_x, comp->cursor_y, comp->current_cursor_type);
 
         /* Tell the kernel exactly what changed so a host-backed framebuffer
-         * (VirtIO-GPU) transfers only these rows, not the whole screen. */
-        if (comp->fb_fd >= 0 && area.valid && area.x1 > area.x0 && area.y1 > area.y0) {
-            struct fb_az_rect d = {
-                (unsigned)(area.x0 < 0 ? 0 : area.x0),
-                (unsigned)(area.y0 < 0 ? 0 : area.y0),
-                (unsigned)(area.x1 - (area.x0 < 0 ? 0 : area.x0)),
-                (unsigned)(area.y1 - (area.y0 < 0 ? 0 : area.y0)),
-            };
-            ioctl(comp->fb_fd, FBIOAZ_DAMAGE, &d);
+         * (VirtIO-GPU) transfers only these rectangles, not their bounding
+         * box and not the whole screen. */
+        if (comp->fb_fd >= 0 && area.count > 0) {
+            struct fb_az_damage_list dl;
+            dl.count = 0;
+            for (int i = 0; i < area.count && dl.count < FB_AZ_DAMAGE_MAX; i++) {
+                const azwm_rect_t *a = &area.r[i];
+                if (a->x1 <= a->x0 || a->y1 <= a->y0) continue;
+                dl.rects[dl.count].x = (unsigned)a->x0;
+                dl.rects[dl.count].y = (unsigned)a->y0;
+                dl.rects[dl.count].w = (unsigned)(a->x1 - a->x0);
+                dl.rects[dl.count].h = (unsigned)(a->y1 - a->y0);
+                dl.count++;
+            }
+            if (dl.count > 0)
+                ioctl(comp->fb_fd, FBIOAZ_DAMAGE_LIST, &dl);
         }
 
-        comp->pending[0].valid = 0;
-        comp->pending[1].valid = 0;
+        region_clear(&comp->pending[0]);
+        region_clear(&comp->pending[1]);
         comp->cursor_rect[0]   = new_cursor;
     }
 
-    comp->has_damage  = 0;
-    comp->dirty_min_x = (int)comp->fb_width;
-    comp->dirty_min_y = (int)comp->fb_height;
-    comp->dirty_max_x = 0;
-    comp->dirty_max_y = 0;
+    region_clear(&comp->damage);
 
     comp->old_cursor_x = comp->cursor_x;
     comp->old_cursor_y = comp->cursor_y;
@@ -2092,61 +2097,26 @@ void compositor_present(az_compositor_t *comp)
     compositor_present_internal(comp, true);
 }
 
-void compose_screen(az_compositor_t *comp)
+/*
+ * Compose one damage rectangle: clear it, then repaint every window that can
+ * reach it, back to front. Every drawing helper below already takes the clip
+ * and honours it, so the rectangle is the only thing that bounds the work.
+ */
+static void compose_rect(az_compositor_t *comp,
+                         int clip_x0, int clip_y0, int clip_x1, int clip_y1)
 {
-    /*
-     * The region compositor_present() is actually going to copy out this
-     * frame — the damage box clamped to the screen, or the whole screen when
-     * nothing called compositor_damage() (the same "nothing said what
-     * changed, assume all of it did" rule compositor_present_internal()
-     * applies on the far end). Steps 1 and 2 below use it to skip work whose
-     * result could not reach the screen anyway, on the same has_damage
-     * contract the present step already trusts.
-     */
-    int clip_x0 = 0, clip_y0 = 0;
-    int clip_x1 = (int)comp->fb_width, clip_y1 = (int)comp->fb_height;
-    if (comp->has_damage) {
-        clip_x0 = comp->dirty_min_x < 0 ? 0 : comp->dirty_min_x;
-        clip_y0 = comp->dirty_min_y < 0 ? 0 : comp->dirty_min_y;
-        clip_x1 = comp->dirty_max_x > (int)comp->fb_width  ? (int)comp->fb_width  : comp->dirty_max_x;
-        clip_y1 = comp->dirty_max_y > (int)comp->fb_height ? (int)comp->fb_height : comp->dirty_max_y;
+    if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) return;
 
-        /* blur_backdrop_region() reads whatever is already in the backbuf
-         * under a blurred window and trusts it to be this frame's real
-         * composite of everything behind it. That only holds if every
-         * window below it actually redrew this frame — which a narrow
-         * damage box can skip for a window outside it. Rather than track
-         * which windows a blur window overlaps, widen to the whole screen
-         * whenever one is visible at all: rare (typically just the lock
-         * screen), so paying for a full recomposite on its account is
-         * cheap insurance against blurring an already-blurred frame. */
-        for (unsigned int wi = 0; wi < AZWM_MAX_WINDOWS; wi++) {
-            az_window_t *bw = &comp->window_pool[wi];
-            if (bw->wid != 0 && bw->visible && bw->blur_backdrop) {
-                clip_x0 = 0; clip_y0 = 0;
-                clip_x1 = (int)comp->fb_width;
-                clip_y1 = (int)comp->fb_height;
-                break;
-            }
-        }
-    }
-
-    /* ── 1. Clear backbuf only if tail window does not fully cover screen,
-     *      and only the part of it the damage box actually names ───────── */
+    /* ── 1. Clear, unless the bottom window already covers this rectangle ─ */
     az_window_t *tail = comp->list_tail;
     bool tail_has_frame = win_has_frame(tail);
     bool full_coverage = (tail && tail->visible && tail->wid != 0 && !tail_has_frame &&
                           tail->x <= 0 && tail->y <= 0 &&
                           tail->width >= comp->fb_width && tail->height >= comp->fb_height);
-    if (!full_coverage && clip_x1 > clip_x0 && clip_y1 > clip_y0) {
+    if (!full_coverage)
         bb_fill_rect(comp, clip_x0, clip_y0, clip_x1 - clip_x0, clip_y1 - clip_y0, 0xFF1E1E2E);
-    }
 
-    /* ── 2. Draw windows that can touch the clip (back to front in Z-order) ─
-     * Every window still gets a full, un-clipped repaint when it is drawn —
-     * only *whether* it's worth drawing at all is decided here — except its
-     * client-area blit, which render_window itself narrows to the clip
-     * (see the comment on render_window). */
+    /* ── 2. Windows that can touch the clip (back to front in Z-order) ──── */
     az_window_t *curr = comp->list_tail;
     while (curr) {
         if (curr->visible && curr->wid != 0) {
@@ -2170,19 +2140,54 @@ void compose_screen(az_compositor_t *comp)
         curr = curr->prev;
     }
 
-    /* ── 3. Draw Snapping Preview, Alt+Tab HUD & Context Menu Overlays ─── */
+    /* ── 3. Snap preview, Alt+Tab HUD, context menu, FPS HUD ───────────── */
     draw_snap_preview(comp, clip_x0, clip_y0, clip_x1, clip_y1);
     draw_alt_tab_hud(comp, clip_x0, clip_y0, clip_x1, clip_y1);
     draw_context_menu(comp, clip_x0, clip_y0, clip_x1, clip_y1);
     draw_fps_hud(comp, clip_x0, clip_y0, clip_x1, clip_y1);
+}
+
+void compose_screen(az_compositor_t *comp)
+{
+    /*
+     * blur_backdrop_region() reads whatever is already in the backbuf under
+     * a blurred window and trusts it to be this frame's real composite of
+     * everything behind it. That only holds if every window below actually
+     * redrew this frame — which a narrow damage rectangle can skip. Rather
+     * than track which windows a blur window overlaps, collapse to the whole
+     * screen whenever one is visible at all: rare (typically just the lock
+     * screen), so paying for a full recomposite on its account is cheap
+     * insurance against blurring an already-blurred frame.
+     */
+    for (unsigned int wi = 0; wi < AZWM_MAX_WINDOWS; wi++) {
+        az_window_t *bw = &comp->window_pool[wi];
+        if (bw->wid != 0 && bw->visible && bw->blur_backdrop) {
+            region_set(&comp->damage, 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+            break;
+        }
+    }
+
+    /* Nothing said what changed, so assume all of it did — the same rule
+     * compositor_present_internal() applies on the far end. */
+    if (region_empty(&comp->damage))
+        region_set(&comp->damage, 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+
+    region_clip(&comp->damage, (int)comp->fb_width, (int)comp->fb_height);
 
     /*
-     * ── 4. Presentation ───────────────────────────────────────────────
-     * Everything above is redrawn from scratch, but only the regions the
-     * damage box names actually come out different — the rest re-renders to
-     * identical pixels.  Presenting that box is therefore both correct and
-     * far cheaper than the screen.  A pass that reports no damage at all is
-     * the exception and is presented whole.
+     * One composite pass per damage rectangle. Two small rectangles at
+     * opposite corners cost the two rectangles, not the screen-sized box
+     * that used to contain them.
+     */
+    for (int i = 0; i < comp->damage.count; i++) {
+        const azwm_rect_t *r = &comp->damage.r[i];
+        compose_rect(comp, r->x0, r->y0, r->x1, r->y1);
+    }
+
+    /*
+     * ── Presentation ──────────────────────────────────────────────────
+     * Only the regions the damage names came out different, so presenting
+     * exactly those is both correct and far cheaper than the screen.
      */
     compositor_present_internal(comp, true);
 }

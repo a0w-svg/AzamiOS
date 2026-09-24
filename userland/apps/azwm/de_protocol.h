@@ -47,6 +47,8 @@
 #define AZ_WM_LAUNCH_APP           33  /* Ask server to spawn an ELF binary         */
 #define AZ_WM_SET_STRUT            34  /* Reserve screen edge (panel geometry)      */
 #define AZ_WM_SET_THEME            35  /* Set active system theme                   */
+#define AZ_WM_BLANK_SCREEN         36  /* Blank the display now (wake on input)     */
+#define AZ_WM_PING                 37  /* Server -> client liveness probe; ignore it */
 
 /* Client -> Server: clipboard */
 #define AZ_WM_CLIPBOARD_SET        60  /* Set system-wide clipboard text            */

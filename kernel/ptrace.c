@@ -22,6 +22,7 @@
 #include "../include/azami/defs.h"
 #include "../include/azami/types.h"
 #include "../drivers/char/console.h"
+#include "time/timekeeping.h"
 
 #define USER_ADDR_MAX  0x0000800000000000ULL
 #define RFL_TF         (1ULL << 8)
@@ -130,6 +131,13 @@ static bool tracee_mem(process_t *tgt, u64 va, void *buf, size_t len, bool write
         u64 fl = vmm_query_flags(tgt->pml4_phys, va);
         if (!(fl & VMM_F_PRESENT) || !(fl & VMM_F_USER)) return false;
         if (fl & VMM_F_HUGE) return false;   /* no user huge pages exist today */
+        /* Uncached user mappings are device MMIO (the vDSO's HPET page, DRM
+         * BARs): not RAM, not reachable through the HHDM. */
+        if (fl & VMM_F_PCD) return false;
+        /* The vvar page is live kernel data: a private copy would freeze the
+         * tracee's clock. Readable, never writable — as Linux's VM_IO. */
+        if (write && vmm_translate(tgt->pml4_phys, page) == timekeeping_vvar_phys())
+            return false;
 
         if (write && ((fl & VMM_F_SHARED) || !(fl & VMM_F_WRITE))) {
             phys_addr_t old = vmm_translate(tgt->pml4_phys, page);

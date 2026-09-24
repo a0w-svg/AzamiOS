@@ -22,6 +22,7 @@
 #include "../azwm/de_protocol.h"
 #include "../azwm/de_font.h"
 #include "../shared/ui_kit.h"
+#include "../../libc/include/sys/statvfs.h"
 
 /* ── Configuration ─────────────────────────────────────────────────────────── */
 #define SERVER_CHAN      1
@@ -169,6 +170,25 @@ static int hit_cell(int mx, int my)
 }
 
 /* ── Render single app cell ───────────────────────────────────────────────── */
+/* Copy `src` into `dst`, shortened with a trailing ".." if it is longer
+ * than `max_chars` glyphs — the launcher's cells are a fixed width and a
+ * label that does not fit has to stop, not spill into the next cell. */
+static void fit_text(char *dst, int dst_size, const char *src, int max_chars)
+{
+    int n = (int)strlen(src);
+    if (max_chars > dst_size - 1) max_chars = dst_size - 1;
+    if (n <= max_chars) {
+        snprintf(dst, (unsigned long)dst_size, "%s", src);
+        return;
+    }
+    int keep = max_chars - 2;
+    if (keep < 1) keep = 1;
+    for (int i = 0; i < keep; i++) dst[i] = src[i];
+    dst[keep] = '.';
+    dst[keep + 1] = '.';
+    dst[keep + 2] = '\0';
+}
+
 static void draw_cell(int slot)
 {
     if (slot < 0 || slot >= g_num_filtered) return;
@@ -266,17 +286,33 @@ static void draw_cell(int slot)
         }
     }
 
-    /* App name (centred) */
+    /* App name and subtitle, centred and kept inside the cell.
+     *
+     * Both were drawn centred at their full width with no bound, so a
+     * subtitle wider than the 145px cell ran straight into its
+     * neighbours: "Breakout Arcade", "Math & Calculations" and "Clock &
+     * World Times" overlapped into one unreadable line. Anything too long
+     * is now cut with an ellipsis, and the clip below is the backstop. */
+    int text_w = cw - 8;
+    int max_chars = text_w / 8;
+    if (max_chars < 4) max_chars = 4;
+
+    char label[64];
+    fit_text(label, sizeof(label), g_apps[app_idx].name, max_chars);
     unsigned int name_col = uk_blend(UK_SUBTEXT1, UK_TEXT, hover_a8);
-    int nlen = strlen(g_apps[app_idx].name);
+    int nlen = strlen(label);
     int nx   = cx + cw / 2 - (nlen * 8) / 2;
     int ny   = icon_y + ICON_BOX_SIZE + 8;
-    uk_draw_text(&g_win, nx, ny, g_apps[app_idx].name, name_col);
 
-    /* Subtitle (centred, dimmer) */
-    int slen = strlen(g_apps[app_idx].subtitle);
+    char sub[64];
+    fit_text(sub, sizeof(sub), g_apps[app_idx].subtitle, max_chars);
+    int slen = strlen(sub);
     int sx   = cx + cw / 2 - (slen * 8) / 2;
-    uk_draw_text(&g_win, sx, ny + 16, g_apps[app_idx].subtitle, UK_OVERLAY0);
+
+    uk_push_clip(&g_win, cx + 4, ny, text_w, 34);
+    uk_draw_text(&g_win, nx, ny, label, name_col);
+    uk_draw_text(&g_win, sx, ny + 16, sub, UK_OVERLAY0);
+    uk_pop_clip(&g_win);
 }
 
 /* ============================================================================
@@ -357,8 +393,30 @@ static void draw_launcher(void)
     uk_fill_rect(&g_win, 0, (int)h - 28, (int)w, 28, UK_SURFACE0);
     uk_hline(&g_win, 0, (int)h - 28, (int)w, UK_SURFACE1);
 
-    uk_draw_text(&g_win, 16, (int)h - 20, "azami@azamios • AzamiOS v7.0 • SATA (/) 512M & (/boot) 64M", UK_SUBTEXT0);
-    uk_draw_text(&g_win, (int)w - 240, (int)h - 20, "Enter: Launch | Esc: Dismiss", UK_OVERLAY1);
+    /* Footer: identity and real disk usage on the left, key hints on the
+     * right. The left string used to be a fixed one naming "512M & 64M"
+     * whatever the disk actually was, and it was long enough to run under
+     * the right-hand hint and collide with it. It now reports what
+     * statvfs() says and is clipped to the space the hint leaves free. */
+    const char *hint = "Enter: Launch | Esc: Dismiss";
+    int hint_w = (int)strlen(hint) * 8;
+    int hint_x = (int)w - hint_w - 16;
+
+    char footer[96];
+    struct statvfs vfs;
+    if (statvfs("/", &vfs) == 0 && vfs.f_blocks > 0) {
+        unsigned long total_mb = (unsigned long)((vfs.f_blocks * (unsigned long long)vfs.f_frsize) >> 20);
+        unsigned long free_mb  = (unsigned long)((vfs.f_bfree  * (unsigned long long)vfs.f_frsize) >> 20);
+        snprintf(footer, sizeof(footer), "azami@azamios • AzamiOS v7.0 • / %luM (%luM free)",
+                 total_mb, free_mb);
+    } else {
+        snprintf(footer, sizeof(footer), "azami@azamios • AzamiOS v7.0");
+    }
+
+    uk_push_clip(&g_win, 16, (int)h - 22, hint_x - 16 - 24, 18);
+    uk_draw_text(&g_win, 16, (int)h - 20, footer, UK_SUBTEXT0);
+    uk_pop_clip(&g_win);
+    uk_draw_text(&g_win, hint_x, (int)h - 20, hint, UK_OVERLAY1);
 
     uk_invalidate(&g_win);
 }
@@ -433,6 +491,14 @@ static void load_default_registry(void)
     registry_add("fontviewer",  "Typography Inspector",CAT_SYSTEM,       0);
     registry_add("imageviewer", "Image & Photo Viewer",CAT_MEDIA,        0);
     registry_add("notes",       "Sticky Notes",        CAT_PRODUCTIVITY, 0);
+    registry_add("pasjans",     "Solitaire Card Game", CAT_GAMES,        0);
+    registry_add("breakout",    "Breakout Arcade",     CAT_GAMES,        0);
+    registry_add("3d_test",     "3D Renderer Demo",    CAT_GAMES,        0);
+    registry_add("demo3d",      "3D Scene Demo",       CAT_GAMES,        0);
+    registry_add("xcalc",       "X11 Calculator",      CAT_SYSTEM,       0);
+    registry_add("xclock",      "X11 Clock",           CAT_SYSTEM,       0);
+    registry_add("xeyes",       "X11 Eyes",            CAT_SYSTEM,       0);
+    registry_add("xgui_demo",   "X11 Widget Demo",     CAT_SYSTEM,       0);
 
     static const char *hidden_defaults[] = {
         "init", "sessiond", "azwm", "wallpaper", "taskbar", "launcher", "gui_test",
@@ -491,6 +557,23 @@ static const registry_entry_t *registry_lookup(const char *name)
     return NULL;
 }
 
+/* Tear the window down before exiting.
+ *
+ * Calling sys_exit() on its own leaves the window mapped until the
+ * compositor notices the process is gone (azwm reaps dead clients once a
+ * second), which is why the launcher used to stay on screen after
+ * launching an app. Sending AZ_WM_DESTROY_WINDOW makes it disappear on the
+ * same frame as the click. */
+static void launcher_close(void)
+{
+    az_wm_msg_t cmsg;
+    memset(&cmsg, 0, sizeof(cmsg));
+    cmsg.type = AZ_WM_DESTROY_WINDOW;
+    cmsg.wid  = g_win.wid;
+    az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&cmsg);
+    sys_exit(0);
+}
+
 /* ============================================================================
  * _start
  * ============================================================================ */
@@ -517,11 +600,20 @@ int main(int argc, char **argv)
                         strncpy(appname, d->d_name, name_len);
                         appname[name_len] = '\0';
 
-                        /* Filter out internal system services & CLI tools,
-                         * and pick up this app's category/subtitle, per
-                         * /etc/launcher.conf (see load_registry_config()). */
+                        /* Only registered applications are listed.
+                         *
+                         * This used to be a denylist: everything in /bin
+                         * appeared unless /etc/launcher.conf said "hidden".
+                         * /bin holds ~200 command-line tools, so the grid
+                         * filled up with entries like "basename —
+                         * Application" that open no window and do nothing
+                         * visible when clicked, and every new coreutil
+                         * added another one. A GUI app is now something
+                         * that says so: one line in /etc/launcher.conf
+                         * (load_default_registry() carries the same list
+                         * compiled in, for an image without the file). */
                         const registry_entry_t *reg = registry_lookup(appname);
-                        if (reg && reg->hidden) continue;
+                        if (!reg || reg->hidden) continue;
 
                         int already_added = 0;
                         for (int a = 0; a < g_num_apps; a++) {
@@ -648,7 +740,7 @@ int main(int argc, char **argv)
                     g_launching = 1;
                     int app_idx = g_filtered_indices[clicked];
                     uk_launch_app(&g_win, g_apps[app_idx].path);
-                    sys_exit(0);
+                    launcher_close();
                 }
             } else {
                 int new_hover = hit_cell(mx, my);
@@ -667,14 +759,14 @@ int main(int argc, char **argv)
             if (msg->key.keycode == 0x1B) { /* Escape */
                 if (!g_launching) {
                     g_launching = 1;
-                    sys_exit(0);
+                    launcher_close();
                 }
             } else if (msg->key.keycode == '\n' || msg->key.keycode == '\r') {
                 if (g_hovered >= 0 && g_hovered < g_num_filtered && !g_launching) {
                     g_launching = 1;
                     int app_idx = g_filtered_indices[g_hovered];
                     uk_launch_app(&g_win, g_apps[app_idx].path);
-                    sys_exit(0);
+                    launcher_close();
                 }
             } else if (msg->key.keycode == 0x08) { /* Backspace */
                 if (g_search_len > 0) {

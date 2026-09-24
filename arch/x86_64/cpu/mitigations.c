@@ -9,6 +9,7 @@
  * ============================================================================ */
 
 #include "mitigations.h"
+#include <azami/sections.h>
 #include "cpu.h"
 #include "msr.h"
 #include "gdt.h"
@@ -18,19 +19,28 @@ extern void kprintf(const char *fmt, ...);
 extern int  scnprintf(char *buf, size_t size, const char *fmt, ...);
 
 /* ── Policy, decided once on the BSP and replayed by every AP ─────────────── */
-u8  g_verw_user_clear = 0;
-u16 g_verw_sel        = SEL_KERNEL_DATA;
-u8  g_spectre_v2_mode = SPECTRE_V2_NONE;
-u8  g_ibpb_on_switch  = 0;
-u8  g_ssbd_enabled    = 0;
-u8  g_tsx_disabled    = 0;
+/* __ro_after_init throughout. These are not statistics, they are the policy
+ * itself, and two of them are consulted on paths that have no other defence:
+ * the syscall and interrupt exit stubs branch on g_verw_user_clear to decide
+ * whether to flush the microarchitectural buffers before returning to ring 3,
+ * and vmm_switch() branches on g_ibpb_on_switch to decide whether to issue
+ * the branch-predictor barrier. An attacker who can clear either byte turns
+ * the mitigation off for the whole system, silently, and /proc goes on
+ * reporting it as active. They are decided once on the BSP and replayed
+ * verbatim by each AP, all of which happens long before kprotect_seal(). */
+u8  g_verw_user_clear __ro_after_init = 0;
+u16 g_verw_sel        __ro_after_init = SEL_KERNEL_DATA;
+u8  g_spectre_v2_mode __ro_after_init = SPECTRE_V2_NONE;
+u8  g_ibpb_on_switch  __ro_after_init = 0;
+u8  g_ssbd_enabled    __ro_after_init = 0;
+u8  g_tsx_disabled    __ro_after_init = 0;
 
 /* The exact IA32_SPEC_CTRL value every core must carry. Computed on the BSP so
  * an AP cannot derive a different one from a slightly different CPUID view
  * (which happens on hybrid parts, where the E-cores enumerate less). */
-static u64 s_spec_ctrl = 0;
-static u8  s_spec_ctrl_valid = 0;
-static u8  s_autoibrs = 0;
+static u64 s_spec_ctrl       __ro_after_init = 0;
+static u8  s_spec_ctrl_valid __ro_after_init = 0;
+static u8  s_autoibrs        __ro_after_init = 0;
 
 /* Number of IBPBs issued, so the cost of the switch-time barrier is visible
  * rather than a mystery in a profile. */

@@ -145,18 +145,18 @@ int virtio_gpu_init(device_t *hal_dev)
     /* 2. Set ACKNOWLEDGE and DRIVER */
     virtio_pci_set_status(&g_gpu.vpci, virtio_pci_get_status(&g_gpu.vpci) | VIRTIO_CONFIG_S_ACKNOWLEDGE | VIRTIO_CONFIG_S_DRIVER);
 
-    /* 3. Negotiate features. We don't request 3D (VIRTIO_GPU_F_VIRGL), but
-     * do ask for EDID: negotiation only grants bits the device actually
-     * offers, so requesting it is free on a host that predates the feature
-     * — negotiated_features simply won't have the bit set and
-     * virtio_gpu_edid_supported() reports that below. */
-    if (!virtio_pci_negotiate_features(&g_gpu.vpci, 1ULL << VIRTIO_GPU_F_EDID)) {
+    /* 3. Negotiate features. We ask for EDID and 3D (VIRTIO_GPU_F_VIRGL).
+     * Negotiation only grants bits the device actually offers. */
+    if (!virtio_pci_negotiate_features(&g_gpu.vpci, (1ULL << VIRTIO_GPU_F_EDID) | (1ULL << VIRTIO_GPU_F_VIRGL))) {
         pr_debug("[VIRTIO-GPU] Failed to negotiate features\n");
         virtio_pci_set_status(&g_gpu.vpci, VIRTIO_CONFIG_S_FAILED);
         return -1;
     }
     if (g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_EDID)) {
         pr_debug("[VIRTIO-GPU] Device offers EDID\n");
+    }
+    if (g_gpu.vpci.negotiated_features & (1ULL << VIRTIO_GPU_F_VIRGL)) {
+        pr_debug("[VIRTIO-GPU] Device offers 3D (virgl)\n");
     }
 
     /* 4. Setup queues */

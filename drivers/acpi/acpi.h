@@ -146,8 +146,11 @@ void acpi_init(void);
 /** acpi_find_table(sig) — Find an ACPI table by its 4-char signature. */
 void *acpi_find_table(const char *signature);
 
-/** acpi_reboot() — Hard reboot the system via FADT ResetReg. */
-void acpi_reboot(void);
+/** acpi_reboot() — Hard reboot the system via FADT ResetReg, falling back to
+ *  power_reboot() if no FADT/reset register is available or it doesn't take. */
+__attribute__((noreturn)) void acpi_reboot(void);
 
-/** acpi_shutdown() — Power off the system via ACPI \_S5_ sleep state. */
-void acpi_shutdown(void);
+/** acpi_shutdown() — Power off the system via ACPI \_S5_ sleep state, falling
+ *  back to power_shutdown() if no FADT/PM1 control block is available or it
+ *  doesn't take. */
+__attribute__((noreturn)) void acpi_shutdown(void);

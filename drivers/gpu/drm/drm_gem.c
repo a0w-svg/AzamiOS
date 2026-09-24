@@ -93,15 +93,12 @@ drm_gem_object_t *drm_gem_object_create(drm_device_t *dev, u32 width, u32 height
 
 void drm_gem_object_get_locked(drm_gem_object_t *obj)
 {
-    if (obj) obj->refcount++;
+    if (obj) __atomic_add_fetch(&obj->refcount, 1, __ATOMIC_SEQ_CST);
 }
 
 void drm_gem_object_get(drm_gem_object_t *obj)
 {
-    if (!obj) return;
-    spinlock_lock(&obj->dev->lock);
-    drm_gem_object_get_locked(obj);
-    spinlock_unlock(&obj->dev->lock);
+    if (obj) drm_gem_object_get_locked(obj);
 }
 
 void drm_gem_object_put(drm_device_t *dev, drm_gem_object_t *obj)
@@ -124,11 +121,11 @@ void drm_gem_object_put(drm_device_t *dev, drm_gem_object_t *obj)
      * not the double-free or the lost decrement — the refcount itself has to
      * be inside the same critical section as the list surgery it gates.
      */
-    spinlock_lock(&dev->lock);
-    if (--obj->refcount > 0) {
-        spinlock_unlock(&dev->lock);
+    if (__atomic_sub_fetch(&obj->refcount, 1, __ATOMIC_SEQ_CST) > 0) {
         return;
     }
+
+    spinlock_lock(&dev->lock);
 
     drm_gem_object_t **pp = &dev->gem_list;
     while (*pp) {
@@ -178,8 +175,7 @@ u32 drm_gem_handle_create(drm_file_t *file, drm_gem_object_t *obj)
 {
     if (!file || !obj) return 0;
 
-    drm_device_t *dev = file->dev;
-    spinlock_lock(&dev->lock);
+    spinlock_lock(&file->file_lock);
 
     /* Handle 0 is reserved as "no object", matching Linux. */
     u32 handle = 0;
@@ -190,14 +186,12 @@ u32 drm_gem_handle_create(drm_file_t *file, drm_gem_object_t *obj)
 
         file->handles[h]  = obj;
         file->next_handle = h;
-        /* _locked(): dev->lock is already held here, and drm_gem_object_get()
-         * taking it again would deadlock (not reentrant). */
-        drm_gem_object_get_locked(obj);
+        drm_gem_object_get(obj);
         handle = h;
         break;
     }
 
-    spinlock_unlock(&dev->lock);
+    spinlock_unlock(&file->file_lock);
     return handle;
 }
 
@@ -205,22 +199,21 @@ drm_gem_object_t *drm_gem_handle_lookup(drm_file_t *file, u32 handle)
 {
     if (!file || handle == 0 || handle >= DRM_MAX_HANDLES) return NULL;
 
-    drm_device_t *dev = file->dev;
-    spinlock_lock(&dev->lock);
+    spinlock_lock(&file->file_lock);
     drm_gem_object_t *obj = file->handles[handle];
-    spinlock_unlock(&dev->lock);
+    spinlock_unlock(&file->file_lock);
     return obj;
 }
 
 int drm_gem_handle_delete(drm_file_t *file, u32 handle)
 {
     if (!file || handle == 0 || handle >= DRM_MAX_HANDLES) return -EINVAL;
-
     drm_device_t *dev = file->dev;
-    spinlock_lock(&dev->lock);
+    
+    spinlock_lock(&file->file_lock);
     drm_gem_object_t *obj = file->handles[handle];
     if (obj) file->handles[handle] = NULL;
-    spinlock_unlock(&dev->lock);
+    spinlock_unlock(&file->file_lock);
 
     if (!obj) return -EINVAL;
     /* Outside the lock: drm_gem_object_put() takes dev->lock itself, and may
@@ -235,10 +228,10 @@ void drm_gem_release_all(drm_file_t *file)
     drm_device_t *dev = file->dev;
 
     for (u32 h = 1; h < DRM_MAX_HANDLES; h++) {
-        spinlock_lock(&dev->lock);
+        spinlock_lock(&file->file_lock);
         drm_gem_object_t *obj = file->handles[h];
         if (obj) file->handles[h] = NULL;
-        spinlock_unlock(&dev->lock);
+        spinlock_unlock(&file->file_lock);
 
         if (obj) drm_gem_object_put(dev, obj);
     }
@@ -337,6 +330,16 @@ void drm_gem_blit_rect(drm_gem_object_t *src, void *dst_virt, u32 dst_pitch,
 
             size_t chunk = PAGE_SIZE - in_pg;
             if (chunk > row_bytes - copied) chunk = row_bytes - copied;
+
+            /* Pre-fetch the next cache line of the source shadow buffer.
+             * This ensures the memory controller starts pulling the next line
+             * before ERMS/MOVNTI finishes draining the current one. */
+            if (in_pg + chunk < PAGE_SIZE) {
+                hw_prefetch_read((u8 *)sp + in_pg + chunk);
+            } else if (page + 1 < src->npages) {
+                void *next_sp = drm_gem_page_ptr(src, page + 1);
+                if (next_sp) hw_prefetch_read(next_sp);
+            }
 
             hw_copy_to_vram(dst + (size_t)y * dst_pitch + x_off + copied,
                             (u8 *)sp + in_pg, chunk);

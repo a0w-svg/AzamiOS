@@ -48,12 +48,17 @@ static uk_window_t g_win;
 /* ── Terminal buffer
  * ─────────────────────────────────────────────────────────── */
 static char g_lines[MAX_OUTPUT][TERM_COLS + 1];
-static unsigned int g_line_colors[MAX_OUTPUT];
+/* Per-character color, not per-line: a single output line commonly mixes
+ * colors (e.g. `ls`'s colorized listing, or any tool that only recolors
+ * part of a line), and the old one-color-per-line scheme flattened all of
+ * it to whatever SGR code happened to be active at the newline. */
+static unsigned int g_char_colors[MAX_OUTPUT][TERM_COLS];
 static int g_line_count = 0;
 static int g_scroll = 0;
 
 static char g_input[MAX_CMD + 1];
 static int g_input_len = 0;
+static int g_input_cursor = 0; /* insertion point within g_input, 0..g_input_len */
 static char g_cwd[128] = "/";
 
 static void draw_terminal(void);
@@ -75,24 +80,30 @@ static void update_cwd(void) {
 
 /* ── Output a line to terminal buffer
  * ─────────────────────────────────────────── */
-static void term_print(const char *s, unsigned int col) {
+/* char_cols, when non-NULL, gives each column its own color (used by the
+ * streamed-output path below, which tracks color changes as they happen);
+ * otherwise every column gets fallback_col, which is what every plain
+ * term_print() call (builtins, static messages) wants. */
+static void term_print_impl(const char *s, unsigned int fallback_col,
+                            const unsigned int *char_cols) {
   if (!s)
     return;
   if (g_line_count >= MAX_OUTPUT) {
     memmove(&g_lines[0], &g_lines[1], sizeof(g_lines[0]) * (MAX_OUTPUT - 1));
-    memmove(&g_line_colors[0], &g_line_colors[1],
-            sizeof(unsigned int) * (MAX_OUTPUT - 1));
+    memmove(&g_char_colors[0], &g_char_colors[1],
+            sizeof(g_char_colors[0]) * (MAX_OUTPUT - 1));
     g_line_count = MAX_OUTPUT - 1;
   }
   int n = g_line_count++;
   memset(g_lines[n], 0, sizeof(g_lines[n]));
+  unsigned int fb = fallback_col ? fallback_col : UK_TEXT;
   int i;
   for (i = 0; s[i] && i < TERM_COLS; i++) {
     unsigned char uc = (unsigned char)s[i];
     g_lines[n][i] = (uc >= 32 && uc <= 126) ? (char)uc : ' ';
+    g_char_colors[n][i] = char_cols ? char_cols[i] : fb;
   }
   g_lines[n][i] = '\0';
-  g_line_colors[n] = col ? col : UK_TEXT;
 
   /* Auto-scroll to bottom */
   int max_vis = ((int)g_win.height > 80) ? ((int)g_win.height - 80) / FONT_H
@@ -104,6 +115,10 @@ static void term_print(const char *s, unsigned int col) {
   } else {
     g_scroll = 0;
   }
+}
+
+static void term_print(const char *s, unsigned int col) {
+  term_print_impl(s, col, NULL);
 }
 
 /* ── Scrolling ──────────────────────────────────────────────────────────────
@@ -171,11 +186,18 @@ static unsigned int parse_ansi_color(const char *code,
   return col;
 }
 
-/* Print raw output stream with ANSI escape sequence filtering & color tracking
+/* Print raw output stream with ANSI escape sequence filtering & color
+ * tracking. s_stream_col stamps s_cur_col onto each character as it's
+ * placed, so a line that changes color partway through (colorized `ls`
+ * output, for instance) keeps each character's own color instead of the
+ * whole line flattening to whichever SGR code was active at the newline.
  */
 static char s_stream_line[TERM_COLS + 1];
+static unsigned int s_stream_col[TERM_COLS];
 static int s_stream_li = 0;
 static unsigned int s_cur_col = UK_TEXT;
+static int s_cmd_lines_printed = 0;
+static int g_cfg_line_delay_ms = 12;
 
 static void term_print_stream_chunk(const char *buf, size_t len) {
   for (size_t k = 0; k < len; k++) {
@@ -198,6 +220,14 @@ static void term_print_stream_chunk(const char *buf, size_t len) {
       if (k < len && buf[k] == 'm') {
         /* SGR sequence — update the current text color */
         s_cur_col = parse_ansi_color(seq, UK_TEXT);
+      } else if (k < len && buf[k] == 'J' && seq[0] == '2' && seq[1] == '\0') {
+        /* ED "clear entire screen" (\033[2J, always paired with \033[H in
+         * practice — top.elf does exactly this every refresh) — actually
+         * clear the scrollback instead of leaving the sequence a no-op and
+         * the old output sitting there under whatever gets printed next. */
+        g_line_count = 0;
+        g_scroll = 0;
+        draw_terminal();
       }
       /* 'continue' → for-loop k++ consumes the terminator byte */
       continue;
@@ -205,24 +235,43 @@ static void term_print_stream_chunk(const char *buf, size_t len) {
 
     if (c == '\n' || s_stream_li >= TERM_COLS) {
       s_stream_line[s_stream_li] = '\0';
-      term_print(s_stream_line, s_cur_col);
+      term_print_impl(s_stream_line, 0, s_stream_col);
       s_stream_li = 0;
+      s_cmd_lines_printed++;
+      draw_terminal();
+      if (g_cfg_line_delay_ms > 0) {
+        int delay = g_cfg_line_delay_ms;
+        if (s_cmd_lines_printed > 40) delay = 4;
+        if (s_cmd_lines_printed > 120) delay = 1;
+        usleep((unsigned long)delay * 1000);
+      }
+    } else if (c == '\r') {
+      s_stream_li = 0;
+      draw_terminal();
     } else if (c == '\t') {
       int spaces = 4 - (s_stream_li % 4);
       while (spaces-- > 0 && s_stream_li < TERM_COLS) {
+        s_stream_col[s_stream_li] = s_cur_col;
         s_stream_line[s_stream_li++] = ' ';
       }
     } else if ((unsigned char)c >= 32 && (unsigned char)c <= 126) {
+      s_stream_col[s_stream_li] = s_cur_col;
       s_stream_line[s_stream_li++] = c;
     }
+  }
+
+  /* Partial stream line without trailing newline rendered immediately */
+  if (s_stream_li > 0) {
+    draw_terminal();
   }
 }
 
 static void term_print_stream_flush(void) {
   if (s_stream_li > 0) {
     s_stream_line[s_stream_li] = '\0';
-    term_print(s_stream_line, s_cur_col);
+    term_print_impl(s_stream_line, 0, s_stream_col);
     s_stream_li = 0;
+    draw_terminal();
   }
 }
 
@@ -360,28 +409,29 @@ static void do_tab_completion(void) {
 /* ── Built-in Help Display
  * ───────────────────────────────────────────────────── */
 static void show_help(void) {
-  term_print("AzamiOS Terminal — Available System Commands & Utilities:",
-             UK_MAUVE);
-  term_print("  System & Info : help, whoami, uname, fetch, sysctl, date, uptime, df, "
-             "free, ps, top, time",
-             UK_TEXT);
-  term_print("  File & Dir    : ls, find, du, cat, head, tail, grep, wc, "
-             "touch, mkdir, rm, cp, mv",
-             UK_TEXT);
-  term_print("  Navigation    : cd <path>, pwd, tree", UK_TEXT);
-  term_print("  Text & Utils  : clear, history, echo, hexdump, base64, md5sum, "
-             "cut, sort, uniq",
-             UK_TEXT);
-  term_print("  Network       : ping, ifconfig, netstat", UK_TEXT);
-  term_print("  Hardware      : lspci, dmesg", UK_TEXT);
-  term_print("  Desktop Apps  : launch <app> (e.g. calculator, filemanager, "
-             "settings, paint)",
-             UK_SAPPHIRE);
-  term_print("  Session       : exit, reboot, poweroff", UK_TEXT);
-  term_print("Shortcuts: Ctrl+Shift+C/V (Clipboard), Ctrl+L (Clear), Ctrl+C/U/W (Edit)",
-             UK_OVERLAY0);
-  term_print("Tip: Use Up/Down arrows for history, Tab for auto-complete.",
-             UK_OVERLAY0);
+  static const struct {
+    const char *text;
+    unsigned int color;
+  } help_lines[] = {
+    {"AzamiOS Terminal — Available System Commands & Utilities:", UK_MAUVE},
+    {"  System & Info : help, whoami, uname, fetch, sysctl, date, uptime, df, free, ps, top, time", UK_TEXT},
+    {"  File & Dir    : ls, find, du, cat, head, tail, grep, wc, touch, mkdir, rm, cp, mv", UK_TEXT},
+    {"  Navigation    : cd <path>, pwd, tree", UK_TEXT},
+    {"  Text & Utils  : clear, history, echo, hexdump, base64, md5sum, cut, sort, uniq", UK_TEXT},
+    {"  Network       : ping, ifconfig, netstat", UK_TEXT},
+    {"  Hardware      : lspci, dmesg", UK_TEXT},
+    {"  Desktop Apps  : launch <app> (e.g. calculator, filemanager, settings, paint)", UK_SAPPHIRE},
+    {"  Session       : exit, reboot, poweroff", UK_TEXT},
+    {"Shortcuts: Ctrl+Shift+C/V (Clipboard), Ctrl+L (Clear), Ctrl+C/U/W (Edit)", UK_OVERLAY0},
+    {"Tip: Use Up/Down arrows for history, Tab for auto-complete.", UK_OVERLAY0},
+  };
+  for (size_t i = 0; i < sizeof(help_lines)/sizeof(help_lines[0]); i++) {
+    term_print(help_lines[i].text, help_lines[i].color);
+    draw_terminal();
+    if (g_cfg_line_delay_ms > 0) {
+      usleep((unsigned long)g_cfg_line_delay_ms * 1000);
+    }
+  }
 }
 
 /* ── Terminal Configuration & Prompt Formatting ─────────────────────── */
@@ -466,13 +516,40 @@ static bool is_gui_app(const char *name) {
 
 /* ── Execute Command
  * ─────────────────────────────────────────────────────────── */
+/* Does this line need a shell?
+ *
+ * The terminal splits a command on spaces and execs it directly, which is
+ * right for `ls -l` and wrong for everything with syntax in it: typing
+ * `echo hi > f`, `ps | grep x` or `echo $HOME` used to pass the operators
+ * to the program as literal arguments, so `echo a; echo b` printed
+ * "a; echo b" and a redirect wrote nothing. Anything holding one of these
+ * characters goes to /bin/sh -c instead, which is GNU bash here, and
+ * behaves the way the line looks like it should. */
+static int needs_shell(const char *cmd)
+{
+    for (const char *c = cmd; *c; c++) {
+        switch (*c) {
+        case '|': case '&': case ';': case '<': case '>': case '(': case ')':
+        case '$': case '`': case '\'': case '"': case '\\':
+        case '*': case '?': case '[': case '{': case '~': case '=':
+            return 1;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+
 static void execute_command(const char *raw_cmd) {
+  s_cmd_lines_printed = 0;
+
   /* Echo prompt + command */
   char prompt_str[64];
   format_prompt(prompt_str, sizeof(prompt_str));
   char echo_line[TERM_COLS + 1];
   snprintf(echo_line, sizeof(echo_line), "%s%s", prompt_str, raw_cmd);
   term_print(echo_line, UK_GREEN);
+  draw_terminal();
 
   while (*raw_cmd == ' ' || *raw_cmd == '\t')
     raw_cmd++;
@@ -566,6 +643,10 @@ static void execute_command(const char *raw_cmd) {
       char hline[TERM_COLS];
       snprintf(hline, sizeof(hline), "%3d  %s", i + 1, g_history[i]);
       term_print(hline, UK_SUBTEXT0);
+      draw_terminal();
+      if (g_cfg_line_delay_ms > 0) {
+        usleep((unsigned long)g_cfg_line_delay_ms * 1000);
+      }
     }
     return;
   }
@@ -573,13 +654,25 @@ static void execute_command(const char *raw_cmd) {
   /* Built-in: config */
   if (strcmp(argv[0], "config") == 0) {
     if (argc >= 2 && strcmp(argv[1], "help") == 0) {
-      term_print("AzamiOS Configuration System (/etc/*.conf)", UK_MAUVE);
-      term_print("Usage: config <list|get|set|edit|reload>", UK_BLUE);
-      term_print("  config list [file]        - Show active settings", UK_TEXT);
-      term_print("  config get <key>          - Query setting value", UK_TEXT);
-      term_print("  config set <key> <val>    - Update setting and persist", UK_TEXT);
-      term_print("  config edit [file]        - Open in GUI Text Editor", UK_TEXT);
-      term_print("  config reload             - Sync changes with desktop", UK_TEXT);
+      static const struct {
+        const char *text;
+        unsigned int color;
+      } conf_lines[] = {
+        {"AzamiOS Configuration System (/etc/*.conf)", UK_MAUVE},
+        {"Usage: config <list|get|set|edit|reload>", UK_BLUE},
+        {"  config list [file]        - Show active settings", UK_TEXT},
+        {"  config get <key>          - Query setting value", UK_TEXT},
+        {"  config set <key> <val>    - Update setting and persist", UK_TEXT},
+        {"  config edit [file]        - Open in GUI Text Editor", UK_TEXT},
+        {"  config reload             - Sync changes with desktop", UK_TEXT},
+      };
+      for (size_t i = 0; i < sizeof(conf_lines)/sizeof(conf_lines[0]); i++) {
+        term_print(conf_lines[i].text, conf_lines[i].color);
+        draw_terminal();
+        if (g_cfg_line_delay_ms > 0) {
+          usleep((unsigned long)g_cfg_line_delay_ms * 1000);
+        }
+      }
       return;
     }
     if (argc >= 2 && strcmp(argv[1], "edit") == 0) {
@@ -660,9 +753,24 @@ static void execute_command(const char *raw_cmd) {
         "HOME=/root",
         "TERM=xterm-256color",
         "TMPDIR=/tmp",
-        "COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin",
-        "LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib",
+        "SHELL=/bin/sh",
+        /* COMPILER_PATH/LIBRARY_PATH used to point into the cross-gcc the
+         * image packed; the compiler is now tcc, which finds its own
+         * headers and libraries (docs/TOOLCHAIN.md). */
         NULL};
+
+    /* A line with shell syntax in it is the shell's job, not a direct
+     * exec's: hand it over before trying to treat argv[0] as a program. */
+    char *sh_argv[4];
+    sh_argv[0] = "/bin/sh";
+    sh_argv[1] = "-c";
+    sh_argv[2] = (char *)raw_cmd;
+    sh_argv[3] = NULL;
+    if (needs_shell(raw_cmd)) {
+        sys_execve("/bin/sh", sh_argv, envp);
+        sys_execve("/bin/sh.elf", sh_argv, envp);
+        sys_execve("/bin/azami-sh.elf", sh_argv, envp);
+    }
 
     /* 1. Direct binary execution */
     char bin_path[256];
@@ -686,14 +794,15 @@ static void execute_command(const char *raw_cmd) {
     snprintf(bin_path, sizeof(bin_path), "/%s.elf", argv[0]);
     sys_execve(bin_path, argv, envp);
 
-    /* 2. Fallback to /bin/sh.elf -c */
-    char *sh_argv[4];
-    sh_argv[0] = "/bin/sh.elf";
-    sh_argv[1] = "-c";
-    sh_argv[2] = (char *)raw_cmd;
-    sh_argv[3] = NULL;
+    /* 2. Fallback: hand the whole line to the system shell, which is GNU
+     *    bash (/bin/sh and /bin/sh.elf both point at it; /bin/azami-sh.elf
+     *    is the native shell, kept as the last resort for an image built
+     *    without the ports). This is the path that gets pipes, redirection
+     *    and quoting right — the parsing above only handles a bare
+     *    command and its arguments. */
+    sys_execve("/bin/sh", sh_argv, envp);
     sys_execve("/bin/sh.elf", sh_argv, envp);
-    sys_execve("/sh.elf", sh_argv, envp);
+    sys_execve("/bin/azami-sh.elf", sh_argv, envp);
 
     printf("%s: command not found\n", argv[0]);
     sys_exit(127);
@@ -705,6 +814,24 @@ static void execute_command(const char *raw_cmd) {
     ssize_t n;
     while ((n = sys_read(pipefd[0], fbuf, sizeof(fbuf))) > 0) {
       term_print_stream_chunk(fbuf, (size_t)n);
+
+      /* Poll window events to allow Ctrl+C and clean window close while streaming */
+      az_wm_msg_t wmsg;
+      while (az_channel_recv_nb(g_win.client_chan, (az_ipc_msg_t *)&wmsg) == 0) {
+        if (wmsg.type == AZ_WM_DESTROY_WINDOW) {
+          sys_kill(pid, 9);
+          int st = 0;
+          sys_wait4(pid, &st, 0);
+          sys_close(pipefd[0]);
+          sys_exit(0);
+        } else if (wmsg.type == AZ_WM_KEY_EVENT && wmsg.key.pressed) {
+          bool ctrl = (wmsg.key.modifiers & AZ_MOD_CTRL) != 0;
+          if (ctrl && (wmsg.key.keycode == 'c' || wmsg.key.keycode == 'C' ||
+                       wmsg.key.scancode == 46 || wmsg.key.scancode == 0x2E)) {
+            sys_kill(pid, 2); /* SIGINT */
+          }
+        }
+      }
     }
     sys_close(pipefd[0]);
     term_print_stream_flush();
@@ -722,6 +849,7 @@ static void execute_command(const char *raw_cmd) {
         snprintf(exit_msg, sizeof(exit_msg), "[Exit: %d]", exit_code);
       }
       term_print(exit_msg, UK_RED);
+      draw_terminal();
     }
 
     update_cwd();
@@ -748,7 +876,7 @@ static void input_line_layout(char *prompt_buf, size_t buf_size,
 
   if (out_input_y) *out_input_y = input_y;
   if (out_plen) *out_plen = plen;
-  if (out_cx) *out_cx = TERM_OX + plen * FONT_W + g_input_len * FONT_W;
+  if (out_cx) *out_cx = TERM_OX + plen * FONT_W + g_input_cursor * FONT_W;
 }
 
 /* ── Draw Terminal Window
@@ -781,7 +909,30 @@ static void draw_terminal(void) {
     if (idx >= g_line_count)
       break;
     int py = TERM_OY + r * FONT_H;
-    uk_draw_text(&g_win, TERM_OX, py, g_lines[idx], g_line_colors[idx]);
+    /* Per-character, not one uk_draw_text() for the whole line: a line
+     * whose color changes partway through (colorized `ls` output, etc.)
+     * needs each character in its own recorded color -- see
+     * term_print_impl()'s g_char_colors. */
+    for (int col_i = 0; g_lines[idx][col_i]; col_i++) {
+      uk_draw_char(&g_win, TERM_OX + col_i * FONT_W, py,
+                   g_lines[idx][col_i], g_char_colors[idx][col_i]);
+    }
+  }
+
+  /* Partial stream line without trailing newline rendered at bottom of output */
+  if (s_stream_li > 0) {
+    int eff_scroll = g_scroll;
+    if (g_line_count + 1 > max_visible) {
+      eff_scroll = (g_line_count + 1) - max_visible;
+    }
+    int cur_r = g_line_count - eff_scroll;
+    if (cur_r >= 0 && cur_r < max_visible) {
+      int py = TERM_OY + cur_r * FONT_H;
+      for (int col_i = 0; col_i < s_stream_li; col_i++) {
+        uk_draw_char(&g_win, TERM_OX + col_i * FONT_W, py,
+                     s_stream_line[col_i], s_stream_col[col_i]);
+      }
+    }
   }
 
   /* Scrollbar */
@@ -852,9 +1003,13 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   /* Enter */
   if (keycode == '\n' || keycode == '\r' || keycode == KEY_ENTER || scancode == 28 || scancode == 0x1C) {
     g_input[g_input_len] = '\0';
-    execute_command(g_input);
+    char cmd_copy[MAX_CMD + 1];
+    strncpy(cmd_copy, g_input, sizeof(cmd_copy) - 1);
+    cmd_copy[sizeof(cmd_copy) - 1] = '\0';
     g_input_len = 0;
+    g_input_cursor = 0;
     g_input[0] = '\0';
+    execute_command(cmd_copy);
     return;
   }
 
@@ -871,27 +1026,30 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   if (ctrl && shift && (keycode == 'v' || keycode == 'V' || scancode == 47 || scancode == 0x2F)) {
     char paste_buf[AZ_WM_CLIPBOARD_TEXT_MAX];
     int n = uk_clipboard_get(&g_win, paste_buf, sizeof(paste_buf));
-    if (n > 0) {
-      for (int i = 0; i < n && g_input_len < MAX_CMD - 1; i++) {
-        char ch = paste_buf[i];
-        if (ch >= 32 && ch <= 126) {
-          g_input[g_input_len++] = ch;
-        }
-      }
-      g_input[g_input_len] = '\0';
+    for (int i = 0; i < n && g_input_len < MAX_CMD - 1; i++) {
+      char ch = paste_buf[i];
+      if (ch < 32 || ch > 126) continue;
+      /* Insert at the cursor rather than always appending at the end, so
+       * pasting mid-line doesn't silently move the paste to the tail. */
+      memmove(&g_input[g_input_cursor + 1], &g_input[g_input_cursor],
+              (size_t)(g_input_len - g_input_cursor));
+      g_input[g_input_cursor] = ch;
+      g_input_len++;
+      g_input_cursor++;
     }
+    g_input[g_input_len] = '\0';
     return;
   }
 
-  /* Ctrl+W: Delete word backward */
+  /* Ctrl+W: Delete word backward from the cursor, not always from the end. */
   if (keycode == 23 || (ctrl && (keycode == 'w' || keycode == 'W' || scancode == 17 || scancode == 0x11))) {
-    while (g_input_len > 0 && (g_input[g_input_len - 1] == ' ' || g_input[g_input_len - 1] == '\t')) {
-      g_input_len--;
-    }
-    while (g_input_len > 0 && g_input[g_input_len - 1] != ' ' && g_input[g_input_len - 1] != '\t') {
-      g_input_len--;
-    }
-    g_input[g_input_len] = '\0';
+    int cut = g_input_cursor;
+    while (cut > 0 && (g_input[cut - 1] == ' ' || g_input[cut - 1] == '\t')) cut--;
+    while (cut > 0 && g_input[cut - 1] != ' ' && g_input[cut - 1] != '\t') cut--;
+    memmove(&g_input[cut], &g_input[g_input_cursor],
+            (size_t)(g_input_len - g_input_cursor) + 1); /* +1 copies the '\0' */
+    g_input_len -= (g_input_cursor - cut);
+    g_input_cursor = cut;
     return;
   }
 
@@ -910,6 +1068,7 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
     snprintf(prompt, sizeof(prompt), "%s%s^C", pbuf, g_input);
     term_print(prompt, UK_OVERLAY0);
     g_input_len = 0;
+    g_input_cursor = 0;
     g_input[0] = '\0';
     return;
   }
@@ -917,6 +1076,7 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   /* Ctrl+U: Clear entire input line */
   if (keycode == 21 || (ctrl && (keycode == 'u' || keycode == 'U' || scancode == 22))) {
     g_input_len = 0;
+    g_input_cursor = 0;
     g_input[0] = '\0';
     return;
   }
@@ -934,17 +1094,50 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
     return;
   }
 
-  /* Backspace */
+  /* Backspace: delete the character before the cursor, not always the last
+   * character in the line. */
   if (keycode == '\b' || keycode == 127 || keycode == KEY_BACKSPACE || scancode == 14 || scancode == 0x0E) {
-    if (g_input_len > 0) {
-      g_input[--g_input_len] = '\0';
+    if (g_input_cursor > 0) {
+      memmove(&g_input[g_input_cursor - 1], &g_input[g_input_cursor],
+              (size_t)(g_input_len - g_input_cursor) + 1);
+      g_input_len--;
+      g_input_cursor--;
     }
+    return;
+  }
+
+  /* Delete: remove the character at the cursor, leaving the cursor in place. */
+  if (keycode == KEY_DELETE || scancode == 83 || scancode == 0x53) {
+    if (g_input_cursor < g_input_len) {
+      memmove(&g_input[g_input_cursor], &g_input[g_input_cursor + 1],
+              (size_t)(g_input_len - g_input_cursor - 1) + 1);
+      g_input_len--;
+    }
+    return;
+  }
+
+  /* Left / Right / Home / End: move the cursor without changing the text. */
+  if (keycode == KEY_LEFT || scancode == 75 || scancode == 0x4B) {
+    if (g_input_cursor > 0) g_input_cursor--;
+    return;
+  }
+  if (keycode == KEY_RIGHT || scancode == 77 || scancode == 0x4D) {
+    if (g_input_cursor < g_input_len) g_input_cursor++;
+    return;
+  }
+  if (keycode == KEY_HOME || scancode == 71 || scancode == 0x47) {
+    g_input_cursor = 0;
+    return;
+  }
+  if (keycode == KEY_END || scancode == 79 || scancode == 0x4F) {
+    g_input_cursor = g_input_len;
     return;
   }
 
   /* Tab: Auto-complete */
   if (keycode == '\t' || keycode == KEY_TAB || scancode == 15 || scancode == 0x0F) {
     do_tab_completion();
+    g_input_cursor = g_input_len; /* completion always replaces from the end */
     return;
   }
 
@@ -955,6 +1148,7 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
       strncpy(g_input, g_history[g_hist_idx], MAX_CMD);
       g_input[MAX_CMD] = '\0';
       g_input_len = strlen(g_input);
+      g_input_cursor = g_input_len;
     }
     return;
   }
@@ -971,6 +1165,7 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
       g_input[0] = '\0';
       g_input_len = 0;
     }
+    g_input_cursor = g_input_len;
     return;
   }
 
@@ -1023,8 +1218,14 @@ static void handle_key(unsigned char keycode, unsigned char scancode,
   }
 
   if (c && g_input_len < MAX_CMD - 1) {
-    g_input[g_input_len++] = c;
-    g_input[g_input_len] = '\0';
+    /* Insert at the cursor rather than always appending at the end, so
+     * typing after Left/Home actually edits mid-line instead of tacking
+     * new characters onto the tail regardless of where the cursor is. */
+    memmove(&g_input[g_input_cursor + 1], &g_input[g_input_cursor],
+            (size_t)(g_input_len - g_input_cursor) + 1);
+    g_input[g_input_cursor] = c;
+    g_input_len++;
+    g_input_cursor++;
   }
 }
 
@@ -1046,6 +1247,10 @@ static void parse_terminal_conf_buf(const char *buf) {
     } else if (strncmp(p, "cursor_blink=", 13) == 0) {
       p += 13;
       g_cfg_cursor_blink = atoi(p);
+      while (*p && *p != '\n') p++;
+    } else if (strncmp(p, "line_delay=", 11) == 0) {
+      p += 11;
+      g_cfg_line_delay_ms = atoi(p);
       while (*p && *p != '\n') p++;
     } else {
       while (*p && *p != '\n') p++;

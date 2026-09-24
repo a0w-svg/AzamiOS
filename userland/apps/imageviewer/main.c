@@ -41,8 +41,16 @@
 #include "../shared/ui_kit.h"
 
 #define SERVER_CHAN  1
-#define WIN_W       780
-#define WIN_H       540
+
+/* Opening size only: WIN_W/WIN_H below read the live window, so the
+ * toolbar, canvas, status bar and the zoom-to-fit calculation all follow a
+ * resize or a maximize. They used to be fixed at 780x540, so a maximized
+ * viewer drew its image and chrome into the top-left corner of the window
+ * and left the rest unpainted. */
+#define INIT_W      780
+#define INIT_H      540
+#define WIN_W       ((int)g_win.width)
+#define WIN_H       ((int)g_win.height)
 #define MAP_ADDR    ((void *)0x6A000000)
 
 #define TOOLBAR_H   42
@@ -877,7 +885,7 @@ int main(int argc, char **argv)
             initial_file = "/usr/share/wallpapers/default.ppm";
     }
 
-    if (uk_window_connect(&g_win, "Azami Image Viewer", 100, 80, WIN_W, WIN_H, MAP_ADDR, SERVER_CHAN) < 0) {
+    if (uk_window_connect(&g_win, "Azami Image Viewer", 100, 80, INIT_W, INIT_H, MAP_ADDR, SERVER_CHAN) < 0) {
         fprintf(stderr, "Failed to create Image Viewer window\n");
         return 1;
     }
@@ -898,6 +906,13 @@ int main(int argc, char **argv)
         int r = az_channel_recv(g_win.client_chan, (az_ipc_msg_t *)&msg);
         if (r < 0) break;
         if (r != 0) continue;
+
+        if (msg.type == AZ_WM_WINDOW_RESIZED) {
+            if (!uk_handle_resize(&g_win, &msg)) break;
+            reset_zoom_and_fit();   /* re-fit the image to the new canvas */
+            redraw_all(&g_win);
+            continue;
+        }
 
         if (msg.type == AZ_WM_DESTROY_WINDOW) {
             break;

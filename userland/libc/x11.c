@@ -313,6 +313,7 @@ Window XCreateWindow(Display *display, Window parent, int x, int y,
     req.create.w = width;
     req.create.h = height;
     strncpy(req.create.title, "X11 Application", sizeof(req.create.title) - 1);
+    req.create.pid = (unsigned int)sys_getpid();
 
     if (az_channel_send(st->server_chan, (az_ipc_msg_t *)&req) < 0) {
         return None;

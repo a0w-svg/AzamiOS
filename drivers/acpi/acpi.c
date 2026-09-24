@@ -4,6 +4,7 @@
  * ============================================================================ */
 
 #include "acpi.h"
+#include "power.h"
 #define DEBUG 1
 #include <azami/debug.h>
 #include "../../include/azami/defs.h"
@@ -174,10 +175,8 @@ void acpi_init(void)
 
 void acpi_reboot(void)
 {
-    if (!g_fadt) return;
-    
     /* ACPI 2.0+ Reboot mechanism (RESET_REG_SUP = bit 10 of flags) */
-    if (g_fadt->flags & (1 << 10)) {
+    if (g_fadt && (g_fadt->flags & (1 << 10))) {
         u8 reset_val = g_fadt->reset_value;
         if (g_fadt->reset_reg.address_space == 1) { /* System I/O */
             outb(g_fadt->reset_reg.address, reset_val);
@@ -185,40 +184,37 @@ void acpi_reboot(void)
             volatile u8 *mem = (volatile u8 *)phys_to_virt(g_fadt->reset_reg.address);
             *mem = reset_val;
         }
+        /* Give real hardware a moment to actually reset before assuming the
+         * register write didn't take. */
+        for (volatile int i = 0; i < 1000000; i++) cpu_pause();
     }
-    
-    /* Fallback: 8042 keyboard controller reset */
-    u8 good = 0x02;
-    while (good & 0x02) {
-        good = inb(0x64);
-    }
-    outb(0x64, 0xFE);
-    
-    /* Halt if all fails */
-    while (1) {
-        __asm__ volatile("cli; hlt");
-    }
+
+    /* No FADT, no RESET_REG_SUP, or the reset register didn't work: fall
+     * back to the 8042/CF9/triple-fault sequence power_reboot() already
+     * implements, rather than a second copy of it here. */
+    power_reboot();
 }
 
 void acpi_shutdown(void)
 {
-    if (!g_fadt || !g_fadt->pm1a_cnt_blk) return;
-    
-    /* ACPI Soft-Off uses SLP_EN bit (13) + SLP_TYP */
-    u16 slp_en = 1 << 13;
-    
-    outw(g_fadt->pm1a_cnt_blk, g_slp_typa | slp_en);
-    
-    if (g_fadt->pm1b_cnt_blk) {
-        outw(g_fadt->pm1b_cnt_blk, g_slp_typb | slp_en);
+    if (g_fadt && g_fadt->pm1a_cnt_blk) {
+        /* ACPI Soft-Off uses SLP_EN bit (13) + the real \_S5_-derived SLP_TYP
+         * this file already parsed in parse_s5(), not a chipset-guessed
+         * constant. */
+        u16 slp_en = 1 << 13;
+
+        outw(g_fadt->pm1a_cnt_blk, g_slp_typa | slp_en);
+
+        if (g_fadt->pm1b_cnt_blk) {
+            outw(g_fadt->pm1b_cnt_blk, g_slp_typb | slp_en);
+        }
+        /* Give real hardware a moment to actually power off before assuming
+         * the write didn't take. */
+        for (volatile int i = 0; i < 1000000; i++) cpu_pause();
     }
-    
-    /* Fallback for QEMU/Bochs/VirtualBox if ACPI fails or \_S5_ not found */
-    outw(0xB004, 0x2000); /* Bochs/QEMU */
-    outw(0x604, 0x2000);  /* Older QEMU */
-    outw(0x4004, 0x3400); /* VirtualBox */
-    
-    while (1) {
-        __asm__ volatile("cli; hlt");
-    }
+
+    /* \_S5_ not found, no PM1 control block, or the write didn't take: fall
+     * back to the emulator-magic-port/APM sequence power_shutdown() already
+     * implements, rather than a second copy of it here. */
+    power_shutdown();
 }

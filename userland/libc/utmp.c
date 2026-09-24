@@ -175,10 +175,12 @@ void logwtmp(const char *line, const char *name, const char *host)
     updwtmp(_PATH_WTMPX, &ut);
 }
 
-int login_tty(int fd)
-{
-    setsid();
-    if (dup2(fd, 0) < 0 || dup2(fd, 1) < 0 || dup2(fd, 2) < 0) return -1;
-    if (fd > 2) close(fd);
-    return 0;
-}
+/* login_tty() lives in pty.c (also sets the controlling tty via
+ * ioctl(TIOCSCTTY), which this file's version didn't) — both utmp.h and
+ * pty.h declare the same prototype, so either header pulls in the one
+ * definition. Having it defined twice was silently tolerated for the
+ * static libc.a build (an archive only pulls in whichever member an app
+ * actually needs, so no app happened to need both utmp.o and pty.o at
+ * once) but is a hard multiple-definition-of error for libc.so, which
+ * links every object together unconditionally. Found while building the
+ * PIC shared libc. */

@@ -7,6 +7,7 @@
 #include "../../include/azami/debug.h"
 #include "../../include/azami/defs.h"
 #include "piix4_pm.h"
+#include "acpi.h"
 #include "../../hal/pci.h"
 #include "../base/pci_bus.h"
 #include "../../fs/vfs.h"
@@ -28,19 +29,16 @@ void piix4_pm_poweroff(void)
 {
     pr_debug("[PIIX4_PM] Initiating ACPI S5 Soft Poweroff...\n");
 
-    if (g_piix4_pm_ready && g_piix4_pm_base != 0) {
-        /* PIIX4 PM1a_CNT S5 sleep state: SLP_TYP = 5, SLP_EN = 1 */
-        outw(g_piix4_pm_base + PIIX4_PM_PM1_CNT, PIIX4_PM1_SLP_TYP_S5 | PIIX4_PM1_SLP_EN);
-        for (volatile int i = 0; i < 50000; i++) cpu_pause();
-        outw(g_piix4_pm_base + PIIX4_PM_PM1_CNT, 0x2000);
-    }
-
-    /* Fallback known ports */
-    outw(0x604, 0x2000);
-    outw(0xB004, 0x2000);
-    outw(0x4004, 0x3400);
-
-    cpu_halt_loop();
+    /* SLP_TYP for S5 is whatever the firmware's DSDT \_S5_ package encodes,
+     * not a chipset-fixed value -- acpi_init() already parsed the real
+     * SLP_TYPa/SLP_TYPb out of it (see parse_s5() in acpi.c). Delegate to
+     * acpi_shutdown() instead of writing a guessed SLP_TYP=5 here: it uses
+     * that real value, writes the same PM1a_CNT register (PIIX4's FADT
+     * advertises PM1a_CNT_BLK as this same I/O port), and already falls back
+     * to the legacy emulator-port sequence if ACPI turns out to be
+     * unavailable, so nothing is lost by not duplicating that fallback here
+     * a third time. */
+    acpi_shutdown();
 }
 
 /* ── Character Device Operations for /dev/acpi_pm ────────────────────────── */

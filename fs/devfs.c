@@ -21,6 +21,12 @@ typedef struct {
     u32 mode; /* S_IFCHR or S_IFBLK */
     u64 rdev; /* MKDEV(major, minor), computed once at registration */
     inode_t *inode;
+    /* A slot stays allocated once used: its inode may still be reachable
+     * from an open file or a cached dentry, so the storage cannot be
+     * recycled out from under them. `present` is what /dev actually shows.
+     * Re-registering the same name reuses — and revives — its slot, which
+     * is what a partition re-read or a losetup detach/attach cycle does. */
+    bool present;
 } devfs_node_t;
 
 static spinlock_t g_devfs_lock = SPINLOCK_INIT;
@@ -184,6 +190,10 @@ static u64 devfs_assign_rdev(const char *name, u32 mode)
     if (devfs_numbered_disk_rdev(name, "nvme", 16, &minor)) return MKDEV(259, minor);
     if (devfs_numbered_rdev(name, "sr",   &n)) return MKDEV(11, n);
     if (devfs_numbered_rdev(name, "loop", &n)) return MKDEV(7, n);
+    /* RAM disks are block major 1 (block and char majors are separate
+     * namespaces, so this does not clash with the char major 1 mem family
+     * listed above — st_rdev is always read together with st_mode). */
+    if (devfs_numbered_rdev(name, "ram", &n)) return MKDEV(1, n);
     if (devfs_numbered_rdev(name, "dri/card", &n)) return MKDEV(226, n);
     if (strncmp(name, "dri/renderD", 11) == 0 && devfs_parse_uint(name + 11, &n))
         return MKDEV(226, n);
@@ -196,6 +206,75 @@ static u64 devfs_assign_rdev(const char *name, u32 mode)
     return MKDEV(DEVFS_MISC_MAJOR, s_next_misc_minor++);
 }
 
+/* devfs_set_size() — give a /dev node an st_size.
+ *
+ * A block device's inode used to report size 0, which is not a cosmetic
+ * problem: lseek(fd, 0, SEEK_END) computes from i_size, so seeking to the
+ * end of a disk landed at offset 0, and every tool that sizes a device that
+ * way (dd, mkfs, fdisk's fallback path, `wc -c </dev/sda`) read it as empty.
+ * Returns 0 on success, -1 if no such node. */
+int devfs_set_size(const char *name, u64 size)
+{
+    if (!name) return -1;
+    int rc = -1;
+    spinlock_lock(&g_devfs_lock);
+    for (u32 i = 0; i < g_device_count; i++) {
+        if (strcmp(g_devices[i].name, name) != 0) continue;
+        if (g_devices[i].inode) g_devices[i].inode->i_size = size;
+        rc = 0;
+        break;
+    }
+    spinlock_unlock(&g_devfs_lock);
+    return rc;
+}
+
+/* devfs_unregister_device() — take a node out of /dev.
+ *
+ * Needed by anything whose devices come and go: a partition re-read after
+ * BLKRRPART, `losetup -d`, a hot-unplugged disk. The inode is deliberately
+ * kept alive — a process may still hold the device open, and yanking the
+ * inode would turn its next read into a use-after-free — so the slot is
+ * only marked absent. It revives if the same name registers again. */
+int devfs_unregister_device(const char *name)
+{
+    if (!name) return -1;
+    int rc = -1;
+    spinlock_lock(&g_devfs_lock);
+    for (u32 i = 0; i < g_device_count; i++) {
+        if (strcmp(g_devices[i].name, name) != 0) continue;
+        g_devices[i].present = false;
+        rc = 0;
+        break;
+    }
+    spinlock_unlock(&g_devfs_lock);
+    return rc;
+}
+
+/* devfs_lookup_rdev() — find the driver registered for a device number.
+ *
+ * This is what makes a device node created by mknod(2) on a real filesystem
+ * behave like a device instead of an empty file. A node on ext2 or tmpfs
+ * carries only its major/minor; its inode's i_fop belongs to the filesystem
+ * that stores it, which knows nothing about drivers. Resolving the number
+ * through this registry is how Linux does it too, and it is why
+ * `mknod /dev/null c 1 3` on a fresh root filesystem produces a working
+ * /dev/null. Returns 0 on a hit, -1 if no driver claims that number. */
+int devfs_lookup_rdev(u64 rdev, file_operations_t **out_fops, void **out_priv)
+{
+    if (!rdev) return -1;
+    int rc = -1;
+    spinlock_lock(&g_devfs_lock);
+    for (u32 i = 0; i < g_device_count; i++) {
+        if (!g_devices[i].present || g_devices[i].rdev != rdev) continue;
+        if (out_fops) *out_fops = g_devices[i].fops;
+        if (out_priv) *out_priv = g_devices[i].private_data;
+        rc = 0;
+        break;
+    }
+    spinlock_unlock(&g_devfs_lock);
+    return rc;
+}
+
 /* devfs_get_rdev() — the device number a /dev node was assigned at
  * registration (see vfs.h). Used by disk-backed filesystems' mount() to
  * give their superblock the same st_dev their block device already
@@ -206,7 +285,7 @@ u64 devfs_get_rdev(const char *name)
     u64 rdev = 0;
     spinlock_lock(&g_devfs_lock);
     for (u32 i = 0; i < g_device_count; i++) {
-        if (strcmp(g_devices[i].name, name) == 0) {
+        if (g_devices[i].present && strcmp(g_devices[i].name, name) == 0) {
             rdev = g_devices[i].rdev;
             break;
         }
@@ -231,6 +310,7 @@ int devfs_register_device(const char *name, file_operations_t *fops, void *priva
         if (strcmp(g_devices[i].name, name) == 0) {
             g_devices[i].fops = fops;
             g_devices[i].private_data = private_data;
+            g_devices[i].present = true;
             if (g_devices[i].inode) {
                 g_devices[i].inode->i_fop = fops;
                 g_devices[i].inode->i_private = private_data;
@@ -245,6 +325,7 @@ int devfs_register_device(const char *name, file_operations_t *fops, void *priva
     node->fops = fops;
     node->private_data = private_data;
     node->mode = S_IFCHR;
+    node->present = true;
     node->rdev = devfs_assign_rdev(node->name, node->mode);
 
     node->inode = (inode_t *)kzalloc(sizeof(inode_t));
@@ -274,6 +355,7 @@ int devfs_register_block_device(const char *name, file_operations_t *fops, void 
         if (strcmp(g_devices[i].name, name) == 0) {
             g_devices[i].fops = fops;
             g_devices[i].private_data = private_data;
+            g_devices[i].present = true;
             if (g_devices[i].inode) {
                 g_devices[i].inode->i_fop = fops;
                 g_devices[i].inode->i_private = private_data;
@@ -288,6 +370,7 @@ int devfs_register_block_device(const char *name, file_operations_t *fops, void 
     node->fops = fops;
     node->private_data = private_data;
     node->mode = S_IFBLK;
+    node->present = true;
     node->rdev = devfs_assign_rdev(node->name, node->mode);
 
     node->inode = (inode_t *)kzalloc(sizeof(inode_t));
@@ -379,6 +462,7 @@ dentry_t *devfs_lookup(struct inode *dir, struct dentry *dentry)
 
     spinlock_lock(&g_devfs_lock);
     for (u32 i = 0; i < g_device_count; i++) {
+        if (!g_devices[i].present) continue;
         if (strcmp(full, g_devices[i].name) == 0) {
             if (!g_devices[i].inode) {
                 g_devices[i].inode = (inode_t *)kzalloc(sizeof(inode_t));
@@ -403,6 +487,7 @@ dentry_t *devfs_lookup(struct inode *dir, struct dentry *dentry)
     size_t flen = strlen(full);
     for (u32 i = 0; i < g_device_count; i++) {
         const char *n = g_devices[i].name;
+        if (!g_devices[i].present) continue;
         if (strncmp(n, full, flen) == 0 && n[flen] == '/') {
             dentry->d_inode = devfs_get_dir_inode(dir->i_sb, full);
             spinlock_unlock(&g_devfs_lock);
@@ -431,6 +516,7 @@ static s64 devfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u6
     spinlock_lock(&g_devfs_lock);
     for (u32 i = 0; i < g_device_count && nents < ARRAY_SIZE(ents); i++) {
         const char *n = g_devices[i].name;
+        if (!g_devices[i].present) continue;
 
         if (plen) {
             if (strncmp(n, prefix, plen) != 0 || n[plen] != '/') continue;

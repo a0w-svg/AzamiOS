@@ -17,6 +17,11 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <sys/auxv.h>
+#include <sys/time.h>
+#include <sys/syscall.h>
+#include <sys/timex.h>
+#include <sched.h>
+#include <elf.h>
 
 static int pass, fail;
 #define T(cond, name) do { \
@@ -25,6 +30,35 @@ static int pass, fail;
 } while (0)
 
 static void *thread_fn(void *arg) { return (void *)((long)arg + 1); }
+
+static long long ts_ns(const struct timespec *t) { return t->tv_sec * 1000000000LL + t->tv_nsec; }
+
+/* Resolve a symbol in the vDSO the way libc does: walk its dynamic section. */
+static void *vdso_sym(const char *name)
+{
+    unsigned long base = getauxval(AT_SYSINFO_EHDR);
+    if (!base) return NULL;
+    Elf64_Ehdr *eh = (Elf64_Ehdr *)base;
+    Elf64_Phdr *ph = (Elf64_Phdr *)(base + eh->e_phoff);
+    Elf64_Dyn *dyn = NULL;
+    long load = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_LOAD) load = base + ph[i].p_offset - ph[i].p_vaddr;
+        if (ph[i].p_type == PT_DYNAMIC) dyn = (Elf64_Dyn *)(base + ph[i].p_offset);
+    }
+    if (!dyn) return NULL;
+    Elf64_Sym *sym = NULL; const char *str = NULL; Elf32_Word *hash = NULL;
+    for (; dyn->d_tag != DT_NULL; dyn++) {
+        if (dyn->d_tag == DT_SYMTAB) sym  = (Elf64_Sym *)(load + dyn->d_un.d_ptr);
+        if (dyn->d_tag == DT_STRTAB) str  = (const char *)(load + dyn->d_un.d_ptr);
+        if (dyn->d_tag == DT_HASH)   hash = (Elf32_Word *)(load + dyn->d_un.d_ptr);
+    }
+    if (!sym || !str || !hash) return NULL;
+    for (Elf32_Word i = 0; i < hash[1]; i++)
+        if (sym[i].st_shndx != SHN_UNDEF && strcmp(str + sym[i].st_name, name) == 0)
+            return (void *)(load + sym[i].st_value);
+    return NULL;
+}
 static volatile sig_atomic_t got_sig;
 static void handler(int s) { got_sig = s; }
 
@@ -105,6 +139,95 @@ int main(int argc, char **argv, char **envp)
     T(t0 > 0, "time()");
     struct timespec req = { 0, 20 * 1000 * 1000 };
     T(nanosleep(&req, NULL) == 0, "nanosleep 20ms");
+
+    printf("-- vDSO / clocks --\n");
+    T(getauxval(AT_SYSINFO_EHDR) != 0, "AT_SYSINFO_EHDR present");
+    int (*vgt)(clockid_t, struct timespec *) = vdso_sym("__vdso_clock_gettime");
+    T(vgt != NULL, "vdso exports __vdso_clock_gettime");
+    T(vdso_sym("__vdso_gettimeofday") && vdso_sym("__vdso_getcpu") && vdso_sym("__vdso_time"),
+      "vdso exports gettimeofday/getcpu/time");
+    if (vgt) {
+        struct timespec a, b, k;
+        T(vgt(CLOCK_MONOTONIC, &a) == 0, "vdso clock_gettime MONOTONIC");
+        syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &k);
+        T(vgt(CLOCK_MONOTONIC, &b) == 0 && ts_ns(&a) <= ts_ns(&k) && ts_ns(&k) <= ts_ns(&b),
+          "vdso and syscall MONOTONIC agree and are ordered");
+        struct timespec vr, sr;
+        vgt(CLOCK_REALTIME, &vr);
+        syscall(SYS_clock_gettime, CLOCK_REALTIME, &sr);
+        long long d = ts_ns(&sr) - ts_ns(&vr);
+        T(d >= 0 && d < 50000000LL, "vdso and syscall REALTIME agree (<50ms)");
+        T(vr.tv_sec > 1600000000L, "REALTIME is a plausible date");
+        /* 100k calls: fast path must not be a disguised syscall per call. */
+        struct timespec t0, t1, tmp;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        long long prev = 0; int mono_ok = 1;
+        for (int i = 0; i < 100000; i++) {
+            vgt(CLOCK_MONOTONIC, &tmp);
+            long long n = ts_ns(&tmp);
+            if (n < prev) mono_ok = 0;
+            prev = n;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        T(mono_ok, "MONOTONIC never goes backwards (100k reads)");
+        printf("  vdso clock_gettime: %lld ns/call\n", (ts_ns(&t1) - ts_ns(&t0)) / 100000);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < 20000; i++) syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &tmp);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        printf("  syscall clock_gettime: %lld ns/call\n", (ts_ns(&t1) - ts_ns(&t0)) / 20000);
+    }
+    struct timespec c1, c2;
+    T(clock_gettime(CLOCK_MONOTONIC_COARSE, &c1) == 0, "clock_gettime MONOTONIC_COARSE");
+    T(clock_gettime(CLOCK_MONOTONIC_RAW, &c1) == 0, "clock_gettime MONOTONIC_RAW");
+    T(clock_gettime(CLOCK_BOOTTIME, &c1) == 0, "clock_gettime BOOTTIME");
+    T(clock_gettime(CLOCK_TAI, &c1) == 0, "clock_gettime TAI");
+    T(clock_gettime(12345, &c1) == -1 && errno == EINVAL, "clock_gettime bad id -> EINVAL");
+    T(clock_getres(CLOCK_MONOTONIC, &c1) == 0 && c1.tv_sec == 0 && c1.tv_nsec > 0 && c1.tv_nsec <= 1000,
+      "clock_getres MONOTONIC is high-resolution");
+    struct timeval tv;
+    T(gettimeofday(&tv, NULL) == 0 && tv.tv_sec > 1600000000L, "gettimeofday");
+    unsigned cpu = 999, node = 999;
+    long (*vgc)(unsigned *, unsigned *, void *) = vdso_sym("__vdso_getcpu");
+    T(vgc && vgc(&cpu, &node, NULL) == 0 && cpu < 64 && node == 0, "vdso getcpu");
+    unsigned scpu = 999;
+    T(syscall(SYS_getcpu, &scpu, NULL, NULL) == 0 && scpu < 64, "getcpu syscall");
+    T(sched_getcpu() >= 0, "sched_getcpu");
+
+    /* CPU-time clocks: spin ~30ms and require the thread clock to advance
+     * by a sensible amount (not 0, not wall time). */
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
+    struct timespec w0, w1;
+    clock_gettime(CLOCK_MONOTONIC, &w0);
+    do { clock_gettime(CLOCK_MONOTONIC, &w1); } while (ts_ns(&w1) - ts_ns(&w0) < 30000000LL);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c2);
+    long long used = ts_ns(&c2) - ts_ns(&c1);
+    printf("  thread cputime over 30ms spin: %lld us\n", used / 1000);
+    T(used > 5000000LL && used <= ts_ns(&w1) - ts_ns(&w0) + 1000000LL, "THREAD_CPUTIME advances while running");
+    T(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &c2) == 0 && ts_ns(&c2) >= used, "PROCESS_CPUTIME >= thread time");
+    clockid_t pcid;
+    T(clock_getcpuclockid(getpid(), &pcid) == 0 && clock_gettime(pcid, &c1) == 0, "clock_getcpuclockid(getpid())");
+
+    /* Sleeps: never short, and a 1ms sleep must not cost a whole 10ms tick. */
+    struct timespec s0, s1, req1 = { 0, 1000000 };
+    clock_gettime(CLOCK_MONOTONIC, &s0);
+    T(nanosleep(&req1, NULL) == 0, "nanosleep 1ms");
+    clock_gettime(CLOCK_MONOTONIC, &s1);
+    long long slept = ts_ns(&s1) - ts_ns(&s0);
+    printf("  nanosleep(1ms) took %lld us\n", slept / 1000);
+    T(slept >= 1000000LL, "nanosleep never returns early");
+    struct timespec abs_t;
+    clock_gettime(CLOCK_MONOTONIC, &abs_t);
+    long long target = ts_ns(&abs_t) + 15000000LL;
+    abs_t.tv_sec = target / 1000000000LL; abs_t.tv_nsec = target % 1000000000LL;
+    T(clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &abs_t, NULL) == 0, "clock_nanosleep TIMER_ABSTIME");
+    clock_gettime(CLOCK_MONOTONIC, &s1);
+    T(ts_ns(&s1) >= target && ts_ns(&s1) - target < 30000000LL, "absolute sleep ends at the deadline");
+    struct timespec past = { 1, 0 };
+    T(clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &past, NULL) == 0, "absolute sleep in the past returns at once");
+
+    struct timex tx = { 0 };
+    int st = adjtimex(&tx);
+    T(st >= 0 && tx.tick == 10000, "adjtimex read-only query");
 
     printf("-- signals --\n");
     T(signal(SIGUSR1, handler) != SIG_ERR, "signal(SIGUSR1)");

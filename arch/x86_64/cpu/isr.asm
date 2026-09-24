@@ -117,6 +117,10 @@ ISR_NOERRCODE 255
 ; ── TLB shootdown IPI (vector 251) ───────────────────────────────────────────
 ISR_NOERRCODE 251
 
+; ── SMP emergency-stop IPI (vector 252, SMP_VEC_STOP) ────────────────────────
+; The %rep block below only reaches 250, so this one needs its own stub.
+ISR_NOERRCODE 252
+
 ; ── BUG-D fix: isr_spurious ──────────────────────────────────────────────────
 ; Safe fallback for unregistered vectors 50–250.  The old fallback was isr_0
 ; (#DE), which dispatched to the exception handler and could kill a user process

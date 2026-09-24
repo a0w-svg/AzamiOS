@@ -1123,7 +1123,7 @@ char *getenv(const char *name)
     if (strcmp(name, "PATH") == 0) return "/bin:/sbin:/usr/bin:/usr/sbin:/";
     if (strcmp(name, "USER") == 0) return "root";
     if (strcmp(name, "HOME") == 0) return "/root";
-    if (strcmp(name, "SHELL") == 0) return "/bin/sh.elf";
+    if (strcmp(name, "SHELL") == 0) return "/bin/sh";
     if (strcmp(name, "TERM") == 0) return "azami";
     return NULL;
 }
@@ -1214,8 +1214,8 @@ int system(const char *command)
     int pid = sys_fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        char *const argv[] = { "/bin/sh.elf", "-c", (char *)command, NULL };
-        sys_execve("/bin/sh.elf", argv, environ);
+        char *const argv[] = { "/bin/sh", "-c", (char *)command, NULL };
+        sys_execve("/bin/sh", argv, environ);
         sys_execve("/sh.elf", argv, environ);
         _exit(127);
     }

@@ -3,7 +3,7 @@
  * File: userland/apps/sysmon/main.c
  *
  * Features:
- *  • Real-time 4-Core SMP CPU telemetry bars & rolling history curves
+ *  • Real-time SMP CPU telemetry bars & rolling history curves (up to 4 cores)
  *  • Physical memory consumption meter + memory history curve
  *  • Storage meters for Root FS (/) and SATA Hard Drive (/hdd)
  *  • Active Process List with PID, name, state, and interactive "End Task"
@@ -43,7 +43,16 @@ static az_sysstat_t g_last_stat;
 
 /* Rolling history for CPU cores and memory */
 #define HIST_LEN  36
-static unsigned int g_cpu_hist[4][HIST_LEN];
+#define MAX_CORE_ROWS 4
+/* Real online CPU count (sysconf(_SC_NPROCESSORS_ONLN), itself backed by the
+ * kernel's actual SMP enumeration), clamped to how many rows this window's
+ * fixed layout has room for. This used to be a flat 4 everywhere below,
+ * which drew fake "Core N: 0%" bars for CPUs that don't exist on a machine
+ * with fewer real cores, and silently dropped any beyond 4 on one with
+ * more -- see az_sysstat_t's real per-core arrays (up to 16) in
+ * kernel/syscall/syscall.c's SYS_AZ_SYSSTAT handler. */
+static int g_ncpus = MAX_CORE_ROWS;
+static unsigned int g_cpu_hist[MAX_CORE_ROWS][HIST_LEN];
 static unsigned int g_mem_hist[HIST_LEN];
 static unsigned int g_mem_used_kb = 0;
 static unsigned int g_mem_total_kb = 0;
@@ -69,7 +78,7 @@ static int g_proc_count = 0;
 static int g_selected_proc = 0;
 static int g_proc_scroll = 0;
 
-static const unsigned int g_core_colors[4] = {
+static const unsigned int g_core_colors[MAX_CORE_ROWS] = {
     UK_TEAL, UK_MAUVE, UK_BLUE, UK_PEACH
 };
 
@@ -174,7 +183,7 @@ static void draw_sysmon(void)
     uk_draw_section_header(&g_win, 12, py, 280, "CPU Core Activity", UK_TEAL);
     py += 22;
 
-    for (int c = 0; c < 4; c++) {
+    for (int c = 0; c < g_ncpus; c++) {
         char core_str[32];
         unsigned int cur_cpu = g_cpu_hist[c][(g_tick + HIST_LEN - 1) % HIST_LEN];
         snprintf(core_str, sizeof(core_str), "Core %d: %3u%%", c, cur_cpu);
@@ -322,7 +331,7 @@ static void update_telemetry(void)
     az_sysstat_t cur_stat;
     syscall1(SYS_AZ_SYSSTAT, (long)&cur_stat);
 
-    for (int cc = 0; cc < 4; cc++) {
+    for (int cc = 0; cc < g_ncpus; cc++) {
         unsigned long long cur_idle = cur_stat.idle_ticks[cc];
         unsigned long long cur_active = cur_stat.active_ticks[cc];
         unsigned long long last_idle = g_last_stat.idle_ticks[cc];
@@ -348,10 +357,15 @@ int main(int argc, char **argv)
     (void)argc; (void)argv;
     puts("[sysmon] Starting v4.0...");
 
+    long real_ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (real_ncpus < 1) real_ncpus = 1;
+    if (real_ncpus > MAX_CORE_ROWS) real_ncpus = MAX_CORE_ROWS;
+    g_ncpus = (int)real_ncpus;
+
     syscall1(SYS_AZ_SYSSTAT, (long)&g_last_stat);
 
     update_telemetry();
-    for (int c = 0; c < 4; c++)
+    for (int c = 0; c < g_ncpus; c++)
         for (int i = 0; i < HIST_LEN; i++)
             g_cpu_hist[c][i] = g_cpu_hist[c][0];
 

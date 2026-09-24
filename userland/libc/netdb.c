@@ -19,10 +19,16 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 
-#define DEFAULT_DNS_IP "8.8.8.8"
 #define DNS_PORT       53
 
-static void dns_get_nameserver(char *out_ip, size_t max_len)
+/* Discovers the resolver's nameserver from live system configuration —
+ * /etc/resolv.conf first, then the kernel's own SIOCGIFDNS target (whatever
+ * DHCP negotiated or the user set statically) — and nothing else. There is
+ * intentionally no baked-in server here: if neither source has one
+ * configured, resolution should fail rather than silently querying some
+ * guessed-at public server the caller never asked for. Returns 0 and fills
+ * out_ip on success, -1 if no nameserver is configured anywhere. */
+int res_get_nameserver(char *out_ip, size_t max_len)
 {
     /* 1. Try reading /etc/resolv.conf */
     int fd = open("/etc/resolv.conf", O_RDONLY, 0);
@@ -41,7 +47,7 @@ static void dns_get_nameserver(char *out_ip, size_t max_len)
                     if (*ip_str) {
                         strncpy(out_ip, ip_str, max_len - 1);
                         out_ip[max_len - 1] = '\0';
-                        return;
+                        return 0;
                     }
                 }
                 line = strtok(NULL, "\r\n");
@@ -58,15 +64,14 @@ static void dns_get_nameserver(char *out_ip, size_t max_len)
                 snprintf(out_ip, max_len, "%u.%u.%u.%u",
                          dns_bytes[0], dns_bytes[1], dns_bytes[2], dns_bytes[3]);
                 close(net_fd);
-                return;
+                return 0;
             }
         }
         close(net_fd);
     }
 
-    /* 3. Fallback */
-    strncpy(out_ip, DEFAULT_DNS_IP, max_len - 1);
-    out_ip[max_len - 1] = '\0';
+    /* No nameserver configured anywhere. */
+    return -1;
 }
 
 typedef struct __attribute__((packed)) {
@@ -129,30 +134,13 @@ static int dns_check_hosts_file(const char *hostname, struct in_addr *out_addr)
     return -1;
 }
 
-static int dns_resolve_ipv4(const char *hostname, struct in_addr *out_addr)
+/* Sends a single Type A query for `hostname` to `dns_ip_str` and parses the
+ * first A record out of the reply. This is the actual wire-protocol
+ * resolver; both the auto-discovered path (dns_resolve_ipv4) and an
+ * explicit caller-chosen server (res_resolve_via, used by nslookup) funnel
+ * through here so there is exactly one DNS client implementation. */
+static int dns_query_server(const char *hostname, const char *dns_ip_str, struct in_addr *out_addr)
 {
-    if (!hostname || !out_addr) return -1;
-
-    /* 1. Direct numeric IPv4 check */
-    if (inet_pton(AF_INET, hostname, out_addr) == 1) {
-        return 0;
-    }
-
-    /* 2. Localhost lookup */
-    if (strcmp(hostname, "localhost") == 0) {
-        out_addr->s_addr = htonl(0x7f000001); /* 127.0.0.1 */
-        return 0;
-    }
-
-    /* 3. Static /etc/hosts file check */
-    if (dns_check_hosts_file(hostname, out_addr) == 0) {
-        return 0;
-    }
-
-    /* 4. Dynamic DNS server lookup from system configuration */
-    char dns_ip_str[64];
-    dns_get_nameserver(dns_ip_str, sizeof(dns_ip_str));
-
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) return -1;
 
@@ -238,6 +226,50 @@ static int dns_resolve_ipv4(const char *hostname, struct in_addr *out_addr)
     }
 
     return -1;
+}
+
+static int dns_resolve_ipv4(const char *hostname, struct in_addr *out_addr)
+{
+    if (!hostname || !out_addr) return -1;
+
+    /* 1. Direct numeric IPv4 check */
+    if (inet_pton(AF_INET, hostname, out_addr) == 1) {
+        return 0;
+    }
+
+    /* 2. Localhost lookup */
+    if (strcmp(hostname, "localhost") == 0) {
+        out_addr->s_addr = htonl(0x7f000001); /* 127.0.0.1 */
+        return 0;
+    }
+
+    /* 3. Static /etc/hosts file check */
+    if (dns_check_hosts_file(hostname, out_addr) == 0) {
+        return 0;
+    }
+
+    /* 4. Dynamic DNS server lookup from system configuration; fail rather
+     * than guess if nothing is configured. */
+    char dns_ip_str[64];
+    if (res_get_nameserver(dns_ip_str, sizeof(dns_ip_str)) != 0) {
+        return -1;
+    }
+
+    return dns_query_server(hostname, dns_ip_str, out_addr);
+}
+
+/* Resolves `hostname` against a caller-specified DNS server, bypassing
+ * whatever the system has configured — used by tools like nslookup that let
+ * the user name an explicit server on the command line. */
+int res_resolve_via(const char *hostname, const char *server_ip, struct in_addr *out_addr)
+{
+    if (!hostname || !server_ip || !out_addr) return -1;
+
+    if (inet_pton(AF_INET, hostname, out_addr) == 1) {
+        return 0;
+    }
+
+    return dns_query_server(hostname, server_ip, out_addr);
 }
 
 static struct hostent g_hostent;

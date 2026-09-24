@@ -6,7 +6,10 @@
 
 #define _PATH_DEFPATH  "/usr/bin:/bin"
 #define _PATH_STDPATH  "/usr/bin:/bin:/usr/sbin:/sbin"
-#define _PATH_BSHELL   "/bin/sh.elf"
+/* /bin/sh is GNU bash on this system (the small native shell is still
+ * installed, as /bin/azami-sh.elf). Naming /bin/sh rather than either
+ * of them keeps this correct whichever one the image was built with. */
+#define _PATH_BSHELL   "/bin/sh"
 #define _PATH_DEVNULL  "/dev/null"
 #define _PATH_TTY      "/dev/tty"
 #define _PATH_DEV      "/dev/"

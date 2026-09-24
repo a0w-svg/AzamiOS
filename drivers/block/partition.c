@@ -132,7 +132,11 @@ void block_scan_partitions(block_dev_t *parent)
 
         snprintf(part_dev->name, sizeof(part_dev->name), "%sp%d", parent->name, i + 1);
         part_dev->sector_size  = parent->sector_size;
+        part_dev->phys_sector_size = parent->phys_sector_size;
         part_dev->sector_count = entry->sector_count;
+        part_dev->start_lba    = entry->lba_start;
+        part_dev->parent       = parent;
+        part_dev->flags        = parent->flags;
         part_dev->ops          = &g_partition_ops;
         part_dev->driver_data  = pdata;
 

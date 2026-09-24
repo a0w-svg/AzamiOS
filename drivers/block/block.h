@@ -32,9 +32,18 @@ typedef struct block_ops {
 
 typedef struct block_dev {
     char        name[32];
-    u32         sector_size;   /* Typically 512 bytes */
+    u32         sector_size;   /* Logical sector size, typically 512 bytes */
+    u32         phys_sector_size; /* Physical/atomic write unit; 0 means "same
+                                   * as sector_size". 4 KiB on an Advanced
+                                   * Format disk, which is what BLKPBSZGET
+                                   * reports and what mkfs aligns to. */
     u64         sector_count;  /* Total sectors on device */
+    u64         start_lba;     /* First sector within the parent disk; 0 for a
+                                * whole disk. HDIO_GETGEO reports it and
+                                * /proc/partitions uses it to order rows. */
     u64         rdev;          /* devfs_get_rdev(name) once registered, else 0 */
+    u32         flags;         /* BLKDEV_* below */
+    struct block_dev *parent;  /* Whole disk this partition belongs to, else NULL */
     block_ops_t *ops;
     void        *driver_data;  /* Driver-specific private data (e.g., Ramdisk base or AHCI port) */
     struct block_dev *next;
@@ -73,3 +82,33 @@ block_dev_t *block_ramdisk_init(phys_addr_t phys_base, size_t size);
 
 /** block_ahci_init() — Initialize AHCI controller and register sata/ahci block devices. */
 void block_ahci_init(void);
+
+/* ── Block device flags ─────────────────────────────────────────────────── */
+#define BLKDEV_RO          0x0001u   /* BLKROSET set it; writes return -EPERM */
+#define BLKDEV_ROTATIONAL  0x0002u   /* spinning media (BLKROTATIONAL)        */
+#define BLKDEV_REMOVABLE   0x0004u   /* floppy, optical, USB, loop            */
+
+/** block_dev_unregister(dev) — remove a block device from the registry and
+ *  from /dev. Used when the media behind it goes away: a partition table
+ *  re-read (BLKRRPART) drops the old partition devices before creating the
+ *  new ones, and `losetup -d` drops a loop device. The block_dev_t itself
+ *  is freed; anything still holding the device open keeps a live inode but
+ *  its fops see a NULL driver and fail cleanly. Returns 0, or -ENODEV. */
+s64 block_dev_unregister(block_dev_t *dev);
+
+/** block_drop_partitions(parent) — unregister every partition device that
+ *  block_scan_partitions() created for @parent. */
+void block_drop_partitions(block_dev_t *parent);
+
+/** block_scan_partitions(parent) — read @parent's MBR and register a child
+ *  block device per partition. Defined in drivers/block/partition.c. */
+void block_scan_partitions(block_dev_t *parent);
+
+/** block_format_proc_partitions() — the body of /proc/partitions (no
+ *  header line), one row per registered device. Returns bytes written. */
+size_t block_format_proc_partitions(char *buf, size_t max);
+
+/** block_dev_first()/block_dev_next() — iterate the registry. Used by
+ *  /proc/partitions and the sysfs /sys/block tree. */
+block_dev_t *block_dev_first(void);
+block_dev_t *block_dev_next(block_dev_t *dev);

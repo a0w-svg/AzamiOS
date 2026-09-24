@@ -133,9 +133,10 @@ dm_bus_t dm_pci_bus = {
 int pci_driver_register(pci_driver_t *pdrv)
 {
     if (!pdrv || !pdrv->id_table) return -EINVAL;
-    pdrv->drv.bus       = &dm_pci_bus;
-    pdrv->drv.id_table  = pdrv->id_table;
-    pdrv->drv.remove    = pci_bus_remove;
+    pdrv->drv.bus         = &dm_pci_bus;
+    pdrv->drv.id_table    = pdrv->id_table;
+    pdrv->drv.remove      = pci_bus_remove;
+    pdrv->drv.probe_async = true;
     return dm_driver_register(&pdrv->drv);
 }
 

@@ -17,6 +17,7 @@
 #include "../../kernel/lib/string.h"
 #include "../../kernel/lib/random.h"
 #include "../../arch/x86_64/cpu/hwaccel.h"
+#include "../../arch/x86_64/vdso/vdso.h"
 
 #define USER_STACK_TOP      0x00007fffffffe000ULL
 #define USER_STACK_PAGES    64
@@ -68,7 +69,7 @@ static void get_random_bytes(void *buf, size_t n)
 static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t top_page_phys,
                             const char *exec_path, const char *const argv[], const char *const envp[],
                             u64 main_entry, u64 phdr_vaddr, u64 phnum, u64 phent, u64 interp_base,
-                            u64 stack_top, u64 *out_rsp)
+                            u64 stack_top, u64 vdso_base, u64 *out_rsp)
 {
     (void)user_space;
     char *kstack = (char *)PHYS_TO_VIRT(top_page_phys);
@@ -87,7 +88,7 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
                              *(u64 *)(kstack + top_offset) = (u64)(v); } while (0)
 
     /* Number of auxv (key,value) pairs written below — keep in sync. */
-    #define AUX_PAIRS 19
+    #define AUX_PAIRS 20
 
     /* Determine argc / envc up front so the string loops can reserve the exact
      * space the fixed structure (argc + pointer arrays + auxv) will need. */
@@ -159,6 +160,8 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
 
     /* ── Auxiliary Vector Table (Standard Linux AMD64 auxv, written high→low) ─ */
     PUSHQ(0);                               PUSHQ(AT_NULL);
+    /* Without a vDSO the pair is AT_IGNORE, keeping AUX_PAIRS exact. */
+    PUSHQ(vdso_base);                       PUSHQ(vdso_base ? AT_SYSINFO_EHDR : AT_IGNORE);
     PUSHQ(u_platform_ptr);                  PUSHQ(AT_PLATFORM);
     PUSHQ(u_execfn_ptr);                    PUSHQ(AT_EXECFN);
     PUSHQ(u_random_ptr);                    PUSHQ(AT_RANDOM);
@@ -524,11 +527,37 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
                 if (ilen >= (s64)sizeof(interp_path)) ilen = sizeof(interp_path) - 1;
                 interp_path[ilen] = '\0';
 
-                file_t *ifile = vfs_open(interp_path, 0, 0);
-                if (!ifile) ifile = vfs_open("/lib64/ld-linux-x86-64.so.2", 0, 0);
-                if (!ifile) ifile = vfs_open("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", 0, 0);
-                if (!ifile) ifile = vfs_open("/lib/ld.so", 0, 0);
-                if (!ifile) ifile = vfs_open("/bin/ld.so", 0, 0);
+                /* Try the path the binary embeds first, then a prioritised list
+                 * of well-known locations that covers glibc, musl, and custom
+                 * AzamiOS installations.  The loop tries each in order and stops
+                 * at the first successful open(). */
+                static const char * const interp_search[] = {
+                    /* exact embedded path (first) */
+                    NULL,
+                    /* standard glibc paths */
+                    "/lib64/ld-linux-x86-64.so.2",
+                    "/lib/ld-linux-x86-64.so.2",
+                    "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                    "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                    "/usr/lib64/ld-linux-x86-64.so.2",
+                    "/usr/lib/ld-linux-x86-64.so.2",
+                    /* musl libc */
+                    "/lib/ld-musl-x86_64.so.1",
+                    "/lib/x86_64-linux-musl/ld-musl-x86_64.so.1",
+                    /* AzamiOS-specific fallbacks */
+                    "/lib/ld.so",
+                    "/lib64/ld.so",
+                    "/bin/ld.so",
+                    NULL,
+                };
+
+                file_t *ifile = NULL;
+                for (int si = 0; interp_search[si] != NULL || si == 0; si++) {
+                    const char *try_path = (si == 0) ? interp_path : interp_search[si];
+                    if (!try_path) continue;
+                    ifile = vfs_open(try_path, 0, 0);
+                    if (ifile) break;
+                }
 
                 if (ifile) {
                     elf64_ehdr_t iehdr;
@@ -547,6 +576,10 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
                         }
                     }
                     vfs_close(ifile);
+                } else {
+                    pr_debug("[ELF] WARNING: PT_INTERP '%s' not found in VFS; "
+                             "binary will likely crash without a dynamic linker.\n",
+                             interp_path);
                 }
             }
             break;
@@ -554,6 +587,20 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     }
 
     vfs_close(file);
+
+    /* NOTE: PT_GNU_RELRO is intentionally NOT applied here.
+     *
+     * On Linux the kernel NEVER applies RELRO write-protection at exec time.
+     * The RELRO region (typically the GOT, .init_array, and other read-after-
+     * relocation data) must remain writable so the dynamic linker can patch all
+     * PLT/GOT entries during its startup relocation pass.  Only after ld.so has
+     * finished every relocation does it call mprotect(PROT_READ) on the range
+     * — which our mprotect(2) syscall already handles correctly.
+     *
+     * Applying RELRO in the kernel (as this code once did) write-protects the
+     * GOT before ld.so can touch it, producing an immediate #PF with err=0x7
+     * (present + write + user) in the dynamic linker's relocation loop — which
+     * is exactly the fault that triggered this correction. */
 
     /* ── 4. Allocate 16 KB Ring-3 User Stack ──────────────────────────────── */
     phys_addr_t top_page_phys = 0;
@@ -570,10 +617,14 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
         }
     }
 
+    /* ── 4b. vDSO: [vvar] + [vdso] (linux-vdso.so.1), AT_SYSINFO_EHDR ─────── */
+    u64 vdso_base = vdso_map(proc, user_space);
+
     /* ── 5. Initialize Linux System V AMD64 Stack Frame ───────────────────── */
     if (setup_user_stack(proc, user_space, top_page_phys, path, argv, envp,
                          main_entry, phdr_user_vaddr, (u64)ehdr.e_phnum,
-                         (u64)sizeof(elf64_phdr_t), interp_base, stack_top, out_rsp) < 0) {
+                         (u64)sizeof(elf64_phdr_t), interp_base, stack_top,
+                         vdso_base, out_rsp) < 0) {
         vmm_destroy_space(user_space);
         return -ENOMEM;
     }
@@ -649,7 +700,7 @@ process_t *sched_spawn_user(const char *path)
         "TERM=azami",
         "USER=root",
         "HOME=/root",
-        "SHELL=/bin/sh.elf",
+        "SHELL=/bin/sh",
         "TMPDIR=/tmp",
         "COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin",
         "LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib",
@@ -665,7 +716,7 @@ process_t *sched_spawn_user_arg(const char *path, const char *arg)
         "TERM=azami",
         "USER=root",
         "HOME=/root",
-        "SHELL=/bin/sh.elf",
+        "SHELL=/bin/sh",
         "TMPDIR=/tmp",
         "COMPILER_PATH=/usr/libexec/gcc/x86_64-elf/14.2.0/:/usr/libexec:/usr/bin:/bin",
         "LIBRARY_PATH=/usr/lib/gcc/x86_64-elf/14.2.0/:/usr/lib:/lib:/lib64:/usr/local/lib",

@@ -24,14 +24,96 @@ static u32 g_next_shmem_id = 1;
 static ipc_channel_t *g_channel_registry[IPC_MAX_CHANNELS];
 static u32             g_channel_count = 0;
 
+/* ── Channel-id hash ──────────────────────────────────────────────────────
+ *
+ * ipc_channel_find() runs on every az_channel_send() and every
+ * az_channel_recv() — on a desktop that is every window message, every input
+ * event and every damage report. It used to walk g_channel_registry[]
+ * comparing ids, up to IPC_MAX_CHANNELS of them, while holding g_ipc_lock:
+ * an O(n) scan inside the one lock every IPC operation on every CPU has to
+ * take, so the scan length was also the length of the serialised section.
+ *
+ * The registry array stays — ipc_cleanup_process() iterates it by owner pid —
+ * but lookups go through this chained hash instead. Channel ids are handed
+ * out sequentially, so id & (BUCKETS-1) spreads at most IPC_MAX_CHANNELS live
+ * channels over 256 buckets and a bucket is almost always one entry long.
+ *
+ * Lookups take only the bucket's stripe lock, never g_ipc_lock, so sends and
+ * receives on unrelated channels no longer serialise against each other or
+ * against channel creation. Lock order where both are held (create, destroy)
+ * is g_ipc_lock -> stripe lock, never the reverse.
+ */
+#define IPC_CHAN_HASH_BUCKETS 256u
+#define IPC_CHAN_HASH_STRIPES 16u
+
+static ipc_channel_t *g_channel_hash[IPC_CHAN_HASH_BUCKETS];
+
+static spinlock_t g_chan_hash_locks[IPC_CHAN_HASH_STRIPES] = {
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+};
+
+static inline u32 chan_hash_bucket(u32 channel_id)
+{
+    return channel_id & (IPC_CHAN_HASH_BUCKETS - 1u);
+}
+
+static inline spinlock_t *chan_hash_lock(u32 bucket)
+{
+    return &g_chan_hash_locks[bucket % IPC_CHAN_HASH_STRIPES];
+}
+
 /* ── Shared memory registry ───────────────────────────────────────────────── */
 static ipc_shmem_t    *g_shmem_registry[IPC_MAX_SHMEM];
 static u32             g_shmem_count = 0;
 
+/* Same arrangement as the channel hash above, for the same reason: lookup by
+ * id was a scan of the registry under g_ipc_lock. Shared-memory ids are also
+ * handed out sequentially. */
+#define IPC_SHMEM_HASH_BUCKETS 256u
+
+static ipc_shmem_t *g_shmem_hash[IPC_SHMEM_HASH_BUCKETS];
+
+static spinlock_t g_shmem_hash_locks[IPC_CHAN_HASH_STRIPES] = {
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+    SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT, SPINLOCK_INIT,
+};
+
+static inline u32 shmem_hash_bucket(u32 shmem_id)
+{
+    return shmem_id & (IPC_SHMEM_HASH_BUCKETS - 1u);
+}
+
+static inline spinlock_t *shmem_hash_lock(u32 bucket)
+{
+    return &g_shmem_hash_locks[bucket % IPC_CHAN_HASH_STRIPES];
+}
+
+/* Unlink @shmem from the id hash. Caller must not hold the stripe lock. */
+static void shmem_hash_remove(ipc_shmem_t *shmem)
+{
+    u32 bucket = shmem_hash_bucket(shmem->shmem_id);
+    spinlock_t *hl = shmem_hash_lock(bucket);
+    spinlock_lock(hl);
+    ipc_shmem_t **pp = &g_shmem_hash[bucket];
+    while (*pp) {
+        if (*pp == shmem) { *pp = shmem->hash_next; break; }
+        pp = &(*pp)->hash_next;
+    }
+    shmem->hash_next = NULL;
+    spinlock_unlock(hl);
+}
+
 void ipc_init(void)
 {
     for (u32 i = 0; i < IPC_MAX_CHANNELS; i++) g_channel_registry[i] = NULL;
+    for (u32 i = 0; i < IPC_CHAN_HASH_BUCKETS; i++) g_channel_hash[i] = NULL;
     for (u32 i = 0; i < IPC_MAX_SHMEM; i++)    g_shmem_registry[i] = NULL;
+    for (u32 i = 0; i < IPC_SHMEM_HASH_BUCKETS; i++) g_shmem_hash[i] = NULL;
     pr_debug("[IPC] Message channels & Shared Memory subsystem ready.\n");
 }
 
@@ -58,6 +140,17 @@ ipc_channel_t *ipc_channel_create(void)
         kfree(chan);
         return NULL;
     }
+
+    /* Publish in the lookup hash. Taken while g_ipc_lock is held, which is
+     * the one direction the two locks are ever nested in. */
+    {
+        u32 bucket = chan_hash_bucket(chan->channel_id);
+        spinlock_t *hl = chan_hash_lock(bucket);
+        spinlock_lock(hl);
+        chan->hash_next = g_channel_hash[bucket];
+        g_channel_hash[bucket] = chan;
+        spinlock_unlock(hl);
+    }
     spinlock_unlock(&g_ipc_lock);
 
     return chan;
@@ -65,16 +158,21 @@ ipc_channel_t *ipc_channel_create(void)
 
 ipc_channel_t *ipc_channel_find(u32 channel_id)
 {
-    spinlock_lock(&g_ipc_lock);
-    for (u32 i = 0; i < g_channel_count; i++) {
-        if (g_channel_registry[i] && g_channel_registry[i]->channel_id == channel_id) {
-            ipc_channel_t *chan = g_channel_registry[i];
+    u32 bucket = chan_hash_bucket(channel_id);
+    spinlock_t *hl = chan_hash_lock(bucket);
+
+    /* The reference is taken under the same stripe lock that
+     * ipc_channel_destroy() unlinks under, so a channel cannot be unlinked
+     * and dropped between being found here and being referenced. */
+    spinlock_lock(hl);
+    for (ipc_channel_t *chan = g_channel_hash[bucket]; chan; chan = chan->hash_next) {
+        if (chan->channel_id == channel_id) {
             __atomic_add_fetch(&chan->refcount, 1, __ATOMIC_SEQ_CST);
-            spinlock_unlock(&g_ipc_lock);
+            spinlock_unlock(hl);
             return chan;
         }
     }
-    spinlock_unlock(&g_ipc_lock);
+    spinlock_unlock(hl);
     return NULL;
 }
 
@@ -120,6 +218,21 @@ void ipc_channel_destroy(ipc_channel_t *chan)
             g_channel_registry[g_channel_count] = NULL;
             break;
         }
+    }
+
+    /* Unlink from the lookup hash. After this no new ipc_channel_find() can
+     * reach the channel, so no new reference can be taken on it. */
+    {
+        u32 bucket = chan_hash_bucket(chan->channel_id);
+        spinlock_t *hl = chan_hash_lock(bucket);
+        spinlock_lock(hl);
+        ipc_channel_t **pp = &g_channel_hash[bucket];
+        while (*pp) {
+            if (*pp == chan) { *pp = chan->hash_next; break; }
+            pp = &(*pp)->hash_next;
+        }
+        chan->hash_next = NULL;
+        spinlock_unlock(hl);
     }
     spinlock_unlock(&g_ipc_lock);
     
@@ -294,6 +407,14 @@ ipc_shmem_t *ipc_shmem_create(size_t page_count)
 
     if (g_shmem_count < IPC_MAX_SHMEM) {
         g_shmem_registry[g_shmem_count++] = shmem;
+        {
+            u32 bucket = shmem_hash_bucket(shmem->shmem_id);
+            spinlock_t *hl = shmem_hash_lock(bucket);
+            spinlock_lock(hl);
+            shmem->hash_next = g_shmem_hash[bucket];
+            g_shmem_hash[bucket] = shmem;
+            spinlock_unlock(hl);
+        }
     } else {
         spinlock_unlock(&g_ipc_lock);
         for (size_t i = 0; i < page_count; i++) pmm_free_page(shmem->phys_pages[i]);
@@ -308,19 +429,21 @@ ipc_shmem_t *ipc_shmem_create(size_t page_count)
 
 ipc_shmem_t *ipc_shmem_find(u32 shmem_id)
 {
-    spinlock_lock(&g_ipc_lock);
-    for (u32 i = 0; i < g_shmem_count; i++) {
-        if (g_shmem_registry[i] && g_shmem_registry[i]->shmem_id == shmem_id) {
-            ipc_shmem_t *shmem = g_shmem_registry[i];
-            /* Bump refcount under the lock before releasing it, so the caller
-             * holds a reference that prevents concurrent ipc_shmem_put() from
-             * freeing the object.  Caller must call ipc_shmem_put() when done. */
+    u32 bucket = shmem_hash_bucket(shmem_id);
+    spinlock_t *hl = shmem_hash_lock(bucket);
+
+    /* The reference is taken under the same stripe lock the unlink below
+     * uses, so the object cannot be dropped between being found and being
+     * referenced. Caller must ipc_shmem_put() when done. */
+    spinlock_lock(hl);
+    for (ipc_shmem_t *shmem = g_shmem_hash[bucket]; shmem; shmem = shmem->hash_next) {
+        if (shmem->shmem_id == shmem_id) {
             __atomic_add_fetch(&shmem->refcount, 1, __ATOMIC_SEQ_CST);
-            spinlock_unlock(&g_ipc_lock);
+            spinlock_unlock(hl);
             return shmem;
         }
     }
-    spinlock_unlock(&g_ipc_lock);
+    spinlock_unlock(hl);
     return NULL;
 }
 
@@ -381,11 +504,35 @@ void ipc_shmem_put(ipc_shmem_t *shmem)
 {
     if (!shmem) return;
 
-    /* Atomically decrement and check: if we reach zero, destroy the object.
-     * Using atomic ops (not a spinlock) to mirror ipc_channel_put() and avoid
-     * a race where two concurrent put() calls both observe refcount > 0 and
-     * both attempt to free the memory. */
-    if (__atomic_sub_fetch(&shmem->refcount, 1, __ATOMIC_SEQ_CST) != 0) return;
+    /*
+     * Drop the reference and decide the object's fate under the same stripe
+     * lock ipc_shmem_find() takes.
+     *
+     * Doing the decrement outside that lock leaves a window: the count can
+     * reach zero while the object is still reachable through the id hash (and
+     * previously, the registry), so a concurrent find() can raise it back to
+     * one and return the object to a caller — which this path then frees
+     * underneath them. Deciding under the lookup lock makes "the count hit
+     * zero" and "nobody can find it any more" one indivisible step.
+     */
+    u32 bucket = shmem_hash_bucket(shmem->shmem_id);
+    spinlock_t *hl = shmem_hash_lock(bucket);
+
+    spinlock_lock(hl);
+    if (__atomic_sub_fetch(&shmem->refcount, 1, __ATOMIC_SEQ_CST) != 0) {
+        spinlock_unlock(hl);
+        return;
+    }
+    /* Zero, and no find() can have slipped in: unlink before letting go. */
+    {
+        ipc_shmem_t **pp = &g_shmem_hash[bucket];
+        while (*pp) {
+            if (*pp == shmem) { *pp = shmem->hash_next; break; }
+            pp = &(*pp)->hash_next;
+        }
+        shmem->hash_next = NULL;
+    }
+    spinlock_unlock(hl);
 
     /* Refcount reached 0 — remove from registry and free pages */
     spinlock_lock(&g_ipc_lock);
@@ -409,6 +556,7 @@ void ipc_shmem_destroy(ipc_shmem_t *shmem)
     if (!shmem) return;
     
     spinlock_lock(&g_ipc_lock);
+    shmem_hash_remove(shmem);
     for (u32 i = 0; i < g_shmem_count; i++) {
         if (g_shmem_registry[i] == shmem) {
             g_shmem_registry[i] = g_shmem_registry[--g_shmem_count];

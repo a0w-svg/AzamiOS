@@ -21,6 +21,7 @@
 #define UART_LCR   3   /* Line Control Register */
 #define UART_MCR   4   /* Modem Control Register */
 #define UART_LSR   5   /* Line Status Register */
+#define UART_MSR   6   /* Modem Status Register */
 #define UART_DLL   0   /* Divisor Latch Low  (when DLAB=1) */
 #define UART_DLH   1   /* Divisor Latch High (when DLAB=1) */
 
@@ -28,8 +29,16 @@
 #define LSR_DR     0x01  /* Data Ready (receive) */
 
 #define IIR_INT_MASK 0x0F
-#define IIR_RX_DATA  0x04
+#define IIR_MODEM    0x00  /* Modem status  — cleared by reading MSR */
 #define IIR_TX_EMPTY 0x02
+#define IIR_RX_DATA  0x04
+#define IIR_LINE_ST  0x06  /* Receiver line status — cleared by reading LSR */
+#define IIR_RX_TIMEO 0x0C  /* Character timeout — cleared by reading RBR */
+
+/* Backstop on the interrupt-service loop. Every cause the 16550 can raise is
+ * acknowledged below, so this should never be reached; it exists so that an
+ * unexpected one cannot wedge a CPU inside an interrupt handler. */
+#define UART_ISR_MAX_ITERS 1024u
 
 #define RING_BUFFER_SIZE 2048
 
@@ -75,10 +84,29 @@ void uart_init(u16 port)
 }
 
 /* ── Polling implementation for kernel prints/panics ─────────────────────── */
+
+/* Bound on the THRE wait below. A 16550 at 115200 baud clears the holding
+ * register in well under 100 us, so this is orders of magnitude more slack
+ * than a working port needs. */
+#define UART_TX_POLL_SPINS 200000u
+
 static inline void uart_wait_tx_poll(u16 port)
 {
-    while (!(inb(port + UART_LSR) & LSR_THRE))
+    /*
+     * Bounded, deliberately.
+     *
+     * Every pr_*() line and every panic() message goes through here. If no
+     * device answers at this port, or a virtual one's FIFO is full because
+     * nothing on the host is draining it, THRE never comes up — and an
+     * unbounded wait then hangs the machine inside the very call that was
+     * trying to say what went wrong. Losing a character is strictly better
+     * than losing the panic and the machine with it.
+     */
+    u32 spins = UART_TX_POLL_SPINS;
+    while (!(inb(port + UART_LSR) & LSR_THRE)) {
+        if (--spins == 0) return;
         cpu_pause();
+    }
 }
 
 void uart_putc(u16 port, char c)
@@ -115,14 +143,42 @@ static void uart_handle_interrupt(uart_port_t *p)
 {
     irqflags_t irqf = spinlock_lock_irqsave(&p->lock);
     
-    while (true) {
+    /*
+     * Every branch below must *clear* the cause it handles, or the 16550 keeps
+     * reporting it and this loop never ends — inside an interrupt handler,
+     * with interrupts disabled and the port lock held, which takes the CPU
+     * with it.
+     *
+     * Receiver-line-status (break, overrun, parity, framing) and modem-status
+     * (CTS/DSR/RI/DCD changes) used to have no branch at all. Both are
+     * reachable in ordinary use — a break or a wrong baud rate raises the
+     * first, plugging a terminal into a virtual port raises the second — and
+     * neither is cleared by anything the old handler did, so either one hung
+     * the machine. They are acknowledged explicitly now, and the iteration
+     * cap catches anything still unaccounted for.
+     */
+    u32 guard = UART_ISR_MAX_ITERS;
+
+    while (guard--) {
         u8 iir = inb(p->port + UART_IIR);
         if (iir & 0x01) break; /* No more interrupts pending */
         
         u8 cause = iir & IIR_INT_MASK;
         
-        if (cause == IIR_RX_DATA || cause == 0x0C /* Character timeout */) {
-            while (inb(p->port + UART_LSR) & LSR_DR) {
+        if (cause == IIR_LINE_ST) {
+            /* Reading LSR is what clears overrun/parity/framing/break. The
+             * byte that arrived with the error, if any, is drained below on
+             * the next pass. */
+            (void)inb(p->port + UART_LSR);
+        }
+        else if (cause == IIR_MODEM) {
+            (void)inb(p->port + UART_MSR);
+        }
+        else if (cause == IIR_RX_DATA || cause == IIR_RX_TIMEO) {
+            /* Bounded by the FIFO depth several times over: a device that
+             * reports Data Ready forever must not hold the CPU here. */
+            u32 rx_guard = RING_BUFFER_SIZE;
+            while ((inb(p->port + UART_LSR) & LSR_DR) && rx_guard--) {
                 u8 c = inb(p->port + UART_RBR);
                 u32 next = (p->rx_head + 1) % RING_BUFFER_SIZE;
                 if (next != p->rx_tail) {
@@ -134,7 +190,7 @@ static void uart_handle_interrupt(uart_port_t *p)
                 sched_unblock(p->rx_waiter);
                 p->rx_waiter = NULL;
             }
-        } 
+        }
         else if (cause == IIR_TX_EMPTY) {
             if (p->tx_head != p->tx_tail) {
                 outb(p->port + UART_THR, p->tx_buf[p->tx_tail]);
@@ -149,6 +205,13 @@ static void uart_handle_interrupt(uart_port_t *p)
                 sched_unblock(p->tx_waiter);
                 p->tx_waiter = NULL;
             }
+        }
+        else {
+            /* Unknown cause: read the status registers that acknowledge the
+             * remaining sources, then give up rather than spin on it. */
+            (void)inb(p->port + UART_LSR);
+            (void)inb(p->port + UART_MSR);
+            break;
         }
     }
     

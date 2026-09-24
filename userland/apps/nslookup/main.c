@@ -20,25 +20,30 @@ int main(int argc, char **argv)
     }
 
     const char *query_host = argv[1];
-    const char *server_ip = (argc >= 3) ? argv[2] : "8.8.8.8";
+    const char *server_ip;
+    char discovered_server[64];
+
+    if (argc >= 3) {
+        server_ip = argv[2];
+    } else if (res_get_nameserver(discovered_server, sizeof(discovered_server)) == 0) {
+        server_ip = discovered_server;
+    } else {
+        fprintf(stderr, "*** No default name servers are configured\n");
+        return 1;
+    }
 
     printf("Server:   %s\n", server_ip);
     printf("Address:  %s#53\n\n", server_ip);
 
-    struct hostent *he = gethostbyname(query_host);
-    if (!he || !he->h_addr_list || !he->h_addr_list[0]) {
+    struct in_addr addr;
+    if (res_resolve_via(query_host, server_ip, &addr) != 0) {
         fprintf(stderr, "** server can't find %s: NXDOMAIN\n", query_host);
         return 1;
     }
 
     printf("Non-authoritative answer:\n");
-    printf("Name:    %s\n", he->h_name);
-
-    for (int i = 0; he->h_addr_list[i] != NULL; i++) {
-        struct in_addr addr;
-        memcpy(&addr, he->h_addr_list[i], sizeof(struct in_addr));
-        printf("Address: %s\n", inet_ntoa(addr));
-    }
+    printf("Name:    %s\n", query_host);
+    printf("Address: %s\n", inet_ntoa(addr));
 
     return 0;
 }

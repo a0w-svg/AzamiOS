@@ -68,3 +68,9 @@ int              getaddrinfo(const char *node, const char *service, const struct
 void             freeaddrinfo(struct addrinfo *res);
 const char      *gai_strerror(int errcode);
 
+/* Resolver internals exposed for tools that need to inspect or override
+ * system DNS configuration directly (e.g. nslookup). Neither function has
+ * a built-in fallback server: if none is configured, they fail. */
+int              res_get_nameserver(char *out_ip, size_t max_len);
+int              res_resolve_via(const char *hostname, const char *server_ip, struct in_addr *out_addr);
+

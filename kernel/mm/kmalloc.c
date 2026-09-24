@@ -14,6 +14,7 @@
 #include "../../drivers/char/console.h"
 #include "../../include/azami/defs.h"
 #include "../sched/sched.h"
+#include <azami/sections.h>
 
 
 #define BUCKET_COUNT  8
@@ -38,6 +39,15 @@ typedef struct {
     spinlock_t    lock;
     size_t        block_size;
     size_t        pages;        /* PMM pages this bucket currently holds */
+    /* How many objects free_list holds, maintained by every path that pushes
+     * or pops it. kmalloc_slab_stats() used to answer that by walking the
+     * list — under this bucket's lock, with interrupts disabled, over every
+     * free object in the class. On a bucket that has seen a fork storm that is
+     * a six-figure pointer chase, and /proc/slabinfo is world-readable, so any
+     * userspace loop reading it could pin a core with interrupts off for as
+     * long as it liked and starve that core's TLB shootdown IPIs. Keeping the
+     * count costs one increment on paths that already hold the lock. */
+    size_t        free_objs;
 } bucket_t;
 
 static bucket_t g_buckets[BUCKET_COUNT];
@@ -48,6 +58,34 @@ static spinlock_t g_large_lock = SPINLOCK_INIT;
  * bucket's lock); g_large_pages counts pages pinned by above-bucket allocs. */
 static u64 g_large_pages;
 
+/* ── Per-CPU magazine sizing ──────────────────────────────────────────────── *
+ * Declared here rather than beside the magazine code below because
+ * kmalloc_init() fills these tables; the magazines themselves, and the
+ * reasoning for having them at all, are further down. */
+
+#define MAG_CAP_MAX 62                  /* slots per magazine (array size)     */
+#define MAG_BUDGET  16384               /* bytes a CPU may cache per bucket    */
+#define MAG_CAP_MIN 4                   /* floor, so big classes still cache   */
+
+typedef struct {
+    u32   count;
+    void *slot[MAG_CAP_MAX];
+} magazine_t;
+
+/* A magazine's *slot* count is fixed by the array above, but how many of those
+ * slots a bucket is allowed to fill is not: a 32-byte class filling 62 slots
+ * parks 2 KiB per core, while a 4 KiB class filling the same 62 slots parks a
+ * quarter of a megabyte — per core, per bucket, held out of the PMM for as long
+ * as the system runs. Capping by bytes instead of by objects keeps the cached
+ * footprint roughly flat across size classes (about 16 KiB each), which cuts
+ * the worst-case per-CPU total from ~494 KiB to ~95 KiB without taking the
+ * lock-free path away from the classes that actually see the traffic.
+ *
+ * Filled by kmalloc_init(); read-only afterwards, so the fast path's load is
+ * always cache-hot and never invalidated. */
+static u16 g_mag_cap[BUCKET_COUNT]   __ro_after_init;
+static u16 g_mag_batch[BUCKET_COUNT] __ro_after_init;
+
 void kmalloc_init(void)
 {
     for (int i = 0; i < BUCKET_COUNT; i++) {
@@ -55,6 +93,13 @@ void kmalloc_init(void)
         g_buckets[i].lock = (spinlock_t)SPINLOCK_INIT;
         g_buckets[i].block_size = (1UL << (i + MIN_BUCKET_SHIFT));
         g_buckets[i].pages = 0;
+        g_buckets[i].free_objs = 0;
+
+        size_t cap = MAG_BUDGET / g_buckets[i].block_size;
+        if (cap > MAG_CAP_MAX) cap = MAG_CAP_MAX;
+        if (cap < MAG_CAP_MIN) cap = MAG_CAP_MIN;
+        g_mag_cap[i]   = (u16)cap;
+        g_mag_batch[i] = (u16)(cap / 2 ? cap / 2 : 1);
     }
     pr_debug("[KMALLOC] Bucket allocator initialized (32B to 4KB pools)\n");
 }
@@ -100,14 +145,6 @@ static int size_to_bucket(size_t size)
  * is single-threaded and allocates straight from the shared buckets.
  * ========================================================================== */
 
-#define MAG_CAP     62                  /* objects cached per CPU per bucket   */
-#define MAG_BATCH   31                  /* moved in/out on a miss / overflow   */
-
-typedef struct {
-    u32   count;
-    void *slot[MAG_CAP];
-} magazine_t;
-
 /* [cpu][bucket]. ~250 KiB of BSS at the 64-core ceiling (SMP_MAX_CPUS *
  * BUCKET_COUNT * sizeof(magazine_t)); each core writes only its own row, and
  * the table is cache-line aligned. */
@@ -127,9 +164,14 @@ static __always_inline void irq_restore(irqflags_t f)
     __asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory");
 }
 
+/* Upper bound on pages pulled from the PMM in one refill. Keeps a single
+ * magazine miss from turning into an unbounded burst of page allocations when
+ * the class is large and the batch is wide. */
+#define BUCKET_REFILL_MAX_PAGES 8
+
 /*
  * Pop up to @want raw objects (block_hdr region) from bucket @b's shared free
- * list into @out, refilling one page from the PMM if the list is empty. One
+ * list into @out, carving fresh pages from the PMM when the list runs dry. One
  * lock acquisition covers the whole batch. Returns how many were obtained;
  * fewer than @want (possibly 0) means the PMM is out of memory.
  */
@@ -142,33 +184,50 @@ static size_t bucket_bulk_alloc(bucket_t *b, void **out, size_t want)
         if (!b->free_list) {
             /* Same as the historical single-object path: drop the bucket lock
              * across pmm_alloc_page() so the bucket->pmm lock order is never
-             * held both ways, build the slice list locally, splice it back. */
+             * held both ways, build the slice list locally, splice it back.
+             *
+             * Two differences from that path. It pulls enough pages to finish
+             * the whole batch rather than one — a 4 KiB class yields exactly
+             * one object per page, so a one-page refill meant dropping and
+             * retaking the bucket lock once per object requested. And it
+             * remembers the tail as it carves instead of walking the list to
+             * find it afterwards, which for a 32-byte class was 128 pointer
+             * chases through memory that was just written and is guaranteed
+             * cold in no useful order. */
             spinlock_unlock_irqrestore(&b->lock, flags);
 
-            phys_addr_t page = pmm_alloc_page();
-            if (!page) return got;
-
-            u8 *virt = (u8 *)PHYS_TO_VIRT(page);
             size_t blk_size = b->block_size;
-            size_t count = PAGE_SIZE / blk_size;
+            size_t per_page = PAGE_SIZE / blk_size;      /* >= 1 */
+            size_t npages   = ((want - got) + per_page - 1) / per_page;
+            if (npages > BUCKET_REFILL_MAX_PAGES) npages = BUCKET_REFILL_MAX_PAGES;
 
-            free_block_t *local_head = NULL;
-            for (size_t j = 0; j < count; j++) {
-                free_block_t *blk = (free_block_t *)(virt + j * blk_size);
-                blk->next = local_head;
-                local_head = blk;
+            free_block_t *local_head = NULL, *local_tail = NULL;
+            size_t got_pages = 0;
+            for (size_t i = 0; i < npages; i++) {
+                phys_addr_t page = pmm_alloc_page();
+                if (!page) break;
+
+                u8 *virt = (u8 *)PHYS_TO_VIRT(page);
+                for (size_t j = 0; j < per_page; j++) {
+                    free_block_t *blk = (free_block_t *)(virt + j * blk_size);
+                    blk->next = local_head;
+                    if (!local_head) local_tail = blk;
+                    local_head = blk;
+                }
+                got_pages++;
             }
 
             flags = spinlock_lock_irqsave(&b->lock);
-            free_block_t *tail = local_head;
-            while (tail->next) tail = tail->next;
-            tail->next = b->free_list;
+            if (!got_pages) break;      /* PMM is out of memory */
+            local_tail->next = b->free_list;
             b->free_list = local_head;
-            b->pages++;
+            b->pages     += got_pages;
+            b->free_objs += got_pages * per_page;
         }
 
         free_block_t *blk = b->free_list;
         b->free_list = blk->next;
+        b->free_objs--;
         out[got++] = blk;
     }
 
@@ -186,7 +245,8 @@ static void bucket_bulk_free(bucket_t *b, void **objs, size_t n)
 
     irqflags_t flags = spinlock_lock_irqsave(&b->lock);
     ((free_block_t *)objs[n - 1])->next = b->free_list;
-    b->free_list = (free_block_t *)objs[0];
+    b->free_list  = (free_block_t *)objs[0];
+    b->free_objs += n;
     spinlock_unlock_irqrestore(&b->lock, flags);
 }
 
@@ -202,7 +262,7 @@ static void *bucket_alloc(int idx)
         irqflags_t f = irq_save();
         magazine_t *m = &g_mag[smp_current_cpu_id()][idx];
         if (m->count == 0)
-            m->count = (u32)bucket_bulk_alloc(b, m->slot, MAG_BATCH);
+            m->count = (u32)bucket_bulk_alloc(b, m->slot, g_mag_batch[idx]);
         if (m->count > 0)
             obj = m->slot[--m->count];
         irq_restore(f);
@@ -224,11 +284,23 @@ static bool bucket_free(int idx, void *obj)
     if (!g_percpu_ready) return false;
 
     bucket_t *b = &g_buckets[idx];
+    u32 cap   = g_mag_cap[idx];
+    u32 batch = g_mag_batch[idx];
+
     irqflags_t f = irq_save();
     magazine_t *m = &g_mag[smp_current_cpu_id()][idx];
-    if (m->count == MAG_CAP) {
-        bucket_bulk_free(b, &m->slot[MAG_BATCH], MAG_CAP - MAG_BATCH);
-        m->count = MAG_BATCH;
+    if (m->count >= cap) {
+        /* Spill the coldest objects, not the newest. The slots at the top of
+         * the magazine were just freed and their cache lines are still warm,
+         * so they are the ones a following kmalloc() wants back; the bottom of
+         * the stack has been sitting untouched and is what the shared list
+         * should get. The shift is a few dozen bytes against a lock
+         * acquisition, and it is what makes the magazine behave like a stack
+         * rather than a slowly rotating buffer. */
+        bucket_bulk_free(b, &m->slot[0], batch);
+        __builtin_memmove(&m->slot[0], &m->slot[batch],
+                          (cap - batch) * sizeof(m->slot[0]));
+        m->count = cap - batch;
     }
     m->slot[m->count++] = obj;
     irq_restore(f);
@@ -251,11 +323,29 @@ static u64 magazine_parked(int idx)
 void kmalloc_enable_percpu(void)
 {
     g_percpu_ready = true;
-    pr_debug("[KMALLOC] per-CPU magazines active (cap %d, batch %d)\n",
-             MAG_CAP, MAG_BATCH);
+    pr_debug("[KMALLOC] per-CPU magazines active (%u..%u objects per bucket)\n",
+             (unsigned)g_mag_cap[BUCKET_COUNT - 1], (unsigned)g_mag_cap[0]);
 }
 
-void *kmalloc(size_t size)
+/*
+ * kmalloc() and kzalloc() share this body so that the zeroing of an
+ * above-bucket allocation can happen where it is cheap.
+ *
+ * kzalloc() used to be kmalloc() followed by memset(). For a bucket object
+ * that is right — a few dozen cached bytes. For a multi-page allocation it is
+ * not: the pages come back from the PMM untouched, and a cached memset drags
+ * every line of them into L1 read-for-ownership first, evicting whatever the
+ * caller was working on, to write zeros it will mostly not read back
+ * immediately. Allocating through pmm_alloc_pages_zeroed() instead hands the
+ * clear to hw_clear_pages(), which issues the whole run as one operation and,
+ * on the CLZERO and non-temporal paths, never reads the pages in at all. A
+ * 1 MB kzalloc() goes from 1 MB of read traffic plus 1 MB of cache pollution
+ * to neither.
+ *
+ * The clear also has to happen before the header is written, since the header
+ * lives in the first bytes of the first page.
+ */
+static void *kmalloc_impl(size_t size, bool zero)
 {
     if (size == 0) return NULL;
 
@@ -265,10 +355,10 @@ void *kmalloc(size_t size)
     if (idx < 0) {
         /* Prevent absurdly large allocations (e.g. > 1 GB) */
         if (size > (1024ULL * 1024 * 1024)) return NULL;
-        
+
         size_t total_size = size + sizeof(block_hdr_t);
         if (total_size < size) return NULL; /* Integer overflow */
-        
+
         size_t pages = (total_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
         irqflags_t flags = spinlock_lock_irqsave(&g_large_lock);
@@ -277,6 +367,15 @@ void *kmalloc(size_t size)
 
         if (!phys) return NULL;
         __atomic_add_fetch(&g_large_pages, pages, __ATOMIC_RELAXED);
+
+        /* Deliberately after the unlock. The pages are private to this caller
+         * the moment pmm_alloc_pages() returns them, so nothing about the
+         * clear needs the lock — and doing it inside would hold g_large_lock
+         * with interrupts disabled for as long as it takes to write the whole
+         * allocation, which for a multi-megabyte kzalloc() is long enough to
+         * stall this core's IPI servicing (a TLB shootdown ack, say) behind a
+         * memset. */
+        if (zero) hw_clear_pages((void *)PHYS_TO_VIRT(phys), pages);
 
         block_hdr_t *hdr = (block_hdr_t *)PHYS_TO_VIRT(phys);
         hdr->magic = KMALLOC_MAGIC;
@@ -294,16 +393,21 @@ void *kmalloc(size_t size)
     hdr->bucket_idx = (u32)idx;
     hdr->size = size;
 
-    return (void *)(hdr + 1);
+    void *payload = (void *)(hdr + 1);
+    /* At most one bucket block (4 KB), already hot from the header write —
+     * an ordinary cached memset is the right instruction here. */
+    if (zero) __builtin_memset(payload, 0, size);
+    return payload;
+}
+
+void *kmalloc(size_t size)
+{
+    return kmalloc_impl(size, true);
 }
 
 void *kzalloc(size_t size)
 {
-    void *ptr = kmalloc(size);
-    if (ptr) {
-        __builtin_memset(ptr, 0, size);
-    }
-    return ptr;
+    return kmalloc_impl(size, true);
 }
 
 void *kcalloc(size_t nmemb, size_t size)
@@ -340,7 +444,10 @@ void *krealloc(void *ptr, size_t new_size)
 
     block_hdr_t *hdr = ((block_hdr_t *)ptr) - 1;
     if (hdr->magic != KMALLOC_MAGIC) {
-        PANIC("krealloc called on corrupted or non-kmalloc pointer!");
+        PANIC("krealloc called on corrupted or non-kmalloc pointer! "
+              "ptr=%p hdr=%p magic=0x%x (expected 0x%x, 0=already freed) caller=%p",
+              ptr, (void *)hdr, (unsigned int)hdr->magic, (unsigned int)KMALLOC_MAGIC,
+              __builtin_return_address(0));
     }
 
     bool same_bucket = (hdr->bucket_idx == 0xFF) ? (size_to_bucket(new_size) == -1) : (size_to_bucket(new_size) == (int)hdr->bucket_idx);
@@ -403,9 +510,17 @@ void kfree(void *ptr)
 
     block_hdr_t *hdr = ((block_hdr_t *)ptr) - 1;
     if (hdr->magic != KMALLOC_MAGIC) {
-        pr_debug("[KMALLOC] Corrupted kfree ptr=%p, hdr=%p, magic=0x%x (expected 0x%x), caller=%p\n",
-                 ptr, hdr, (unsigned int)hdr->magic, (unsigned int)KMALLOC_MAGIC, __builtin_return_address(0));
-        PANIC("kfree called on corrupted or non-kmalloc pointer!");
+        /* This diagnostic is the only lead a real double-free/corruption panic
+         * leaves behind, so it must survive regardless of the DEBUG build flag
+         * (pr_debug() compiles to nothing when DEBUG=0, which is kmalloc.c's
+         * default and was swallowing exactly this information). magic==0 means
+         * some caller freed this same pointer once already (kfree() zeroes it
+         * below to make that detectable) — caller is that *second*, offending
+         * free, not the original allocation. */
+        PANIC("kfree called on corrupted or non-kmalloc pointer! "
+              "ptr=%p hdr=%p magic=0x%x (expected 0x%x, 0=already freed) caller=%p",
+              ptr, (void *)hdr, (unsigned int)hdr->magic, (unsigned int)KMALLOC_MAGIC,
+              __builtin_return_address(0));
     }
 
     hdr->magic = 0; /* Invalidate magic to catch double-free */
@@ -448,6 +563,7 @@ void kfree(void *ptr)
     irqflags_t flags = spinlock_lock_irqsave(&b->lock);
     blk->next = b->free_list;
     b->free_list = blk;
+    b->free_objs++;
     spinlock_unlock_irqrestore(&b->lock, flags);
 }
 
@@ -499,10 +615,35 @@ static size_t bucket_reclaim(bucket_t *b)
     void  *pages[KMALLOC_RECLAIM_MAX_PAGES];
     size_t npages = 0;
 
+    /*
+     * Detach the whole free list, then sort and scan it with the lock dropped
+     * and interrupts back on.
+     *
+     * The sort is O(n log n) over every free object in the class, which on a
+     * 32-byte bucket that has seen a fork storm is six figures. Doing that
+     * inside spinlock_lock_irqsave() meant a reaper tick could hold interrupts
+     * off for milliseconds — on every core, since the bucket lock is shared —
+     * for work that is pure bookkeeping.
+     *
+     * Detached, it costs other CPUs nothing worse than a PMM refill if they
+     * allocate from this bucket meanwhile, and the result is spliced back
+     * below. It is also safe against a concurrent kfree(): a page is only
+     * reclaimed when every one of its objects is in this detached list, which
+     * means none of them is allocated, which means no other core can be about
+     * to free one. Objects parked in another CPU's magazine are likewise
+     * absent from this list, so any page holding one falls short of bpp and is
+     * kept — which is exactly why kmalloc_drain_local() cannot reach remote
+     * magazines and does not need to.
+     */
     irqflags_t flags = spinlock_lock_irqsave(&b->lock);
+    free_block_t *detached = b->free_list;
+    b->free_list  = NULL;
+    b->free_objs  = 0;      /* the whole list left with us */
+    spinlock_unlock_irqrestore(&b->lock, flags);
 
-    free_block_t *cur = fb_sort(b->free_list);
+    free_block_t *cur = fb_sort(detached);
     free_block_t *newhead = NULL, *newtail = NULL;
+    size_t kept = 0;
 
     while (cur) {
         uintptr_t page = (uintptr_t)cur & ~(uintptr_t)(PAGE_SIZE - 1);
@@ -524,12 +665,22 @@ static size_t bucket_reclaim(bucket_t *b)
             if (newtail) newtail->next = cur;
             else         newhead = cur;
             newtail = runend;
+            kept += cnt;
         }
         cur = after;
     }
-    b->free_list = newhead;
-    b->pages -= npages;
 
+    /* Splice the survivors back in front of anything freed while we scanned. */
+    flags = spinlock_lock_irqsave(&b->lock);
+    if (newtail) {
+        newtail->next = b->free_list;
+        b->free_list  = newhead;
+    }
+    /* Add back rather than assign: other cores have been pushing and popping
+     * the (initially empty) list for the whole time we were scanning, and
+     * their adjustments are already in there. */
+    b->free_objs += kept;
+    b->pages     -= npages;
     spinlock_unlock_irqrestore(&b->lock, flags);
 
     for (size_t i = 0; i < npages; i++)
@@ -560,8 +711,7 @@ int kmalloc_slab_stats(kmalloc_slab_stat_t *out, int max)
 
         irqflags_t flags = spinlock_lock_irqsave(&b->lock);
         u64 pages = b->pages;
-        u64 freen = 0;
-        for (free_block_t *f = b->free_list; f; f = f->next) freen++;
+        u64 freen = b->free_objs;
         spinlock_unlock_irqrestore(&b->lock, flags);
 
         /* Objects parked in per-CPU magazines are free too, just not on the
@@ -591,7 +741,7 @@ void kmalloc_drain_local(void)
     if (!g_percpu_ready) return;
 
     for (int i = 0; i < BUCKET_COUNT; i++) {
-        void *tmp[MAG_CAP];
+        void *tmp[MAG_CAP_MAX];
         size_t n;
 
         irqflags_t f = irq_save();

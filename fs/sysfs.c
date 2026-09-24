@@ -10,10 +10,12 @@
 #include <azami/debug.h>
 #include "sysfs.h"
 #include "vfs.h"
+#include "../drivers/block/block.h"
 #include "../kernel/mm/kmalloc.h"
 #include "../kernel/sched/sched.h"
 #include "../kernel/lib/string.h"
 #include "../arch/x86_64/cpu/smp.h"
+#include "../arch/x86_64/cpu/topology.h"
 #include "../include/azami/net.h"
 #include "../drivers/base/base.h"
 #include "../userland/libc/include/sys/dirent.h"
@@ -56,6 +58,10 @@ typedef enum {
     SYSFS_TYPE_BLOCK_ATTR_SIZE,
     SYSFS_TYPE_BLOCK_ATTR_REMOVABLE,
     SYSFS_TYPE_BLOCK_ATTR_STAT,
+    SYSFS_TYPE_BLOCK_ATTR_RO,
+    SYSFS_TYPE_BLOCK_ATTR_START,
+    SYSFS_TYPE_BLOCK_QUEUE_DIR,
+    SYSFS_TYPE_BLOCK_QUEUE_ATTR,
 
     /* Sound */
     SYSFS_TYPE_SOUND_CARD_DIR,
@@ -68,6 +74,9 @@ typedef enum {
     SYSFS_TYPE_CPU_ATTR_ONLINE,
     SYSFS_TYPE_CPU_ATTR_PRESENT,
     SYSFS_TYPE_CPU_ATTR_POSSIBLE,
+    SYSFS_TYPE_CPU_TOPO_DIR,
+    SYSFS_TYPE_CPU_TOPO_ATTR,
+    SYSFS_TYPE_CPU_CACHE_DIR,
     SYSFS_TYPE_CPU_CORE_ONLINE,
 
     /* Driver-model backed nodes (drivers/base) — buses, drivers, classes and
@@ -121,6 +130,108 @@ static file_operations_t g_sysfs_file_ops = {
     .write = sysfs_file_write,
     .readdir = sysfs_dir_readdir,
 };
+
+/* ── /sys/devices/system/cpu/cpuN/topology ────────────────────────────────
+ *
+ * The standard Linux attributes. Userspace reads this tree rather than
+ * CPUID — it is the only way an unprivileged process can learn the machine's
+ * core/thread layout — and a great deal of software sizes itself from it:
+ * lscpu, hwloc, OpenMP and TBB runtimes deciding how many worker threads a
+ * machine is worth, JVM ergonomics, container CPU accounting. With the tree
+ * absent they all fall back to "one thread per logical CPU", which on an SMT
+ * part oversubscribes every physical core by two.
+ */
+
+/* Stable storage for the cpuN directory names handed back by readdir(): the
+ * caller keeps the pointers past this function's return, so they cannot be
+ * stack buffers. One slot per possible CPU, filled on demand. */
+static char g_sysfs_cpu_names[SMP_MAX_CPUS][12];
+
+static const char *sysfs_cpu_dir_name(u32 cpu)
+{
+    if (cpu >= SMP_MAX_CPUS) return "cpu0";
+    if (!g_sysfs_cpu_names[cpu][0])
+        scnprintf(g_sysfs_cpu_names[cpu], sizeof(g_sysfs_cpu_names[cpu]), "cpu%u", cpu);
+    return g_sysfs_cpu_names[cpu];
+}
+
+static bool sysfs_cpu_topo_attr_valid(const char *name)
+{
+    static const char *attrs[] = {
+        "physical_package_id", "die_id", "core_id",
+        "thread_siblings", "thread_siblings_list",
+        "core_siblings", "core_siblings_list",
+    };
+    for (u32 i = 0; i < ARRAY_SIZE(attrs); i++)
+        if (strcmp(name, attrs[i]) == 0) return true;
+    return false;
+}
+
+/* Linux prints a cpumask as 32-bit hex groups, most significant first,
+ * separated by commas — "00000000,0000000f" for CPUs 0-3 on a machine with
+ * more than 32 possible CPUs. Groups beyond the highest set bit are omitted
+ * for small machines, which is what every parser expects. */
+static size_t sysfs_format_cpumask(char *buf, size_t max, u64 mask)
+{
+    if (mask >> 32)
+        return (size_t)scnprintf(buf, max, "%08x,%08x\n",
+                                 (unsigned)(mask >> 32), (unsigned)(mask & 0xFFFFFFFFULL));
+    return (size_t)scnprintf(buf, max, "%08x\n", (unsigned)(mask & 0xFFFFFFFFULL));
+}
+
+/* And as a range list — "0-3", "0,2", "0-1,4-5". */
+static size_t sysfs_format_cpulist(char *buf, size_t max, u64 mask)
+{
+    size_t off = 0;
+    bool first = true;
+
+    for (u32 i = 0; i < 64; ) {
+        if (!(mask & (1ULL << i))) { i++; continue; }
+        u32 start = i;
+        while (i < 64 && (mask & (1ULL << i))) i++;
+        u32 end = i - 1;
+
+        off += (size_t)scnprintf(buf + off, max > off ? max - off : 0,
+                                 "%s%u", first ? "" : ",", start);
+        if (end != start)
+            off += (size_t)scnprintf(buf + off, max > off ? max - off : 0, "-%u", end);
+        first = false;
+    }
+    off += (size_t)scnprintf(buf + off, max > off ? max - off : 0, "\n");
+    return off;
+}
+
+static size_t sysfs_format_cpu_topo(char *buf, size_t max, u32 cpu, const char *attr)
+{
+    const cpu_topology_t *t = topology_of(cpu);
+
+    /* No decoded topology for this CPU: report it as a package of its own
+     * with no siblings, which is both true as far as anything here knows and
+     * the answer that makes consumers behave conservatively. */
+    u64 self = (cpu < 64) ? (1ULL << cpu) : 0;
+    u32 pkg  = t ? t->package_id : cpu;
+    u32 die  = t ? t->die_id : 0;
+    u32 core = t ? t->core_id : 0;
+    u64 smt  = (t && t->smt_mask)  ? t->smt_mask  : self;
+    u64 llc  = (t && t->core_mask) ? t->core_mask : self;
+
+    if (strcmp(attr, "physical_package_id") == 0)
+        return (size_t)scnprintf(buf, max, "%u\n", pkg);
+    if (strcmp(attr, "die_id") == 0)
+        return (size_t)scnprintf(buf, max, "%u\n", die);
+    if (strcmp(attr, "core_id") == 0)
+        return (size_t)scnprintf(buf, max, "%u\n", core);
+    if (strcmp(attr, "thread_siblings") == 0)
+        return sysfs_format_cpumask(buf, max, smt);
+    if (strcmp(attr, "thread_siblings_list") == 0)
+        return sysfs_format_cpulist(buf, max, smt);
+    if (strcmp(attr, "core_siblings") == 0)
+        return sysfs_format_cpumask(buf, max, llc);
+    if (strcmp(attr, "core_siblings_list") == 0)
+        return sysfs_format_cpulist(buf, max, llc);
+
+    return (size_t)scnprintf(buf, max, "0\n");
+}
 
 static inode_t *sysfs_alloc_inode(super_block_t *sb, u64 ino, u32 mode, sysfs_node_type_t type, const char *name, u32 index)
 {
@@ -360,39 +471,132 @@ static s64 sysfs_file_read(struct file *filp, void *buf, size_t len, u64 *offset
     case SYSFS_TYPE_NET_ATTR_TYPE:
         total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%u\n", (strcmp(priv->name, "lo") == 0) ? 772 : 1);
         break;
-    case SYSFS_TYPE_NET_STAT_RX_BYTES:
-        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "14200\n");
+    /* Real counters from the same net_device_t stats block
+     * fs/procfs.c's format_proc_net_dev() already reads for /proc/net/dev,
+     * instead of fixed "14200"/"8400"/"128"/"64" that never moved no matter
+     * how much traffic actually crossed the interface. */
+    case SYSFS_TYPE_NET_STAT_RX_BYTES: {
+        net_device_t *ndev = net_get_default_device();
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%llu\n",
+            (unsigned long long)(ndev ? ndev->stats.rx_bytes : 0));
         break;
-    case SYSFS_TYPE_NET_STAT_TX_BYTES:
-        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "8400\n");
+    }
+    case SYSFS_TYPE_NET_STAT_TX_BYTES: {
+        net_device_t *ndev = net_get_default_device();
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%llu\n",
+            (unsigned long long)(ndev ? ndev->stats.tx_bytes : 0));
         break;
-    case SYSFS_TYPE_NET_STAT_RX_PACKETS:
-        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "128\n");
+    }
+    case SYSFS_TYPE_NET_STAT_RX_PACKETS: {
+        net_device_t *ndev = net_get_default_device();
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%llu\n",
+            (unsigned long long)(ndev ? ndev->stats.rx_packets : 0));
         break;
-    case SYSFS_TYPE_NET_STAT_TX_PACKETS:
-        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "64\n");
+    }
+    case SYSFS_TYPE_NET_STAT_TX_PACKETS: {
+        net_device_t *ndev = net_get_default_device();
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%llu\n",
+            (unsigned long long)(ndev ? ndev->stats.tx_packets : 0));
         break;
-    case SYSFS_TYPE_BLOCK_ATTR_DEV:
-        if (strcmp(priv->name, "sda") == 0) total_len = (size_t)scnprintf(tmp, sizeof(tmp), "8:0\n");
-        else if (strcmp(priv->name, "sda1") == 0) total_len = (size_t)scnprintf(tmp, sizeof(tmp), "8:1\n");
-        else if (strcmp(priv->name, "loop0") == 0) total_len = (size_t)scnprintf(tmp, sizeof(tmp), "7:0\n");
-        else total_len = (size_t)scnprintf(tmp, sizeof(tmp), "1:0\n");
+    }
+    /* Every one of these used to be a constant chosen per hard-coded device
+     * name, so /sys/block described a disk layout that had nothing to do
+     * with the machine. They come from the block registry now. */
+    case SYSFS_TYPE_BLOCK_ATTR_DEV: {
+        block_dev_t *bd = block_dev_get(priv->name);
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%u:%u\n",
+                        bd ? (unsigned)MAJOR(bd->rdev) : 0u,
+                        bd ? (unsigned)MINOR(bd->rdev) : 0u);
         break;
-    case SYSFS_TYPE_BLOCK_ATTR_SIZE:
-        if (strcmp(priv->name, "sda") == 0) total_len = (size_t)scnprintf(tmp, sizeof(tmp), "4194304\n");
-        else if (strcmp(priv->name, "sda1") == 0) total_len = (size_t)scnprintf(tmp, sizeof(tmp), "4192256\n");
-        else total_len = (size_t)scnprintf(tmp, sizeof(tmp), "409600\n");
+    }
+    case SYSFS_TYPE_BLOCK_ATTR_SIZE: {
+        /* Always in 512-byte units, whatever the device's sector size —
+         * that is the documented unit for this file. */
+        block_dev_t *bd = block_dev_get(priv->name);
+        u64 sectors = bd ? (bd->sector_count * (u64)bd->sector_size) / 512 : 0;
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%llu\n", (unsigned long long)sectors);
         break;
-    case SYSFS_TYPE_BLOCK_ATTR_REMOVABLE:
-        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "0\n");
+    }
+    case SYSFS_TYPE_BLOCK_ATTR_REMOVABLE: {
+        block_dev_t *bd = block_dev_get(priv->name);
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%d\n",
+                        (bd && (bd->flags & BLKDEV_REMOVABLE)) ? 1 : 0);
         break;
+    }
+    case SYSFS_TYPE_BLOCK_ATTR_RO: {
+        block_dev_t *bd = block_dev_get(priv->name);
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%d\n",
+                        (bd && (bd->flags & BLKDEV_RO)) ? 1 : 0);
+        break;
+    }
+    case SYSFS_TYPE_BLOCK_ATTR_START: {
+        block_dev_t *bd = block_dev_get(priv->name);
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%llu\n",
+                        (unsigned long long)(bd ? bd->start_lba : 0));
+        break;
+    }
     case SYSFS_TYPE_BLOCK_ATTR_STAT:
-        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "    2400     120    38400     1200     1800      90    28800      900        0      450     2100\n");
+        /* No per-device I/O counters are kept, and inventing plausible ones
+         * (which is what the previous fixed line did) is worse than zeros:
+         * a monitoring tool reading it would report traffic that never
+         * happened. All-zero is the honest "nothing recorded". */
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp),
+            "       0       0        0        0       0       0        0        0        0        0        0\n");
         break;
+    case SYSFS_TYPE_BLOCK_QUEUE_ATTR: {
+        block_dev_t *bd = block_dev_get(priv->name);
+        u32 ss  = bd && bd->sector_size ? bd->sector_size : 512;
+        u32 pss = bd && bd->phys_sector_size ? bd->phys_sector_size : ss;
+        const char *a = priv->name3;
+        if (strcmp(a, "logical_block_size") == 0 || strcmp(a, "hw_sector_size") == 0 ||
+            strcmp(a, "minimum_io_size") == 0) {
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%u\n", ss);
+        } else if (strcmp(a, "physical_block_size") == 0) {
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%u\n", pss);
+        } else if (strcmp(a, "optimal_io_size") == 0) {
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "0\n");
+        } else if (strcmp(a, "rotational") == 0) {
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%d\n",
+                            (bd && (bd->flags & BLKDEV_ROTATIONAL)) ? 1 : 0);
+        } else if (strcmp(a, "discard_granularity") == 0) {
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%u\n",
+                            (bd && bd->ops && bd->ops->trim) ? ss : 0u);
+        } else if (strcmp(a, "discard_max_bytes") == 0) {
+            u64 cap = bd ? bd->sector_count * (u64)ss : 0;
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%llu\n",
+                            (unsigned long long)((bd && bd->ops && bd->ops->trim) ? cap : 0));
+        } else if (strcmp(a, "max_sectors_kb") == 0 || strcmp(a, "max_hw_sectors_kb") == 0) {
+            /* The 1 MiB cap block_map_range() enforces on one transfer. */
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "1024\n");
+        } else if (strcmp(a, "read_ahead_kb") == 0) {
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "128\n");
+        } else if (strcmp(a, "nr_requests") == 0) {
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "128\n");
+        } else if (strcmp(a, "scheduler") == 0) {
+            /* Requests go straight to the driver; "none" is what a
+             * queue with no elevator reports. */
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "[none]\n");
+        } else if (strcmp(a, "write_cache") == 0) {
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%s\n",
+                            (bd && bd->ops && bd->ops->flush) ? "write back" : "write through");
+        } else {
+            total_len = (size_t)scnprintf(tmp, sizeof(tmp), "0\n");
+        }
+        break;
+    }
     case SYSFS_TYPE_SOUND_ATTR_ID:
         total_len = (size_t)scnprintf(tmp, sizeof(tmp), "AzamiAudio0\n");
         break;
-    case SYSFS_TYPE_CPU_ATTR_ONLINE:
+    case SYSFS_TYPE_CPU_ATTR_ONLINE: {
+        /* The CPUs actually running, not just the ones the firmware listed.
+         * An AP that failed to come up is present but not online, and
+         * anything sizing a thread pool off this file would otherwise create
+         * workers for a core that will never execute them. */
+        u64 mask = smp_online_mask();
+        if (!mask) mask = 1ULL;
+        total_len = sysfs_format_cpulist(tmp, sizeof(tmp), mask);
+        break;
+    }
     case SYSFS_TYPE_CPU_ATTR_PRESENT:
     case SYSFS_TYPE_CPU_ATTR_POSSIBLE: {
         u32 cpus = smp_cpu_count();
@@ -401,7 +605,13 @@ static s64 sysfs_file_read(struct file *filp, void *buf, size_t len, u64 *offset
         break;
     }
     case SYSFS_TYPE_CPU_CORE_ONLINE:
-        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "1\n");
+        /* Real state, not a constant: an AP that failed to come up is
+         * present but not online, and this is where userspace looks. */
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%u\n",
+                                      smp_cpu_online(priv->index) ? 1u : 0u);
+        break;
+    case SYSFS_TYPE_CPU_TOPO_ATTR:
+        total_len = sysfs_format_cpu_topo(tmp, sizeof(tmp), priv->index, priv->name);
         break;
     case SYSFS_TYPE_POWER_ATTR_STATE:
         total_len = (size_t)scnprintf(tmp, sizeof(tmp), "freeze mem disk\n");
@@ -486,6 +696,10 @@ static struct dentry *sysfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 14, S_IFDIR | 0555, SYSFS_TYPE_BUS_DIR, NULL, 0);
         } else if (strcmp(name, "fs") == 0) {
             dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 15, S_IFDIR | 0555, SYSFS_TYPE_FS_DIR, NULL, 0);
+        } else if (strcmp(name, "block") == 0) {
+            /* /sys/block is the traditional location and still the one most
+             * tools look in first; /sys/class/block below is the same set. */
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 16, S_IFDIR | 0555, SYSFS_TYPE_CLASS_BLOCK_DIR, NULL, 0);
         }
     } else if (priv->type == SYSFS_TYPE_CLASS_DIR) {
         if (strcmp(name, "net") == 0) {
@@ -532,7 +746,10 @@ static struct dentry *sysfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 113, S_IFREG | 0444, SYSFS_TYPE_NET_STAT_TX_PACKETS, priv->name, 0);
         }
     } else if (priv->type == SYSFS_TYPE_CLASS_BLOCK_DIR) {
-        if (strcmp(name, "sda") == 0 || strcmp(name, "sda1") == 0 || strcmp(name, "loop0") == 0 || strcmp(name, "ram0") == 0) {
+        /* The set of block devices used to be a fixed list of four names.
+         * Ask the registry instead, so a disk that is actually present shows
+         * up and one that is not does not. */
+        if (block_dev_get(name)) {
             dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 200, S_IFDIR | 0555, SYSFS_TYPE_BLOCK_DEV_DIR, name, 0);
         }
     } else if (priv->type == SYSFS_TYPE_BLOCK_DEV_DIR) {
@@ -544,6 +761,34 @@ static struct dentry *sysfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 203, S_IFREG | 0444, SYSFS_TYPE_BLOCK_ATTR_REMOVABLE, priv->name, 0);
         } else if (strcmp(name, "stat") == 0) {
             dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 204, S_IFREG | 0444, SYSFS_TYPE_BLOCK_ATTR_STAT, priv->name, 0);
+        } else if (strcmp(name, "ro") == 0) {
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 205, S_IFREG | 0444, SYSFS_TYPE_BLOCK_ATTR_RO, priv->name, 0);
+        } else if (strcmp(name, "start") == 0) {
+            /* Only a partition has a start offset, which is exactly how
+             * lsblk and udev tell a partition from a whole disk. */
+            block_dev_t *bd = block_dev_get(priv->name);
+            if (bd && bd->parent)
+                dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 206, S_IFREG | 0444, SYSFS_TYPE_BLOCK_ATTR_START, priv->name, 0);
+        } else if (strcmp(name, "queue") == 0) {
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 207, S_IFDIR | 0555, SYSFS_TYPE_BLOCK_QUEUE_DIR, priv->name, 0);
+        }
+    } else if (priv->type == SYSFS_TYPE_BLOCK_QUEUE_DIR) {
+        static const char *qattrs[] = {
+            "logical_block_size", "physical_block_size", "hw_sector_size",
+            "minimum_io_size", "optimal_io_size", "rotational",
+            "discard_granularity", "discard_max_bytes", "max_sectors_kb",
+            "max_hw_sectors_kb", "read_ahead_kb", "nr_requests", "scheduler",
+            "write_cache", "add_random", "nomerges",
+        };
+        for (size_t i = 0; i < ARRAY_SIZE(qattrs); i++) {
+            if (strcmp(name, qattrs[i]) != 0) continue;
+            inode_t *ino = sysfs_alloc_inode(dir->i_sb, 220 + i, S_IFREG | 0444,
+                                             SYSFS_TYPE_BLOCK_QUEUE_ATTR, priv->name, 0);
+            if (ino && ino->i_private)
+                strncpy(((sysfs_priv_t *)ino->i_private)->name3, qattrs[i],
+                        sizeof(((sysfs_priv_t *)ino->i_private)->name3) - 1);
+            dentry->d_inode = ino;
+            break;
         }
     } else if (priv->type == SYSFS_TYPE_CLASS_SOUND_DIR) {
         if (strcmp(name, "card0") == 0) {
@@ -583,6 +828,19 @@ static struct dentry *sysfs_lookup(struct inode *dir, struct dentry *dentry)
     } else if (priv->type == SYSFS_TYPE_CPU_CORE_DIR) {
         if (strcmp(name, "online") == 0) {
             dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 540 + priv->index, S_IFREG | 0444, SYSFS_TYPE_CPU_CORE_ONLINE, priv->name, priv->index);
+        } else if (strcmp(name, "topology") == 0) {
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 700 + priv->index, S_IFDIR | 0555, SYSFS_TYPE_CPU_TOPO_DIR, NULL, priv->index);
+        }
+    } else if (priv->type == SYSFS_TYPE_CPU_TOPO_DIR) {
+        /* One inode type for every topology attribute; the attribute name is
+         * carried in priv->name and dispatched on at read time. They are all
+         * one short line derived from the same decoded record, so a type per
+         * file would be six enum values and six switch arms saying the same
+         * thing. */
+        if (sysfs_cpu_topo_attr_valid(name)) {
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 720 + priv->index * 8,
+                                                S_IFREG | 0444, SYSFS_TYPE_CPU_TOPO_ATTR,
+                                                name, priv->index);
         }
     } else if (priv->type == SYSFS_TYPE_POWER_DIR) {
         if (strcmp(name, "state") == 0) {
@@ -702,8 +960,8 @@ static s64 sysfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u6
     entries[1] = ".."; types[1] = DT_DIR;
 
     if (priv->type == SYSFS_TYPE_ROOT_DIR) {
-        const char *r[] = { "class", "devices", "kernel", "power", "bus", "fs" };
-        for (int i = 0; i < 6; i++) { entries[total_entries] = r[i]; types[total_entries++] = DT_DIR; }
+        const char *r[] = { "class", "devices", "kernel", "power", "bus", "fs", "block" };
+        for (int i = 0; i < 7; i++) { entries[total_entries] = r[i]; types[total_entries++] = DT_DIR; }
     } else if (priv->type == SYSFS_TYPE_CLASS_DIR) {
         const char *c[] = { "net", "block", "sound" };
         for (int i = 0; i < 3; i++) { entries[total_entries] = c[i]; types[total_entries++] = DT_DIR; }
@@ -724,11 +982,27 @@ static s64 sysfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u6
         const char *ns[] = { "rx_bytes", "tx_bytes", "rx_packets", "tx_packets" };
         for (int i = 0; i < 4; i++) { entries[total_entries] = ns[i]; types[total_entries++] = DT_REG; }
     } else if (priv->type == SYSFS_TYPE_CLASS_BLOCK_DIR) {
-        const char *b[] = { "sda", "sda1", "loop0", "ram0" };
-        for (int i = 0; i < 4; i++) { entries[total_entries] = b[i]; types[total_entries++] = DT_DIR; }
+        for (block_dev_t *bd = block_dev_first(); bd && total_entries < ARRAY_SIZE(entries);
+             bd = block_dev_next(bd)) {
+            entries[total_entries] = bd->name; types[total_entries++] = DT_DIR;
+        }
     } else if (priv->type == SYSFS_TYPE_BLOCK_DEV_DIR) {
-        const char *ba[] = { "dev", "size", "removable", "stat" };
-        for (int i = 0; i < 4; i++) { entries[total_entries] = ba[i]; types[total_entries++] = DT_REG; }
+        const char *ba[] = { "dev", "size", "removable", "stat", "ro" };
+        for (int i = 0; i < 5; i++) { entries[total_entries] = ba[i]; types[total_entries++] = DT_REG; }
+        block_dev_t *bd = block_dev_get(priv->name);
+        if (bd && bd->parent) { entries[total_entries] = "start"; types[total_entries++] = DT_REG; }
+        entries[total_entries] = "queue"; types[total_entries++] = DT_DIR;
+    } else if (priv->type == SYSFS_TYPE_BLOCK_QUEUE_DIR) {
+        static const char *qa[] = {
+            "logical_block_size", "physical_block_size", "hw_sector_size",
+            "minimum_io_size", "optimal_io_size", "rotational",
+            "discard_granularity", "discard_max_bytes", "max_sectors_kb",
+            "max_hw_sectors_kb", "read_ahead_kb", "nr_requests", "scheduler",
+            "write_cache", "add_random", "nomerges",
+        };
+        for (size_t i = 0; i < ARRAY_SIZE(qa) && total_entries < ARRAY_SIZE(entries); i++) {
+            entries[total_entries] = qa[i]; types[total_entries++] = DT_REG;
+        }
     } else if (priv->type == SYSFS_TYPE_CLASS_SOUND_DIR) {
         entries[total_entries] = "card0"; types[total_entries++] = DT_DIR;
     } else if (priv->type == SYSFS_TYPE_SOUND_CARD_DIR) {
@@ -747,12 +1021,29 @@ static s64 sysfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u6
         entries[total_entries] = "online"; types[total_entries++] = DT_REG;
         entries[total_entries] = "present"; types[total_entries++] = DT_REG;
         entries[total_entries] = "possible"; types[total_entries++] = DT_REG;
-        entries[total_entries] = "cpu0"; types[total_entries++] = DT_DIR;
-        entries[total_entries] = "cpu1"; types[total_entries++] = DT_DIR;
-        entries[total_entries] = "cpu2"; types[total_entries++] = DT_DIR;
-        entries[total_entries] = "cpu3"; types[total_entries++] = DT_DIR;
+        /* One entry per CPU that actually exists. This used to be a fixed
+         * cpu0..cpu3, which listed four CPUs on a single-core boot and hid
+         * every CPU past the fourth on anything larger — and the directories
+         * it named did resolve, because lookup parses any cpuN. Anything
+         * enumerating CPUs through sysfs (nproc, lscpu, hwloc, glibc's
+         * get_nprocs) reads this list. */
+        u32 ncpu = smp_cpu_count();
+        if (ncpu == 0) ncpu = 1;
+        for (u32 i = 0; i < ncpu && total_entries < ARRAY_SIZE(entries) - 1; i++) {
+            entries[total_entries] = sysfs_cpu_dir_name(i);
+            types[total_entries++] = DT_DIR;
+        }
     } else if (priv->type == SYSFS_TYPE_CPU_CORE_DIR) {
         entries[total_entries] = "online"; types[total_entries++] = DT_REG;
+        entries[total_entries] = "topology"; types[total_entries++] = DT_DIR;
+    } else if (priv->type == SYSFS_TYPE_CPU_TOPO_DIR) {
+        entries[total_entries] = "physical_package_id"; types[total_entries++] = DT_REG;
+        entries[total_entries] = "die_id";              types[total_entries++] = DT_REG;
+        entries[total_entries] = "core_id";             types[total_entries++] = DT_REG;
+        entries[total_entries] = "thread_siblings";     types[total_entries++] = DT_REG;
+        entries[total_entries] = "thread_siblings_list";types[total_entries++] = DT_REG;
+        entries[total_entries] = "core_siblings";       types[total_entries++] = DT_REG;
+        entries[total_entries] = "core_siblings_list";  types[total_entries++] = DT_REG;
     } else if (priv->type == SYSFS_TYPE_POWER_DIR) {
         entries[total_entries] = "state"; types[total_entries++] = DT_REG;
     } else if (priv->type == SYSFS_TYPE_KERNEL_DIR) {

@@ -8,6 +8,7 @@
 #include "../../arch/x86_64/cpu/idt.h"   /* pt_regs_t */
 
 struct process;
+struct file;
 
 /* Canonical syscall-number / uapi-struct definitions, shared verbatim with
  * the native libc (userland/libc/include/sys/syscall.h -> a build-time copy
@@ -47,6 +48,20 @@ void syscall_init(void);
  * Returns the descriptor, or -EMFILE when the table is full.
  */
 s64 syscall_install_fd(struct process *proc, void *file, u8 fd_flags);
+
+/**
+ * syscall_fget(proc, fd) / syscall_fput(file) — take and drop a reference on
+ * the open file behind a descriptor, from outside kernel/syscall/syscall.c.
+ *
+ * Exported for the same reason as syscall_install_fd() above: a subsystem
+ * that is handed a raw descriptor number (DRM's PRIME import, fanotify's
+ * dirfd-relative marks) must not reach into proc->handle_table itself — the
+ * reference count is what stops a concurrent close(2) in another thread from
+ * freeing the file mid-call. Every successful syscall_fget() needs exactly
+ * one syscall_fput().
+ */
+struct file *syscall_fget(struct process *proc, int fd);
+void         syscall_fput(struct file *file);
 
 /**
  * fd_table_release(proc) — detach and release every descriptor @proc still

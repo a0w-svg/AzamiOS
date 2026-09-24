@@ -783,7 +783,7 @@ static int ahci_identify(ahci_drive_t *d, bool *out_ncq_supported)
 
 /* ── Per-port bring-up ─────────────────────────────────────────────────── */
 
-static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 hba_ncs)
+static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 hba_ncs, bool hba_s64a)
 {
     if (g_drive_count >= AHCI_MAX_DRIVES) return;
 
@@ -821,8 +821,18 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 
         return;
     }
 
-    d->page_phys = pmm_alloc_page();
-    d->bounce_phys = pmm_alloc_pages(AHCI_BOUNCE_PAGES);
+    /* CAP.S64A (bit 31) says whether this HBA can even DMA to a 64-bit
+     * address: CLBU/FBU/CTBAU are reserved on a controller that doesn't set
+     * it, so writing them is a no-op and the HBA would otherwise silently
+     * truncate to the low 32 bits of whatever pmm_alloc_page()/
+     * pmm_alloc_pages() happened to return -- a real, if increasingly rare,
+     * class of hardware, and always possible on a machine with more than
+     * 4GB of RAM. Use the existing sub-4GB allocator when S64A is unset
+     * instead of assuming every controller can address full physical
+     * memory. */
+    d->page_phys = hba_s64a ? pmm_alloc_page() : pmm_alloc_32(0);
+    d->bounce_phys = hba_s64a ? pmm_alloc_pages(AHCI_BOUNCE_PAGES)
+                              : pmm_alloc_pages_32(AHCI_BOUNCE_PAGES);
     if (!d->page_phys || !d->bounce_phys) {
         if (d->page_phys) pmm_free_page(d->page_phys);
         if (d->bounce_phys) pmm_free_pages(d->bounce_phys, AHCI_BOUNCE_PAGES);
@@ -934,7 +944,9 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 
         u32 nslots = hba_ncs - 1;
         if (nslots > AHCI_NCQ_MAX_SLOTS - 1) nslots = AHCI_NCQ_MAX_SLOTS - 1;
         if (nslots >= 1) {
-            d->ncq_bounce_phys = pmm_alloc_pages(nslots * AHCI_NCQ_SLOT_BOUNCE_BYTES / PAGE_SIZE);
+            size_t ncq_pages = nslots * AHCI_NCQ_SLOT_BOUNCE_BYTES / PAGE_SIZE;
+            d->ncq_bounce_phys = hba_s64a ? pmm_alloc_pages(ncq_pages)
+                                          : pmm_alloc_pages_32(ncq_pages);
             if (d->ncq_bounce_phys) {
                 d->ncq_bounce_virt = PHYS_TO_VIRT(d->ncq_bounce_phys);
                 d->ncq_nslots = nslots;
@@ -1139,14 +1151,16 @@ static int ahci_probe(dm_device_t *dm, const pci_device_id_t *id)
     u32 cap = mr(&hba->cap);
     u32 pi = mr(&hba->pi);
     u32 nports = (cap & 0x1F) + 1;
-    bool hba_ncq = (cap & (1U << 30)) != 0;      /* CAP.SNCQ */
-    u32  hba_ncs = ((cap >> 8) & 0x1F) + 1;       /* CAP.NCS  */
-    pr_debug("[AHCI] controller NCQ=%s, %u command slot%s\n",
-             hba_ncq ? "yes" : "no", hba_ncs, hba_ncs == 1 ? "" : "s");
+    bool hba_ncq  = (cap & (1U << 30)) != 0;      /* CAP.SNCQ */
+    u32  hba_ncs  = ((cap >> 8) & 0x1F) + 1;      /* CAP.NCS  */
+    bool hba_s64a = (cap & (1U << 31)) != 0;      /* CAP.S64A */
+    pr_debug("[AHCI] controller NCQ=%s, %u command slot%s, 64-bit DMA=%s\n",
+             hba_ncq ? "yes" : "no", hba_ncs, hba_ncs == 1 ? "" : "s",
+             hba_s64a ? "yes" : "no");
     for (u32 i = 0; i < 32; i++) {
         if (!(pi & (1U << i))) continue;
         if (i >= nports && nports < 32) continue;
-        ahci_port_bringup(&hba->ports[i], i, hba_ncq, hba_ncs);
+        ahci_port_bringup(&hba->ports[i], i, hba_ncq, hba_ncs, hba_s64a);
     }
 
     dm_set_drvdata(dm, (void *)hba);

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "protocol.h"
+#include "region.h"
 
 #define AZWM_MAX_WINDOWS   32
 #define AZWM_TITLEBAR_H    24
@@ -20,13 +21,6 @@
  * see compositor_animate_step()'s comment for why a step count doesn't work
  * here. 180ms is snappy without being so short it reads as a flicker. */
 #define AZWM_ANIM_DURATION_NS (180LL * 1000000LL)
-
-/* A screen-space rectangle; x1/y1 are exclusive.  `valid` is 0 for "empty",
- * which is not the same as a zero-sized rect at the origin. */
-typedef struct {
-    int x0, y0, x1, y1;
-    int valid;
-} azwm_rect_t;
 
 /* ── Window descriptor ────────────────────────────────────────────────────── */
 typedef struct az_window_t {
@@ -82,7 +76,7 @@ typedef struct {
      * `cursor_rect[i]` remembers where the pointer was left in each, so the
      * copy that repays the debt also erases it.
      */
-    azwm_rect_t   pending[2];
+    azwm_region_t pending[2];
     azwm_rect_t   cursor_rect[2];
 
     /* Windows */
@@ -117,12 +111,13 @@ typedef struct {
     /* IPC */
     int           server_channel; /* Channel ID for receiving client requests */
 
-    /* Damage tracking / Dirty rect bounding box */
-    int           has_damage;
-    int           dirty_min_x;
-    int           dirty_min_y;
-    int           dirty_max_x;
-    int           dirty_max_y;
+    /* Damage tracking.
+     *
+     * A set of rectangles, not one bounding box: a clock ticking in one
+     * corner and a caret blinking in the other have a bounding box of the
+     * whole screen, and composing/copying/transferring that every frame is
+     * most of what an idle desktop used to cost. See region.h. */
+    azwm_region_t damage;
 
     /* Active animation tracker */
     int           has_animating_windows;

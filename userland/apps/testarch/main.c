@@ -256,6 +256,142 @@ static void print_caps(const cpu_caps_t *caps, bool verbose)
     }
 }
 
+__attribute__((target("avx,avx2")))
+static void bench_avx(void)
+{
+    float a[8] __attribute__((aligned(32))) = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f };
+    float b[8] __attribute__((aligned(32))) = { 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f };
+    uint64_t t0 = rdtsc_read();
+    for (int i = 0; i < 1000000; i++) {
+        __asm__ volatile(
+            "vmovaps %0, %%ymm0\n"
+            "vmovaps %1, %%ymm1\n"
+            "vaddps %%ymm1, %%ymm0, %%ymm2\n"
+            "vmulps %%ymm2, %%ymm0, %%ymm0\n"
+            : : "m"(a), "m"(b) : "ymm0", "ymm1", "ymm2"
+        );
+    }
+    uint64_t t1 = rdtsc_read();
+    printf("  \033[32m[AVX/AVX2]\033[0m 1M 256-bit VADDPS+VMULPS (8M FLOPs): %lu cycles (avg %.2f cycles/vec)\n",
+           t1 - t0, (double)(t1 - t0) / 1000000.0);
+}
+
+__attribute__((target("fma")))
+static void bench_fma(void)
+{
+    float a[8] __attribute__((aligned(32))) = { 1.1f, 2.2f, 3.3f, 4.4f, 5.5f, 6.6f, 7.7f, 8.8f };
+    float b[8] __attribute__((aligned(32))) = { 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f };
+    uint64_t t0 = rdtsc_read();
+    for (int i = 0; i < 1000000; i++) {
+        __asm__ volatile(
+            "vmovaps %0, %%ymm0\n"
+            "vmovaps %1, %%ymm1\n"
+            "vfmadd213ps %%ymm1, %%ymm0, %%ymm0\n"
+            : : "m"(a), "m"(b) : "ymm0", "ymm1"
+        );
+    }
+    uint64_t t1 = rdtsc_read();
+    printf("  \033[32m[FMA3]\033[0m     1M 256-bit VFMADD213PS (16M FLOPs): %lu cycles (avg %.2f cycles/op)\n",
+           t1 - t0, (double)(t1 - t0) / 1000000.0);
+}
+
+__attribute__((target("aes")))
+static void bench_aes(void)
+{
+    uint64_t t0 = rdtsc_read();
+    for (int i = 0; i < 1000000; i++) {
+        __asm__ volatile(
+            "pxor %%xmm0, %%xmm0\n"
+            "pxor %%xmm1, %%xmm1\n"
+            "aesenc %%xmm1, %%xmm0\n"
+            : : : "xmm0", "xmm1"
+        );
+    }
+    uint64_t t1 = rdtsc_read();
+    printf("  \033[32m[AES-NI]\033[0m   1M AESENC rounds: %lu cycles (avg %.2f cycles/round)\n",
+           t1 - t0, (double)(t1 - t0) / 1000000.0);
+}
+
+__attribute__((target("sha")))
+static void bench_sha(void)
+{
+    uint64_t t0 = rdtsc_read();
+    for (int i = 0; i < 1000000; i++) {
+        __asm__ volatile(
+            "pxor %%xmm0, %%xmm0\n"
+            "pxor %%xmm1, %%xmm1\n"
+            "sha256rnds2 %%xmm0, %%xmm1, %%xmm0\n"
+            : : : "xmm0", "xmm1"
+        );
+    }
+    uint64_t t1 = rdtsc_read();
+    printf("  \033[32m[SHA-NI]\033[0m   1M SHA256RNDS2 steps (2M SHA rounds): %lu cycles (avg %.2f cycles/step)\n",
+           t1 - t0, (double)(t1 - t0) / 1000000.0);
+}
+
+__attribute__((target("sse")))
+static void bench_3d_transform(void)
+{
+    float mat[16] __attribute__((aligned(16))) = {
+        1.5f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.5f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.5f, 5.0f,
+        0.0f, 0.0f, -1.0f, 0.0f
+    };
+    float in_v[4] __attribute__((aligned(16))) = { 1.2f, 3.4f, 5.6f, 1.0f };
+    float out_v[4] __attribute__((aligned(16)));
+
+    /* Scalar baseline */
+    uint64_t t0 = rdtsc_read();
+    float x = in_v[0], y = in_v[1], z = in_v[2], w = in_v[3];
+    for (int i = 0; i < 200000; i++) {
+        float ox = mat[0]*x + mat[1]*y + mat[2]*z + mat[3]*w;
+        float oy = mat[4]*x + mat[5]*y + mat[6]*z + mat[7]*w;
+        float oz = mat[8]*x + mat[9]*y + mat[10]*z + mat[11]*w;
+        float ow = mat[12]*x + mat[13]*y + mat[14]*z + mat[15]*w;
+        out_v[0] = ox / ow;
+        out_v[1] = oy / ow;
+        out_v[2] = oz / ow;
+        out_v[3] = 1.0f;
+    }
+    uint64_t t1 = rdtsc_read();
+    uint64_t scalar_cycles = t1 - t0;
+
+    /* SIMD accelerated */
+    t0 = rdtsc_read();
+    for (int i = 0; i < 200000; i++) {
+        __asm__ volatile(
+            "movss 0(%1), %%xmm0\n"
+            "shufps $0, %%xmm0, %%xmm0\n"
+            "mulps 0(%0), %%xmm0\n"
+
+            "movss 4(%1), %%xmm1\n"
+            "shufps $0, %%xmm1, %%xmm1\n"
+            "mulps 16(%0), %%xmm1\n"
+            "addps %%xmm1, %%xmm0\n"
+
+            "movss 8(%1), %%xmm2\n"
+            "shufps $0, %%xmm2, %%xmm2\n"
+            "mulps 32(%0), %%xmm2\n"
+            "addps %%xmm2, %%xmm0\n"
+
+            "movss 12(%1), %%xmm3\n"
+            "shufps $0, %%xmm3, %%xmm3\n"
+            "mulps 48(%0), %%xmm3\n"
+            "addps %%xmm3, %%xmm0\n"
+
+            "movaps %%xmm0, %2\n"
+            : : "r"(mat), "r"(in_v), "m"(out_v)
+            : "xmm0", "xmm1", "xmm2", "xmm3", "memory"
+        );
+    }
+    t1 = rdtsc_read();
+    uint64_t simd_cycles = t1 - t0;
+
+    printf("  \033[32m[3D MVP]\033[0m   200K 4x4 Vertex Transforms: Scalar=%lu cyc, SIMD=%lu cyc (\033[1;32m%.2fx speedup\033[0m)\n",
+           scalar_cycles, simd_cycles, (double)scalar_cycles / (double)simd_cycles);
+}
+
 static void run_benchmarks(const cpu_caps_t *caps)
 {
     printf("\n\033[1;36m=== Hardware Instruction Microbenchmarks ===\033[0m\n\n");
@@ -369,6 +505,39 @@ static void run_benchmarks(const cpu_caps_t *caps)
     } else {
         printf("  \033[31m[FAIL]\033[0m   Scanner mismatch! len=%zu, first=%p, last=%p\n",
                len, first_z, last_z);
+    }
+
+    /* 7. AVX / AVX2 256-bit SIMD */
+    if (caps->avx && caps->os_avx_enabled) {
+        bench_avx();
+    } else {
+        printf("  \033[33m[AVX/AVX2]\033[0m Skipped (AVX or OSXSAVE not active)\n");
+    }
+
+    /* 8. FMA3 */
+    if (caps->fma && caps->os_avx_enabled) {
+        bench_fma();
+    } else {
+        printf("  \033[33m[FMA3]\033[0m     Skipped (FMA not supported)\n");
+    }
+
+    /* 9. AES-NI */
+    if (caps->aesni) {
+        bench_aes();
+    } else {
+        printf("  \033[33m[AES-NI]\033[0m   Skipped (AES-NI not supported)\n");
+    }
+
+    /* 10. SHA-NI */
+    if (caps->sha) {
+        bench_sha();
+    } else {
+        printf("  \033[33m[SHA-NI]\033[0m   Skipped (SHA-NI not supported)\n");
+    }
+
+    /* 11. 3D Graphics Transform */
+    if (caps->sse) {
+        bench_3d_transform();
     }
 }
 

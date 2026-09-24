@@ -310,6 +310,7 @@ static void bga_remove(dm_device_t *dm)
 
 static const pci_device_id_t bga_pci_ids[] = {
     { PCI_DEVICE(0x1234, 0x1111) },   /* QEMU/Bochs standard VGA */
+    { PCI_DEVICE(0x80EE, 0xBEEF) },   /* VirtualBox VBoxVGA */
     { 0 }
 };
 

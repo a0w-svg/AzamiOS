@@ -44,17 +44,31 @@ static inline u32 e1000_read32(u32 reg)
 
 /* ── EEPROM Helpers ──────────────────────────────────────────────────────── */
 
+/* Spins allowed per EEPROM word. A real part answers in microseconds. */
+#define E1000_EEPROM_WAIT_SPINS 100000u
+
 static u16 e1000_eeprom_read(u8 addr)
 {
     u32 temp = 0;
+    u32 spins = E1000_EEPROM_WAIT_SPINS;
+
+    /*
+     * Bounded: this runs during probe, and the done bit never arriving —
+     * no EEPROM fitted, or the presence detection above guessing wrong —
+     * used to hang the boot here with no output and no way forward.
+     * Returning 0 lands in e1000_read_mac()'s existing "EEPROM gave zeros"
+     * path, which falls back to reading the address out of RAL/RAH.
+     */
     if (g_e1000_dev.has_eeprom) {
         e1000_write32(E1000_EERD, 1 | ((u32)addr << 8));
         while (!((temp = e1000_read32(E1000_EERD)) & (1 << 4))) {
+            if (--spins == 0) return 0;
             cpu_pause();
         }
     } else {
         e1000_write32(E1000_EERD, 1 | ((u32)addr << 2));
         while (!((temp = e1000_read32(E1000_EERD)) & (1 << 1))) {
+            if (--spins == 0) return 0;
             cpu_pause();
         }
     }
@@ -263,8 +277,22 @@ static int e1000_probe(dm_device_t *dm, const pci_device_id_t *id)
         hal_irq_enable(g_e1000_dev.irq, g_e1000_dev.irq + 32);
     }
 
-    /* Enable interrupts in controller */
-    e1000_write32(E1000_IMS, E1000_IMS_RXT0 | E1000_IMS_RXO | E1000_IMS_LSC | E1000_IMS_TXDW);
+    /* Interrupt moderation. Without it the NIC raises one interrupt per
+     * received frame; e1000_poll_rx() already drains every ready descriptor
+     * per call, so throttling the rate costs nothing in throughput and turns
+     * a per-packet interrupt storm into a bounded one. */
+    e1000_write32(E1000_ITR,  E1000_ITR_USECS);
+    e1000_write32(E1000_RDTR, E1000_RDTR_USECS);
+    e1000_write32(E1000_RADV, E1000_RADV_USECS);
+
+    /* Enable interrupts in controller.
+     *
+     * TXDW is deliberately not requested. The handler has never done anything
+     * with it — e1000_send_packet() finds a free descriptor by reading the DD
+     * bit itself — so every transmitted frame was raising an interrupt whose
+     * only effect was an IDT dispatch and an ICR read. Descriptors still carry
+     * RS so DD is written back; the driver just stops being told about it. */
+    e1000_write32(E1000_IMS, E1000_IMS_RXT0 | E1000_IMS_RXO | E1000_IMS_LSC);
 
     g_e1000_ready = true;
     g_e1000_dev.link_up = true;
@@ -417,8 +445,27 @@ s64 e1000_send_packet(const void *data, size_t len)
     irqflags_t flags = spinlock_lock_irqsave(&g_e1000_tx_lock);
     u32 cur = g_e1000_dev.tx_cur;
 
-    /* Wait for descriptor to be free */
+    /*
+     * Wait for the descriptor to come back, but never forever.
+     *
+     * This spun on DD with the TX lock held and interrupts disabled. A NIC
+     * that stops completing — link down mid-transmit, a wedged emulation, a
+     * ring the hardware never advances — took the CPU with it, in a state
+     * where nothing could interrupt to recover. Even without a fault it burns
+     * a core with interrupts off whenever the ring is full.
+     *
+     * The ring being full is a normal condition with a normal answer: tell the
+     * caller to retry. E1000_TX_WAIT_SPINS covers the microseconds a healthy
+     * controller needs to retire a descriptor at line rate; past that the
+     * queue is genuinely backed up (or broken), and -EAGAIN is both true and
+     * survivable.
+     */
+    u32 spins = 0;
     while (!(g_e1000_dev.tx_descs[cur].status & E1000_TXD_STAT_DD)) {
+        if (++spins >= E1000_TX_WAIT_SPINS) {
+            spinlock_unlock_irqrestore(&g_e1000_tx_lock, flags);
+            return -(s64)EAGAIN;
+        }
         cpu_pause();
     }
 

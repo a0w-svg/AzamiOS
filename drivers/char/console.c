@@ -32,6 +32,34 @@ static u32  g_fb_row    = 0;   /* current text row    (pixels / char height) */
 #define FG_COLOR 0x00E0E0E0  /* Light grey */
 #define BG_COLOR 0x00000000  /* Black */
 
+/* ── ANSI SGR color palette ───────────────────────────────────────────────
+ * Boot/init output (the "userspace test suite" banner, fetch's neofetch-
+ * style dashboard, colored [PASS]/[FAIL] lines, anything piping through
+ * kprintf/console_write) is written assuming a real ANSI-capable terminal —
+ * exactly the assumption the serial/UART side already satisfies. This
+ * framebuffer console had no escape-sequence handling at all: every SGR
+ * code came out as literal garbage glyphs ("[1;35m") mixed into the text,
+ * and color never actually changed. These map the standard 8 ANSI colors
+ * (plus bright variants) to real RGB, close to common terminal defaults;
+ * code 30 (black) is deliberately not pure black since the background here
+ * is always black too — true black-on-black would just be invisible. */
+#define COL_BLACK      0x00555555
+#define COL_RED        0x00E06C75
+#define COL_GREEN      0x0098C379
+#define COL_YELLOW     0x00E5C07B
+#define COL_BLUE       0x0061AFEF
+#define COL_MAGENTA    0x00C678DD
+#define COL_CYAN       0x0056B6C2
+#define COL_WHITE      0x00E0E0E0
+#define COL_BR_BLACK   0x00808080
+#define COL_BR_RED     0x00FF6E6E
+#define COL_BR_GREEN   0x00B5E890
+#define COL_BR_YELLOW  0x00F0DA85
+#define COL_BR_BLUE    0x0082C0FF
+#define COL_BR_MAGENTA 0x00E0A0F0
+#define COL_BR_CYAN    0x0080E0E8
+#define COL_BR_WHITE   0x00FFFFFF
+
 /*
  * ── Why the console keeps its own copy of the text ──────────────────────────
  * Video memory is mapped write-combining: writes stream out in bursts, reads
@@ -49,8 +77,17 @@ static u32  g_fb_row    = 0;   /* current text row    (pixels / char height) */
 #define CON_MAX_ROWS 128
 
 static char g_text[CON_MAX_ROWS][CON_MAX_COLS];
+static u32  g_text_col[CON_MAX_ROWS][CON_MAX_COLS]; /* per-cell foreground, set by SGR */
 static u32  g_cols = 0;
 static u32  g_rows = 0;
+
+/* ── Escape sequence parser state (persists across fb_putc() calls, one
+ * character at a time) ─────────────────────────────────────────────────── */
+static u32  g_cur_fg = FG_COLOR;
+typedef enum { CON_ESC_NONE, CON_ESC_START, CON_ESC_CSI } con_esc_state_t;
+static con_esc_state_t g_esc_state = CON_ESC_NONE;
+static char g_esc_buf[16];
+static int  g_esc_len = 0;
 
 /* ── Init ─────────────────────────────────────────────────────────────────── */
 
@@ -76,7 +113,7 @@ void console_init_fb(void *fb_base, u32 width, u32 height, u32 pitch, u8 bpp)
     if (g_rows > CON_MAX_ROWS) g_rows = CON_MAX_ROWS;
 
     for (u32 r = 0; r < g_rows; r++) {
-        for (u32 c = 0; c < g_cols; c++) g_text[r][c] = ' ';
+        for (u32 c = 0; c < g_cols; c++) { g_text[r][c] = ' '; g_text_col[r][c] = FG_COLOR; }
     }
     g_fb_ready = true;
 }
@@ -107,7 +144,7 @@ static inline void fb_store_pixel(u8 *p, u32 color)
 }
 
 /* Paint one character cell.  Writes only — never reads video memory. */
-static void fb_draw_char(u32 col, u32 row, char c)
+static void fb_draw_char(u32 col, u32 row, char c, u32 fg)
 {
     u32 px = col * FONT_W;
     u32 py = row * FONT_H;
@@ -123,13 +160,13 @@ static void fb_draw_char(u32 col, u32 row, char c)
         if (g_fb_bpp == 32) {
             u32 *d32 = (u32 *)dst;
             for (u32 b = 0; b < FONT_W; b++) {
-                d32[b] = (bits & (0x80 >> b)) ? (FG_COLOR | 0xFF000000u)
+                d32[b] = (bits & (0x80 >> b)) ? (fg | 0xFF000000u)
                                               : (BG_COLOR | 0xFF000000u);
             }
         } else {
             for (u32 b = 0; b < FONT_W; b++) {
                 fb_store_pixel(dst + b * bytes_pp,
-                               (bits & (0x80 >> b)) ? FG_COLOR : BG_COLOR);
+                               (bits & (0x80 >> b)) ? fg : BG_COLOR);
             }
         }
     }
@@ -150,8 +187,9 @@ static void fb_redraw_all(void)
                 u32 *d = (u32 *)row;
                 for (u32 c = 0; c < g_cols; c++) {
                     u8 bits = fb_glyph(g_text[r][c])[gy];
+                    u32 fg = g_text_col[r][c];
                     for (u32 b = 0; b < FONT_W; b++) {
-                        *d++ = (bits & (0x80 >> b)) ? (FG_COLOR | 0xFF000000u)
+                        *d++ = (bits & (0x80 >> b)) ? (fg | 0xFF000000u)
                                                     : (BG_COLOR | 0xFF000000u);
                     }
                 }
@@ -164,9 +202,10 @@ static void fb_redraw_all(void)
             } else {
                 for (u32 c = 0; c < g_cols; c++) {
                     u8 bits = fb_glyph(g_text[r][c])[gy];
+                    u32 fg = g_text_col[r][c];
                     for (u32 b = 0; b < FONT_W; b++) {
                         fb_store_pixel(row + (c * FONT_W + b) * bytes_pp,
-                                       (bits & (0x80 >> b)) ? FG_COLOR : BG_COLOR);
+                                       (bits & (0x80 >> b)) ? fg : BG_COLOR);
                     }
                 }
                 for (u32 x = g_cols * FONT_W; x < g_fb_width; x++) {
@@ -197,15 +236,102 @@ static void fb_scroll(void)
     /* Shift the text in RAM, then repaint.  The framebuffer is never read. */
     for (u32 r = 1; r < g_rows; r++) {
         memcpy(g_text[r - 1], g_text[r], g_cols);
+        memcpy(g_text_col[r - 1], g_text_col[r], g_cols * sizeof(u32));
     }
-    for (u32 c = 0; c < g_cols; c++) g_text[g_rows - 1][c] = ' ';
+    for (u32 c = 0; c < g_cols; c++) { g_text[g_rows - 1][c] = ' '; g_text_col[g_rows - 1][c] = FG_COLOR; }
 
     fb_redraw_all();
+}
+
+/* Applies one complete CSI sequence's effect once its final byte has been
+ * seen. Only SGR (color) and the two escape codes boot output actually
+ * relies on (ED "\033[2J" to clear the screen, CUP "\033[H" to home the
+ * cursor -- both of which top.elf already emits) do anything; any other
+ * final byte (K, etc.) is consumed harmlessly, matching how a real
+ * terminal swallows sequences it doesn't implement rather than leaking
+ * their bytes into the visible text. */
+static void con_apply_csi(char final, const char *params)
+{
+    if (final == 'm') {
+        const char *p = params;
+        if (!*p) { g_cur_fg = FG_COLOR; return; }
+        while (*p) {
+            int val = 0;
+            while (*p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); p++; }
+            if (*p == ';') p++;
+            switch (val) {
+            case 0:  g_cur_fg = FG_COLOR; break;
+            case 30: g_cur_fg = COL_BLACK; break;
+            case 31: g_cur_fg = COL_RED; break;
+            case 32: g_cur_fg = COL_GREEN; break;
+            case 33: g_cur_fg = COL_YELLOW; break;
+            case 34: g_cur_fg = COL_BLUE; break;
+            case 35: g_cur_fg = COL_MAGENTA; break;
+            case 36: g_cur_fg = COL_CYAN; break;
+            case 37: g_cur_fg = COL_WHITE; break;
+            case 39: g_cur_fg = FG_COLOR; break;
+            case 90: g_cur_fg = COL_BR_BLACK; break;
+            case 91: g_cur_fg = COL_BR_RED; break;
+            case 92: g_cur_fg = COL_BR_GREEN; break;
+            case 93: g_cur_fg = COL_BR_YELLOW; break;
+            case 94: g_cur_fg = COL_BR_BLUE; break;
+            case 95: g_cur_fg = COL_BR_MAGENTA; break;
+            case 96: g_cur_fg = COL_BR_CYAN; break;
+            case 97: g_cur_fg = COL_BR_WHITE; break;
+            /* 1 (bold), 40-47/100-107 (background): no-ops -- this console
+             * has one fixed background and no separate bold glyph set. */
+            default: break;
+            }
+        }
+    } else if (final == 'J') {
+        /* ED - Erase in Display. Only "clear everything" (param 2, what
+         * every real caller here actually sends) is worth acting on. */
+        if (params[0] == '2' && params[1] == '\0') {
+            for (u32 r = 0; r < g_rows; r++) {
+                for (u32 c = 0; c < g_cols; c++) { g_text[r][c] = ' '; g_text_col[r][c] = FG_COLOR; }
+            }
+            fb_redraw_all();
+        }
+    } else if (final == 'H' && params[0] == '\0') {
+        /* CUP with no row;col defaults to the home position. */
+        g_fb_col = 0;
+        g_fb_row = 0;
+    }
 }
 
 static void fb_putc(char c)
 {
     if (!g_fb_ready || !g_fb_base || g_cols == 0 || g_rows == 0) return;
+
+    /* Escape-sequence parser: ESC, then '[', then any run of digits/';'/'?',
+     * then one final letter/symbol that both terminates the sequence and
+     * says what it means. Every byte belonging to a recognized sequence is
+     * consumed here and never reaches the text grid below -- that's what
+     * fixes it showing up as literal "[1;35m"-style garbage. */
+    if (g_esc_state == CON_ESC_NONE && c == 0x1B) {
+        g_esc_state = CON_ESC_START;
+        return;
+    }
+    if (g_esc_state == CON_ESC_START) {
+        if (c == '[') {
+            g_esc_state = CON_ESC_CSI;
+            g_esc_len = 0;
+        } else {
+            g_esc_state = CON_ESC_NONE; /* not a CSI sequence; drop it */
+        }
+        return;
+    }
+    if (g_esc_state == CON_ESC_CSI) {
+        if ((c >= '0' && c <= '9') || c == ';' || c == '?') {
+            if (g_esc_len < (int)sizeof(g_esc_buf) - 1) g_esc_buf[g_esc_len++] = c;
+            return;
+        }
+        g_esc_buf[g_esc_len] = '\0';
+        con_apply_csi(c, g_esc_buf);
+        g_esc_state = CON_ESC_NONE;
+        g_esc_len = 0;
+        return;
+    }
 
     if (c == '\n') {
         g_fb_col = 0;
@@ -214,7 +340,8 @@ static void fb_putc(char c)
         g_fb_col = 0;
     } else if (c >= 0x20 && c < 0x7F) {
         g_text[g_fb_row][g_fb_col] = c;
-        fb_draw_char(g_fb_col, g_fb_row, c);
+        g_text_col[g_fb_row][g_fb_col] = g_cur_fg;
+        fb_draw_char(g_fb_col, g_fb_row, c, g_cur_fg);
         g_fb_col++;
         if (g_fb_col >= g_cols) { g_fb_col = 0; g_fb_row++; }
     }

@@ -29,8 +29,17 @@
 #include "../shared/ui_kit.h"
 
 #define SERVER_CHAN  1
-#define WIN_W       340
-#define WIN_H       340
+
+/* The window opens at this size and can be resized or maximized from
+ * there; WIN_W/WIN_H below follow the window rather than naming a fixed
+ * one, so the layout tracks it. Before that the note was drawn at a
+ * hardcoded 340x340 whatever the window became: maximizing left the note
+ * painted in the top-left corner of a window whose remaining area was
+ * never cleared. */
+#define INIT_W      340
+#define INIT_H      340
+#define WIN_W       ((int)g_win.width)
+#define WIN_H       ((int)g_win.height)
 #define MAP_ADDR    ((void *)0x6B000000)
 #define HEADER_H     34
 #define PADDING      14
@@ -291,7 +300,7 @@ int main(int argc, char **argv)
         snprintf(g_save_path, sizeof(g_save_path), "/home/azami/.notes/note_%u.note", (unsigned int)getpid());
     }
 
-    if (uk_window_connect(&g_win, "Notes", 240, 180, WIN_W, WIN_H, MAP_ADDR, SERVER_CHAN) < 0) {
+    if (uk_window_connect(&g_win, "Notes", 240, 180, INIT_W, INIT_H, MAP_ADDR, SERVER_CHAN) < 0) {
         fprintf(stderr, "Failed to create Notes window\n");
         return 1;
     }
@@ -307,6 +316,12 @@ int main(int argc, char **argv)
         int r = az_channel_recv(g_win.client_chan, (az_ipc_msg_t *)&msg);
         if (r < 0) break;
         if (r != 0) continue;
+
+        if (msg.type == AZ_WM_WINDOW_RESIZED) {
+            if (!uk_handle_resize(&g_win, &msg)) break;
+            render_note(&g_win);
+            continue;
+        }
 
         if (msg.type == AZ_WM_DESTROY_WINDOW) {
             save_note();
