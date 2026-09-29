@@ -184,8 +184,15 @@ typedef struct xhci_trb {
 #define EP_CTX_MPS(m)         ((u32)(m) << 16)
 #define EP_CTX_AVG_TRB(l)     ((u32)(l) & 0xFFFF)
 #define EP_CTX_ESIT_LO(p)     (((u32)(p) & 0xFFFF) << 16)
+#define EP_CTX_MAX_PSTREAMS(p) ((u32)(p) << 10)
+#define EP_CTX_LSA            (1U << 15)
 
+#define EP_TYPE_ISOC_OUT      1
+#define EP_TYPE_BULK_OUT      2
+#define EP_TYPE_INT_OUT       3
 #define EP_TYPE_CONTROL       4
+#define EP_TYPE_ISOC_IN       5
+#define EP_TYPE_BULK_IN       6
 #define EP_TYPE_INT_IN        7
 
 /** xhci_init() — register the xHCI PCI driver (class 0C0330). */

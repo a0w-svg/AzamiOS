@@ -72,6 +72,7 @@ typedef struct {
      * present_gen advances on every write()/pan so the flusher can skip a
      * frame that nothing touched. */
     bool        is_virtio;
+    bool        is_vmwgfx;
     bool        mmap_active;
     u64         present_gen;
     u64         flushed_gen;
@@ -179,17 +180,22 @@ static void fbdev_damage_add_locked(u32 x1, u32 y1, u32 x2, u32 y2)
  * rectangle, not the screen. */
 static s64 fbdev_virtio_present_rect(u32 x, u32 y, u32 w, u32 h)
 {
-    if (!g_fb_state.is_virtio) return 0;
+    if (!g_fb_state.is_virtio && !g_fb_state.is_vmwgfx) return 0;
     if (w == 0 || h == 0) return 0;
     if (x >= g_fb_state.width || y >= g_fb_state.height) return 0;
     if (x + w > g_fb_state.width)  w = g_fb_state.width  - x;
     if (y + h > g_fb_state.height) h = g_fb_state.height - y;
 
-    u64 off = (u64)y * g_fb_state.pitch + (u64)x * 4;
-    if (virtio_gpu_transfer_to_host_2d_rect(g_gpu.resource_id, x, y, w, h, off) < 0)
-        return -(s64)EIO;
-    if (virtio_gpu_resource_flush_rect(g_gpu.resource_id, x, y, w, h) < 0)
-        return -(s64)EIO;
+    if (g_fb_state.is_vmwgfx) {
+        extern void vmwgfx_update_rect_fb(u32 x, u32 y, u32 w, u32 h);
+        vmwgfx_update_rect_fb(x, y, w, h);
+    } else {
+        u64 off = (u64)y * g_fb_state.pitch + (u64)x * 4;
+        if (virtio_gpu_transfer_to_host_2d_rect(g_gpu.resource_id, x, y, w, h, off) < 0)
+            return -(s64)EIO;
+        if (virtio_gpu_resource_flush_rect(g_gpu.resource_id, x, y, w, h) < 0)
+            return -(s64)EIO;
+    }
     g_fb_state.flushed_gen = __atomic_load_n(&g_fb_state.present_gen, __ATOMIC_RELAXED);
     return 0;
 }
@@ -222,6 +228,17 @@ static s64 fbdev_flip_to(u32 buf_idx, bool wait_vsync)
                                       g_fb_state.width, g_fb_state.height);
         virtio_gpu_resource_flush_rect(g_gpu.resource_id, 0, y_off,
                                        g_fb_state.width, g_fb_state.height);
+        g_fb_state.y_offset = y_off;
+        return 0;
+    }
+
+    if (g_fb_state.is_vmwgfx) {
+        extern void vmwgfx_set_scanout_offset(u32 offset);
+        extern void vmwgfx_update_rect_fb(u32 x, u32 y, u32 w, u32 h);
+        u32 y_off = buf_idx * g_fb_state.height;
+        u32 byte_off = y_off * g_fb_state.pitch;
+        vmwgfx_set_scanout_offset(byte_off);
+        vmwgfx_update_rect_fb(0, 0, g_fb_state.width, g_fb_state.height);
         g_fb_state.y_offset = y_off;
         return 0;
     }
@@ -267,7 +284,28 @@ static void fbdev_probe_hardware(void)
         return;
     }
 
-    /* 2. Try VirtIO GPU — before the Limine GOP fallback. When a virtio-gpu
+    /* 2. Try VMWGFX (VMware SVGA II) */
+    extern phys_addr_t vmwgfx_get_fb_phys(u32 *w, u32 *h, u32 *pitch, size_t *size);
+    phys_addr_t vmw_phys = vmwgfx_get_fb_phys(&g_fb_state.width, &g_fb_state.height, &g_fb_state.pitch, &g_fb_state.total_vram_size);
+    if (vmw_phys != 0) {
+        g_fb_state.phys_addr       = vmw_phys;
+        g_fb_state.bpp             = 32;
+        g_fb_state.single_fb_size  = (size_t)g_fb_state.pitch * g_fb_state.height;
+        g_fb_state.buffers         = 1;
+        if (g_fb_state.single_fb_size && g_fb_state.total_vram_size / g_fb_state.single_fb_size >= 2) {
+            g_fb_state.buffers = 2;
+        }
+        g_fb_state.has_hw_flip     = (g_fb_state.buffers > 1);
+        g_fb_state.y_offset        = 0;
+        g_fb_state.is_vmwgfx       = true;
+        pr_debug("[FBDEV] Active Backend: VMware SVGA II (%ux%ux32, %u buffer%s, LFB: 0x%016llx)\n",
+                 g_fb_state.width, g_fb_state.height,
+                 g_fb_state.buffers, g_fb_state.buffers == 1 ? "" : "s",
+                 (unsigned long long)vmw_phys);
+        return;
+    }
+
+    /* 3. Try VirtIO GPU — before the Limine GOP fallback. When a virtio-gpu
      * was initialised its backing is a host-owned 2D resource, and the
      * damage-scoped TRANSFER_TO_HOST path plus the hardware-cursor overlay
      * are what this driver drives it with. If QEMU also exposed a std-VGA the
@@ -532,7 +570,7 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
             return virtio_gpu_cursor_hide(0) ? -(s64)EIO : 0;
 
         case FBIOAZ_DAMAGE: {
-            if (!g_fb_state.is_virtio) return 0;   /* nothing to sync; harmless */
+            if (!g_fb_state.is_virtio && !g_fb_state.is_vmwgfx) return 0;   /* nothing to sync; harmless */
             struct fb_az_rect r;
             if (copy_from_user(&r, (void *)(uintptr_t)arg, sizeof(r)) != 0) return -(s64)EFAULT;
             if (r.w == 0 || r.h == 0) return 0;
@@ -545,7 +583,7 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
         }
 
         case FBIOAZ_DAMAGE_LIST: {
-            if (!g_fb_state.is_virtio) return 0;   /* nothing to sync; harmless */
+            if (!g_fb_state.is_virtio && !g_fb_state.is_vmwgfx) return 0;   /* nothing to sync; harmless */
             struct fb_az_damage_list dl;
             if (copy_from_user(&dl, (void *)(uintptr_t)arg, sizeof(dl)) != 0) return -(s64)EFAULT;
             if (dl.count == 0) return 0;
@@ -683,7 +721,7 @@ static s64 fbdev_mmap(struct file *filp, virt_addr_t vaddr, size_t len, u32 prot
                 phys_base + i * PAGE_SIZE, vmm_flags);
     }
 
-    if (g_fb_state.is_virtio)
+    if (g_fb_state.is_virtio || g_fb_state.is_vmwgfx)
         __atomic_store_n(&g_fb_state.mmap_active, true, __ATOMIC_RELAXED);
 
     extern void console_disable_fb(void);
@@ -733,10 +771,10 @@ static void fbdev_flusher(void *arg)
     for (;;) {
         vsync_wait(0);
 
-        /* is_virtio is settled by fbdev_probe_hardware(), which can run after
+        /* is_virtio and is_vmwgfx are settled by fbdev_probe_hardware(), which can run after
          * fbdev_init() (on the first open of /dev/fb0), so this is re-checked
          * every iteration rather than gating whether the worker exists. */
-        if (!g_fb_state.is_virtio ||
+        if (!(g_fb_state.is_virtio || g_fb_state.is_vmwgfx) ||
             !__atomic_load_n(&g_fb_state.mmap_active, __ATOMIC_RELAXED))
             continue;
 

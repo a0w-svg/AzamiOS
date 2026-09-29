@@ -7,6 +7,8 @@
 #include "../../drivers/input/input.h"
 #include "../../include/azami/defs.h"
 #include "../../include/azami/types.h"
+#include "../../arch/x86_64/boot/limine.h"
+#include "../../arch/x86_64/boot/limine_req.h"
 
 extern int kprintf(const char *fmt, ...);
 
@@ -52,10 +54,24 @@ static void vboxguest_irq_handler(pt_regs_t *r, void *ctx)
         vboxguest_send_request(mouse_req);
         
         if (mouse_req->header.rc == 0) {
+            static u32 s_screen_w = 0, s_screen_h = 0;
+            if (s_screen_w == 0) {
+                extern u32 bga_get_width(void);
+                extern u32 bga_get_height(void);
+                s_screen_w = bga_get_width();
+                s_screen_h = bga_get_height();
+                if (s_screen_w == 0) {
+                    struct limine_framebuffer *lfb = az_boot_framebuffer();
+                    s_screen_w = (lfb && lfb->width) ? (u32)lfb->width : 1280;
+                    s_screen_h = (lfb && lfb->height) ? (u32)lfb->height : 800;
+                }
+            }
+
             input_event_t evt = {
                 .type = INPUT_EVENT_MOUSE_ABS,
-                .mouse_dx = (s16)mouse_req->x,
-                .mouse_dy = (s16)mouse_req->y,
+                .flags = INPUT_MOUSE_FLAG_BUTTONS,
+                .mouse_dx = (s16)(((u64)mouse_req->x * s_screen_w) / 0xFFFF),
+                .mouse_dy = (s16)(((u64)mouse_req->y * s_screen_h) / 0xFFFF),
                 .mouse_buttons = 0,
                 .timestamp = 0
             };

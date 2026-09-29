@@ -83,6 +83,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] __ro_after_init;
 static file_t *fget(process_t *proc, int fd)
 {
     if (!proc || fd < 0 || fd >= PROC_MAX_FDS) return NULL;
+    fd = (int)array_index_nospec((unsigned long)fd, (unsigned long)PROC_MAX_FDS);
     irqflags_t f = spinlock_lock_irqsave(&proc->fd_lock);
     file_t *file = (file_t *)proc->handle_table[fd];
     if (file && (uintptr_t)file >= 0xFFFF800000000000ULL) {

@@ -1,0 +1,35 @@
+--- userland/apps/azwm/compositor.c
++++ userland/apps/azwm/compositor.c
+@@ -1436,6 +1436,10 @@
+             for (int ty2 = ty_start; ty2 < ty_end; ty2++) {
+                 if (ty2 < 0 || ty2 >= (int)comp->fb_height) continue;
+                 unsigned int t = (tb_range > 1) ? (unsigned int)((ty2 - tb_top_y) * 255 / (tb_range - 1)) : 0;
++                
++                /* Top rounded corner mask (Radius 6) */
++                int corner_inset = 0;
++                int dy = ty2 - tb_top_y;
++                if (dy < 6) {
++                    static const int insets[6] = { 4, 2, 1, 1, 0, 0 };
++                    corner_inset = insets[dy];
++                }
++                int curr_tx_start = tx_start;
++                int curr_tx_end = tx_end;
++                if (curr_tx_start < wx + corner_inset) curr_tx_start = wx + corner_inset;
++                if (curr_tx_end > wx + ww - corner_inset) curr_tx_end = wx + ww - corner_inset;
++                
+                 unsigned int col;
+                 unsigned int alpha = 0xAA; /* Semi-transparent */
+                 if (win->focused) {
+@@ -1453,9 +1457,9 @@
+                     unsigned int b2 = (0x28 * (255 - t) + 0x2E * t) / 255;
+                     col = (alpha << 24) | (r2 << 16) | (g2 << 8) | b2;
+                 }
+-                if (tx_start < tx_end) {
+-                    unsigned int *dst = &comp->backbuf[ty2 * pitch_px2 + tx_start];
+-                    int count = tx_end - tx_start;
++                if (curr_tx_start < curr_tx_end) {
++                    unsigned int *dst = &comp->backbuf[ty2 * pitch_px2 + curr_tx_start];
++                    int count = curr_tx_end - curr_tx_start;
+                     for (int i = 0; i < count; i++) {
+                         dst[i] = alpha_blend(dst[i], col, alpha);
+                     }

@@ -15,12 +15,16 @@
 #define AZWM_ANIM_OPEN     1
 #define AZWM_ANIM_MINIMIZE 2
 #define AZWM_ANIM_RESTORE  3
+#define AZWM_ANIM_CLOSE    4
+#define AZWM_ANIM_MAXIMIZE 5
+#define AZWM_ANIM_UNMAXIMIZE 6
 
 /* Window open/minimize/restore animations are timed against wall-clock
  * nanoseconds (anim_start_ns below), not counted in fixed loop iterations —
  * see compositor_animate_step()'s comment for why a step count doesn't work
- * here. 180ms is snappy without being so short it reads as a flicker. */
-#define AZWM_ANIM_DURATION_NS (180LL * 1000000LL)
+ * here. 300ms is snappy without being so short it reads as a flicker, and gives
+ * enough time for spring physics to settle. */
+#define AZWM_ANIM_DURATION_NS (300LL * 1000000LL)
 
 /* ── Window descriptor ────────────────────────────────────────────────────── */
 typedef struct az_window_t {
@@ -39,6 +43,7 @@ typedef struct az_window_t {
     unsigned char  blur_backdrop; /* AZ_WIN_FLAG_BLUR_BACKDROP was set at create time */
     unsigned char  opacity;       /* Window alpha: 0 = transparent, 255 = fully opaque */
     unsigned char  pinned;        /* 1 = always on top, 0 = normal */
+    unsigned char  pending_destroy; /* 1 = waiting for close animation to finish */
     unsigned int   cursor_type;   /* Client-requested cursor shape */
     /* Pre-maximize geometry, restored on un-maximize */
     int            saved_x, saved_y;
@@ -53,10 +58,16 @@ typedef struct az_window_t {
     char           title[64];
     struct az_window_t *next;
     struct az_window_t *prev;
+    unsigned int hw_tex;
 } az_window_t;
+
+struct hw3d_context;
 
 /* ── Compositor state ─────────────────────────────────────────────────────── */
 typedef struct {
+    struct hw3d_context *hw3d_ctx;
+    unsigned int hw3d_rt;
+
     /* Framebuffer & Hardware Page Flipping */
     unsigned int *frontbuf;   /* Currently displayed buffer */
     unsigned int *backbuf;    /* Off-screen buffer for rendering */
@@ -238,8 +249,11 @@ void compositor_update_cursor(az_compositor_t *comp);
 
 /** Window animation triggers */
 void compositor_trigger_open_animation(az_compositor_t *comp, az_window_t *win);
+void compositor_trigger_close_animation(az_compositor_t *comp, az_window_t *win);
 void compositor_trigger_minimize_animation(az_compositor_t *comp, az_window_t *win, int dock_x, int dock_y);
 void compositor_trigger_restore_animation(az_compositor_t *comp, az_window_t *win, int dock_x, int dock_y);
+void compositor_trigger_maximize_animation(az_compositor_t *comp, az_window_t *win, int target_x, int target_y, unsigned int target_w, unsigned int target_h);
+void compositor_trigger_unmaximize_animation(az_compositor_t *comp, az_window_t *win);
 int  compositor_animate_step(az_compositor_t *comp);
 
 /** Cursor, Opacity, and Title API Helpers */

@@ -36,6 +36,8 @@ typedef struct vmwgfx_device {
     drm_crtc_t *crtc;
 } vmwgfx_device_t;
 
+static vmwgfx_device_t *g_vmwgfx = NULL;
+
 /* ── Register access ─────────────────────────────────────────────────────── */
 
 static void svga_write(vmwgfx_device_t *sv, u32 index, u32 value)
@@ -396,8 +398,31 @@ static int vmwgfx_pci_probe(dm_device_t *dm, const pci_device_id_t *id)
     }
 
     dm_set_drvdata(dm, dev);
+    g_vmwgfx = sv;
     pr_debug("[VMWGFX] SVGA interface version %u accepted\n", version & 0xFF);
     return 0;
+}
+
+phys_addr_t vmwgfx_get_fb_phys(u32 *w, u32 *h, u32 *pitch, size_t *size)
+{
+    if (!g_vmwgfx) return 0;
+    if (w) *w = g_vmwgfx->width;
+    if (h) *h = g_vmwgfx->height;
+    if (pitch) *pitch = g_vmwgfx->pitch;
+    if (size) *size = g_vmwgfx->fb_size;
+    return (phys_addr_t)svga_read(g_vmwgfx, SVGA_REG_FB_START);
+}
+
+void vmwgfx_update_rect_fb(u32 x, u32 y, u32 w, u32 h)
+{
+    if (!g_vmwgfx) return;
+    svga_update_rect(g_vmwgfx, x, y, w, h);
+}
+
+void vmwgfx_set_scanout_offset(u32 offset)
+{
+    if (!g_vmwgfx) return;
+    svga_write(g_vmwgfx, SVGA_REG_FB_OFFSET, offset);
 }
 
 static void vmwgfx_pci_remove(dm_device_t *dm)

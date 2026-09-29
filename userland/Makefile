@@ -88,6 +88,7 @@ SBIN_APPS = \
     $(SBIN_DIR)/lockscreen.elf
 
 BIN_APPS_SIMPLE = \
+    $(BIN_DIR)/hw_ui_demo.elf \
     $(BIN_DIR)/testarch.elf \
     $(BIN_DIR)/hwtest.elf \
     $(BIN_DIR)/strace.elf \
@@ -582,8 +583,8 @@ $(BIN_DIR)/thread_tls_test_dyn.elf: libc/crt0_dyn.o $(OBJ_DIR)/dyn_thread_tls_te
 $(OBJ_DIR)/thread_tls_test.o: examples/thread_tls_test.c | skeleton
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BIN_DIR)/thread_tls_test.elf: $(OBJ_DIR)/thread_tls_test.o libc/libc.a libc/crt0.o | skeleton
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/thread_tls_test.o libc/libc.a -o $@
+$(BIN_DIR)/thread_tls_test.elf: $(OBJ_DIR)/thread_tls_test.o libc/libc.a libgame/libgame.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/thread_tls_test.o libc/libc.a libgame/libgame.a -o $@
 
 .PHONY: dynlink
 dynlink: toolchain $(BUILD_DIR)/lib/ld-azami.so $(BUILD_DIR)/lib/libc.so $(BIN_DIR)/dltest_app.elf \
@@ -882,20 +883,20 @@ SBIN_APPS_SIMPLE := $(filter-out $(SBIN_DIR)/azwm.elf,$(SBIN_APPS))
 # longer /bin/sh.elf — GNU bash is (see the `apps` target). Only the link
 # needs naming here; $(OBJ_DIR)/sh.o comes from the ordinary object rule
 # below like every other app's.
-$(BIN_DIR)/azami-sh.elf: $(OBJ_DIR)/sh.o libc/libc.a libc/crt0.o | skeleton
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sh.o libc/libc.a -o $@
+$(BIN_DIR)/azami-sh.elf: $(OBJ_DIR)/sh.o libc/libc.a libgame/libgame.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/sh.o libc/libc.a libgame/libgame.a -o $@
 
 $(OBJ_DIR)/%.o: apps/%/main.c | skeleton
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(SBIN_APPS_SIMPLE): $(SBIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libc/crt0.o | skeleton
-	$(LD) $(LDFLAGS) libc/crt0.o $< libc/libc.a -o $@
+$(SBIN_APPS_SIMPLE): $(SBIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libgame/libgame.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $< libc/libc.a libgame/libgame.a -o $@
 
-$(BIN_APPS_SIMPLE): $(BIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libc/crt0.o | skeleton
-	$(LD) $(LDFLAGS) libc/crt0.o $< libc/libc.a -o $@
+$(BIN_APPS_SIMPLE): $(BIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libgame/libgame.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $< libc/libc.a libgame/libgame.a -o $@
 
 $(GAME_APPS): $(BIN_DIR)/%.elf: $(OBJ_DIR)/%.o libc/libc.a libc/crt0.o libgame/libgame.a | skeleton
-	$(LD) $(LDFLAGS) libc/crt0.o $< libgame/libgame.a libc/libc.a -o $@
+	$(LD) $(LDFLAGS) libc/crt0.o $< libgame/libgame.a libc/libc.a libgame/libgame.a -o $@
 
 
 # ── settings.elf (Settings Panel) ──────────────────────────────────────────
@@ -925,8 +926,8 @@ SETTINGS_OBJS = $(OBJ_DIR)/settings_main.o $(OBJ_DIR)/settings_tab_display.o $(O
                 $(OBJ_DIR)/settings_tab_power.o $(OBJ_DIR)/settings_tab_disks.o $(OBJ_DIR)/settings_tab_security.o \
                 $(OBJ_DIR)/settings_tab_system.o
 
-$(BIN_DIR)/settings.elf: $(SETTINGS_OBJS) libc/libc.a libc/crt0.o | skeleton
-	$(LD) $(LDFLAGS) libc/crt0.o $(SETTINGS_OBJS) libc/libc.a -o $@
+$(BIN_DIR)/settings.elf: $(SETTINGS_OBJS) libc/libc.a libgame/libgame.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $(SETTINGS_OBJS) libc/libc.a libgame/libgame.a -o $@
 
 # ── azwm.elf (window manager + compositor + DE extension + desktop) ─────────
 $(OBJ_DIR)/azwm_main.o: apps/azwm/main.c | skeleton
@@ -938,8 +939,8 @@ $(OBJ_DIR)/azwm_de.o: apps/azwm/de_compositor.c | skeleton
 $(OBJ_DIR)/azwm_desk.o: apps/azwm/desktop.c | skeleton
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(SBIN_DIR)/azwm.elf: $(OBJ_DIR)/azwm_main.o $(OBJ_DIR)/azwm_comp.o $(OBJ_DIR)/azwm_de.o $(OBJ_DIR)/azwm_desk.o libc/libc.a libc/crt0.o | skeleton
-	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/azwm_main.o $(OBJ_DIR)/azwm_comp.o $(OBJ_DIR)/azwm_de.o $(OBJ_DIR)/azwm_desk.o libc/libc.a -o $@
+$(SBIN_DIR)/azwm.elf: $(OBJ_DIR)/azwm_main.o $(OBJ_DIR)/azwm_comp.o $(OBJ_DIR)/azwm_de.o $(OBJ_DIR)/azwm_desk.o libc/libc.a libgame/libgame.a libc/crt0.o | skeleton
+	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/azwm_main.o $(OBJ_DIR)/azwm_comp.o $(OBJ_DIR)/azwm_de.o $(OBJ_DIR)/azwm_desk.o libc/libc.a libgame/libgame.a -o $@
 
 # ── Header dependencies (must stay last; see CFLAGS += -MMD -MP above) ──────
 #

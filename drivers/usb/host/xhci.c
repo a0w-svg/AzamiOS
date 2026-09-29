@@ -65,8 +65,15 @@ typedef struct xhci_ring {
 
 typedef struct xhci_ep {
     xhci_ring_t   ring;
+    xhci_ring_t  *stream_rings;
+    u64          *stream_ctx;
+    phys_addr_t   stream_ctx_phys;
+    u32           num_streams;
     bool          active;
     bool          needs_reset;
+    volatile bool bulk_done;
+    u8            bulk_cc;
+    u32           bulk_residual;
     u16           mps;
     u8           *buf;
     phys_addr_t   buf_phys;
@@ -284,18 +291,23 @@ static void handle_transfer_event(xhci_hc_t *hc, const xhci_trb_t *e)
 
     xhci_ep_t *ep = &s->ep[dci];
     if (!ep->active) return;
-    if (cc == CC_SUCCESS || cc == CC_SHORT_PACKET) {
-        u32 got = residual <= ep->mps ? ep->mps - residual : 0;
-        if (ep->cb) ep->cb(s->udev, ep->cb_ctx, ep->buf, got);
-        if (ep->active) {
-            ring_push(&ep->ring, ep->buf_phys, ep->mps,
-                      TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
-            ring_doorbell(hc, s->id, dci);
+    if (ep->cb) {
+        if (cc == CC_SUCCESS || cc == CC_SHORT_PACKET) {
+            u32 got = residual <= ep->mps ? ep->mps - residual : 0;
+            ep->cb(s->udev, ep->cb_ctx, ep->buf, got);
+            if (ep->active) {
+                ring_push(&ep->ring, ep->buf_phys, ep->mps,
+                          TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
+                ring_doorbell(hc, s->id, dci);
+            }
+        } else {
+            ep->needs_reset = true;
         }
     } else {
-        /* The endpoint halted; recovery issues commands, which cannot be
-         * done from inside event processing — the thread does it. */
-        ep->needs_reset = true;
+        /* Synchronous bulk transfer */
+        ep->bulk_residual = residual;
+        ep->bulk_cc = (u8)(cc == CC_SHORT_PACKET ? CC_SUCCESS : cc);
+        ep->bulk_done = true;
     }
 }
 
@@ -531,10 +543,150 @@ static int xhci_op_intr_in(usb_device_t *dev, const usb_endpoint_descriptor_t *e
     return 0;
 }
 
+
+static int xhci_op_bulk(usb_device_t *dev, const usb_endpoint_descriptor_t *epd,
+                        void *data, u32 len, u32 stream_id)
+{
+    xhci_slot_t *s = (xhci_slot_t *)dev->hcd_priv;
+    if (!s) return -ENODEV;
+    xhci_hc_t *hc = s->hc;
+    if (hc->dead) return -EIO;
+
+    bool in = (epd->bEndpointAddress & USB_DIR_IN) != 0;
+    u32 ep_num = epd->bEndpointAddress & USB_ENDPOINT_NUM_MASK;
+    u32 dci = ep_num * 2 + (in ? 1 : 0);
+    if (dci < 2 || dci > 31) return -EINVAL;
+    
+    xhci_ep_t *ep = &s->ep[dci];
+    u16 wmps  = epd->wMaxPacketSize;
+    u16 mps   = wmps & 0x7FF;
+    if (!mps) return -EINVAL;
+
+    if (!ep->active) {
+        if (ring_init(hc, &ep->ring) < 0) return -ENOMEM;
+        
+        memset(s->in_ctx, 0, PAGE_SIZE);
+        in_ctrl(s)[1] = (1U << 0) | (1U << dci);
+        memcpy(in_slot(s), out_slot(s), hc->ctx_size);
+        u32 entries = (in_slot(s)[0] & SLOT_CTX_ENTRIES_MASK) >> 27;
+        if (dci > entries)
+            in_slot(s)[0] = (in_slot(s)[0] & ~SLOT_CTX_ENTRIES_MASK) | SLOT_CTX_ENTRIES(dci);
+            
+        u32 burst = s->xspeed == XHCI_SPEED_HIGH ? (wmps >> 11) & 3 : 0;
+        u32 *e = in_ep(s, dci);
+        e[1] = EP_CTX_CERR(3) | EP_CTX_TYPE(in ? EP_TYPE_BULK_IN : EP_TYPE_BULK_OUT) | EP_CTX_MPS(mps) | EP_CTX_BURST(burst);
+        
+        if (ep->num_streams > 0) {
+            u32 max_pstreams = 0;
+            while ((1U << max_pstreams) < ep->num_streams && max_pstreams < 15) max_pstreams++;
+            e[1] |= EP_CTX_MAX_PSTREAMS(max_pstreams);
+            ep_ctx_set_dequeue(e, ep->stream_ctx_phys | 1);
+        } else {
+            ep_ctx_set_dequeue(e, ep->ring.phys | 1);
+        }
+        e[4] = EP_CTX_AVG_TRB(mps);
+        
+        int rc = xhci_command(hc, s->in_ctx_phys, TRB_TYPE(TRB_CONFIGURE_EP) | TRB_SLOT(s->id), NULL);
+        if (rc < 0) {
+            ring_free(&ep->ring);
+            return rc;
+        }
+        ep->mps = mps;
+        ep->cb = NULL;
+        ep->active = true;
+    }
+
+    if (len == 0) return 0;
+    
+    // Bounce buffer for data (up to PAGE_SIZE for now)
+    if (len > PAGE_SIZE) return -EINVAL;
+    
+    phys_addr_t data_phys = 0;
+    void *data_virt = dma_page(hc, &data_phys);
+    if (!data_virt) return -ENOMEM;
+    if (!in) memcpy(data_virt, data, len);
+
+    ep->bulk_done = false;
+    ep->bulk_cc = 0;
+    ep->bulk_residual = 0;
+
+    xhci_ring_t *target_ring = (stream_id > 0 && stream_id < ep->num_streams) ? &ep->stream_rings[stream_id] : &ep->ring;
+    ring_push(target_ring, data_phys, len, TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP | (in ? TRB_DIR_IN : 0));
+    ring_doorbell(hc, s->id, dci | (stream_id << 16));
+    
+    int rc = xhci_wait(hc, &ep->bulk_done, 5000);
+    if (rc < 0) {
+        xhci_ep_recover(s, dci, true);
+        dma_free(data_phys);
+        return rc;
+    }
+    if (ep->bulk_cc != CC_SUCCESS && ep->bulk_cc != CC_SHORT_PACKET) {
+        xhci_ep_recover(s, dci, false);
+        dma_free(data_phys);
+        return ep->bulk_cc == CC_STALL ? -EPIPE : -EIO;
+    }
+    
+    u32 actual = ep->bulk_residual <= len ? len - ep->bulk_residual : 0;
+    if (in && actual > 0) memcpy(data, data_virt, actual);
+    dma_free(data_phys);
+    return (int)actual;
+}
+
+
+static int xhci_op_alloc_streams(usb_device_t *dev, const usb_endpoint_descriptor_t *epd, u32 num_streams)
+{
+    xhci_slot_t *s = (xhci_slot_t *)dev->hcd_priv;
+    if (!s || !num_streams || num_streams > 65536) return -EINVAL;
+    
+    bool in = (epd->bEndpointAddress & USB_DIR_IN) != 0;
+    u32 ep_num = epd->bEndpointAddress & USB_ENDPOINT_NUM_MASK;
+    u32 dci = ep_num * 2 + (in ? 1 : 0);
+    if (dci < 2 || dci > 31) return -EINVAL;
+    
+    xhci_ep_t *ep = &s->ep[dci];
+    if (ep->active) return -EBUSY; /* Must be called before first transfer */
+    
+    u32 max_pstreams = 0;
+    while ((1U << max_pstreams) < num_streams && max_pstreams < 15) max_pstreams++;
+    u32 actual_streams = 1U << max_pstreams;
+    
+    ep->stream_ctx = (u64 *)dma_page(s->hc, &ep->stream_ctx_phys);
+    if (!ep->stream_ctx) return -ENOMEM;
+    
+    ep->stream_rings = kmalloc(sizeof(xhci_ring_t) * actual_streams);
+    if (!ep->stream_rings) {
+        dma_free(ep->stream_ctx_phys);
+        return -ENOMEM;
+    }
+    
+    for (u32 i = 1; i < actual_streams; i++) {
+        if (ring_init(s->hc, &ep->stream_rings[i]) < 0) {
+            for (u32 j = 1; j < i; j++) ring_free(&ep->stream_rings[j]);
+            kfree(ep->stream_rings);
+            dma_free(ep->stream_ctx_phys);
+            return -ENOMEM;
+        }
+        /* Stream Context Array format: 64-bit TRB Dequeue Pointer */
+        /* Bit 0 is SCT (Stream Context Type) = 1 (Primary Stream Context) */
+        ep->stream_ctx[i * 2] = ep->stream_rings[i].phys | 1;
+        ep->stream_ctx[i * 2 + 1] = 0;
+    }
+    
+    ep->num_streams = actual_streams;
+    return actual_streams;
+}
+
+static int xhci_op_isoc_start(usb_device_t *dev, const usb_endpoint_descriptor_t *ep)
+{
+    return -ENOSYS; /* Stub for now */
+}
 static const usb_hcd_ops_t g_xhci_ops = {
     .control     = xhci_op_control,
     .set_ep0_mps = xhci_op_set_ep0_mps,
     .intr_in     = xhci_op_intr_in,
+    .bulk        = xhci_op_bulk,
+    .isoc_start  = xhci_op_isoc_start,
+    .alloc_streams = xhci_op_alloc_streams,
 };
 
 /* ── Devices ──────────────────────────────────────────────────────────────── */

@@ -156,9 +156,11 @@ __noreturn void __stack_chk_fail(void)
 bool security_validate_user_ptr(const void *ptr, size_t size)
 {
     uintptr_t addr = (uintptr_t)ptr;
-    /* User space must reside below the canonical hole (< 0x00007FFFFFFFFFFF) */
+    if (!ptr) return false;
+    if (addr < g_mmap_min_addr) return false;
+    /* User space must reside below the canonical hole (< 0x0000800000000000ULL) */
     if (addr >= 0x0000800000000000ULL) return false;
-    if (addr + size < addr || addr + size >= 0x0000800000000000ULL) return false;
+    if (addr + size < addr || addr + size > 0x0000800000000000ULL) return false;
     return true;
 }
 

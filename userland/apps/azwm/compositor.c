@@ -6,6 +6,8 @@
 #include "compositor.h"
 #include "de_protocol.h"
 #include "desktop.h"
+#include <game/game_hw3d.h>
+#include <math.h>
 #include "../../libc/include/az/ipc.h"
 #include "../../libc/include/string.h"
 #include "../../libc/include/stdio.h"
@@ -99,6 +101,13 @@ void compositor_init(az_compositor_t *comp,
     comp->hover_btn      = AZWM_BTN_NONE;
     comp->server_channel = server_channel;
     comp->has_animating_windows = 0;
+
+    comp->hw3d_ctx = hw3d_init();
+    if (comp->hw3d_ctx) {
+        printf("[azwm] Hardware 3D acceleration (Virgl) enabled.\n");
+        hw3d_resource_create(comp->hw3d_ctx, PIPE_TEXTURE_2D, PIPE_FORMAT_B8G8R8A8_UNORM,
+                                            VIRGL_BIND_RENDER_TARGET, w, h, 1, 1, &comp->hw3d_rt);
+    }
 
     /* Setup hardware double-buffered VRAM pointers */
     comp->frontbuf = frontbuf;
@@ -796,7 +805,8 @@ static inline void composite_blend_span_opacity(unsigned int *dst, const unsigne
         unsigned int col = src[px];
         unsigned int a = (col >> 24) & 0xFF;
         if (a > 0) {
-            unsigned int eff_a = (a * win_opacity) / 255;
+            unsigned int prod = a * win_opacity + 0x80;
+            unsigned int eff_a = (prod + (prod >> 8)) >> 8;
             if (eff_a > 0) {
                 dst[px] = alpha_blend(dst[px], col, eff_a);
             }
@@ -864,6 +874,50 @@ static void bb_fill_rect_clipped(az_compositor_t *comp, int rx, int ry, int rw, 
 static void bb_fill_rect(az_compositor_t *comp, int rx, int ry, int rw, int rh, unsigned int color)
 {
     bb_fill_rect_clipped(comp, rx, ry, rw, rh, color, 0, 0, (int)comp->fb_width, (int)comp->fb_height);
+}
+static void bb_fill_rect_blend_clipped(az_compositor_t *comp, int rx, int ry, int rw, int rh, unsigned int color,
+                                       int cx0, int cy0, int cx1, int cy1)
+{
+    if (rw <= 0 || rh <= 0) return;
+    int x0 = rx < cx0 ? cx0 : rx;
+    int y0 = ry < cy0 ? cy0 : ry;
+    int x1 = rx + rw;
+    int y1 = ry + rh;
+    if (x1 > cx1) x1 = cx1;
+    if (y1 > cy1) y1 = cy1;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    unsigned int pitch_px = comp->fb_pitch / 4;
+    int fill_w = x1 - x0;
+    unsigned int alpha = (color >> 24) & 0xFF;
+
+    for (int y = y0; y < y1; y++) {
+        unsigned int *dst = &comp->backbuf[(unsigned int)y * pitch_px + (unsigned int)x0];
+        for (int i = 0; i < fill_w; i++) {
+            dst[i] = alpha_blend(dst[i], color, alpha);
+        }
+    }
+}
+
+static void bb_fill_circle_blend_clipped(az_compositor_t *comp, int cx, int cy, int r, unsigned int color, int clip_x0, int clip_y0, int clip_x1, int clip_y1);
+
+static void bb_fill_rounded_rect_blend_clipped(az_compositor_t *comp, int rx, int ry, int rw, int rh, int radius, unsigned int color,
+                                               int cx0, int cy0, int cx1, int cy1)
+{
+    if (rw <= 0 || rh <= 0) return;
+    if (radius * 2 > rw) radius = rw / 2;
+    if (radius * 2 > rh) radius = rh / 2;
+    if (radius <= 0) {
+        bb_fill_rect_blend_clipped(comp, rx, ry, rw, rh, color, cx0, cy0, cx1, cy1);
+        return;
+    }
+    bb_fill_rect_blend_clipped(comp, rx + radius, ry, rw - 2 * radius, rh, color, cx0, cy0, cx1, cy1);
+    bb_fill_rect_blend_clipped(comp, rx, ry + radius, radius, rh - 2 * radius, color, cx0, cy0, cx1, cy1);
+    bb_fill_rect_blend_clipped(comp, rx + rw - radius, ry + radius, radius, rh - 2 * radius, color, cx0, cy0, cx1, cy1);
+    bb_fill_circle_blend_clipped(comp, rx + radius, ry + radius, radius, color, cx0, cy0, cx1, cy1);
+    bb_fill_circle_blend_clipped(comp, rx + rw - radius - 1, ry + radius, radius, color, cx0, cy0, cx1, cy1);
+    bb_fill_circle_blend_clipped(comp, rx + radius, ry + rh - radius - 1, radius, color, cx0, cy0, cx1, cy1);
+    bb_fill_circle_blend_clipped(comp, rx + rw - radius - 1, ry + rh - radius - 1, radius, color, cx0, cy0, cx1, cy1);
 }
 
 static inline void bb_put_pixel_clipped(az_compositor_t *comp, int x, int y, unsigned int color,
@@ -1156,6 +1210,9 @@ static void box_blur_line(const unsigned int *src, unsigned int *dst, int count,
 {
     if (count <= 0) return;
     int window = 2 * radius + 1;
+    if (window <= 0) return;
+    unsigned long long inv_window = ((1ULL << 32) + (unsigned long long)window - 1) / (unsigned long long)window;
+
     long sum_r = 0, sum_g = 0, sum_b = 0;
     for (int i = -radius; i <= radius; i++) {
         int xi = i < 0 ? 0 : (i >= count ? count - 1 : i);
@@ -1165,10 +1222,10 @@ static void box_blur_line(const unsigned int *src, unsigned int *dst, int count,
         sum_b += c & 0xFF;
     }
     for (int x = 0; x < count; x++) {
-        dst[x] = 0xFF000000u |
-                 (((unsigned int)(sum_r / window)) << 16) |
-                 (((unsigned int)(sum_g / window)) << 8) |
-                 ((unsigned int)(sum_b / window));
+        unsigned int r = (unsigned int)(((unsigned long long)sum_r * inv_window) >> 32);
+        unsigned int g = (unsigned int)(((unsigned long long)sum_g * inv_window) >> 32);
+        unsigned int b = (unsigned int)(((unsigned long long)sum_b * inv_window) >> 32);
+        dst[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
         int add_x = x + radius + 1; if (add_x >= count) add_x = count - 1;
         int sub_x = x - radius;     if (sub_x < 0)      sub_x = 0;
         unsigned int cadd = src[add_x];
@@ -1351,16 +1408,20 @@ static void render_window(az_compositor_t *comp, az_window_t *win,
          * We draw ONLY the outer perimeter strips; we NEVER fill the client area [wx, wy, ww, wh]! */
         unsigned int border_color = win->focused ? 0xFF89B4FA : 0xFF45475A;
 
-        /* 1. Top border */
-        bb_fill_rect_clipped(comp, fx, fy, fw, AZWM_BORDER_W,
-                             border_color, clip_x0, clip_y0, clip_x1, clip_y1);
+        /* 1. Top border (rounded) */
+        for (int row = 0; row < AZWM_BORDER_W; row++) {
+            int border_y = fy + row;
+            int inset = (row == 0) ? 6 : (row == 1 ? 4 : 0);
+            bb_fill_rect_clipped(comp, fx + inset, border_y, fw - 2 * inset, 1,
+                                 border_color, clip_x0, clip_y0, clip_x1, clip_y1);
+        }
         /* 2. Left border */
-        bb_fill_rect_clipped(comp, fx, wy - AZWM_TITLEBAR_H, AZWM_BORDER_W,
-                             wh + AZWM_TITLEBAR_H + AZWM_BORDER_W, border_color,
+        bb_fill_rect_clipped(comp, fx, wy - AZWM_TITLEBAR_H + 4, AZWM_BORDER_W,
+                             wh + AZWM_TITLEBAR_H + AZWM_BORDER_W - 4, border_color,
                              clip_x0, clip_y0, clip_x1, clip_y1);
         /* 3. Right border */
-        bb_fill_rect_clipped(comp, wx + ww, wy - AZWM_TITLEBAR_H, AZWM_BORDER_W,
-                             wh + AZWM_TITLEBAR_H + AZWM_BORDER_W, border_color,
+        bb_fill_rect_clipped(comp, wx + ww, wy - AZWM_TITLEBAR_H + 4, AZWM_BORDER_W,
+                             wh + AZWM_TITLEBAR_H + AZWM_BORDER_W - 4, border_color,
                              clip_x0, clip_y0, clip_x1, clip_y1);
         /* 4. Bottom border */
         bb_fill_rect_clipped(comp, fx, wy + wh, fw, AZWM_BORDER_W,
@@ -1378,23 +1439,46 @@ static void render_window(az_compositor_t *comp, az_window_t *win,
             int tx_start = wx < clip_x0 ? clip_x0 : wx;
             int tx_end   = (wx + ww) > clip_x1 ? clip_x1 : (wx + ww);
 
+            /* Acrylic Glass Blur! */
+            if (tx_end > tx_start && ty_end > ty_start) {
+                blur_backdrop_region(comp, tx_start, ty_start, tx_end, ty_end);
+            }
+
             for (int ty2 = ty_start; ty2 < ty_end; ty2++) {
                 if (ty2 < 0 || ty2 >= (int)comp->fb_height) continue;
                 unsigned int t = (tb_range > 1) ? (unsigned int)((ty2 - tb_top_y) * 255 / (tb_range - 1)) : 0;
+                
+                /* Top rounded corner mask (Radius 6) */
+                int corner_inset = 0;
+                int dy = ty2 - tb_top_y;
+                if (dy < 6) {
+                    static const int insets[6] = { 4, 2, 1, 1, 0, 0 };
+                    corner_inset = insets[dy];
+                }
+                int curr_tx_start = tx_start;
+                int curr_tx_end = tx_end;
+                if (curr_tx_start < wx + corner_inset) curr_tx_start = wx + corner_inset;
+                if (curr_tx_end > wx + ww - corner_inset) curr_tx_end = wx + ww - corner_inset;
+
                 unsigned int col;
+                unsigned int alpha = 0xAA; /* Semi-transparent */
                 if (win->focused) {
                     unsigned int r2 = (0x25 * (255 - t) + 0x31 * t) / 255;
                     unsigned int g2 = (0x25 * (255 - t) + 0x32 * t) / 255;
                     unsigned int b2 = (0x35 * (255 - t) + 0x44 * t) / 255;
-                    col = 0xFF000000 | (r2 << 16) | (g2 << 8) | b2;
+                    col = (alpha << 24) | (r2 << 16) | (g2 << 8) | b2;
                 } else {
                     unsigned int r2 = (0x18 * (255 - t) + 0x1E * t) / 255;
                     unsigned int g2 = (0x18 * (255 - t) + 0x1E * t) / 255;
                     unsigned int b2 = (0x28 * (255 - t) + 0x2E * t) / 255;
-                    col = 0xFF000000 | (r2 << 16) | (g2 << 8) | b2;
+                    col = (alpha << 24) | (r2 << 16) | (g2 << 8) | b2;
                 }
-                if (tx_start < tx_end) {
-                    bb_fill_span(&comp->backbuf[ty2 * pitch_px2 + tx_start], col, tx_end - tx_start);
+                if (curr_tx_start < curr_tx_end) {
+                    unsigned int *dst = &comp->backbuf[ty2 * pitch_px2 + curr_tx_start];
+                    int count = curr_tx_end - curr_tx_start;
+                    for (int i = 0; i < count; i++) {
+                        dst[i] = alpha_blend(dst[i], col, alpha);
+                    }
                 }
             }
 
@@ -1649,8 +1733,11 @@ static void draw_alt_tab_hud(az_compositor_t *comp, int clip_x0, int clip_y0, in
     /* Drop shadow for HUD */
     draw_drop_shadow(comp, hx, hy, hud_w, hud_h, clip_x0, clip_y0, clip_x1, clip_y1);
 
+    /* Acrylic Glass Blur */
+    blur_backdrop_region(comp, hx, hy, hx + hud_w, hy + hud_h);
+
     /* Background panel with rounded rect */
-    bb_fill_rounded_rect_clipped(comp, hx, hy, hud_w, hud_h, 12, 0xFF181825, clip_x0, clip_y0, clip_x1, clip_y1);
+    bb_fill_rounded_rect_blend_clipped(comp, hx, hy, hud_w, hud_h, 12, 0xAA181825, clip_x0, clip_y0, clip_x1, clip_y1);
     /* Border outline */
     bb_fill_rect_clipped(comp, hx, hy, hud_w, 2, 0xFFB4BEFE, clip_x0, clip_y0, clip_x1, clip_y1);
 
@@ -1738,8 +1825,11 @@ static void draw_context_menu(az_compositor_t *comp, int clip_x0, int clip_y0, i
     /* Shadow */
     draw_drop_shadow(comp, mx, my, mw, mh, clip_x0, clip_y0, clip_x1, clip_y1);
 
+    /* Acrylic Glass Blur */
+    blur_backdrop_region(comp, mx, my, mx + mw, my + mh);
+
     /* Main Menu Frame with top accent */
-    bb_fill_rounded_rect_clipped(comp, mx, my, mw, mh, 8, 0xFF181825, clip_x0, clip_y0, clip_x1, clip_y1);
+    bb_fill_rounded_rect_blend_clipped(comp, mx, my, mw, mh, 8, 0xCC181825, clip_x0, clip_y0, clip_x1, clip_y1);
     bb_fill_rect_clipped(comp, mx, my, mw, 2, 0xFF89B4FA, clip_x0, clip_y0, clip_x1, clip_y1);
 
     /* Render Menu Items */
@@ -2285,36 +2375,64 @@ void compositor_trigger_restore_animation(az_compositor_t *comp, az_window_t *wi
     comp->has_animating_windows = 1;
 }
 
+void compositor_trigger_close_animation(az_compositor_t *comp, az_window_t *win)
+{
+    if (!win) return;
+    win->anim_state    = AZWM_ANIM_CLOSE;
+    win->anim_start_ns = monotonic_now_ns();
+    win->anim_start_x  = win->x;
+    win->anim_start_y  = win->y;
+    win->anim_start_w  = win->width;
+    win->anim_start_h  = win->height;
+
+    /* Sink down and shrink */
+    win->anim_target_x = win->x + (int)win->width / 4;
+    win->anim_target_y = win->y + (int)win->height / 2;
+    win->anim_target_w = win->width / 2;
+    win->anim_target_h = win->height / 2;
+    comp->has_animating_windows = 1;
+}
+
+void compositor_trigger_maximize_animation(az_compositor_t *comp, az_window_t *win, int target_x, int target_y, unsigned int target_w, unsigned int target_h)
+{
+    if (!win) return;
+    win->anim_state    = AZWM_ANIM_MAXIMIZE;
+    win->anim_start_ns = monotonic_now_ns();
+    win->anim_start_x  = win->x;
+    win->anim_start_y  = win->y;
+    win->anim_start_w  = win->width;
+    win->anim_start_h  = win->height;
+    
+    win->anim_target_x = target_x;
+    win->anim_target_y = target_y;
+    win->anim_target_w = target_w;
+    win->anim_target_h = target_h;
+    comp->has_animating_windows = 1;
+}
+
+void compositor_trigger_unmaximize_animation(az_compositor_t *comp, az_window_t *win)
+{
+    if (!win) return;
+    win->anim_state    = AZWM_ANIM_UNMAXIMIZE;
+    win->anim_start_ns = monotonic_now_ns();
+    win->anim_start_x  = win->x;
+    win->anim_start_y  = win->y;
+    win->anim_start_w  = win->width;
+    win->anim_start_h  = win->height;
+    
+    win->anim_target_x = win->saved_x > 0 ? win->saved_x : win->x;
+    win->anim_target_y = win->saved_y > 0 ? win->saved_y : win->y;
+    win->anim_target_w = win->saved_w > 0 ? win->saved_w : win->width;
+    win->anim_target_h = win->saved_h > 0 ? win->saved_h : win->height;
+    comp->has_animating_windows = 1;
+}
+
 /*
- * compositor_animate_step() drives progress from elapsed wall-clock time
- * (anim_start_ns), not a fixed count of calls. It used to advance one fixed
- * step per call and finish after AZWM_ANIM_STEPS calls — which only gives a
- * fixed real-world duration if this function is called at a fixed rate, and
- * it isn't: the main loop below calls it on every spin of an unthrottled
- * while(running) whenever anything is animating, with no sleep in that
- * branch at all. So the animation's actual on-screen duration was however
- * long the scheduler let this process spin through AZWM_ANIM_STEPS
- * iterations — a handful of *microseconds* on an otherwise-idle machine
- * (i.e. no visible animation at all, just a pop), and something else
- * entirely under load. Timing it against monotonic_now_ns() instead makes
- * every open/minimize/restore take the same AZWM_ANIM_DURATION_NS on any
- * machine, at any system load, regardless of how many times this function
- * happens to get called along the way — which is also what makes it safe
- * to pair with the frame-rate cap in main() below without the animation's
- * apparent speed changing when that cap changes how often we're called.
+ * compositor_animate_step() drives progress from elapsed wall-clock time.
  */
 int compositor_animate_step(az_compositor_t *comp)
 {
     int still_animating = 0;
-    /* Distinct from still_animating: true for the settling call too, the one
-     * where a window's last leg of motion lands exactly on its target and
-     * anim_state drops back to NONE. still_animating is false on that call
-     * (correctly — there is nothing left to step next time), but the window
-     * moved this call and that final frame still needs to reach the screen;
-     * returning still_animating there used to tell the caller "nothing to
-     * redraw" and skip compositing it, so every animated window visibly
-     * stopped one eased step short of its real final geometry until
-     * something unrelated forced the next redraw. */
     int any_window_updated = 0;
     long long now_ns = monotonic_now_ns();
     az_window_t *curr = comp->list_head;
@@ -2322,17 +2440,45 @@ int compositor_animate_step(az_compositor_t *comp)
         if (curr->anim_state != AZWM_ANIM_NONE) {
             any_window_updated = 1;
             long long elapsed = now_ns - curr->anim_start_ns;
-            if (elapsed < 0) elapsed = 0; /* clock_gettime hiccup: hold at start rather than misfire */
+            if (elapsed < 0) elapsed = 0; 
 
-            /* Ease-out quadratic: progress = t * (512 - t) / 256 */
-            int t = (int)((elapsed * 256) / AZWM_ANIM_DURATION_NS);
-            if (t > 256) t = 256;
-            int ease = (t * (512 - t)) / 256;
+            float tf = (float)elapsed / (float)AZWM_ANIM_DURATION_NS;
+            if (tf > 1.0f) tf = 1.0f;
+            
+            float progress = 1.0f;
+            if (curr->anim_state == AZWM_ANIM_OPEN || curr->anim_state == AZWM_ANIM_RESTORE) {
+                /* Underdamped spring bounce */
+                progress = 1.0f - expf(-6.0f * tf) * cosf(tf * 15.0f);
+            } else if (curr->anim_state == AZWM_ANIM_MINIMIZE || curr->anim_state == AZWM_ANIM_CLOSE) {
+                /* Smooth ease-in for closing/minimizing */
+                progress = tf * tf * tf;
+            } else {
+                /* Smooth ease-out for maximize/unmaximize */
+                progress = 1.0f - (1.0f - tf) * (1.0f - tf) * (1.0f - tf);
+            }
+            
+            /* Slide-in specific modification for OPEN: add Y-offset slide */
+            float y_slide = 0;
+            if (curr->anim_state == AZWM_ANIM_OPEN) {
+                y_slide = (1.0f - progress) * 20.0f; /* Slight slide up while bouncing */
+            }
 
-            curr->x = curr->anim_start_x + ((curr->anim_target_x - curr->anim_start_x) * ease) / 256;
-            curr->y = curr->anim_start_y + ((curr->anim_target_y - curr->anim_start_y) * ease) / 256;
-            curr->width = (unsigned int)((int)curr->anim_start_w + ((int)(curr->anim_target_w - curr->anim_start_w) * ease) / 256);
-            curr->height = (unsigned int)((int)curr->anim_start_h + ((int)(curr->anim_target_h - curr->anim_start_h) * ease) / 256);
+            curr->x = curr->anim_start_x + (int)((float)(curr->anim_target_x - curr->anim_start_x) * progress);
+            curr->y = curr->anim_start_y + (int)((float)(curr->anim_target_y - curr->anim_start_y) * progress) + (int)y_slide;
+            curr->width = (unsigned int)((float)curr->anim_start_w + (float)((int)curr->anim_target_w - (int)curr->anim_start_w) * progress);
+            curr->height = (unsigned int)((float)curr->anim_start_h + (float)((int)curr->anim_target_h - (int)curr->anim_start_h) * progress);
+            
+            if (curr->anim_state == AZWM_ANIM_CLOSE || curr->anim_state == AZWM_ANIM_MINIMIZE) {
+                /* Fade out opacity as it minimizes/closes */
+                int op = 255 - (int)(progress * 255.0f);
+                if (op < 0) op = 0;
+                curr->opacity = op;
+            } else {
+                /* Fade in */
+                int op = (int)(progress * 255.0f);
+                if (op > 255) op = 255;
+                curr->opacity = op;
+            }
 
             if (elapsed >= AZWM_ANIM_DURATION_NS) {
                 if (curr->anim_state == AZWM_ANIM_MINIMIZE) {
@@ -2341,11 +2487,16 @@ int compositor_animate_step(az_compositor_t *comp)
                     curr->y = curr->saved_y;
                     curr->width = curr->saved_w;
                     curr->height = curr->saved_h;
+                    curr->opacity = 255;
+                } else if (curr->anim_state == AZWM_ANIM_CLOSE) {
+                    curr->visible = 0;
+                    curr->opacity = 255;
                 } else {
                     curr->x = curr->anim_target_x;
                     curr->y = curr->anim_target_y;
                     curr->width = curr->anim_target_w;
                     curr->height = curr->anim_target_h;
+                    curr->opacity = 255;
                 }
                 curr->anim_state = AZWM_ANIM_NONE;
                 curr->anim_start_ns = 0;

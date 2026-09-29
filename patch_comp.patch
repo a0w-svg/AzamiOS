@@ -1,0 +1,11 @@
+--- userland/apps/azwm/compositor.c
++++ userland/apps/azwm/compositor.c
+@@ -904,6 +904,8 @@
+     }
+ }
+ 
++static void bb_fill_circle_blend_clipped(az_compositor_t *comp, int cx, int cy, int r, unsigned int color, int clip_x0, int clip_y0, int clip_x1, int clip_y1);
++
+ static void bb_fill_rounded_rect_blend_clipped(az_compositor_t *comp, int rx, int ry, int rw, int rh, int radius,
+                                                unsigned int color, int cx0, int cy0, int cx1, int cy1)
+ {

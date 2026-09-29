@@ -110,8 +110,8 @@ static int          g_num_dock_apps = 0;
 #define DOCK_GAP      4
 
 /* ── Catppuccin Mocha palette (ARGB) ────────────────────────────────────────── */
-#define C_BG          0xFF0A0A14  /* deeper than crust — premium dark panel      */
-#define C_BG_TOP      0xFF2A2A3E  /* top border gradient highlight               */
+#define C_BG          0xAA0A0A14  /* deeper than crust — premium dark panel      */
+#define C_BG_TOP      0xAA2A2A3E  /* top border gradient highlight               */
 #define C_SEPARATOR   0xFF252535  /* vertical separators                         */
 
 /* Start button */
@@ -132,7 +132,7 @@ static int          g_num_dock_apps = 0;
 /* Tray */
 #define C_CLOCK       0xFFA6E3A1  /* green                                       */
 #define C_DATE        0xFF6C7086  /* overlay0 — secondary text                   */
-#define C_TRAY_BG     0xFF141420  /* very dark tray background                   */
+#define C_TRAY_BG     0xAA141420  /* very dark tray background                   */
 #define C_WIFI        0xFF89B4FA  /* blue                                        */
 
 /* Overflow indicator */
@@ -1398,6 +1398,7 @@ int main(int argc, char **argv)
     req.create.h       = WINDOW_H;
     req.create.title[0]= '\0';
     req.create.pid     = (unsigned int)sys_getpid();
+    req.create.flags   = AZ_WIN_FLAG_BLUR_BACKDROP;
 
     if (az_channel_send(g_srv, (az_ipc_msg_t *)&req) < 0) {
         de_log("[taskbar] FATAL: channel_send"); return -1;

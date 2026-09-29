@@ -11,6 +11,7 @@
 #include "../../drivers/char/console.h"
 #include "../../include/azami/defs.h"
 #include "../syscall/syscall.h" /* EINVAL, EBADF, EMFILE */
+#include "../../arch/x86_64/cpu/nospec.h"
 
 
 /* EMFILE is already defined in defs.h (included via syscall.h) */
@@ -126,6 +127,7 @@ s64 az_handle_open(process_t *proc, az_object_t *obj)
 az_object_t *az_handle_get(process_t *proc, s64 handle_id)
 {
     if (!proc || handle_id < 0 || handle_id >= PROC_MAX_FDS) return NULL;
+    handle_id = (s64)array_index_nospec((unsigned long)handle_id, (unsigned long)PROC_MAX_FDS);
     spinlock_lock(&g_object_lock);
     az_object_t *obj = (az_object_t *)__atomic_load_n(&proc->obj_handle_table[handle_id],
                                                       __ATOMIC_ACQUIRE);
@@ -140,6 +142,7 @@ az_object_t *az_handle_get(process_t *proc, s64 handle_id)
 s64 az_handle_close(process_t *proc, s64 handle_id)
 {
     if (!proc || handle_id < 0 || handle_id >= PROC_MAX_FDS) return -(s64)EBADF;
+    handle_id = (s64)array_index_nospec((unsigned long)handle_id, (unsigned long)PROC_MAX_FDS);
     /* Clear the slot under g_object_lock, the same lock az_handle_get() holds
      * while it loads the slot and bumps ref_count. Without it a get() on
      * another CPU can read this obj, then this close drops the last reference

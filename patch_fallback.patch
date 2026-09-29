@@ -1,0 +1,11 @@
+--- arch/x86_64/cpu/cpu.c
++++ arch/x86_64/cpu/cpu.c
+@@ -599,6 +599,8 @@
+         if (size <= FPU_STATE_MAX_SIZE - 63) {
+             g_xsave_area_size = size;
+             break;
+         }
++        if (want & (3ULL << 17))     { want &= ~(3ULL << 17); continue; } /* AMX */
++        if (want & (1ULL << 19))     { want &= ~(1ULL << 19); continue; } /* APX */
+         if (want & XCR0_AVX512)      { want &= ~XCR0_AVX512; continue; }
+         if (want & XCR0_PKRU)        { want &= ~XCR0_PKRU;   continue; }

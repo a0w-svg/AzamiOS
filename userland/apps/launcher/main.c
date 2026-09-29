@@ -324,7 +324,7 @@ static void draw_launcher(void)
     unsigned int h = g_win.height;
 
     /* ── Background: Smooth frosted gradient ──────────────────────────────── */
-    uk_gradient_v(&g_win, 0, 0, (int)w, (int)h, UK_MANTLE, UK_CRUST);
+    uk_gradient_v(&g_win, 0, 0, (int)w, (int)h, 0xAA181825, 0xAA11111B);
 
     /* Surrounding glowing border outline */
     uk_hline(&g_win, 0, 0, (int)w, UK_MAUVE);
@@ -685,8 +685,8 @@ int main(int argc, char **argv)
     int win_y = (int)sh - TASKBAR_H - MODAL_H;
     if (win_y < 20) win_y = 20;
 
-    if (uk_window_connect(&g_win, "AzamiOS App Launcher", win_x, win_y, MODAL_W, MODAL_H,
-                          LAUNCHER_MAP, SERVER_CHAN) < 0) {
+    if (uk_window_connect_ex(&g_win, "AzamiOS App Launcher", win_x, win_y, MODAL_W, MODAL_H,
+                          LAUNCHER_MAP, SERVER_CHAN, AZ_WIN_FLAG_BLUR_BACKDROP) < 0) {
         de_log("[launcher] FATAL: Failed to create window");
         sys_exit(1);
     }

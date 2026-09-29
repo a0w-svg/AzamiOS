@@ -1,11 +1,24 @@
 #include "softirq.h"
 #include <arch/x86_64/cpu/spinlock.h>
+#include <arch/x86_64/cpu/smp.h>
 #include <kernel/sched/sched.h>
 #include <azami/defs.h>
 
 static spinlock_t tasklet_lock = SPINLOCK_INIT;
 static struct tasklet_struct *tasklet_list = NULL;
-static int bh_disable_count = 0; /* Note: should be per-cpu, but simple global for now */
+
+/* Per-CPU bottom-half disable nesting count.  The Linux semantics are per-CPU:
+ * disabling BH on one core must not block tasklet dispatch on another.  The
+ * old global atomic counter ping-ponged a shared cache line on every
+ * local_bh_disable/enable pair across all cores. */
+static int bh_disable_count[SMP_MAX_CPUS];
+
+static inline int *my_bh_count(void)
+{
+    u32 id = smp_current_cpu_id();
+    if (id >= SMP_MAX_CPUS) id = 0;
+    return &bh_disable_count[id];
+}
 
 void tasklet_init(struct tasklet_struct *t, void (*func)(unsigned long), unsigned long data) {
     t->next = NULL;
@@ -48,7 +61,7 @@ void tasklet_action(void) {
     unsigned long flags;
     struct tasklet_struct *list, *t;
 
-    if (bh_disable_count > 0)
+    if (*my_bh_count() > 0)
         return;
 
     flags = spinlock_lock_irqsave(&tasklet_lock);
@@ -76,11 +89,16 @@ void tasklet_action(void) {
 }
 
 void local_bh_disable(void) {
-    __atomic_fetch_add(&bh_disable_count, 1, __ATOMIC_SEQ_CST);
+    irqflags_t f = spinlock_lock_irqsave(&tasklet_lock);
+    (*my_bh_count())++;
+    spinlock_unlock_irqrestore(&tasklet_lock, f);
 }
 
 void local_bh_enable(void) {
-    if (__atomic_sub_fetch(&bh_disable_count, 1, __ATOMIC_SEQ_CST) == 0) {
+    irqflags_t f = spinlock_lock_irqsave(&tasklet_lock);
+    int val = --(*my_bh_count());
+    spinlock_unlock_irqrestore(&tasklet_lock, f);
+    if (val == 0) {
         tasklet_action();
     }
 }

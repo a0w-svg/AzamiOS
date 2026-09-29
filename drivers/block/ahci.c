@@ -1185,6 +1185,7 @@ static int ahci_probe(dm_device_t *dm, const pci_device_id_t *id)
         return -EIO;
     }
     mw(&hba->ghc, mr(&hba->ghc) | AHCI_GHC_AE);
+    mw(&hba->ghc, mr(&hba->ghc) | AHCI_GHC_IE);
 
     u32 cap = mr(&hba->cap);
     u32 pi = mr(&hba->pi);

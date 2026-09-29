@@ -457,7 +457,7 @@ static u64 compose_cr4(u64 cr4)
  * protection bits set. PGE is deliberately *not* pinned — tlb.c toggles it to
  * force a global TLB flush, which is a legitimate transient clear.
  * ------------------------------------------------------------------------- */
-#define CR4_PINNABLE  (CR4_SMEP | CR4_SMAP | CR4_UMIP | CR4_FSGSBASE)
+#define CR4_PINNABLE  (CR4_SMEP | CR4_SMAP | CR4_UMIP | CR4_FSGSBASE | (g_pku_enabled ? CR4_PKE : 0))
 
 void cpu_write_cr4(u64 val)
 {
@@ -570,15 +570,17 @@ static void configure_xsave(void)
     if (!(g_cpu_info.features & CPU_FEAT_XSAVE)) return;
     if ((g_cpu_info.xsave_supported_mask & XCR0_X87_SSE) != XCR0_X87_SSE) return;
 
-    u64 want = XCR0_X87_SSE;
-    if (g_cpu_info.has_avx)                        want |= XCR0_AVX;
-    if (g_cpu_info.has_avx512f && (want & XCR0_AVX)) want |= XCR0_AVX512;
-    if (g_cpu_info.has_pku)                        want |= XCR0_PKRU;
-    want &= g_cpu_info.xsave_supported_mask;
+    u64 want = g_cpu_info.xsave_supported_mask;
 
     /* AVX-512 needs all three of its components or none. */
     if ((want & XCR0_AVX512) != XCR0_AVX512) want &= ~XCR0_AVX512;
     if (!(want & XCR0_AVX))                  want &= ~XCR0_AVX512;
+    
+    /* MPX needs both BNDREGS and BNDCSR. */
+    if ((want & (0x18ULL)) != 0x18ULL) want &= ~(0x18ULL);
+    
+    /* AMX needs both XTILECFG (17) and XTILEDATA (18). */
+    if ((want & (3ULL << 17)) != (3ULL << 17)) want &= ~(3ULL << 17);
 
     /* OSXSAVE must be live before XSETBV, and CPUID leaf 0xD reports sizes
      * against the XCR0 that is actually programmed. */
@@ -594,6 +596,8 @@ static void configure_xsave(void)
             g_xsave_area_size = size;
             break;
         }
+        if (want & (3ULL << 17))     { want &= ~(3ULL << 17); continue; } /* AMX */
+        if (want & (1ULL << 19))     { want &= ~(1ULL << 19); continue; } /* APX */
         if (want & XCR0_AVX512)      { want &= ~XCR0_AVX512; continue; }
         if (want & XCR0_PKRU)        { want &= ~XCR0_PKRU;   continue; }
         if (want & XCR0_AVX)         { want &= ~XCR0_AVX;    continue; }

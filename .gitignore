@@ -45,3 +45,4 @@ tools/linux/log/
 
 # disk image input digest (scripts/create_disk.py)
 *.img.inputs
+hdd.vdi

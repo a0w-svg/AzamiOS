@@ -483,8 +483,32 @@ void *memchr(const void *s, int c, size_t n)
 {
     const unsigned char *p = (const unsigned char *)s;
     unsigned char uc = (unsigned char)c;
-    for (size_t i = 0; i < n; i++) {
-        if (p[i] == uc) return (void *)(p + i);
+
+    /* Byte-at-a-time until aligned. */
+    while (n && ((uintptr_t)p & 7)) {
+        if (*p == uc) return (void *)p;
+        p++; n--;
+    }
+    if (n == 0) return NULL;
+
+    /* Word-at-a-time scan: broadcast the search byte to every lane of a
+     * qword, then XOR each qword with that pattern — a matching byte becomes
+     * 0x00, which the null-byte detector picks up. Exactly the same trick
+     * strlen already uses, applied to a different sentinel. */
+    u64 broadcast = uc * 0x0101010101010101ULL;
+    const u64 *w = (const u64 *)p;
+    while (n >= 8) {
+        u64 val = *w ^ broadcast;
+        if (((val - 0x0101010101010101ULL) & ~val & 0x8080808080808080ULL) != 0)
+            break;
+        w++; n -= 8;
+    }
+
+    /* Locate exact byte. */
+    p = (const unsigned char *)w;
+    while (n--) {
+        if (*p == uc) return (void *)p;
+        p++;
     }
     return NULL;
 }
@@ -492,11 +516,27 @@ void *memchr(const void *s, int c, size_t n)
 size_t strnlen(const char *str, size_t maxlen)
 {
     if (!str) return 0;
-    size_t len = 0;
-    while (len < maxlen && str[len] != '\0') {
-        len++;
+
+    /* Byte-at-a-time until aligned, or until maxlen exhausted. */
+    const char *s = str;
+    while (maxlen && ((uintptr_t)s & 7)) {
+        if (*s == '\0') return (size_t)(s - str);
+        s++; maxlen--;
     }
-    return len;
+    if (maxlen == 0) return (size_t)(s - str);
+
+    /* Word-at-a-time, same null-byte detector as strlen. */
+    const u64 *w = (const u64 *)s;
+    while (maxlen >= 8) {
+        u64 val = *w;
+        if (((val - 0x0101010101010101ULL) & ~val & 0x8080808080808080ULL) != 0)
+            break;
+        w++; maxlen -= 8;
+    }
+
+    s = (const char *)w;
+    while (maxlen && *s) { s++; maxlen--; }
+    return (size_t)(s - str);
 }
 
 char *strcat(char *dest, const char *src)
@@ -534,15 +574,20 @@ char *strstr(const char *haystack, const char *needle)
 {
     if (!haystack || !needle) return NULL;
     if (!*needle) return (char *)haystack;
-    for (; *haystack; haystack++) {
-        if (*haystack == *needle) {
-            const char *h = haystack;
-            const char *n = needle;
-            while (*h && *n && *h == *n) {
-                h++;
-                n++;
-            }
-            if (!*n) return (char *)haystack;
+
+    /* Fast rejection: test first *and* second needle byte together so a
+     * single-character mismatch at the start skips the inner loop entirely.
+     * This is the classic two-byte-lead optimisation from glibc's strstr. */
+    char n0 = needle[0];
+    char n1 = needle[1];
+    if (!n1) return strchr(haystack, n0);
+
+    for (const char *h = haystack; *h && *(h + 1); h++) {
+        if (*h == n0 && *(h + 1) == n1) {
+            const char *hp = h + 2;
+            const char *np = needle + 2;
+            while (*np && *hp == *np) { hp++; np++; }
+            if (!*np) return (char *)h;
         }
     }
     return NULL;
@@ -550,41 +595,64 @@ char *strstr(const char *haystack, const char *needle)
 
 size_t strspn(const char *s, const char *accept)
 {
-    size_t count = 0;
-    while (*s) {
-        const char *a = accept;
-        while (*a && *a != *s) a++;
-        if (!*a) break;
-        count++;
-        s++;
+    if (!s || !accept) return 0;
+    if (!*accept) return 0;
+    if (!accept[1]) {
+        const char *p = s;
+        while (*p == *accept) p++;
+        return (size_t)(p - s);
     }
-    return count;
+    u64 table[4] = {0, 0, 0, 0};
+    const unsigned char *a = (const unsigned char *)accept;
+    while (*a) {
+        table[*a / 64] |= (1ULL << (*a % 64));
+        a++;
+    }
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p && (table[*p / 64] & (1ULL << (*p % 64)))) {
+        p++;
+    }
+    return (size_t)(p - (const unsigned char *)s);
 }
 
 size_t strcspn(const char *s, const char *reject)
 {
-    size_t count = 0;
-    while (*s) {
-        const char *r = reject;
-        while (*r) {
-            if (*r == *s) return count;
-            r++;
-        }
-        count++;
-        s++;
+    if (!s || !reject) return 0;
+    if (!*reject) return strlen(s);
+    if (!reject[1]) {
+        const char *found = strchr(s, *reject);
+        return found ? (size_t)(found - s) : strlen(s);
     }
-    return count;
+    u64 table[4] = {0, 0, 0, 0};
+    const unsigned char *r = (const unsigned char *)reject;
+    while (*r) {
+        table[*r / 64] |= (1ULL << (*r % 64));
+        r++;
+    }
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p && !(table[*p / 64] & (1ULL << (*p % 64)))) {
+        p++;
+    }
+    return (size_t)(p - (const unsigned char *)s);
 }
 
 char *strpbrk(const char *s, const char *accept)
 {
-    while (*s) {
-        const char *a = accept;
-        while (*a) {
-            if (*a == *s) return (char *)s;
-            a++;
-        }
-        s++;
+    if (!s || !accept) return NULL;
+    if (!*accept) return NULL;
+    if (!accept[1]) return strchr(s, *accept);
+
+    u64 table[4] = {0, 0, 0, 0};
+    const unsigned char *a = (const unsigned char *)accept;
+    while (*a) {
+        table[*a / 64] |= (1ULL << (*a % 64));
+        a++;
+    }
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        if (table[*p / 64] & (1ULL << (*p % 64)))
+            return (char *)p;
+        p++;
     }
     return NULL;
 }
@@ -593,16 +661,29 @@ char *strsep(char **stringp, const char *delim)
 {
     if (!stringp || !*stringp) return NULL;
     char *start = *stringp;
-    char *p = start;
+    if (!delim || !*delim) return start;
+    if (!delim[1]) {
+        char *p = strchr(start, *delim);
+        if (p) {
+            *p = '\0';
+            *stringp = p + 1;
+        } else {
+            *stringp = NULL;
+        }
+        return start;
+    }
+    u64 table[4] = {0, 0, 0, 0};
+    const unsigned char *d = (const unsigned char *)delim;
+    while (*d) {
+        table[*d / 64] |= (1ULL << (*d % 64));
+        d++;
+    }
+    unsigned char *p = (unsigned char *)start;
     while (*p) {
-        const char *d = delim;
-        while (*d) {
-            if (*p == *d) {
-                *p = '\0';
-                *stringp = p + 1;
-                return start;
-            }
-            d++;
+        if (table[*p / 64] & (1ULL << (*p % 64))) {
+            *p = '\0';
+            *stringp = (char *)(p + 1);
+            return start;
         }
         p++;
     }
@@ -648,5 +729,8 @@ int crypto_memneq(const void *a, const void *b, size_t size)
     for (size_t i = 0; i < size; i++) {
         res |= (pa[i] ^ pb[i]);
     }
+    /* Enforce constant-time execution: prevent compiler from optimizing
+     * away loop iterations or introducing early exit branches. */
+    __asm__ volatile("" : "+r"(res) : : "memory");
     return res != 0;
 }

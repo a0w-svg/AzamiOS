@@ -350,7 +350,7 @@ typedef struct {
  * 64-byte alignment bump inside the buffer cannot run past its end.
  * x87+SSE+AVX+AVX-512 (XCR0 0xE7) needs 2696 bytes; 3136 leaves headroom and
  * cpu_enable_features_bsp() refuses to enable components that would exceed it. */
-#define FPU_STATE_MAX_SIZE  3136
+#define FPU_STATE_MAX_SIZE  12288
 
 extern cpu_features_t g_cpu_info;
 extern u8  g_fsgsbase_enabled;

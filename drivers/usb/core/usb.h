@@ -160,6 +160,13 @@ typedef struct usb_hcd_ops {
     int (*set_ep0_mps)(usb_device_t *dev, u16 mps);
     /* Configure an interrupt-IN endpoint and keep a transfer queued on it,
      * calling @cb with every completed one. */
+    /* Synchronous bulk transfer. */
+    int (*bulk)(usb_device_t *dev, const usb_endpoint_descriptor_t *ep, void *data, u32 len, u32 stream_id);
+    /* Setup an isochronous stream. */
+    int (*isoc_start)(usb_device_t *dev, const usb_endpoint_descriptor_t *ep);
+    /* Allocate USB 3.0 streams for a bulk endpoint. */
+    int (*alloc_streams)(usb_device_t *dev, const usb_endpoint_descriptor_t *ep, u32 num_streams);
+
     int (*intr_in)(usb_device_t *dev, const usb_endpoint_descriptor_t *ep,
                    usb_intr_cb_t cb, void *ctx);
 } usb_hcd_ops_t;

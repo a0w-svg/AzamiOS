@@ -212,7 +212,7 @@ static thread_t *thread_alloc(void)
     }
     spinlock_unlock_irqrestore(&g_thread_cache_lock, f);
 
-    if (t) __builtin_memset(t, 0, sizeof(*t));
+    if (likely(t)) __builtin_memset(t, 0, sizeof(*t));
     else   t = (thread_t *)kzalloc(sizeof(thread_t));
 
     if (t) t->magic = THREAD_MAGIC;
@@ -262,7 +262,7 @@ static inline void thread_zombify_locked(thread_t *t)
 void sched_post_switch(void)
 {
     cpu_info_t *cpu = smp_get_cpu();
-    if (!cpu) return;
+    if (unlikely(!cpu)) return;
 
     __atomic_add_fetch(&g_context_switches, 1, __ATOMIC_RELAXED);
 
@@ -702,10 +702,10 @@ static void enqueue_ready(thread_t *t)
      * able to do this — proc->wait_thread left dangling by a thread killed
      * while parked in waitpid — are fixed at the source too, but this is the
      * backstop that makes the invariant hold for future wake-up sites. */
-    if (t->state == THREAD_ZOMBIE) return;
+    if (unlikely(t->state == THREAD_ZOMBIE)) return;
 
     /* Retired struct reached through a stale wait slot — see thread_alloc(). */
-    if (t->magic != THREAD_MAGIC) return;
+    if (unlikely(t->magic != THREAD_MAGIC)) return;
 
     /* Already linked on some CPU's run-queue tree. Re-inserting a node that
      * is still in a tree would corrupt it, and the thread is going to be
@@ -889,6 +889,9 @@ static thread_t *dequeue_ready(void)
         rt->rq_cpu = (u32)-1;
         if (rt->rr_ticks_left == 0) rt->rr_ticks_left = SCHED_RR_TICKS;
         spinlock_unlock(&my_rq->lock);
+        /* Overlap memory latency with the caller's switch bookkeeping. */
+        __builtin_prefetch(&rt->fpu_state, 0, 1);
+        if (rt->proc) __builtin_prefetch(rt->proc, 0, 1);
         return rt;
     }
 
@@ -900,6 +903,9 @@ static thread_t *dequeue_ready(void)
         if (my_rq->nr_running > 0) my_rq->nr_running--;
         if (t->vruntime > my_rq->min_vruntime) my_rq->min_vruntime = t->vruntime;
         spinlock_unlock(&my_rq->lock);
+        /* Overlap memory latency with the caller's switch bookkeeping. */
+        __builtin_prefetch(&t->fpu_state, 0, 1);
+        if (t->proc) __builtin_prefetch(t->proc, 0, 1);
         return t;
     }
     spinlock_unlock(&my_rq->lock);
@@ -2053,6 +2059,17 @@ void sched_yield(void)
 
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
+
+    /* Prefetch the incoming thread's hot data before the switch. The FPU save
+     * area is 2–4 KiB and will be needed by fpu_restore() moments from now;
+     * the process struct is touched by sched_post_switch() for FS base and
+     * perf accounting. Starting the fetches here overlaps the memory latency
+     * with the outgoing thread's FPU save and the stack switch. */
+    if (thread_uses_fpu(next))
+        __builtin_prefetch(&next->fpu_state, 0 /* read */, 1 /* L2 */);
+    if (next->proc)
+        __builtin_prefetch(next->proc, 0, 1);
+
     fpu_switch(prev, next);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
@@ -2369,6 +2386,10 @@ void sched_block(thread_state_t new_state)
 
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
+    if (thread_uses_fpu(next))
+        __builtin_prefetch(&next->fpu_state, 0, 1);
+    if (next->proc)
+        __builtin_prefetch(next->proc, 0, 1);
     fpu_switch(prev, next);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
@@ -2419,6 +2440,10 @@ static void sched_sleep_common(u64 ticks, u64 deadline_ns)
     
     cpu->prev_thread = prev;
     spinlock_unlock(&g_sched_lock);
+    if (thread_uses_fpu(next))
+        __builtin_prefetch(&next->fpu_state, 0, 1);
+    if (next->proc)
+        __builtin_prefetch(next->proc, 0, 1);
     fpu_switch(prev, next);
     switch_to_asm(&prev->kernel_rsp, next->kernel_rsp);
     sched_post_switch();
