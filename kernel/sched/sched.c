@@ -143,6 +143,12 @@ static void rq_remove_thread_locked(thread_t *t);
 
 /* Sleep queue is kept sorted by sleep_end_ticks (ascending) for O(1) tick scan */
 static thread_t *g_sleep_queue = NULL;
+
+/* High-resolution sleepers (sched_sleep_until_ns), sorted ascending by
+ * sleep_deadline_ns and protected by g_sched_lock like g_sleep_queue. Kept
+ * apart from the tick-ordered queue because the two are keyed differently:
+ * a wake-up here is due at a time, not at a tick number. */
+static thread_t *g_hr_sleep_queue = NULL;
 u64 g_system_ticks = 0;
 
 static thread_t *g_idle_threads[SMP_MAX_CPUS] = {NULL};
@@ -159,6 +165,9 @@ u64 g_context_switches = 0;
 static volatile u64 g_idle_cpu_mask = 0;
 
 static void sleep_queue_insert_sorted(thread_t *t); /* forward decl */
+static void hr_queue_insert_sorted(thread_t *t);           /* forward decls: the */
+static void hr_arm_for_deadline(u64 deadline_ns, u64 now_ns); /* high-resolution   */
+static void hr_expire_locked(u32 cpu_id, u64 now_ns);     /* sleep queue      */
 static void notify_waiter_locked(process_t *parent, int sig); /* forward decl */
 
 /* ── Type-stable thread_t allocation ───────────────────────────────────────
@@ -330,9 +339,20 @@ void sched_post_switch(void)
                 enqueue_ready(prev);
             }
         } else if (prev->state == THREAD_SLEEPING_PENDING) {
-            if (prev->unblock_pending || g_system_ticks >= prev->sleep_end_ticks) {
+            bool due = prev->sleep_deadline_ns
+                     ? now_ns >= prev->sleep_deadline_ns
+                     : g_system_ticks >= prev->sleep_end_ticks;
+            if (prev->unblock_pending || due) {
                 prev->unblock_pending = false;
+                prev->sleep_deadline_ns = 0;
                 enqueue_ready(prev);
+            } else if (prev->sleep_deadline_ns) {
+                prev->state  = THREAD_SLEEPING;
+                prev->hr_cpu = cpu->cpu_id;
+                hr_queue_insert_sorted(prev);
+                /* This CPU owns the wake-up: it is the one that just went
+                 * quiet, and the one the sleeper will most likely run on. */
+                hr_arm_for_deadline(prev->sleep_deadline_ns, now_ns);
             } else {
                 prev->state = THREAD_SLEEPING;
                 /* Insert into sorted sleep queue (PERF-02) */
@@ -2093,12 +2113,26 @@ void sched_tick(pt_regs_t *regs)
     extern void lapic_eoi(void);
     lapic_eoi();
 
+    cpu_info_t *cpu = smp_get_cpu();
+
+    /* An early interrupt armed for a high-resolution sleeper, not the tick:
+     * wake whoever is due, put the tick's deadline back into the MSR (it
+     * disarmed itself firing), and leave every per-tick duty — accounting,
+     * timekeeping, balancing — to the real tick. */
+    if (!lapic_timer_tick_due()) {
+        lapic_timer_rearm_tick();
+        if (!cpu || !cpu->current_thread) return;
+        irqflags_t f = spinlock_lock_irqsave(&g_sched_lock);
+        hr_expire_locked(cpu->cpu_id, ktime_get_ns());
+        spinlock_unlock_irqrestore(&g_sched_lock, f);
+        return;
+    }
+
     /* In TSC-deadline mode the LAPIC timer is one-shot by construction, so
      * the next tick has to be armed from here or this CPU never gets another
      * one. A no-op when the timer is running in classic periodic mode. */
     lapic_timer_rearm();
 
-    cpu_info_t *cpu = smp_get_cpu();
     if (!cpu || !cpu->current_thread) return;
 
     u64 current_ticks;
@@ -2107,6 +2141,7 @@ void sched_tick(pt_regs_t *regs)
         /* Accumulate the clocksource and republish the vvar page. First,
          * so everything below this tick sees the updated clocks. */
         timekeeping_tick();
+        console_tick();
         extern void net_poll(void);
         net_poll();
 
@@ -2177,6 +2212,12 @@ void sched_tick(pt_regs_t *regs)
      */
     thread_t *sq_head = __atomic_load_n(&g_sleep_queue, __ATOMIC_RELAXED);
     bool wake_due   = sq_head && sq_head->sleep_end_ticks <= current_ticks;
+    /* High-resolution sleepers: due now, or due before this CPU's next tick
+     * (in which case the rearm above just overwrote any early deadline this
+     * CPU had armed for them, and it has to be put back). */
+    thread_t *hr_head = __atomic_load_n(&g_hr_sleep_queue, __ATOMIC_RELAXED);
+    u64 tick_now_ns = hr_head ? ktime_get_ns() : 0;
+    bool hr_due = hr_head && hr_head->sleep_deadline_ns < tick_now_ns + NSEC_PER_SEC / TK_HZ;
     u32 my_cpu = (cpu->cpu_id < SMP_MAX_CPUS) ? cpu->cpu_id : 0;
     runqueue_t *my_rq = &g_cpu_rq[my_cpu];
     bool rq_nonempty = __atomic_load_n(&rq_head(my_rq), __ATOMIC_RELAXED) != NULL ||
@@ -2211,7 +2252,7 @@ void sched_tick(pt_regs_t *regs)
         }
     }
 
-    if (wake_due || rq_nonempty) {
+    if (wake_due || hr_due || rq_nonempty) {
         spinlock_lock(&g_sched_lock);
 
         /* Wake sleeping threads. Queue is sorted ascending by sleep_end_ticks
@@ -2222,6 +2263,7 @@ void sched_tick(pt_regs_t *regs)
             waking->next = NULL;
             enqueue_ready(waking);
         }
+        if (hr_due) hr_expire_locked(cpu->cpu_id, tick_now_ns);
 
         spinlock_lock(&my_rq->lock);
         if (my_rq->rt_head) {
@@ -2333,13 +2375,10 @@ void sched_block(thread_state_t new_state)
     if (irqf & (1 << 9)) cpu_sti();
 }
 
-void sched_sleep(u64 ticks)
+/* Common body of sched_sleep() and sched_sleep_until_ns(): exactly one of
+ * @ticks (tick-count sleep) and @deadline_ns (high-resolution) is non-zero. */
+static void sched_sleep_common(u64 ticks, u64 deadline_ns)
 {
-    if (ticks == 0) {
-        sched_yield();
-        return;
-    }
-    
     cpu_info_t *cpu = smp_get_cpu();
     if (!cpu || !cpu->current_thread) return;
     
@@ -2348,7 +2387,8 @@ void sched_sleep(u64 ticks)
     thread_t *prev = cpu->current_thread;
     /* Don't let a sleep request bury a pending kill — see sched_yield. */
     if (prev->state != THREAD_DYING) {
-        prev->sleep_end_ticks = g_system_ticks + ticks;
+        prev->sleep_end_ticks   = deadline_ns ? ~0ULL : g_system_ticks + ticks;
+        prev->sleep_deadline_ns = deadline_ns;
         prev->state = THREAD_SLEEPING_PENDING;
         prev->unblock_pending = false;
     }
@@ -2385,6 +2425,82 @@ void sched_sleep(u64 ticks)
     if (irqf & (1 << 9)) cpu_sti();
 }
 
+void sched_sleep(u64 ticks)
+{
+    if (ticks == 0) {
+        sched_yield();
+        return;
+    }
+    sched_sleep_common(ticks, 0);
+}
+
+bool sched_hrsleep_available(void)
+{
+    return lapic_hrtimer_available();
+}
+
+void sched_sleep_until_ns(u64 deadline_ns)
+{
+    if (deadline_ns == 0) deadline_ns = 1;
+    if (ktime_get_ns() >= deadline_ns) {
+        sched_yield();
+        return;
+    }
+    if (!lapic_hrtimer_available()) {
+        /* No one-shot timer: the first tick at or after the deadline. */
+        u64 rem = deadline_ns - ktime_get_ns();
+        u64 tick_ns = NSEC_PER_SEC / TK_HZ;
+        sched_sleep((rem + tick_ns - 1) / tick_ns);
+        return;
+    }
+    sched_sleep_common(0, deadline_ns);
+}
+
+/* Insert into the high-resolution queue, ascending by sleep_deadline_ns.
+ * Caller holds g_sched_lock. */
+static void hr_queue_insert_sorted(thread_t *t)
+{
+    thread_t **pp = &g_hr_sleep_queue;
+    while (*pp && (*pp)->sleep_deadline_ns <= t->sleep_deadline_ns)
+        pp = &(*pp)->next;
+    t->next = *pp;
+    *pp = t;
+}
+
+/* Arm the calling CPU's timer for @deadline_ns (a CLOCK_MONOTONIC time), if
+ * that is before its next tick; @now_ns is the current time. */
+static void hr_arm_for_deadline(u64 deadline_ns, u64 now_ns)
+{
+    if (!lapic_hrtimer_available()) return;
+    u64 khz = lapic_tsc_khz();
+    if (!khz) return;
+    u64 delta_ns = deadline_ns > now_ns ? deadline_ns - now_ns : 0;
+    /* A deadline further out than one tick is the tick's business. */
+    if (delta_ns >= NSEC_PER_SEC / TK_HZ) return;
+    lapic_timer_arm_at(rdtsc() + delta_ns * khz / 1000000ULL);
+}
+
+/* Wake every high-resolution sleeper whose deadline has passed, then arm the
+ * calling CPU for the earliest remaining one it owns that falls before its
+ * next tick. Caller holds g_sched_lock. */
+static void hr_expire_locked(u32 cpu_id, u64 now_ns)
+{
+    while (g_hr_sleep_queue && g_hr_sleep_queue->sleep_deadline_ns <= now_ns) {
+        thread_t *t = g_hr_sleep_queue;
+        g_hr_sleep_queue = t->next;
+        t->next = NULL;
+        t->sleep_deadline_ns = 0;
+        enqueue_ready(t);
+    }
+    u64 horizon = now_ns + NSEC_PER_SEC / TK_HZ;
+    for (thread_t *t = g_hr_sleep_queue; t && t->sleep_deadline_ns < horizon; t = t->next) {
+        if (t->hr_cpu == cpu_id) {
+            hr_arm_for_deadline(t->sleep_deadline_ns, now_ns);
+            break;
+        }
+    }
+}
+
 /* Insert thread into sleep queue keeping it sorted ascending by sleep_end_ticks.
  * This lets sched_tick() early-exit as soon as it sees a future wakeup time. */
 static void sleep_queue_insert_sorted(thread_t *t)
@@ -2408,11 +2524,13 @@ static void sleep_queue_insert_sorted(thread_t *t)
  * drop a node. */
 static void sleep_queue_remove_locked(thread_t *t)
 {
-    thread_t *curr = g_sleep_queue, *prev = NULL;
+    thread_t **head = t->sleep_deadline_ns ? &g_hr_sleep_queue : &g_sleep_queue;
+    t->sleep_deadline_ns = 0;
+    thread_t *curr = *head, *prev = NULL;
     while (curr) {
         if (curr == t) {
             if (prev) prev->next = curr->next;
-            else      g_sleep_queue = curr->next;
+            else      *head = curr->next;
             curr->next = NULL;
             return;
         }
@@ -2703,8 +2821,7 @@ void sched_exit_group_mark(void)
         if (t->state == THREAD_READY) {
             rq_remove_thread_locked(t);
         } else if (t->state == THREAD_SLEEPING) {
-            for (thread_t **pp = &g_sleep_queue; *pp; pp = &(*pp)->next)
-                if (*pp == t) { *pp = t->next; break; }
+            sleep_queue_remove_locked(t);
         }
         thread_zombify_locked(t);
     }

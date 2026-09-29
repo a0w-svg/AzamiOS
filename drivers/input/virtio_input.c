@@ -87,11 +87,10 @@ typedef struct virtio_input_device {
     bool   is_pointer;
     bool   is_absolute;
 
-    /* Absolute devices report a position in their own coordinate space; the
-     * kernel's event carries deltas, so the previous position is kept here. */
+    /* Absolute devices report a position in their own coordinate space,
+     * scaled to the screen and held here until the burst's SYN. */
     u32    abs_max_x, abs_max_y;
     s32    last_abs_x, last_abs_y;
-    bool   have_last_abs;
 
     /* Accumulated across one EV_SYN-terminated burst. */
     s32    acc_dx, acc_dy, acc_dz;
@@ -189,10 +188,10 @@ static void vinput_handle_key(virtio_input_device_t *vi, u16 code, u32 value)
 static void vinput_handle_abs(virtio_input_device_t *vi, u16 code, u32 value)
 {
     /*
-     * Tablets report a position over their own axis range.  Consumers here
-     * work in screen pixels and in deltas, so the position is scaled to the
-     * boot framebuffer and differentiated against the previous report.  The
-     * first report only establishes the origin.
+     * Tablets report a position over their own axis range; it is scaled to
+     * the boot framebuffer and sent on as an absolute event at the next
+     * SYN (see INPUT_EVENT_MOUSE_ABS in input.h), so the cursor lands
+     * exactly where the host pointer is.
      */
     static u32 s_screen_w, s_screen_h;
     if (s_screen_w == 0) {
@@ -201,31 +200,34 @@ static void vinput_handle_abs(virtio_input_device_t *vi, u16 code, u32 value)
         s_screen_h = (lfb && lfb->height) ? (u32)lfb->height : 1080;
     }
 
-    s32 scaled;
     if (code == ABS_X) {
-        scaled = vi->abs_max_x ? (s32)(((u64)value * s_screen_w) / vi->abs_max_x) : (s32)value;
-        if (vi->have_last_abs) { vi->acc_dx += scaled - vi->last_abs_x; vi->pending = true; }
-        vi->last_abs_x = scaled;
+        vi->last_abs_x = vi->abs_max_x ? (s32)(((u64)value * s_screen_w) / vi->abs_max_x) : (s32)value;
+        vi->pending = true;
     } else if (code == ABS_Y) {
-        scaled = vi->abs_max_y ? (s32)(((u64)value * s_screen_h) / vi->abs_max_y) : (s32)value;
-        if (vi->have_last_abs) { vi->acc_dy += scaled - vi->last_abs_y; vi->pending = true; }
-        vi->last_abs_y = scaled;
+        vi->last_abs_y = vi->abs_max_y ? (s32)(((u64)value * s_screen_h) / vi->abs_max_y) : (s32)value;
+        vi->pending = true;
     }
 }
 
 /* Emit one pointer event for everything accumulated since the last SYN. */
 static void vinput_flush(virtio_input_device_t *vi)
 {
-    vi->have_last_abs = vi->is_absolute;
 
     if (!vi->pending) return;
     vi->pending = false;
 
     input_event_t evt;
     memset(&evt, 0, sizeof(evt));
-    evt.type          = INPUT_EVENT_MOUSE;
-    evt.mouse_dx      = (s16)vi->acc_dx;
-    evt.mouse_dy      = (s16)vi->acc_dy;
+    if (vi->is_absolute) {
+        evt.type     = INPUT_EVENT_MOUSE_ABS;
+        evt.flags    = INPUT_MOUSE_FLAG_BUTTONS;
+        evt.mouse_dx = (s16)vi->last_abs_x;
+        evt.mouse_dy = (s16)vi->last_abs_y;
+    } else {
+        evt.type     = INPUT_EVENT_MOUSE;
+        evt.mouse_dx = (s16)vi->acc_dx;
+        evt.mouse_dy = (s16)vi->acc_dy;
+    }
     evt.mouse_dz      = (s8)vi->acc_dz;
     evt.mouse_buttons = vi->buttons;
     input_inject(&evt);

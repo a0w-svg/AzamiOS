@@ -93,7 +93,8 @@ static void key_state_observe(const input_event_t *evt)
     if (evt->type == INPUT_EVENT_KEY) {
         u8 sc = evt->scancode & 0x7F;
         if (sc) key_state_set(sc, (evt->flags & KEY_FLAG_RELEASED) == 0);
-    } else if (evt->type == INPUT_EVENT_MOUSE) {
+    } else if (evt->type == INPUT_EVENT_MOUSE ||
+               (evt->type == INPUT_EVENT_MOUSE_ABS && (evt->flags & INPUT_MOUSE_FLAG_BUTTONS))) {
         for (u32 i = 0; i < ARRAY_SIZE(g_btn_map); i++) {
             key_state_set(g_btn_map[i].code, (evt->mouse_buttons & g_btn_map[i].mask) != 0);
         }
@@ -326,6 +327,15 @@ static void keyboard_update_leds(void)
  * paths compose: whichever last touched the lock wins, and a subsequent real
  * keypress toggles from that state rather than from stale hardware state.
  */
+u32 input_get_led_state(void)
+{
+    u32 leds = 0;
+    if (g_capslock)   leds |= 1U << INPUT_LED_CAPSLOCK;
+    if (g_numlock)    leds |= 1U << INPUT_LED_NUMLOCK;
+    if (g_scrolllock) leds |= 1U << INPUT_LED_SCROLLLOCK;
+    return leds;
+}
+
 void input_set_led(u32 led, bool on)
 {
     switch (led) {

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
 /* ============================================================================
  * AzamiOS — Linux Userfaultfd ABI definitions
  * File: include/azami/uapi/userfaultfd.h

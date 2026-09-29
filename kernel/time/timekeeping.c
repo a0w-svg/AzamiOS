@@ -28,6 +28,8 @@
 #include "../../arch/x86_64/cpu/lapic.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
 #include "../../drivers/misc/hpet.h"
+#include "../../arch/x86_64/cpu/hypervisor.h"
+#include "../cmdline.h"
 #include "../../drivers/misc/rtc.h"
 #include "../../drivers/char/console.h"
 #include "../mm/pmm.h"
@@ -365,9 +367,13 @@ static void tk_publish(void)
  * adopt each better estimate, as Linux's tsc_refine_calibration_work does. */
 static const u64 g_refine_windows_sec[] = { 1, 10, 100 };
 
+/* Set when the hypervisor stated the TSC frequency: there is nothing left to
+ * refine, and a measurement against an emulated HPET could only make it worse. */
+static bool g_tsc_freq_exact;
+
 static void tk_refine_start(void)
 {
-    tk.refine_active = (tk.cs == &g_cs_tsc) && hpet_available();
+    tk.refine_active = (tk.cs == &g_cs_tsc) && hpet_available() && !g_tsc_freq_exact;
     if (!tk.refine_active) return;
     tk.refine_stage       = 0;
     tk.refine_tsc0        = rdtsc_ordered();
@@ -809,16 +815,26 @@ void timekeeping_init(void)
     g_vd = (struct vdso_data *)PHYS_TO_VIRT(g_vvar_phys);
 
     /* Which sources exist. */
+    hypervisor_detect();
     u32 tsc_khz = lapic_tsc_khz();
     bool vm = (g_cpu_info.features & CPU_FEAT_HYPERVISOR) != 0;
+    /* A frequency the hypervisor states is exact; the HPET calibration and
+     * its refinement only estimate it. */
+    if (hypervisor_tsc_khz()) {
+        tsc_khz = hypervisor_tsc_khz();
+        g_tsc_freq_exact = true;
+    }
     if (tsc_khz) {
         g_cs_tsc.freq_hz = (u64)tsc_khz * 1000ULL;
-        /* An invariant TSC is the reference clock of every modern x86. A
-         * non-invariant one is still constant-rate under a hypervisor (the
-         * host virtualises it), but ranks below the HPET there until the
-         * administrator picks it through sysfs. On bare metal without the
-         * invariant bit it stops in deep C-states: never use it. */
-        if (g_cpu_info.has_invariant_tsc) {
+        /* An invariant TSC is the reference clock of every modern x86, and
+         * so is one the hypervisor vouches for (kvmclock's TSC-stable flag,
+         * VMware's timing leaf) — KVM does not pass the invariant bit
+         * through by default, so that is how a KVM guest learns it. A
+         * non-invariant TSC the hypervisor says nothing about is still
+         * constant-rate there (the host virtualises it), but ranks below the
+         * HPET until the administrator picks it through sysfs. On bare metal
+         * without the invariant bit it stops in deep C-states: never use it. */
+        if (g_cpu_info.has_invariant_tsc || hypervisor_tsc_reliable()) {
             g_cs_tsc.usable = true;
         } else if (vm) {
             g_cs_tsc.usable = true;
@@ -838,6 +854,21 @@ void timekeeping_init(void)
     for (size_t i = 0; i < NR_CLOCKSOURCES; i++)
         if (g_clocksources[i]->usable && g_clocksources[i]->rating > best->rating)
             best = g_clocksources[i];
+
+    /* clocksource=<name> on the command line, as on Linux: the same override
+     * /sys/devices/system/clocksource/clocksource0/current_clocksource offers
+     * at runtime, applied before anything has read the clock. */
+    char want[16];
+    if (cmdline_get_str("clocksource", want, sizeof(want))) {
+        bool found = false;
+        for (size_t i = 0; i < NR_CLOCKSOURCES; i++) {
+            if (strcmp(g_clocksources[i]->name, want) != 0) continue;
+            found = true;
+            if (g_clocksources[i]->usable) best = g_clocksources[i];
+            else kprintf("[TIME] clocksource=%s is not usable on this machine\n", want);
+        }
+        if (!found) kprintf("[TIME] clocksource=%s: no such clocksource\n", want);
+    }
 
     memset(&tk, 0, sizeof(tk));
     tk.cs        = best;

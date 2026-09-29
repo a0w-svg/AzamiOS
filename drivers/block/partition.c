@@ -130,7 +130,13 @@ void block_scan_partitions(block_dev_t *parent)
             continue;
         }
 
-        snprintf(part_dev->name, sizeof(part_dev->name), "%sp%d", parent->name, i + 1);
+        /* Linux's rule (disk_name() in block/partitions/core.c): a "p"
+         * separates the partition number only when the disk's own name ends
+         * in a digit — sata0p2, nvme0p2 — and not otherwise: vda2, hda2. */
+        size_t plen = strlen(parent->name);
+        bool digit_end = plen > 0 && parent->name[plen - 1] >= '0' && parent->name[plen - 1] <= '9';
+        snprintf(part_dev->name, sizeof(part_dev->name), digit_end ? "%sp%d" : "%s%d",
+                 parent->name, i + 1);
         part_dev->sector_size  = parent->sector_size;
         part_dev->phys_sector_size = parent->phys_sector_size;
         part_dev->sector_count = entry->sector_count;

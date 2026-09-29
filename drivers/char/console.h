@@ -16,6 +16,22 @@ void console_init_early(void);
 /** console_init_fb(fb_base, width, height, pitch, bpp) — Enable framebuffer. */
 void console_init_fb(void *fb_base, u32 width, u32 height, u32 pitch, u8 bpp);
 
+/** console_setup() — apply console=, quiet and loglevel= from the kernel
+ * command line. Call once, after cmdline_init(). */
+void console_setup(void);
+
+/** console_getc() — next input byte for /dev/console, or -1 if none is
+ * waiting: serial input, plus the keyboard while the kernel text console is
+ * on screen. Never blocks. */
+int console_getc(void);
+
+/** console_tick() — paint kernel-message output the rate limit deferred.
+ * Called from the timer tick; never blocks on the console lock. */
+void console_tick(void);
+
+/** console_force_verbose() — undo `quiet` so a panic is always visible. */
+void console_force_verbose(void);
+
 /** console_disable_fb() — Disable direct kernel text rendering to framebuffer. */
 void console_disable_fb(void);
 

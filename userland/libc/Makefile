@@ -1,3 +1,7 @@
+# Shared toolchain selection (mk/toolchain.mk). Optional, because this
+# Makefile is also shipped on the image for on-device rebuilds, where the rest
+# of the source tree is not; there the fallback below applies.
+-include $(dir $(lastword $(MAKEFILE_LIST)))../../mk/toolchain.mk
 CROSS_PREFIX ?= $(HOME)/opt/cross-x86_64/bin/x86_64-elf-
 CC = $(CROSS_PREFIX)gcc
 AR = $(CROSS_PREFIX)ar
@@ -28,7 +32,7 @@ CFLAGS = -std=c11 -ffreestanding -fstack-protector-strong -mstack-protector-guar
 
 # Header dependency tracking: without it, editing a header rebuilds nothing and
 # libc.a keeps stale objects compiled against the old declarations.
-CFLAGS += -MMD -MP
+CFLAGS += -MMD -MP $(TOOLCHAIN_CFLAGS)
 
 SRCS = mqueue.c semaphore.c linuxext.c syscall.c stdio.c stdlib.c string.c string_simd.c ctype.c dirent.c time.c math.c az_ipc.c signal.c mman.c pthread.c termios.c resource.c getopt.c acl.c x11.c socket.c netdb.c pwd.c grp.c regex.c fnmatch.c glob.c spawn.c syslog.c search.c utmp.c xsi.c tls.c ldso_bridge.c pty.c ftw.c wordexp.c font.c theme.c sha256.c dlfcn.c
 OBJS = $(SRCS:.c=.o) setjmp.o
@@ -49,7 +53,7 @@ OBJS = $(SRCS:.c=.o) setjmp.o
 PIC_CFLAGS = -std=c11 -ffreestanding -fno-stack-protector -fpic -fno-plt \
              -m64 -Wall -Wextra -Wformat=2 -Wformat-security \
              $(OPT_FLAGS) -pipe -ffunction-sections -fdata-sections \
-             -ftls-model=initial-exec -I. -Iinclude -MMD -MP
+             -ftls-model=initial-exec -I. -Iinclude -MMD -MP $(TOOLCHAIN_CFLAGS)
 
 PIC_OBJS = $(SRCS:.c=.pic.o) setjmp.pic.o
 

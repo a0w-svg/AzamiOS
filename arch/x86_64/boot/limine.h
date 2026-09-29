@@ -208,6 +208,21 @@ struct limine_module_request {
     struct limine_internal_module **internal_modules;
 };
 
+/* ── Kernel file (the kernel's own image, path and command line) ─────────── */
+#define LIMINE_KERNEL_FILE_REQUEST \
+    { LIMINE_COMMON_MAGIC, 0xad97e90e83f1ed67ULL, 0x31eb5d1c5ff23b69ULL }
+
+struct limine_kernel_file_response {
+    uint64_t            revision;
+    struct limine_file *kernel_file;
+};
+
+struct limine_kernel_file_request {
+    uint64_t id[4];
+    uint64_t revision;
+    struct limine_kernel_file_response *response;
+};
+
 /* ── Boot time ────────────────────────────────────────────────────────────── */
 #define LIMINE_BOOT_TIME_REQUEST \
     { LIMINE_COMMON_MAGIC, 0x502746e184c088aaULL, 0xfbc5ec83e6327893ULL }

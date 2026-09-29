@@ -25,6 +25,7 @@
 #include "../../kernel/mm/kmalloc.h"
 #include "../../kernel/lib/string.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../arch/x86_64/boot/limine_req.h"
 
 extern int devfs_register_device(const char *name, file_operations_t *fops, void *private_data);
 extern u64 get_cached_unix_time(void);
@@ -48,6 +49,11 @@ extern u64 sched_get_ticks(void);
 #define REL_X           0x00
 #define REL_Y           0x01
 #define REL_WHEEL       0x08
+#define EV_ABS          0x03
+#define ABS_X           0x00
+#define ABS_Y           0x01
+#define ABS_CNT         0x40
+#define EVIOCGABS_BASE  0x40            /* EVIOCGABS(abs) = _IOR('E', 0x40 + abs, input_absinfo) */
 #define MSC_SCAN        0x04
 
 /* Lock LEDs, in Linux's own numbering (input-event-codes.h). */
@@ -184,6 +190,26 @@ static void evdev_observe(const input_event_t *evt)
             any = true;
         }
         g_last_buttons = evt->mouse_buttons;
+    } else if (evt->type == INPUT_EVENT_MOUSE_ABS) {
+        evdev_emit(EV_ABS, ABS_X, evt->mouse_dx);
+        evdev_emit(EV_ABS, ABS_Y, evt->mouse_dy);
+        any = true;
+        if (evt->flags & INPUT_MOUSE_FLAG_BUTTONS) {
+            if (evt->mouse_dz) evdev_emit(EV_REL, REL_WHEEL, evt->mouse_dz);
+            u8 changed = (u8)(evt->mouse_buttons ^ g_last_buttons);
+            static const struct { u8 mask; u16 code; } abtns[] = {
+                { MOUSE_BTN_LEFT,   BTN_LEFT   },
+                { MOUSE_BTN_RIGHT,  BTN_RIGHT  },
+                { MOUSE_BTN_MIDDLE, BTN_MIDDLE },
+                { MOUSE_BTN_4,      BTN_SIDE   },
+                { MOUSE_BTN_5,      BTN_EXTRA  },
+            };
+            for (u32 i = 0; i < ARRAY_SIZE(abtns); i++) {
+                if (!(changed & abtns[i].mask)) continue;
+                evdev_emit(EV_KEY, abtns[i].code, (evt->mouse_buttons & abtns[i].mask) ? 1 : 0);
+            }
+            g_last_buttons = evt->mouse_buttons;
+        }
     }
 
     /* Every logical update ends with a synchronisation record. */
@@ -395,6 +421,7 @@ static s64 evdev_ioctl(file_t *filp, u32 cmd, u64 arg)
             bitmap_set(map, maplen, EV_SYN);
             bitmap_set(map, maplen, EV_KEY);
             bitmap_set(map, maplen, EV_REL);
+            bitmap_set(map, maplen, EV_ABS);
             bitmap_set(map, maplen, EV_MSC);
             bitmap_set(map, maplen, EV_LED);
         } else if (ev == EV_KEY) {
@@ -409,6 +436,9 @@ static s64 evdev_ioctl(file_t *filp, u32 cmd, u64 arg)
             bitmap_set(map, maplen, REL_X);
             bitmap_set(map, maplen, REL_Y);
             bitmap_set(map, maplen, REL_WHEEL);
+        } else if (ev == EV_ABS) {
+            bitmap_set(map, maplen, ABS_X);
+            bitmap_set(map, maplen, ABS_Y);
         } else if (ev == EV_MSC) {
             bitmap_set(map, maplen, MSC_SCAN);
         } else if (ev == EV_LED) {
@@ -419,6 +449,21 @@ static s64 evdev_ioctl(file_t *filp, u32 cmd, u64 arg)
 
         if (maplen && copy_to_user(uarg, map, maplen) != 0) return -(s64)EFAULT;
         return (s64)maplen;
+    }
+
+    /* EVIOCGABS: absolute axes report screen pixels, so their range is the
+     * screen (struct input_absinfo: value, minimum, maximum, fuzz, flat,
+     * resolution). */
+    if (nr >= EVIOCGABS_BASE && nr < EVIOCGABS_BASE + ABS_CNT) {
+        u32 axis = nr - EVIOCGABS_BASE;
+        if (axis != ABS_X && axis != ABS_Y) return -(s64)EINVAL;
+        struct limine_framebuffer *lfb = az_boot_framebuffer();
+        s32 extent = axis == ABS_X ? (lfb && lfb->width ? (s32)lfb->width : 1920)
+                                   : (lfb && lfb->height ? (s32)lfb->height : 1080);
+        s32 info[6] = { 0, 0, extent - 1, 0, 0, 0 };
+        size_t n = size < sizeof(info) ? size : sizeof(info);
+        if (n && copy_to_user(uarg, info, n) != 0) return -(s64)EFAULT;
+        return 0;
     }
 
     return -(s64)ENOTTY;

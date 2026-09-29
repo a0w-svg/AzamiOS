@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
 /* ============================================================================
  * AzamiOS — Canonical POSIX/Linux errno value list
  * File: include/azami/uapi/errno.h

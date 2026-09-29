@@ -1,0 +1,30 @@
+# AzamiOS build environment.
+#
+# Everything the tree needs to go from a clean checkout to a booted VM —
+# kernel, userland, disk/ISO images, the stock-Linux ports under tools/linux,
+# and QEMU to run the result — pinned to one distribution release so a build
+# does not depend on what happens to be installed on the host.
+#
+# Not used directly; scripts/devenv.sh builds this image once and then runs
+# commands in it with the source tree bind-mounted at the same path, so object
+# files, .d dependency files and gdb's source paths all agree between the
+# container and the host.
+#
+# No x86_64-elf cross-GCC is built here. The host x86_64 GCC produces the same
+# freestanding code once the distribution's hardening defaults are switched
+# off, which mk/toolchain.mk does; see the comment there.
+FROM registry.fedoraproject.org/fedora:44
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+        gcc gcc-c++ make nasm binutils ccache gdb \
+        python3 e2fsprogs mtools dosfstools xorriso \
+        qemu-system-x86-core qemu-img edk2-ovmf \
+        git curl ca-certificates tar gzip bzip2 xz zstd unzip patch \
+        perl bison flex bc cpio file diffutils findutils which gawk \
+        texinfo gettext autoconf automake libtool pkgconf-pkg-config \
+    && dnf clean all
+
+# devenv.sh mounts a named volume here, so the cache survives `make clean`
+# (which deletes build/), container restarts and image rebuilds.
+ENV CCACHE_DIR=/ccache \
+    CCACHE_MAXSIZE=5G

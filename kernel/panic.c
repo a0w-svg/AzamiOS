@@ -58,6 +58,10 @@ __noreturn void kernel_panic(const char *fmt, ...)
     extern void smp_stop_other_cpus(void);
     smp_stop_other_cpus();
 
+    /* A `quiet` boot keeps kernel messages off the screen; a panic must not
+     * be one of them. */
+    console_force_verbose();
+
     kprintf("\n\n");
     kprintf("=====================================\n");
     kprintf("       AzamiOS  KERNEL  PANIC        \n");

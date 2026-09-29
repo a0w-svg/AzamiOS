@@ -1387,7 +1387,7 @@ static s64 sys_read_impl(pt_regs_t *r)
     file_t *file = fget(proc, fd);
 
     if (fd == 0 && !file) {
-        int c = uart_getc(UART_COM1);
+        int c = console_getc();
         if (c != -1) {
             char kchar = (char)c;
             if (copy_to_user(buf, &kchar, 1) != 0) return -(s64)EFAULT;
@@ -5180,6 +5180,7 @@ static s64 sys_getdents64_impl(pt_regs_t *r)
  * usleep() return in microseconds rather than in a full 10 ms tick. */
 #define SLEEP_TICK_NS   (NSEC_PER_SEC / TK_HZ)
 #define SLEEP_SPIN_NS   200000ULL           /* 200 µs */
+#define SLEEP_HR_SPIN_NS 20000ULL           /* 20 µs, with one-shot timers */
 
 static inline bool sleep_signal_pending(process_t *proc)
 {
@@ -5199,7 +5200,11 @@ static s64 sleep_until_mono(u64 deadline, u64 *left)
             return -(s64)EINTR;
         }
         u64 rem = deadline - now;
-        if (rem <= SLEEP_SPIN_NS) {
+        /* With one-shot LAPIC interrupts the scheduler can wake this thread
+         * at the deadline itself, so only the last few microseconds — less
+         * than an interrupt plus a context switch costs — are spun. */
+        bool hr = sched_hrsleep_available();
+        if (rem <= (hr ? SLEEP_HR_SPIN_NS : SLEEP_SPIN_NS)) {
             while (ktime_get_ns() < deadline) {
                 if (sleep_signal_pending(proc)) {
                     u64 n2 = ktime_get_ns();
@@ -5209,6 +5214,11 @@ static s64 sleep_until_mono(u64 deadline, u64 *left)
                 cpu_pause();
             }
             return 0;
+        }
+        if (hr) {
+            /* May come back early (a signal, an unblock); the loop re-checks. */
+            sched_sleep_until_ns(deadline);
+            continue;
         }
         /* Ticks until the first tick boundary at or after the deadline. */
         s64 cs = 0, cn = 0;
@@ -5373,7 +5383,17 @@ static s64 cpu_clock_read(s32 clk, u64 *ns)
             rc = 0;
         }
     } else {
-        process_t *p = (id == 0) ? self : sched_get_process_by_pid((u32)id);
+        /* Walked inline, not through sched_get_process_by_pid(): that takes
+         * g_sched_lock itself, and it is already held here and not
+         * reentrant — clock_gettime(clock_getcpuclockid(pid)) used to spin
+         * forever with interrupts off on the CPU that asked. */
+        process_t *p = NULL;
+        if (id == 0) {
+            p = self;
+        } else {
+            for (process_t *q = sched_get_process_list(); q; q = q->next)
+                if (q->pid == (u32)id) { p = q; break; }
+        }
         if (p && !p->is_zombie) {
             if (which == CPUCLOCK_SCHED)
                 *ns = process_cputime_ns_locked(p);

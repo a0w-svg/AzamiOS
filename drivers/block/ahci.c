@@ -59,6 +59,8 @@
 #include "../../hal/pci.h"
 #include "../../hal/device.h"
 #include "../base/pci_bus.h"
+#include <azami/linux_compat.h>
+#include "../../kernel/cmdline.h"
 
 /* ── Register bits not already in ahci.h ─────────────────────────────────── */
 #define AHCI_GHC_HR         (1U << 0)     /* HBA reset            */
@@ -113,6 +115,7 @@ typedef struct ahci_drive {
     u64          ncq_bounce_phys;
     void        *ncq_bounce_virt;
 
+    wait_queue_head_t wq;
     bool         trim_supported; /* IDENTIFY word 169 bit 0 */
 
     block_dev_t  bdev;
@@ -989,7 +992,11 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 
      * against it. Saving these sectors first and writing them back after is
      * what makes that safe: the disk is bit-for-bit what it was before this
      * ran, whether the drive actually discarded the range or left it alone. */
-    if (d->trim_supported && d->bdev.sector_count > 208) {
+    /* Writes to (and TRIMs) the real disk behind this port, so it only runs
+     * when asked for: azami.disk_selftest=1. See the comment above. */
+    bool disk_selftest = cmdline_get_bool("azami.disk_selftest", false);
+
+    if (disk_selftest && d->trim_supported && d->bdev.sector_count > 208) {
         u8 saved[8 * 512];
         s64 sr = ahci_read_sectors(&d->bdev, 200, 8, saved);
         s64 tr = (sr > 0) ? ahci_trim(&d->bdev, 200, 8) : -(s64)EIO;
@@ -1014,7 +1021,7 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 
      * actually behind this port, so the original contents of both ranges
      * are saved first and written back at the end regardless of how the
      * test came out. */
-    if (d->ncq_active && d->bdev.sector_count > 300) {
+    if (disk_selftest && d->ncq_active && d->bdev.sector_count > 300) {
         u8 orig1[2048], orig2[2048];
         s64 sr1 = ahci_read_sectors(&d->bdev, 250, 4, orig1);
         s64 sr2 = ahci_read_sectors(&d->bdev, 280, 4, orig2);
@@ -1108,6 +1115,31 @@ fail:
 
 /* ── Controller bring-up ───────────────────────────────────────────────── */
 
+
+static irqreturn_t ahci_interrupt(int irq, void *dev_id)
+{
+    ahci_hba_t *hba = dev_id;
+    u32 is = mr(&hba->is);
+    if (!is) return IRQ_NONE;
+
+    for (u32 i = 0; i < 32; i++) {
+        if (is & (1u << i)) {
+            ahci_port_t *p = &hba->ports[i];
+            u32 pis = mr(&p->is);
+            mw(&p->is, pis);
+
+            for (u32 j = 0; j < g_drive_count; j++) {
+                if (g_drives[j].port == p) {
+                    wake_up_all(&g_drives[j].wq);
+                    break;
+                }
+            }
+        }
+    }
+    mw(&hba->is, is);
+    return IRQ_HANDLED;
+}
+
 static int ahci_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
     (void)id;
@@ -1120,6 +1152,7 @@ static int ahci_probe(dm_device_t *dm, const pci_device_id_t *id)
 
     pci_enable_bus_mastering(dev);
 
+
     phys_addr_t abar_phys = pci_get_bar(dev, 5);
     if (!abar_phys) { pr_debug("[AHCI] no ABAR (BAR5)\n"); return -ENODEV; }
 
@@ -1129,6 +1162,11 @@ static int ahci_probe(dm_device_t *dm, const pci_device_id_t *id)
         vmm_map(0, abar_va + off, abar_pg + off, VMM_MMIO);
 
     ahci_hba_t *hba = (ahci_hba_t *)(abar_va + (abar_phys - abar_pg));
+
+    if (pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_ALL_TYPES) > 0) {
+        int irq = pci_irq_vector(dev, 0);
+        request_irq(irq, ahci_interrupt, IRQF_SHARED, "ahci", hba);
+    }
 
     /* BIOS/OS handoff (AHCI 1.2+). Ask for ownership and wait for BIOS to
      * release it; give up after ~1 s and take it anyway. */

@@ -493,9 +493,30 @@ def add_bytes(tf, arcname, payload, mode, mtime):
     add_member(tf, Member(arcname, mode, payload), mtime)
 
 
+def build_timestamp():
+    """The mtime stamped on every archive member.
+
+    Reproducible-builds convention: SOURCE_DATE_EPOCH if the caller set it,
+    otherwise the time of the last commit. Never the wall clock — a package
+    whose bytes depend on when it was built changes its SHA-256 in index.txt
+    on every build, which in turn made the disk image look modified (and get
+    rebuilt) on every `make` even when nothing had changed."""
+    env = os.environ.get("SOURCE_DATE_EPOCH")
+    if env and env.isdigit():
+        return int(env)
+    try:
+        out = subprocess.run(["git", "log", "-1", "--format=%ct"], capture_output=True,
+                             text=True, cwd=os.path.dirname(os.path.abspath(__file__)))
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            return int(out.stdout.strip())
+    except OSError:
+        pass
+    return 1704067200   # 2024-01-01T00:00:00Z
+
+
 def build_package(out_path, pkg, members):
     """members: list of Member."""
-    mtime = int(time.time())
+    mtime = build_timestamp()
     manifest = (
         f"name={pkg['name']}\n"
         f"version={pkg['version']}\n"

@@ -4,6 +4,7 @@
  * ============================================================================ */
 
 #include "lapic.h"
+#include "smp.h"
 #include "cpu.h"
 #include "msr.h"
 #include "pic.h"
@@ -33,6 +34,27 @@ static u32 g_tsc_khz = 0;                  /* 0 = TSC-deadline unavailable */
  * arms the same frequency — but the *deadline* is, and that lives in the
  * IA32_TSC_DEADLINE MSR, which is already per-CPU hardware. */
 static u64 g_tsc_deadline_period = 0;
+
+/* High-resolution one-shots (TSC-deadline mode only). The deadline MSR holds
+ * one value per CPU, so the periodic tick and an earlier wake-up share it:
+ * g_next_tick_tsc is when this CPU's next scheduler tick is due, and
+ * g_armed_tsc is what the MSR currently holds — equal, or earlier when a
+ * sleeper asked to be woken before the tick (lapic_timer_arm_at()). The
+ * interrupt handler tells the two apart with lapic_timer_tick_due(). */
+static u64 g_next_tick_tsc[SMP_MAX_CPUS];
+static u64 g_armed_tsc[SMP_MAX_CPUS];
+
+static inline u32 this_cpu_slot(void)
+{
+    u32 c = smp_current_cpu_id();
+    return c < SMP_MAX_CPUS ? c : 0;
+}
+
+static inline void arm_deadline(u32 cpu, u64 tsc)
+{
+    g_armed_tsc[cpu] = tsc;
+    wrmsr(MSR_IA32_TSC_DEADLINE, tsc);
+}
 
 /* ── Register access ──────────────────────────────────────────────────────── */
 
@@ -293,7 +315,9 @@ void lapic_timer_start(u32 hz)
          * across each other: the MSR is only honoured once the LVT selects
          * deadline mode. MFENCE is the architecturally required separator. */
         __asm__ volatile("mfence" ::: "memory");
-        wrmsr(MSR_IA32_TSC_DEADLINE, rdtsc() + g_tsc_deadline_period);
+        u32 cpu = this_cpu_slot();
+        g_next_tick_tsc[cpu] = rdtsc() + g_tsc_deadline_period;
+        arm_deadline(cpu, g_next_tick_tsc[cpu]);
         return;
     }
 
@@ -317,7 +341,46 @@ void lapic_timer_rearm(void)
      * back-to-back trying to catch up — a livelock the periodic mode this
      * replaces could not produce. Linux's clockevents core makes the same
      * trade for exactly this reason. */
-    wrmsr(MSR_IA32_TSC_DEADLINE, rdtsc() + g_tsc_deadline_period);
+    u32 cpu = this_cpu_slot();
+    g_next_tick_tsc[cpu] = rdtsc() + g_tsc_deadline_period;
+    arm_deadline(cpu, g_next_tick_tsc[cpu]);
+}
+
+bool lapic_hrtimer_available(void)
+{
+    return g_tsc_deadline_period != 0;
+}
+
+bool lapic_timer_tick_due(void)
+{
+    if (!g_tsc_deadline_period) return true;          /* periodic: always a tick */
+    u32 cpu = this_cpu_slot();
+    /* The deadline interrupt is delivered once the TSC has reached the armed
+     * value, so an interrupt that finds the TSC still short of the tick's
+     * deadline can only be an early (high-resolution) one. */
+    return rdtsc() >= g_next_tick_tsc[cpu];
+}
+
+void lapic_timer_arm_at(u64 tsc)
+{
+    if (!g_tsc_deadline_period) return;
+    u32 cpu = this_cpu_slot();
+    if (tsc >= g_next_tick_tsc[cpu]) return;          /* the tick comes first anyway */
+    u64 armed = g_armed_tsc[cpu];
+    if (armed <= tsc && armed > rdtsc()) return;      /* an earlier one is pending */
+    arm_deadline(cpu, tsc);
+}
+
+void lapic_timer_rearm_tick(void)
+{
+    if (!g_tsc_deadline_period) return;
+    u32 cpu = this_cpu_slot();
+    arm_deadline(cpu, g_next_tick_tsc[cpu]);
+}
+
+u64 lapic_next_tick_tsc(void)
+{
+    return g_tsc_deadline_period ? g_next_tick_tsc[this_cpu_slot()] : 0;
 }
 
 void lapic_timer_stop(void)

@@ -82,6 +82,17 @@
 #define KEY_NUMPAD_ADD   168
 #define KEY_NUMPAD_5     169
 
+/* ── Absolute pointer events ─────────────────────────────────────────────────
+ * INPUT_EVENT_MOUSE_ABS carries the pointer position in screen pixels in
+ * mouse_dx/mouse_dy, from devices that know where the pointer is (tablets,
+ * touchscreens, hypervisor pointers). Consumers place the cursor there
+ * directly — no acceleration, no accumulation — which is what keeps a guest
+ * cursor exactly under the host's. INPUT_MOUSE_FLAG_BUTTONS in .flags says
+ * mouse_buttons/mouse_dz are part of the report; without it (VirtualBox's
+ * position-only notifications) the buttons come from a separate device and
+ * must be left as they were. */
+#define INPUT_MOUSE_FLAG_BUTTONS 0x0100
+
 /* ── Mouse button bits ───────────────────────────────────────────────────── */
 #define MOUSE_BTN_LEFT     0x01
 #define MOUSE_BTN_RIGHT    0x02
@@ -218,6 +229,14 @@ int input_get_key_state(u8 *bitmap, size_t len);
  * wins, exactly as on real Linux.
  */
 void input_set_led(u32 led, bool on);
+
+/**
+ * input_get_led_state() — the lock state every keyboard should display, as
+ * a bitmask of (1 << INPUT_LED_*). Keyboards that drive their own LEDs (USB
+ * HID, which the host must tell) poll this so a Caps Lock pressed on any
+ * keyboard, or set through evdev, lights all of them.
+ */
+u32 input_get_led_state(void);
 
 /**
  * input_set_keyboard_repeat(delay_ms, period_ms) — reprogram PS/2 typematic

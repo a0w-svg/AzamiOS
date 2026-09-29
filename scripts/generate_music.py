@@ -303,10 +303,20 @@ def main():
     dest_dir = sys.argv[1] if len(sys.argv) > 1 else "userland/build/music"
     print(f"Generating AzamiOS CD-Quality WAV Tracks into {dest_dir}...")
 
-    make_track_neon_horizon(os.path.join(dest_dir, "01_Neon_Horizon.wav"))
-    make_track_starlight_odyssey(os.path.join(dest_dir, "02_Starlight_Odyssey.wav"))
-    make_track_cyber_city_rain(os.path.join(dest_dir, "03_Cyber_City_Rain.wav"))
-    make_track_azami_anthem(os.path.join(dest_dir, "04_Azami_Anthem.wav"))
+    # Each track's noise comes from its own fixed seed, so the output is
+    # byte-for-byte identical on every build — and, being identical, is not
+    # regenerated at all when it already exists and this script has not
+    # changed since (pure-Python synthesis is most of a no-op build's time).
+    this_script = os.path.abspath(__file__)
+    for name, fn in (("01_Neon_Horizon.wav", make_track_neon_horizon),
+                     ("02_Starlight_Odyssey.wav", make_track_starlight_odyssey),
+                     ("03_Cyber_City_Rain.wav", make_track_cyber_city_rain),
+                     ("04_Azami_Anthem.wav", make_track_azami_anthem)):
+        path = os.path.join(dest_dir, name)
+        if os.path.isfile(path) and os.path.getmtime(path) >= os.path.getmtime(this_script):
+            continue
+        random.seed(name)
+        fn(path)
 
     # Install in-tree MP3 tracks
     script_dir = os.path.dirname(os.path.abspath(__file__))

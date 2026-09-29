@@ -64,6 +64,7 @@
 #include "../drivers/base/base.h"
 #include "../arch/x86_64/cpu/smp.h"
 #include "../arch/x86_64/cpu/lapic.h"
+#include "cmdline.h"
 
 
 /* Syscall ABI init is in assembly; we declare the C wrapper here. */
@@ -178,6 +179,7 @@ static void kernel_init_thread(void *arg)
     extern void hda_init(void);
     extern void es1370_init(void);
     extern int  mpu401_init(void);
+    extern int  xhci_init(void);
     extern int  uhci_init(void);
     extern int  ehci_init(void);
     extern int  pm_timer_init(void);
@@ -199,6 +201,7 @@ static void kernel_init_thread(void *arg)
     hda_init();
     es1370_init();
     mpu401_init();
+    xhci_init();
     uhci_init();
     ehci_init();
     pm_timer_init();
@@ -241,16 +244,40 @@ static void kernel_init_thread(void *arg)
     /* ── Mount Root Filesystem (Partitioned Disk or Initrd Fallback) ────── */
     bool root_mounted = false;
 
-    /* 1. Try mounting from disk partition 2 (sata0p2 / sda2) */
-    if (block_dev_get("sata0p2") && vfs_mount("sata0p2", "/", "ext2", NULL) == 0) {
-        pr_debug("[BOOT] Mounted disk partition 'sata0p2' as root (/)\n");
-        root_mounted = true;
-    } else if (block_dev_get("sata0") && vfs_mount("sata0", "/", "ext2", NULL) == 0) {
-        pr_debug("[BOOT] Mounted unpartitioned 'sata0' as root (/)\n");
-        root_mounted = true;
-    } else if (block_dev_get("hda2") && vfs_mount("hda2", "/", "ext2", NULL) == 0) {
-        pr_debug("[BOOT] Mounted disk partition 'hda2' as root (/)\n");
-        root_mounted = true;
+    /* 0. root= / rootfstype= from the command line, as on Linux. The device
+     *    may be named with or without /dev/. A root= that names no device,
+     *    or one that does not mount, is reported and then treated as absent
+     *    rather than fatal: the probe below still finds a bootable system,
+     *    which on this OS (no initramfs to drop into) is the more useful way
+     *    to fail. */
+    char root_dev[64], root_fs[16];
+    if (cmdline_get_str("root", root_dev, sizeof(root_dev))) {
+        const char *dev = root_dev;
+        if (strncmp(dev, "/dev/", 5) == 0) dev += 5;
+        if (!cmdline_get_str("rootfstype", root_fs, sizeof(root_fs)))
+            strcpy(root_fs, "ext2");
+        if (!block_dev_get(dev)) {
+            kprintf("[BOOT] root=%s: no such block device; probing for a root filesystem\n",
+                    root_dev);
+        } else if (vfs_mount(dev, "/", root_fs, NULL) != 0) {
+            kprintf("[BOOT] root=%s: mounting as %s failed; probing for a root filesystem\n",
+                    root_dev, root_fs);
+        } else {
+            pr_debug("[BOOT] Mounted %s (%s) as root (/) from root=\n", dev, root_fs);
+            root_mounted = true;
+        }
+    }
+
+    /* 1. Probe the usual places: the second partition of the first SATA,
+     *    NVMe or virtio disk, then whole-disk and legacy IDE layouts. */
+    static const char *const root_probe[] = {
+        "sata0p2", "nvme0p2", "vda2", "sata0", "hda2",
+    };
+    for (size_t i = 0; !root_mounted && i < sizeof(root_probe) / sizeof(root_probe[0]); i++) {
+        if (block_dev_get(root_probe[i]) && vfs_mount(root_probe[i], "/", "ext2", NULL) == 0) {
+            pr_debug("[BOOT] Mounted '%s' as root (/)\n", root_probe[i]);
+            root_mounted = true;
+        }
     }
 
     /* 2. Fallback to initrd ramdisk (ram0) if disk root was not mounted */
@@ -356,8 +383,21 @@ static void kernel_init_thread(void *arg)
     pr_debug("\n[BOOT] All core microkernel subsystems initialized successfully.\n");
 
     /* Launch ring-3 userspace init process */
-    pr_debug("[BOOT] Launching Userspace Init process (/sbin/init.elf)...\n");
-    process_t *init_proc = sched_spawn_user("/sbin/init.elf");
+    /* init= overrides the first process, as on Linux (init=/bin/sh is the
+     * classic way into a broken system). If it cannot be started the normal
+     * search below still runs, so a typo does not cost a working boot. */
+    process_t *init_proc = NULL;
+    char init_path[256];
+    if (cmdline_get_str("init", init_path, sizeof(init_path)) && init_path[0]) {
+        pr_debug("[BOOT] Launching init=%s...\n", init_path);
+        init_proc = sched_spawn_user(init_path);
+        if (!init_proc)
+            kprintf("[BOOT] init=%s could not be started; trying the default init\n", init_path);
+    }
+    if (!init_proc) {
+        pr_debug("[BOOT] Launching Userspace Init process (/sbin/init.elf)...\n");
+        init_proc = sched_spawn_user("/sbin/init.elf");
+    }
     if (!init_proc) {
         init_proc = sched_spawn_user("/init.elf");
     }
@@ -387,8 +427,16 @@ void kernel_main(void)
 {
     /* ── Step 1: Early console (UART COM1) ──────────────────────────────── */
     console_init_early();
+
+    /* The command line lives in bootloader-reclaimable memory, so it is
+     * copied before pmm_init() can hand that memory out; console_setup()
+     * applies console=/quiet before the first message is printed. */
+    cmdline_init();
+    console_setup();
+
     print_banner();
     pr_debug("[BOOT] AzamiOS kernel starting...\n");
+    pr_debug("[BOOT] Command line: %s\n", cmdline_get()[0] ? cmdline_get() : "(none)");
 
     /* ── Verify Limine base revision ─────────────────────────────────────── */
     if (LIMINE_BASE_REVISION_SUPPORTED) {

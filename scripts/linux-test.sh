@@ -10,6 +10,7 @@
 #
 #   scripts/linux-test.sh                       # run the ABI probe
 #   scripts/linux-test.sh path/to/static-binary # run any static Linux binary
+#   LINUX_TEST_CMDLINE="clocksource=hpet" scripts/linux-test.sh   # extra kernel args
 #
 # The initrd is built from scratch here rather than reusing build/initrd.ext2:
 # the point is to isolate the ABI, so the image holds the binary under test,
@@ -74,7 +75,9 @@ mke2fs -q -F -t ext2 -b 4096 -d "$WORK/root" "$WORK/initrd.ext2" 24M || exit 1
 
 cp build/kernel.elf         "$WORK/iso/boot/kernel.elf"
 cp "$WORK/initrd.ext2"      "$WORK/iso/boot/initrd.ext2"
-cp limine.conf              "$WORK/iso/boot/limine/limine.conf"
+# LINUX_TEST_CMDLINE appends kernel parameters to every boot entry.
+sed -e "s|^\(\s*kernel_cmdline:.*\)$|\1 ${LINUX_TEST_CMDLINE:-}|" \
+    limine.conf > "$WORK/iso/boot/limine/limine.conf"
 cp "$LIMINE/limine-bios-cd.bin" "$LIMINE/limine-bios.sys" "$WORK/iso/boot/limine/"
 [ -f "$LIMINE/BOOTX64.EFI" ] && cp "$LIMINE/BOOTX64.EFI" "$WORK/iso/EFI/BOOT/"
 
@@ -84,13 +87,37 @@ $MKISOFS -b boot/limine/limine-bios-cd.bin -no-emul-boot \
         echo "error: ISO build failed." >&2; exit 1; }
 [ -x "$LIMINE/limine" ] && "$LIMINE/limine" bios-install "$WORK/test.iso" >/dev/null 2>&1
 
+# KVM when this user can open it (an order of magnitude faster, and the CPU
+# model is the real one), multi-threaded TCG otherwise — the same choice the
+# top-level Makefile makes for `make run`.
+if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    ACCEL="-enable-kvm -cpu host"
+else
+    ACCEL="-accel tcg,thread=multi,tb-size=512 -cpu max,+rdrand,+rdseed"
+fi
+
 echo "  ▸  Booting $(basename "$PAYLOAD") as PID 1 (timeout ${TIMEOUT}s)..."
 rm -f "$WORK/serial.log"
+# shellcheck disable=SC2086
 timeout "$TIMEOUT" qemu-system-x86_64 \
     -M q35 -m 1536M -smp 4 \
-    -accel tcg,thread=multi,tb-size=512 -cpu max,+rdrand,+rdseed \
+    $ACCEL \
     -serial "file:$WORK/serial.log" -vga std -display none -no-reboot \
-    -cdrom "$WORK/test.iso" >/dev/null 2>&1
+    -cdrom "$WORK/test.iso" >/dev/null 2>&1 &
+QEMU_PID=$!
+
+# The payload is PID 1 and never exits, so the VM runs until the timeout
+# unless stopped. Stop it as soon as the verdict line is out (plus a moment
+# for trailing output), which turns a fixed 60 s wait into a few seconds.
+while kill -0 "$QEMU_PID" 2>/dev/null; do
+    if grep -aq "probe complete:" "$WORK/serial.log" 2>/dev/null; then
+        sleep 1
+        kill "$QEMU_PID" 2>/dev/null || true
+        break
+    fi
+    sleep 0.5
+done
+wait "$QEMU_PID" 2>/dev/null || true
 
 echo "  ── guest output ────────────────────────────────────────────────────"
 # Everything from the first line the payload printed; the kernel's own boot

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
 /* ============================================================================
  * AzamiOS — Linux AIO ABI definitions
  * File: include/azami/uapi/aio_abi.h

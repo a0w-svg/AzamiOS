@@ -634,6 +634,7 @@ static void isr_dispatch_inner(pt_regs_t *r)
                          (unsigned long long)pte);
         }
 
+        console_force_verbose();   /* the dump below must reach the screen */
         kprintf("[ISR] Kernel Exception %llu (%s)  err=0x%016llx\n"
                 "  RIP=0x%016llx  CS=0x%llx  RFLAGS=0x%016llx\n"
                 "  RAX=0x%016llx  RBX=0x%016llx  RCX=0x%016llx  RDX=0x%016llx\n"

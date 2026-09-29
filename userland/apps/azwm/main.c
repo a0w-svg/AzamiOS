@@ -605,12 +605,33 @@ int main(int argc, char **argv)
                 continue;
             }
 
+            /* Tablets, touchscreens and hypervisor pointers say where the
+             * pointer *is*. Turn that into the exact move that lands the
+             * cursor there, and keep it out of the acceleration curve below
+             * — accelerated, the cursor drifts away from the host's. */
+            bool absolute = false;
+            if (ev.type == AZ_INPUT_EVENT_MOUSE_ABS) {
+                int tx = ev.mouse_dx, ty = ev.mouse_dy;
+                if (tx < 0) tx = 0;
+                if (tx >= (int)screen_w) tx = (int)screen_w - 1;
+                if (ty < 0) ty = 0;
+                if (ty >= (int)screen_h) ty = (int)screen_h - 1;
+                ev.mouse_dx = (short)(tx - abs_x);
+                ev.mouse_dy = (short)(ty - abs_y);
+                if (!(ev.flags & AZ_MOUSE_FLAG_BUTTONS)) {
+                    ev.mouse_buttons = (unsigned char)prev_buttons;
+                    ev.mouse_dz = 0;
+                }
+                ev.type = AZ_INPUT_EVENT_MOUSE;
+                absolute = true;
+            }
+
             if (ev.type == AZ_INPUT_EVENT_MOUSE) {
                 /* Smooth acceleration curve */
                 int mdx = (int)ev.mouse_dx;
                 int mdy = (int)ev.mouse_dy;
                 int speed_sq = mdx * mdx + mdy * mdy;
-                if (speed_sq > 36) {
+                if (!absolute && speed_sq > 36) {
                     mdx = (mdx * 14) / 10;
                     mdy = (mdy * 14) / 10;
                 }

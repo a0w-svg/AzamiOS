@@ -134,9 +134,15 @@ toolchain: $(MUSL_GCC)
 $(MUSL_GCC): $(MUSL_SRC)/configure
 	@mkdir -p $(LOG_DIR)
 	@echo "  ⚙  Building musl $(MUSL_VER) (log: $(LOG_DIR)/musl.log)"
-	@cd $(MUSL_SRC) && CC="$(HOST_CC)" ./configure --prefix=$(MUSL_DIR) \
+	@# The generated musl-gcc wrapper runs its compiler as
+	@# `exec "$${REALGCC:-$(WRAPCC_GCC)}"` — one quoted word, and WRAPCC_GCC
+	@# defaults to CC. "ccache gcc" there is a command named "ccache gcc"
+	@# that does not exist, so the wrapper is pinned to the bare compiler
+	@# and ccache is applied only to musl's own compile. BB_CC already puts
+	@# ccache in front of the wrapper for everything built on top of it.
+	@cd $(MUSL_SRC) && CC=gcc ./configure --prefix=$(MUSL_DIR) \
 	    --disable-shared --enable-wrapper=gcc > $(LOG_DIR)/musl.log 2>&1
-	@$(MAKE) -C $(MUSL_SRC) -j$(NPROC) >> $(LOG_DIR)/musl.log 2>&1
+	@$(MAKE) -C $(MUSL_SRC) -j$(NPROC) CC="$(HOST_CC)" WRAPCC_GCC=gcc >> $(LOG_DIR)/musl.log 2>&1
 	@$(MAKE) -C $(MUSL_SRC) install >> $(LOG_DIR)/musl.log 2>&1
 	@echo "  ✓  musl-gcc: $(MUSL_GCC)"
 

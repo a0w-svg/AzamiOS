@@ -42,3 +42,6 @@ userland/libc/include/azami/uapi/
 tools/linux/musl/
 tools/linux/out/
 tools/linux/log/
+
+# disk image input digest (scripts/create_disk.py)
+*.img.inputs

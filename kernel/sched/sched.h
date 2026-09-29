@@ -70,6 +70,9 @@ typedef struct thread {
     u32             cpu_id;          /* Currently assigned logical CPU */
     pt_regs_t      *user_regs;       /* Saved user frame during syscalls/interrupts */
     u64             sleep_end_ticks; /* Ticks when sleeping should end */
+    u64             sleep_deadline_ns; /* Non-zero: high-resolution sleep until this
+                                        * CLOCK_MONOTONIC time (see sched_sleep_until_ns) */
+    u32             hr_cpu;          /* CPU whose timer is armed for sleep_deadline_ns */
     u64             fs_base;         /* Per-thread FS_BASE (TLS) override */
     bool            has_thread_fs_base; /* fs_base is an explicit override (arch_prctl/
                                           * CLONE_SETTLS), even if the value is 0 —
@@ -451,6 +454,18 @@ void sched_block(thread_state_t new_state);
 
 /** sched_sleep(ticks) — Put current thread to sleep for specified tick count. */
 void sched_sleep(u64 ticks);
+
+/**
+ * sched_sleep_until_ns(deadline_ns) — sleep until CLOCK_MONOTONIC reaches
+ * @deadline_ns, with sub-tick precision where the local APIC can deliver a
+ * one-shot interrupt (TSC-deadline mode); otherwise the wake-up lands on the
+ * first tick at or after the deadline. May return early if the thread is
+ * woken (sched_unblock, a signal), so callers re-check their condition.
+ */
+void sched_sleep_until_ns(u64 deadline_ns);
+
+/** sched_hrsleep_available() — sched_sleep_until_ns() is sub-tick precise. */
+bool sched_hrsleep_available(void);
 
 /** sched_waitpid(target_pid, status, options) — Wait for child process termination. */
 s64 sched_waitpid(s32 target_pid, int *status, int options);

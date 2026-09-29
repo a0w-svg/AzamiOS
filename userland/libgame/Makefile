@@ -1,3 +1,7 @@
+# Shared toolchain selection (mk/toolchain.mk). Optional, because this
+# Makefile is also shipped on the image for on-device rebuilds, where the rest
+# of the source tree is not; there the fallback below applies.
+-include $(dir $(lastword $(MAKEFILE_LIST)))../../mk/toolchain.mk
 CROSS_PREFIX ?= $(HOME)/opt/cross-x86_64/bin/x86_64-elf-
 CC = $(CROSS_PREFIX)gcc
 AR = $(CROSS_PREFIX)ar
@@ -22,7 +26,7 @@ CFLAGS = -std=c11 -ffreestanding -fstack-protector-strong -mstack-protector-guar
          -Wno-unused-parameter $(OPT_FLAGS) -pipe \
          -ffunction-sections -fdata-sections \
          -Iinclude -I../libc/include -I../apps/shared -I../apps/azwm -I../../include \
-         -MMD -MP
+         -MMD -MP $(TOOLCHAIN_CFLAGS)
 
 SRCS = game_ecs.c game_physics.c game_audio.c game_asset.c game_scene.c game_core.c game_hw3d.c game_render3d.c
 OBJS = $(SRCS:.c=.o)

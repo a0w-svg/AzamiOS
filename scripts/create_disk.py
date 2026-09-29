@@ -11,8 +11,19 @@ Constructs a bootable dual-partition hard disk image (hdd.img):
   - Partition 2 (LBA 133120..1181695, 512MB ext2):
       Full userspace rootfs (/bin, /sbin, /etc, /usr, /music, etc.)
   - Installs Limine BIOS bootloader via 'limine bios-install'
+
+The image is only rebuilt when something that goes into it changed: a digest
+of every input (the rootfs tree, kernel, bootloader, kernel command line and
+this script) is kept next to it, so `make run` after editing one app
+rebuilds the disk, and `make run` after editing nothing boots the existing one
+— guest-side changes to it included — without a 3-second mke2fs.
+
+Environment:
+  AZAMI_CMDLINE   extra kernel command-line parameters (make CMDLINE="...")
+  AZAMI_FORCE     rebuild even if the inputs are unchanged
 """
 
+import hashlib
 import os
 import sys
 import struct
@@ -25,10 +36,50 @@ PART1_SIZE_MB = 64
 PART1_SECTORS = (PART1_SIZE_MB * 1024 * 1024) // SECTOR_SIZE
 
 PART2_START_LBA = PART1_START_LBA + PART1_SECTORS
-PART2_SIZE_MB = 512
-PART2_SECTORS = (PART2_SIZE_MB * 1024 * 1024) // SECTOR_SIZE
+# The root partition is at least this big, and grows with its contents (see
+# root_partition_mb()) so installing the stock-Linux ports cannot overflow it.
+PART2_MIN_MB = 512
 
-TOTAL_SECTORS = PART2_START_LBA + PART2_SECTORS
+BASE_CMDLINE = "root=/dev/sata0p2"
+
+
+def root_partition_mb(tree):
+    """Size for an ext2 holding @tree with room to spare: +25% for metadata
+    and 4 KiB-block rounding of small files, plus 128 MiB of free space."""
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(tree):
+        for name in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    want = total * 5 // 4 // (1024 * 1024) + 128
+    return max(PART2_MIN_MB, (want + 63) // 64 * 64)
+
+
+def inputs_digest(paths, extra):
+    """SHA-256 over file names, modes, symlink targets and contents."""
+    h = hashlib.sha256()
+    h.update(extra.encode())
+    for top in paths:
+        if os.path.isfile(top):
+            walk = [(os.path.dirname(top), [], [os.path.basename(top)])]
+        else:
+            walk = os.walk(top)
+        for dirpath, dirnames, filenames in walk:
+            dirnames.sort()
+            for name in sorted(filenames) + [d for d in dirnames
+                                             if os.path.islink(os.path.join(dirpath, d))]:
+                path = os.path.join(dirpath, name)
+                st = os.lstat(path)
+                h.update(f"\0{path}\0{st.st_mode:o}\0".encode())
+                if os.path.islink(path):
+                    h.update(os.readlink(path).encode())
+                else:
+                    with open(path, "rb") as f:
+                        for chunk in iter(lambda: f.read(1 << 20), b""):
+                            h.update(chunk)
+    return h.hexdigest()
 
 def create_mbr(part1_lba, part1_sec, part2_lba, part2_sec):
     mbr = bytearray(512)
@@ -67,6 +118,27 @@ def main():
         print(f"Error: {kernel_elf} not found. Run 'make' first.")
         sys.exit(1)
 
+    cmdline = " ".join(x for x in (BASE_CMDLINE, os.environ.get("AZAMI_CMDLINE", "").strip()) if x)
+    limine_inputs = [p for p in ("tools/limine/limine-bios.sys", "tools/limine/BOOTX64.EFI",
+                                 "tools/limine/limine") if os.path.isfile(p)]
+    digest = inputs_digest([userland_build, kernel_elf, os.path.abspath(__file__)] + limine_inputs,
+                           cmdline)
+    digest_file = hdd_img + ".inputs"
+    if (not os.environ.get("AZAMI_FORCE") and os.path.isfile(hdd_img)
+            and os.path.isfile(digest_file)
+            and open(digest_file).read().strip() == digest):
+        print(f"  ✓  {hdd_img} is up to date")
+        return
+
+    # From here on the image is being replaced; a digest left behind by an
+    # interrupted run must not vouch for a half-written one.
+    if os.path.exists(digest_file):
+        os.remove(digest_file)
+
+    part2_size_mb = root_partition_mb(userland_build)
+    part2_sectors = (part2_size_mb * 1024 * 1024) // SECTOR_SIZE
+    total_sectors = PART2_START_LBA + part2_sectors
+
     print("  ↓  Preparing boot partition root (build/boot_root)...")
     os.makedirs(os.path.join(boot_root, "boot", "limine"), exist_ok=True)
     os.makedirs(os.path.join(boot_root, "EFI", "BOOT"), exist_ok=True)
@@ -84,7 +156,7 @@ terminal_background: 0x000000
 /:AzamiOS (Partitioned Disk Boot)
     protocol: limine
     kernel_path: boot():/boot/kernel.elf
-    kernel_cmdline: root=/dev/sata0p2 debug
+    kernel_cmdline: {cmdline}
     framebuffer_width:  1280
     framebuffer_height: 800
     framebuffer_bpp:    32
@@ -92,11 +164,19 @@ terminal_background: 0x000000
 /:AzamiOS (Single-Core Debug)
     protocol: limine
     kernel_path: boot():/boot/kernel.elf
-    kernel_cmdline: root=/dev/sata0p2 debug nosmp
+    kernel_cmdline: {cmdline} nosmp
     framebuffer_width:  1280
     framebuffer_height: 800
     framebuffer_bpp:    32
-"""
+
+/:AzamiOS (Rescue Shell)
+    protocol: limine
+    kernel_path: boot():/boot/kernel.elf
+    kernel_cmdline: {cmdline} init=/bin/sh
+    framebuffer_width:  1280
+    framebuffer_height: 800
+    framebuffer_bpp:    32
+""".format(cmdline=cmdline)
     with open(os.path.join(boot_root, "limine.conf"), "w") as f:
         f.write(limine_conf)
     with open(os.path.join(boot_root, "boot", "limine", "limine.conf"), "w") as f:
@@ -126,16 +206,16 @@ terminal_background: 0x000000
     root_ext2 = os.path.join(build_dir, "rootfs.ext2")
     if os.path.exists(root_ext2):
         os.remove(root_ext2)
-    print(f"  ↓  Building root partition ({PART2_SIZE_MB}M ext2 from {userland_build})...")
+    print(f"  ↓  Building root partition ({part2_size_mb}M ext2 from {userland_build})...")
     cmd_p2 = [
         "mke2fs", "-q", "-F", "-t", "ext2", "-b", "4096",
-        "-d", userland_build, root_ext2, f"{PART2_SIZE_MB}M"
+        "-d", userland_build, root_ext2, f"{part2_size_mb}M"
     ]
     subprocess.run(cmd_p2, check=True)
 
     # Assemble raw partitioned disk image
-    print(f"  ↓  Assembling partitioned disk image {hdd_img} ({TOTAL_SECTORS * SECTOR_SIZE // (1024*1024)}M)...")
-    mbr = create_mbr(PART1_START_LBA, PART1_SECTORS, PART2_START_LBA, PART2_SECTORS)
+    print(f"  ↓  Assembling partitioned disk image {hdd_img} ({total_sectors * SECTOR_SIZE // (1024*1024)}M)...")
+    mbr = create_mbr(PART1_START_LBA, PART1_SECTORS, PART2_START_LBA, part2_sectors)
 
     with open(hdd_img, "wb") as out_f:
         # Write MBR at sector 0
@@ -176,7 +256,9 @@ terminal_background: 0x000000
 
     print(f"  ✓  Partitioned disk ready: {hdd_img}")
     print(f"     • Partition 1 (Boot): LBA {PART1_START_LBA}..{PART2_START_LBA-1} ({PART1_SIZE_MB} MB)")
-    print(f"     • Partition 2 (Root): LBA {PART2_START_LBA}..{TOTAL_SECTORS-1} ({PART2_SIZE_MB} MB)")
+    print(f"     • Partition 2 (Root): LBA {PART2_START_LBA}..{total_sectors-1} ({part2_size_mb} MB)")
+    with open(digest_file, "w") as f:
+        f.write(digest + "\n")
 
 if __name__ == "__main__":
     main()

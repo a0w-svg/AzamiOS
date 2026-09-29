@@ -11,6 +11,7 @@
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../kernel/lib/string.h"
+#include "../../kernel/cmdline.h"
 
 /* One global HBA instance — a second virtio-scsi-pci controller is refused
  * in probe() rather than silently reinitializing the transport and disks[]
@@ -301,8 +302,9 @@ static void vscsi_scan_targets(virtio_scsi_dev_t *dev, u16 max_target)
         /* TEMP-SELFTEST: same idea as the one in drivers/block/nvme.c — round
          * a write through the actual WRITE(10)/READ(10) wire path and back,
          * far enough into the disk (sector 100) to stay clear of any real
-         * boot sector or partition table already on it. */
-        {
+         * boot sector or partition table already on it. It still destroys
+         * whatever sector 100 held, so it is opt-in: azami.disk_selftest=1. */
+        if (cmdline_get_bool("azami.disk_selftest", false)) {
             u8 wbuf[4096], rbuf[4096];
             for (u32 i = 0; i < sizeof(wbuf); i++) wbuf[i] = (u8)(i * 5 + 7);
             u32 nsec = sizeof(wbuf) / block_size;

@@ -11,7 +11,7 @@
 Key technical highlights include:
 - **64-bit Native Architecture**: Designed purely for 64-bit `x86_64` Long Mode with PML4 paging.
 - **Filesystem Hierarchy Standard (FHS)**: Full Unix-like directory tree populated dynamically at boot (`/bin`, `/sbin`, `/etc`, `/dev`, `/proc`, `/var`, `/home`).
-- **Rich Hardware & Paravirtualization Drivers**: ATA IDE, Floppy DMA/FDC, VirtIO block/net/GPU/RNG/9P, Intel e1000/e100 (PRO/100), Realtek RTL8139/RTL8169 (Gigabit), AMD PCNet, VMware VMXNET3, AC'97/Intel HDA/ES1370 audio, MPU-401 MIDI, PC Speaker, USB (UHCI/EHCI), PIIX4 ACPI PM & Timer, QEMU fw_cfg & pvpanic, Bochs debugcon, PCI 16550A Serial, CPU Digital Thermal Sensor (coretemp), BGA display, and DRM.
+- **Rich Hardware & Paravirtualization Drivers**: ATA IDE, Floppy DMA/FDC, VirtIO block/net/GPU/RNG/9P, Intel e1000/e100 (PRO/100), Realtek RTL8139/RTL8169 (Gigabit), AMD PCNet, VMware VMXNET3, AC'97/Intel HDA/ES1370 audio, MPU-401 MIDI, PC Speaker, USB (xHCI with HID keyboards/mice/tablets; UHCI/EHCI detection), PIIX4 ACPI PM & Timer, QEMU fw_cfg & pvpanic, Bochs debugcon, PCI 16550A Serial, CPU Digital Thermal Sensor (coretemp), BGA display, and DRM.
 - **POSIX-Compliant Custom libc**: A full freestanding C runtime — `stdio`, `stdlib`, `string`, `math`, `pthread`, `socket`, `setjmp`, `wchar`, and more — with zero kernel leakage into userspace.
 - **Compositing GUI**: Azami Window Manager (`azwm`) with a desktop environment, taskbar, terminal emulator, text editor, file manager, system monitor, and X11 client protocol support.
 
@@ -228,46 +228,62 @@ AzamiOS includes a fully custom freestanding C runtime (`userland/libc/`) target
 
 ## 🚀 Building and Running
 
-### 1. Toolchain Setup
+### 1. Toolchain
+
+Any of these works; `make doctor` tells you what this machine has and prints
+the exact install command for anything missing.
 
 ```bash
-# Builds and installs x86_64-elf cross-compiler toolchain to ~/opt/cross-x86_64
-chmod +x scripts/build_toolchain.sh
-./scripts/build_toolchain.sh
+# a) Nothing installed on the host: build and run inside a container
+#    (podman or docker; image built once from tools/devenv/Containerfile)
+scripts/devenv.sh make run
+
+# b) An x86_64 Linux host: the distribution's gcc is enough
+sudo dnf install gcc make nasm e2fsprogs python3 xorriso qemu-system-x86-core ccache
+#   (Debian/Ubuntu: gcc make nasm e2fsprogs python3 xorriso qemu-system-x86 ccache)
+
+# c) A dedicated x86_64-elf cross-compiler in ~/opt/cross-x86_64 (optional;
+#    needed on non-x86_64 hosts). Downloads are checksum-verified.
+scripts/build_toolchain.sh
 ```
+
+`mk/toolchain.mk` picks the compiler (cross-compiler first, then the host gcc)
+and switches off the distribution defaults — CET instrumentation, stack-clash
+probes, the hosted include path — that would otherwise make a host-gcc build
+differ from a cross-compiled one.
 
 ### 2. Build the OS
 
 ```bash
-make clean
-make all
+make            # kernel + bootable disk image (hdd.img)
+make iso        # hybrid BIOS + UEFI ISO (build/AzamiOS.iso), also bootable from USB
 ```
 
-*Outputs: `build/kernel.elf` (kernel) and `build/bin/*.elf` (userland binaries)*
+The build is incremental end to end: `hdd.img` is rebuilt only when its
+contents change (a digest of every input is kept in `hdd.img.inputs`), and
+the generated assets are reproducible (`SOURCE_DATE_EPOCH` is honoured).
+A no-op `make` takes about a second.
 
-### 3. Build libc Only
+### 3. Run in QEMU
 
 ```bash
-make -C userland/libc
+make run                       # BIOS boot of hdd.img (KVM when /dev/kvm is usable)
+make run CMDLINE="quiet"       # append kernel parameters (docs/KERNEL-PARAMETERS.md)
+make run CMDLINE="init=/bin/sh"   # rescue shell instead of the desktop
+make run-uefi                  # UEFI boot of the ISO under OVMF firmware
+make run-iso                   # BIOS boot of the ISO
+make run AUDIO=none            # audio backend: auto-detected (PulseAudio/PipeWire or none)
 ```
 
-### 4. Build Userland Apps Only
+`make run` attaches a USB tablet, so the mouse moves in and out of the QEMU
+window without being grabbed.
+
+### 4. Tests
 
 ```bash
-make -C userland apps
-```
-
-### 5. Run in QEMU
-
-```bash
-# Run 64-bit kernel with VirtIO drive and initrd
-make run
-
-# Run bootable CD-ROM ISO
-make run-iso
-
-# Run with UEFI firmware (requires OVMF.fd)
-make run-uefi
+make linux-test                          # Linux-ABI conformance probe (musl), 82 checks
+scripts/linux-test.sh path/to/static-bin # boot any static Linux binary as PID 1
+LINUX_TEST_CMDLINE="clocksource=hpet" make linux-test
 ```
 
 ---
@@ -280,6 +296,8 @@ make run-uefi
 - **Scheduler**: Preemptive multi-tasking with per-CPU run queues, ELF64 binary loader, POSIX threads with System V AMD64 stack alignment, signal delivery, and job-control stop — `SIGSTOP`/`SIGTSTP` park a process instead of killing it, `SIGCONT` resumes it, and `wait4(WUNTRACED|WCONTINUED)` reports both. A process asleep inside a blocking syscall stops too, because the stop is raised through the same pending-signal test the rest of the kernel already uses for `EINTR`.
 - **Debugging and profiling**: `ptrace(2)` with `TRACEME`/`ATTACH`/`SEIZE`, syscall entry-and-exit stops, signal-delivery stops, `int3` breakpoints and `RFLAGS.TF` single-step, `PEEK`/`POKE` (which breaks a page shared with the tracee's parent rather than patching both), `GETREGS`/`SETREGS`/`GETREGSET`, and the `PTRACE_O_TRACE*` events — enough for `strace`- and `gdb`-shaped tools. `perf_event_open(2)` counts hardware events on the Intel architectural PMU or AMD's counters, plus software events (task clock, page faults, context switches) drawn from real per-process counters; sampling is not implemented and is refused rather than silently ignored. `RDPMC` is probed once at boot behind an exception fixup, so a hypervisor that enumerates a PMU it does not emulate falls back to software events instead of panicking. The result is reported in `/proc/cpuinfo`'s `azami_pmu` field.
 - **System Calls**: Linux-compatible system call ABI (`syscall` instruction, x86_64 System V AMD64 calling convention) with over 100+ registered handlers including `flock`, `fsync`, `fdatasync`, `sync`, `syncfs`, `getpgid`, `getsid`, `setreuid`, `setregid`, `setresuid`, `getresuid`, `setresgid`, `getresgid`, `getgroups`, `setgroups`, `clock_getres`, `clock_settime`, `clock_nanosleep`, and more.
+- **Timekeeping**: TSC clocksource whenever the CPU or the hypervisor vouches for it (KVM's pvclock stable bit, VMware's timing leaf), so `clock_gettime()` is a ~20 ns vDSO call in a VM instead of a ~6 µs HPET exit; `clocksource=` overrides it. Sleeps are high-resolution: sub-tick deadlines are armed as one-shot TSC-deadline interrupts, so `nanosleep(1 ms)` takes 1 ms rather than a 10 ms scheduler tick.
+- **Kernel command line**: `root=`, `rootfstype=`, `init=`, `nosmp`/`maxcpus=`/`nr_cpus=`, `quiet`/`loglevel=`, `console=`, `clocksource=`, shown in `/proc/cmdline` — see [docs/KERNEL-PARAMETERS.md](docs/KERNEL-PARAMETERS.md).
 - **IPC**: Inter-process communication via pipes, shared memory, and the AzamiOS IPC message bus.
 - **Security**: Capability-based security model with POSIX ACL enforcement.
 - **CPU Extensions**: CPUID enumeration across leaves 1, 4-7, 0xB, 0xD, 0x15/0x16 and 0x8000_0001-8 (including leaf 7 subleaf 1 and AMD's 0x8000_0008 EBX), surfaced as Linux-format flag and bug lists in `/proc/cpuinfo`. What the CPU offers is then actually spent: SMEP/SMAP/UMIP/PKU/NX/FSGSBASE/PCID, XSAVE-XSAVEOPT-XSAVEC context switching (each probed before use), MONITOR/MWAIT idling, RDRAND/RDSEED entropy, SSE4.2 CRC-32C for the dentry hash, POPCNT for the physical-page bitmap, CLZERO or non-temporal stores for page clearing, and WAITPKG's TPAUSE for spin-lock backoff. Every instruction whose absence would only show up as a `#UD` is probed once at boot behind an exception fixup, so a hypervisor that advertises a feature it does not implement causes a fallback rather than a panic. The chosen paths are reported in `/proc/cpuinfo`'s `azami_hwaccel` field.
@@ -298,8 +316,9 @@ make run-uefi
 | **Networking** | Intel e1000, Realtek RTL8139, AMD PCNet, VirtIO Net |
 | **Video** | BGA Display, VirtIO GPU, Framebuffer DRM |
 | **Audio** | AC'97, Intel HDA (High Definition Audio), PC Speaker |
-| **Misc** | RTC, VirtIO RNG, ACPI/IOAPIC/power management |
-| **Input** | PS/2 keyboard and mouse |
+| **USB** | xHCI (USB 3.x) host controller: BIOS handoff, Intel PCH port routing, hot-plug; HID class driver (boot-protocol keyboards with autorepeat and lock LEDs, report-protocol mice, absolute tablets) |
+| **Misc** | RTC, VirtIO RNG, ACPI/IOAPIC/power management, KVM/VMware paravirtual clock detection |
+| **Input** | PS/2 keyboard and mouse, USB HID, virtio-input; absolute pointers land exactly under the host cursor |
 
 ### Networking Stack
 
@@ -324,4 +343,16 @@ make run-uefi
 
 ## 📄 License
 
-AzamiOS is an independent open-source project. See [LICENSE](LICENSE) for details.
+AzamiOS is licensed like Linux and its user space, so code from the Linux
+kernel can be used in it:
+
+- **Kernel** (`arch/`, `kernel/`, `drivers/`, `fs/`, `hal/`, `include/`):
+  [GPL-2.0-only](LICENSE). Programs that only use its system calls, and the
+  user-space API headers in `include/azami/uapi/` (GPL-2.0-only WITH
+  Linux-syscall-note), are not derived works of it.
+- **User space and tooling** (`userland/`, `tools/`, `scripts/`):
+  [BSD-3-Clause](LICENSES/BSD-3-Clause.txt), so programs built against the
+  AzamiOS C library can use any license.
+
+Third-party files keep their own notices. The full breakdown is in
+[COPYING](COPYING); license texts are in [LICENSES/](LICENSES/).

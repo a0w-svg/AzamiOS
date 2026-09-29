@@ -10,6 +10,7 @@
 
 #define DEBUG 1
 #include <azami/debug.h>
+#include "../kernel/cmdline.h"
 #include "procfs.h"
 #include "../kernel/ipc/sysvipc.h"
 #include "vfs.h"
@@ -618,7 +619,8 @@ static size_t format_proc_filesystems(char *buf, size_t max)
 
 static size_t format_proc_cmdline(char *buf, size_t max)
 {
-    return (size_t)scnprintf(buf, max, "BOOT_IMAGE=/boot/kernel.elf root=/dev/sata0p2 rw console=ttyS0 quiet\n");
+    /* Exactly what the bootloader passed, as on Linux. */
+    return (size_t)scnprintf(buf, max, "%s\n", cmdline_get());
 }
 
 static size_t format_proc_net_tcp(char *buf, size_t max)

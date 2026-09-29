@@ -1,4 +1,4 @@
-CROSS_PREFIX ?= $(HOME)/opt/cross-x86_64/bin/x86_64-elf-
+include ../mk/toolchain.mk
 CC = $(CROSS_PREFIX)gcc
 LD = $(CROSS_PREFIX)ld
 AR = $(CROSS_PREFIX)ar
@@ -61,7 +61,7 @@ CFLAGS = -std=c11 -ffreestanding -fstack-protector-strong -mstack-protector-guar
 # naming the headers it read; -MP adds phony targets so deleting a header does
 # not wedge the build. See "Header dependencies" near the bottom of this file
 # for where these get pulled back in.
-CFLAGS += -MMD -MP
+CFLAGS += -MMD -MP $(TOOLCHAIN_CFLAGS)
 
 LDFLAGS = -T ../scripts/user.ld -nostdlib -z max-page-size=0x1000 --gc-sections
 
@@ -455,7 +455,7 @@ toolchain: skeleton libc libgame
 # DTPMOD64/DTPOFF64 relocations, which -fpic would otherwise default TLS
 # access to, are unsupported (see that file for why).
 DYNLINK_CFLAGS = -std=c11 -ffreestanding -fno-stack-protector -fpic -fno-plt \
-                 -m64 -Wall -Wextra -O2 -ftls-model=initial-exec
+                 -m64 -Wall -Wextra -O2 -ftls-model=initial-exec $(TOOLCHAIN_CFLAGS)
 
 ldso/ldso.o: ldso/ldso.c libc/include/sys/syscall.h
 	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
@@ -548,7 +548,7 @@ $(BUILD_DIR)/lib/libc.so: libc/libc.so toolchain
 # -fpie is needed too.
 DYNAPP_CFLAGS = -std=c11 -ffreestanding -fno-stack-protector -fpic -fno-plt \
                 -m64 -Wall -Wextra -Wno-unused-parameter -O2 -ftls-model=initial-exec \
-                -I. -Ilibc/include
+                -I. -Ilibc/include $(TOOLCHAIN_CFLAGS)
 
 DYNAPP_LDFLAGS = -pie -T ../scripts/user-pic.ld --dynamic-linker=/lib/ld-azami.so \
                  -nostdlib -z max-page-size=0x1000

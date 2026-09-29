@@ -28,6 +28,11 @@ typedef struct {
 #define AZ_INPUT_EVENT_NONE   0
 #define AZ_INPUT_EVENT_KEY    1
 #define AZ_INPUT_EVENT_MOUSE  2
+/* Absolute pointer: mouse_dx/mouse_dy are the position in screen pixels.
+ * AZ_MOUSE_FLAG_BUTTONS set means mouse_buttons/mouse_dz belong to this
+ * report; without it they come from another device and are not included. */
+#define AZ_INPUT_EVENT_MOUSE_ABS 3
+#define AZ_MOUSE_FLAG_BUTTONS 0x0100
 
 #define AZ_KEY_FLAG_PRESSED   0x01
 #define AZ_KEY_FLAG_RELEASED  0x02

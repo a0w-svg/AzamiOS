@@ -16,6 +16,7 @@
  *   - Kernel Address   — physical and virtual base of the loaded kernel ELF
  *   - SMP              — number of CPUs and their LAPIC IDs
  *   - Modules          — boot modules (initrd.tar)
+ *   - Kernel File      — the kernel's own path and command line
  * ============================================================================ */
 #pragma once
 
@@ -45,6 +46,7 @@ extern volatile struct limine_kernel_address_request g_limine_kaddr_req;
 extern volatile struct limine_smp_request            g_limine_smp_req;
 extern volatile struct limine_module_request         g_limine_module_req;
 extern volatile struct limine_boot_time_request      g_limine_btime_req;
+extern volatile struct limine_kernel_file_request    g_limine_kfile_req;
 
 /* Convenience accessors — return NULL on failure (bootloader did not fill). */
 static inline struct limine_framebuffer *az_boot_framebuffer(void) {

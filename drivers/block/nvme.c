@@ -41,6 +41,7 @@
 #include "../../hal/pci.h"
 #include "../../hal/device.h"
 #include "../base/pci_bus.h"
+#include "../../kernel/cmdline.h"
 
 /* ── Controller register offsets (NVMe 1.4 §3.1) ─────────────────────────── */
 #define NVME_REG_CAP      0x00   /* u64 Controller Capabilities   */
@@ -488,8 +489,10 @@ static void nvme_scan_namespaces(nvme_ctrl_t *c, u32 nn)
                  (unsigned long long)mib, ns->bdev.name);
         g_ns_count++;
 
-        /* TEMP-SELFTEST */
-        {
+        /* TEMP-SELFTEST: overwrites LBAs 50..115 of the namespace without
+         * saving them first, so it must never run against a disk someone
+         * cares about. Opt-in only: azami.disk_selftest=1. */
+        if (cmdline_get_bool("azami.disk_selftest", false)) {
             static u8 wbuf[20480], rbuf[20480];
             for (u32 i = 0; i < sizeof(wbuf); i++) wbuf[i] = (u8)(i * 7 + 3);
             u32 nsec = sizeof(wbuf) / lba_bytes;

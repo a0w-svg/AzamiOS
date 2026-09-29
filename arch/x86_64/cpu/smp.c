@@ -4,6 +4,7 @@
  * ============================================================================ */
 
 #include "smp.h"
+#include "../../../kernel/cmdline.h"
 #include "cpu.h"
 #include "gdt.h"
 #include "idt.h"
@@ -449,6 +450,21 @@ void smp_init(void)
                     (unsigned long long)smp_resp->cpu_count, (unsigned int)SMP_MAX_CPUS);
         }
         g_cpu_count = (smp_resp->cpu_count > SMP_MAX_CPUS) ? SMP_MAX_CPUS : (u32)smp_resp->cpu_count;
+
+        /* nosmp / maxcpus= / nr_cpus=, with Linux's meanings for this
+         * kernel's purposes: each caps how many CPUs are brought up, and
+         * maxcpus=0 is nosmp. The APs left out are simply never started. */
+        long limit = (long)g_cpu_count;
+        if (cmdline_has("nosmp")) limit = 1;
+        long maxcpus = cmdline_get_long("maxcpus", -1);
+        if (maxcpus >= 0 && maxcpus < limit) limit = maxcpus > 0 ? maxcpus : 1;
+        long nr_cpus = cmdline_get_long("nr_cpus", -1);
+        if (nr_cpus > 0 && nr_cpus < limit) limit = nr_cpus;
+        if ((u32)limit < g_cpu_count) {
+            kprintf("[SMP] Command line limits CPUs to %ld of %u\n", limit, g_cpu_count);
+            g_cpu_count = (u32)limit;
+        }
+
         kprintf("[SMP] Limine reported %u total CPU(s). Initializing APs...\n", g_cpu_count);
     }
 

@@ -3,8 +3,11 @@
 # Target: x86_64, Limine boot protocol
 # Toolchain: x86_64-elf cross-compiler (GCC) + NASM
 #
-# Key make targets:
-#   make            — build kernel.elf
+# Key make targets (`make help` lists them all):
+#   make            — build kernel.elf and the bootable disk image (hdd.img)
+#   make world      — complete build: Linux userland, kernel, disk image, ISO
+#                     (./build.sh drives the same thing, with or without make
+#                     installed on the host)
 #   make run        — build + launch in QEMU (UART → serial, 4 CPUs)
 #   make run-debug  — same + GDB server on :1234
 #   make gdb        — attach GDB to a waiting run-debug instance
@@ -12,10 +15,17 @@
 #   make iso        — build bootable ISO image (requires xorriso + limine)
 #   make linux      — build stock Linux binaries (musl + BusyBox) for the initrd
 #   make linux-test — boot a headless VM and run the Linux-ABI probe
+#   make doctor     — check the host for build dependencies
+#
+# No compiler on the host? `scripts/devenv.sh make run` builds and runs in a
+# container with everything preinstalled (tools/devenv/Containerfile).
 # ==============================================================================
 
 # ── Toolchain ─────────────────────────────────────────────────────────────────
-CROSS_PREFIX ?= $(HOME)/opt/cross-x86_64/bin/x86_64-elf-
+# Picks CROSS_PREFIX (dedicated x86_64-elf cross-GCC if installed, otherwise a
+# suitable host gcc) and the flags that make a hosted gcc behave like a bare
+# one. See mk/toolchain.mk; `make doctor` shows what it chose.
+include mk/toolchain.mk
 CC    := $(CROSS_PREFIX)gcc
 LD    := $(CROSS_PREFIX)ld
 AR    := $(CROSS_PREFIX)ar
@@ -124,7 +134,8 @@ CFLAGS := \
     -I. \
     -Iinclude \
     -Iarch/x86_64 \
-    -Ikernel
+    -Ikernel \
+    $(TOOLCHAIN_CFLAGS)
 
 # stack-protector-strong relies on __stack_chk_guard / __stack_chk_fail,
 # which kernel/security/security.c already defines (a fixed placeholder
@@ -162,6 +173,7 @@ BOOT_ASM_SRCS := arch/x86_64/boot/entry.asm
 ARCH_C_SRCS := \
     arch/x86_64/boot/limine_req.c \
     arch/x86_64/cpu/cpu.c \
+    arch/x86_64/cpu/hypervisor.c \
     arch/x86_64/cpu/hwaccel.c \
     arch/x86_64/cpu/pmu.c \
     arch/x86_64/cpu/mitigations.c \
@@ -191,6 +203,7 @@ ARCH_ASM_SRCS := \
 # Kernel C sources
 KERNEL_C_SRCS := \
     kernel/main.c \
+    kernel/cmdline.c \
     kernel/panic.c \
     kernel/signal.c \
     kernel/ptrace.c \
@@ -208,6 +221,7 @@ KERNEL_C_SRCS := \
     kernel/mm/kmalloc.c \
     kernel/mm/kmodmem.c \
     kernel/mm/vma.c \
+    kernel/mm/dma.c \
     kernel/syscall/syscall.c \
     kernel/sched/sched.c \
     kernel/sched/elf.c \
@@ -216,6 +230,17 @@ KERNEL_C_SRCS := \
     kernel/ipc/mqueue.c \
     kernel/ipc/posix_sem.c \
     kernel/ktimer.c \
+    kernel/jiffies.c \
+    kernel/timer_list.c \
+    kernel/wait.c \
+    kernel/kthread.c \
+    kernel/completion.c \
+    kernel/softirq.c \
+    kernel/workqueue.c \
+    kernel/linux_compat_irq.c \
+    kernel/linux_compat_devres.c \
+    kernel/linux_compat_fw.c \
+    kernel/net/linux_compat_net.c \
     kernel/time/timekeeping.c \
     kernel/security/security.c \
     kernel/security/seccomp.c \
@@ -323,6 +348,8 @@ KERNEL_C_SRCS := \
     drivers/hwmon/coretemp.c \
     drivers/usb/core/usb.c \
     drivers/usb/host/uhci.c \
+    drivers/usb/host/xhci.c \
+    drivers/usb/class/usbhid.c \
     drivers/net/vmxnet3.c \
     drivers/acpi/pm_timer.c \
     drivers/sound/mpu401.c \
@@ -357,8 +384,8 @@ UTIL_LIST := ls help cat write time clear ifconfig ping arp lsmod reload cpu \
 UTIL_TARGETS := $(foreach u,$(UTIL_LIST),userland/apps/$(u)/$(u))
 
 # ── Primary targets ───────────────────────────────────────────────────────────
-.PHONY: all run run-debug gdb iso clean userspace doc \
-        linux linux-install linux-test linux-clean pkgserve
+.PHONY: all world help run run-debug run-iso run-uefi run-gui run-direct gdb iso clean \
+        userspace doc doctor linux linux-install linux-test linux-clean pkgserve
 
 # `doc` regenerates docs/*.md from source comments; it is not a build input, so
 # it is no longer a prerequisite of `all` (run `make doc` to refresh it).
@@ -386,6 +413,72 @@ endif
 	@echo "  ✓  Kernel linked: $@"
 	@echo "     Size: $$(wc -c < $@ | tr -d ' ') bytes"
 
+# ── Complete build ───────────────────────────────────────────────────────────
+# Everything, in the one order that works: the stock-Linux userland first
+# (the disk image and the package repository both pick it up), then the
+# kernel, the native userland and the disk image, then the ISO. Each step is
+# its own make so the order holds under -j.
+#
+#   make world               the whole system
+#   make world PORTS=1       plus the ported software in tools/linux/ports.mk
+#                            (bash, coreutils, vim, gcc, … — a long build)
+#   make world TEST=1        then boot the Linux-ABI probe and check it
+#   make world NO_LINUX=1    skip the stock-Linux userland (offline builds)
+PORTS    ?= 0
+TEST     ?= 0
+NO_LINUX ?= 0
+
+world:
+ifneq ($(NO_LINUX),1)
+	@echo "  ▸  [1/5] Stock Linux userland (musl, BusyBox, ABI probe)"
+	@$(MAKE) --no-print-directory linux
+else
+	@echo "  ▸  [1/5] Stock Linux userland: skipped (NO_LINUX=1)"
+endif
+ifeq ($(PORTS),1)
+	@echo "  ▸  [2/5] Ported software"
+	@$(MAKE) --no-print-directory -C tools/linux ports
+else
+	@echo "  ▸  [2/5] Ported software: skipped (PORTS=1 to build)"
+endif
+	@echo "  ▸  [3/5] Kernel, userland and disk image"
+	@$(MAKE) --no-print-directory all
+	@echo "  ▸  [4/5] Hybrid BIOS/UEFI ISO"
+	@$(MAKE) --no-print-directory iso
+ifeq ($(TEST),1)
+	@echo "  ▸  [5/5] Linux-ABI conformance probe"
+	@$(MAKE) --no-print-directory linux-test
+else
+	@echo "  ▸  [5/5] Tests: skipped (TEST=1 to run)"
+endif
+	@echo "  ✓  World built: $(KERNEL_ELF), hdd.img, $(BUILD_DIR)/AzamiOS.iso"
+
+help:
+	@echo "Build"
+	@echo "  make                 kernel + bootable disk image (hdd.img)"
+	@echo "  make world           complete build (also: ./build.sh --help)"
+	@echo "  make iso             hybrid BIOS/UEFI ISO, bootable from CD or USB stick"
+	@echo "  make linux           stock Linux userland (musl, BusyBox, ABI probe)"
+	@echo "  make -C tools/linux ports   ported software (bash, coreutils, vim, ...)"
+	@echo "  make DEBUG=1 | LTO=1 -O0 debug build | link-time optimised kernel"
+	@echo "Run"
+	@echo "  make run             boot hdd.img in QEMU (CMDLINE=\"...\" adds kernel parameters)"
+	@echo "  make run-uefi        boot the ISO under OVMF (UEFI)"
+	@echo "  make run-iso         boot the ISO (BIOS)"
+	@echo "  make run-debug / gdb boot halted with a GDB stub / attach GDB"
+	@echo "Test and inspect"
+	@echo "  make linux-test      Linux-ABI conformance probe"
+	@echo "  make doctor          check this machine for build dependencies"
+	@echo "Clean"
+	@echo "  make clean           kernel, disk image and ISO outputs"
+	@echo "  make linux-clean     stock-Linux build output (keeps downloads)"
+
+# Check the host for everything the build needs and print the exact install
+# command when something is missing. Works without a compiler installed.
+doctor:
+	@CROSS_PREFIX="$(CROSS_PREFIX)" TOOLCHAIN_SOURCE="$(TOOLCHAIN_SOURCE)" \
+	    scripts/doctor.sh
+
 doc:
 	@echo "  ↓  Generating documentation..."
 	@python3 scripts/autodoc.py
@@ -411,7 +504,7 @@ VDSO_SRC    := arch/x86_64/vdso
 VDSO_CFLAGS := -std=c11 -O2 -fPIC -ffreestanding -fno-builtin -nostdlib \
                -fno-stack-protector -mgeneral-regs-only -fno-common \
                -fasynchronous-unwind-tables -fno-omit-frame-pointer \
-               -Wall -Wextra -g
+               -Wall -Wextra -g $(TOOLCHAIN_CFLAGS)
 VDSO_LDFLAGS := -shared -soname=linux-vdso.so.1 --hash-style=both \
                 --eh-frame-hdr -z max-page-size=4096 -z noexecstack \
                 --no-undefined -Bsymbolic --build-id=none \
@@ -450,6 +543,21 @@ else
   QEMU_ACCEL ?= -accel tcg,thread=multi,tb-size=512 -cpu max,+rdrand,+rdseed
 endif
 
+# Audio backend. QEMU refuses to start at all when the chosen backend cannot
+# connect, so a hard-coded `pa` made `make run` fail outright on any host (or
+# container, or SSH session) without a reachable PulseAudio server. Pick
+# PulseAudio when its socket is there — PipeWire's pulse shim provides the
+# same one — and otherwise run with sound devices present but silent.
+# `make run AUDIO=none|pa|pipewire|alsa|sdl` overrides.
+ifeq ($(origin AUDIO),undefined)
+  PULSE_SOCK := $(or $(patsubst unix:%,%,$(filter unix:%,$(PULSE_SERVER))),$(XDG_RUNTIME_DIR)/pulse/native)
+  AUDIO := $(if $(wildcard $(PULSE_SOCK)),pa,none)
+endif
+
+# The xHCI controller carries a USB tablet: an absolute pointer, so the mouse
+# moves in and out of the QEMU window without being grabbed, and the guest
+# cursor stays exactly under the host's (drivers/usb/host/xhci.c,
+# drivers/usb/class/usbhid.c). The PS/2 keyboard and mouse remain as well.
 QEMU_FLAGS := \
     -M q35 \
     -m 1536M \
@@ -464,7 +572,7 @@ QEMU_FLAGS := \
     -device ide-hd,drive=drv0,bus=ide.0 \
     -netdev user,id=net0,net=10.0.2.0/24,dhcpstart=10.0.2.15 \
     -device e1000,netdev=net0 \
-    -audiodev pa,id=snd0 \
+    -audiodev $(AUDIO),id=snd0 \
     -device AC97,audiodev=snd0 \
     -device intel-hda -device hda-duplex,audiodev=snd0 \
     -device ES1370,audiodev=snd0 \
@@ -473,6 +581,8 @@ QEMU_FLAGS := \
     -device pci-serial \
     -device ich9-usb-uhci1 \
     -device ich9-usb-ehci1 \
+    -device qemu-xhci,id=xhci \
+    -device usb-tablet,bus=xhci.0 \
     -device vmxnet3
 
 # Fast partitioned disk run (Partition 1: kernel, Partition 2: rootfs + music)
@@ -482,6 +592,29 @@ run: hdd.img
 # Limine-based ISO run (GUI window + serial terminal)
 run-iso: iso
 	$(QEMU) $(QEMU_FLAGS) -cdrom $(BUILD_DIR)/AzamiOS.iso
+
+# UEFI boot of the hybrid ISO under OVMF, the way a UEFI-only PC boots it.
+# The firmware's variable store is copied so each run starts from a clean
+# one and the system image is never written to.
+OVMF_CODE ?= $(firstword $(wildcard /usr/share/edk2/ovmf/OVMF_CODE.fd \
+                                    /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd \
+                                    /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
+                                    /usr/share/qemu/ovmf-x86_64-code.bin))
+OVMF_VARS ?= $(firstword $(wildcard $(dir $(OVMF_CODE))OVMF_VARS.fd $(dir $(OVMF_CODE))OVMF_VARS_4M.fd \
+                                    $(dir $(OVMF_CODE))OVMF_VARS.4m.fd $(dir $(OVMF_CODE))ovmf-x86_64-vars.bin))
+
+run-uefi: iso hdd.img
+	@if [ -z "$(OVMF_CODE)" ]; then \
+	    echo "  ✗  No OVMF firmware found (Fedora: edk2-ovmf, Debian/Ubuntu: ovmf, Arch: edk2-ovmf)."; \
+	    echo "     Set OVMF_CODE=/path/to/OVMF_CODE.fd, or use scripts/devenv.sh make run-uefi."; \
+	    exit 1; \
+	fi
+	@if [ -n "$(OVMF_VARS)" ]; then cp $(OVMF_VARS) $(BUILD_DIR)/ovmf_vars.fd; \
+	 else truncate -s 540672 $(BUILD_DIR)/ovmf_vars.fd; fi
+	$(QEMU) $(QEMU_FLAGS) \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(BUILD_DIR)/ovmf_vars.fd \
+	    -cdrom $(BUILD_DIR)/AzamiOS.iso -boot d
 
 # Graphical GUI window run
 run-gui: run
@@ -506,13 +639,34 @@ gdb: $(KERNEL_ELF)
 LIMINE_DIR := $(shell [ -d tools/limine ] && echo tools/limine || echo /usr/share/limine)
 MKISOFS := $(shell command -v xorriso >/dev/null 2>&1 && echo "xorriso -as mkisofs" || (command -v mkisofs >/dev/null 2>&1 && echo "mkisofs" || echo "genisoimage"))
 
-tools/limine:
-	@echo "  ↓  Bootstrapping local Limine bootloader..."
-	@mkdir -p tools
-	@git clone https://github.com/limine-bootloader/limine.git --branch=v8.x-binary --depth=1 tools/limine
-	@$(MAKE) -C tools/limine >/dev/null 2>&1 || true
+# tools/limine is recorded in git as a gitlink pinned to one v8.x-binary commit,
+# so a fresh checkout has it as an *empty directory*. The bootstrap therefore
+# keys on the host `limine` utility, not on the directory existing — keying on
+# the directory is what used to let every fresh clone skip this step and
+# produce an hdd.img with no boot sector. It fetches exactly the pinned commit
+# (falling back to the branch head outside a git checkout), then builds the
+# small host-side `limine` installer from it.
+LIMINE_REPO   := https://github.com/limine-bootloader/limine.git
+LIMINE_BRANCH := v8.x-binary
+LIMINE_PIN    := $(shell git ls-tree HEAD tools/limine 2>/dev/null | awk '{print $$3}')
+LIMINE_BIN    := tools/limine/limine
 
-iso: $(KERNEL_ELF) | tools/limine
+$(LIMINE_BIN):
+	@if [ ! -f tools/limine/limine-bios.sys ]; then \
+	    if [ -d tools/limine ] && [ -n "$$(ls -A tools/limine)" ]; then \
+	        echo "  ✗  tools/limine exists but has no limine-bios.sys; remove it and re-run make" >&2; \
+	        exit 1; \
+	    fi; \
+	    echo "  ↓  Fetching Limine $(or $(LIMINE_PIN),$(LIMINE_BRANCH))..."; \
+	    rm -rf tools/limine && git init -q tools/limine && \
+	    git -C tools/limine fetch -q --depth=1 $(LIMINE_REPO) $(or $(LIMINE_PIN),$(LIMINE_BRANCH)) && \
+	    git -C tools/limine checkout -q FETCH_HEAD || exit 1; \
+	fi
+	@echo "  ↓  Building the limine host utility..."
+	@$(MAKE) --no-print-directory -C tools/limine >/dev/null
+	@test -x $@
+
+iso: $(KERNEL_ELF) $(LIMINE_BIN)
 	@mkdir -p $(BUILD_DIR)/iso_root/boot/limine
 	@mkdir -p $(BUILD_DIR)/iso_root/EFI/BOOT
 	@$(MAKE) -C userland ARCH=x86_64 >/dev/null
@@ -545,18 +699,29 @@ iso: $(KERNEL_ELF) | tools/limine
 	fi
 	@if [ -f tools/limine/BOOTX64.EFI ]; then \
 	    cp tools/limine/BOOTX64.EFI $(BUILD_DIR)/iso_root/EFI/BOOT/; \
+	    cp tools/limine/limine-uefi-cd.bin $(BUILD_DIR)/iso_root/boot/limine/; \
 	elif [ -f $(LIMINE_DIR)/BOOTX64.EFI ]; then \
 	    cp $(LIMINE_DIR)/BOOTX64.EFI $(BUILD_DIR)/iso_root/EFI/BOOT/ 2>/dev/null || true; \
+	    cp $(LIMINE_DIR)/limine-uefi-cd.bin $(BUILD_DIR)/iso_root/boot/limine/ 2>/dev/null || true; \
 	fi
-	$(MKISOFS) \
-	    -b boot/limine/limine-bios-cd.bin \
-	    -no-emul-boot \
-	    -boot-load-size 4 \
-	    -boot-info-table \
-	    -R -J \
-	    -o $(BUILD_DIR)/AzamiOS.iso \
-	    $(BUILD_DIR)/iso_root 2>/dev/null || \
-	    echo "  ⚠  ISO build failed — verify mkisofs or genisoimage is installed"
+	@# Hybrid image: El Torito entries for BIOS *and* UEFI, plus a protective
+	@# MBR so the same file also boots when written to a USB stick. Most PCs
+	@# sold today are UEFI-only (no CSM), and a BIOS-only ISO simply does not
+	@# boot on them. Only xorriso can build the UEFI half; with mkisofs or
+	@# genisoimage the image stays BIOS-only, and says so.
+	@if command -v xorriso >/dev/null 2>&1 && [ -f $(BUILD_DIR)/iso_root/boot/limine/limine-uefi-cd.bin ]; then \
+	    xorriso -as mkisofs -R -J \
+	        -b boot/limine/limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table \
+	        --efi-boot boot/limine/limine-uefi-cd.bin -efi-boot-part --efi-boot-image \
+	        --protective-msdos-label \
+	        -o $(BUILD_DIR)/AzamiOS.iso $(BUILD_DIR)/iso_root >/dev/null 2>&1 || \
+	        { echo "  ✗  ISO build failed (xorriso)"; exit 1; }; \
+	 else \
+	    $(MKISOFS) -b boot/limine/limine-bios-cd.bin -no-emul-boot -boot-load-size 4 \
+	        -boot-info-table -R -J -o $(BUILD_DIR)/AzamiOS.iso $(BUILD_DIR)/iso_root 2>/dev/null || \
+	        { echo "  ✗  ISO build failed — install xorriso (or mkisofs/genisoimage)"; exit 1; }; \
+	    echo "  ⚠  BIOS-only ISO: install xorriso for UEFI boot support"; \
+	 fi
 	@if [ -x tools/limine/limine ]; then \
 	    tools/limine/limine bios-install $(BUILD_DIR)/AzamiOS.iso 2>/dev/null || true; \
 	elif command -v limine >/dev/null 2>&1; then \
@@ -591,10 +756,24 @@ linux-test: $(KERNEL_ELF)
 linux-clean:
 	@$(MAKE) -C tools/linux clean
 
-hdd.img: $(KERNEL_ELF) | tools/limine
-	@echo "  ↓  Generating dual-partition bootable storage disk (hdd.img)..."
+# Always consulted: the userland build is not incremental on its own, so the
+# only reliable test of "is hdd.img stale" is the content digest that
+# create_disk.py keeps in hdd.img.inputs. Unchanged inputs skip the rebuild,
+# which also keeps whatever the guest wrote to the disk on the last run.
+#
+# CMDLINE appends kernel parameters to every boot entry, e.g.
+#   make run CMDLINE="quiet"         make run CMDLINE="init=/bin/sh"
+CMDLINE ?=
+
+hdd.img: $(KERNEL_ELF) $(LIMINE_BIN) FORCE
 	@$(MAKE) -C userland ARCH=x86_64
-	@python3 scripts/create_disk.py
+	@# Same userland as the ISO: BusyBox and the ABI probe go on the disk too
+	@# once `make linux` has built them (a no-op before that).
+	@$(MAKE) --no-print-directory linux-install
+	@AZAMI_CMDLINE="$(CMDLINE)" python3 scripts/create_disk.py
+
+.PHONY: FORCE
+FORCE:
 
 vbox: hdd.img
 	@echo "  ↓  Converting hdd.img to VirtualBox VDI image..."
@@ -646,7 +825,7 @@ userspace:
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
-	rm -rf $(BUILD_DIR) kernel.log hdd.img azamios.vdi
+	rm -rf $(BUILD_DIR) kernel.log hdd.img hdd.img.inputs azamios.vdi
 	@echo "  ✓  Build directory cleaned"
 
 # ── Header dependencies (must stay last; see DEPFILES above) ─────────────────

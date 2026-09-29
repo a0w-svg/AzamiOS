@@ -130,7 +130,7 @@ static s64 console_dev_read(file_t *filp, void *buf, size_t len, u64 *offset)
     char *dst = (char *)buf;
     size_t count = 0;
     while (count < len) {
-        int c = uart_getc(UART_COM1);
+        int c = console_getc();
         if (c == -1) {
             if (count > 0) break;
             return -(s64)EAGAIN;

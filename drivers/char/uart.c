@@ -131,10 +131,33 @@ void uart_write(u16 port, const char *buf, size_t len)
 
 int uart_getc(u16 port)
 {
-    if (inb(port + UART_LSR) & LSR_DR) {
-        return (int)inb(port + UART_RBR);
+    /* Once the port's receive interrupt is live, uart_handle_interrupt()
+     * moves every byte into the ring below the moment it arrives, so the
+     * data-ready bit is almost never still set by the time a poller looks.
+     * Reading the ring first is what lets /dev/console and fd 0 of the first
+     * process see serial input at all; the register read covers the early
+     * boot window before the IRQ is registered.
+     *
+     * Both reads happen under the lock the interrupt handler takes. With the
+     * register read outside it, the handler on another CPU could pull the
+     * older byte out of the FIFO into the ring while this returned the newer
+     * one straight from the FIFO — "echo" arriving as "ceho". */
+    uart_port_t *p = (port == UART_COM1) ? &g_com1 : (port == UART_COM2) ? &g_com2 : NULL;
+    if (!p) {
+        if (inb(port + UART_LSR) & LSR_DR) return (int)inb(port + UART_RBR);
+        return -1;
     }
-    return -1;
+
+    int c = -1;
+    irqflags_t irqf = spinlock_lock_irqsave(&p->lock);
+    if (p->rx_tail != p->rx_head) {
+        c = (u8)p->rx_buf[p->rx_tail];
+        p->rx_tail = (p->rx_tail + 1) % RING_BUFFER_SIZE;
+    } else if (inb(port + UART_LSR) & LSR_DR) {
+        c = (int)inb(port + UART_RBR);
+    }
+    spinlock_unlock_irqrestore(&p->lock, irqf);
+    return c;
 }
 
 /* ── Interrupt Driven Implementation ─────────────────────────────────────── */

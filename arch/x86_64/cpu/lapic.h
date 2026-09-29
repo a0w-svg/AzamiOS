@@ -122,6 +122,32 @@ void lapic_timer_start(u32 hz);
  *  in periodic mode. Must be called from the vector-48 handler. */
 void lapic_timer_rearm(void);
 
+/* ── High-resolution one-shots (TSC-deadline mode) ───────────────────────────
+ * The scheduler tick and an earlier wake-up share each CPU's deadline MSR.
+ * All of these act on the calling CPU and are no-ops (or answer "tick") in
+ * periodic mode, where only the tick exists. */
+
+/** lapic_hrtimer_available() — one-shot interrupts at arbitrary TSC values
+ *  are possible (the timer is in TSC-deadline mode). */
+bool lapic_hrtimer_available(void);
+
+/** lapic_timer_tick_due() — called at the top of the vector-48 handler:
+ *  true if this interrupt is the periodic tick, false if it is an early
+ *  wake-up armed by lapic_timer_arm_at(). */
+bool lapic_timer_tick_due(void);
+
+/** lapic_timer_arm_at(tsc) — request an interrupt at @tsc, if that is before
+ *  both the next tick and any wake-up already armed. */
+void lapic_timer_arm_at(u64 tsc);
+
+/** lapic_timer_rearm_tick() — after an early interrupt, re-arm for the tick
+ *  that is still due (the deadline MSR disarms itself when it fires). */
+void lapic_timer_rearm_tick(void);
+
+/** lapic_next_tick_tsc() — TSC value of the calling CPU's next tick, 0 in
+ *  periodic mode. */
+u64 lapic_next_tick_tsc(void);
+
 /** lapic_timer_stop() — Stop the LAPIC timer on the calling CPU. */
 void lapic_timer_stop(void);
 

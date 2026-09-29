@@ -69,3 +69,9 @@ LIMINE_REQUEST(struct limine_boot_time_request) g_limine_btime_req = {
     .id       = LIMINE_BOOT_TIME_REQUEST,
     .revision = 0,
 };
+
+/* ── Kernel file (command line: see kernel/cmdline.c) ────────────────────── */
+LIMINE_REQUEST(struct limine_kernel_file_request) g_limine_kfile_req = {
+    .id       = LIMINE_KERNEL_FILE_REQUEST,
+    .revision = 0,
+};

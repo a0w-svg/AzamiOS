@@ -1,0 +1,62 @@
+AzamiOS licensing
+=================
+
+Copyright (c) 2021-2026, a0w-svg and contributors.
+
+AzamiOS is made of two parts under two licenses, the same arrangement the
+Linux kernel and its user space use:
+
+The kernel — GPL-2.0-only
+-------------------------
+
+Everything outside userland/, tools/ and scripts/ — arch/, kernel/, drivers/,
+fs/, hal/, include/ and the build files that produce kernel.elf — is
+provided under the terms of the GNU General Public License version 2 only
+(LICENSES/GPL-2.0.txt, also in the top-level LICENSE file).
+
+This is what allows code from the Linux kernel, which is GPL-2.0-only, to be
+used in AzamiOS: a kernel binary that contains it must be distributed under
+the GPL, and so the kernel as a whole is licensed that way.
+
+  NOTE: the kernel's license does not cover programs that use it through
+  normal system calls. Running on AzamiOS, calling its system calls, and
+  including its user-space API headers (include/azami/uapi/, marked
+  "GPL-2.0-only WITH Linux-syscall-note") is normal use of the kernel and does
+  not make a program a derived work of it. This is the same exception Linux
+  makes; its SPDX text is in LICENSES/Linux-syscall-note.txt.
+
+  Only version 2 of the GPL applies to the kernel, not later versions,
+  unless a file states otherwise.
+
+User space and build tooling — BSD-3-Clause
+-------------------------------------------
+
+userland/ (the C library, dynamic linker, libgame and applications), tools/
+and scripts/ remain under the BSD 3-Clause License
+(LICENSES/BSD-3-Clause.txt). BSD-3-Clause is compatible with the GPL, so
+these parts can also be combined with the kernel's GPL code where needed,
+while programs built against AzamiOS's C library are not required to be GPL.
+
+Third-party files
+-----------------
+
+Files that carry their own license notice keep it. In particular:
+
+  - arch/x86_64/boot/limine.h, derived from the Limine boot protocol header,
+    and tools/limine/ (the Limine bootloader): 0BSD / BSD-2-Clause, see the
+    notices in those files.
+  - Software fetched and built by tools/linux/ (musl, BusyBox, Bash, GNU
+    coreutils, ...): each under its upstream license; nothing of it is
+    stored in this repository.
+  - Code ported from the Linux kernel keeps its original copyright notices
+    and SPDX-License-Identifier lines.
+
+Per-file license identifiers
+----------------------------
+
+A file may state its license with an SPDX line, for example
+
+    // SPDX-License-Identifier: GPL-2.0-only
+    /* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
+
+A file without one is covered by the directory rules above.
