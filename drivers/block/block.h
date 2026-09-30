@@ -83,6 +83,9 @@ block_dev_t *block_ramdisk_init(phys_addr_t phys_base, size_t size);
 /** block_ahci_init() — Initialize AHCI controller and register sata/ahci block devices. */
 void block_ahci_init(void);
 
+/** sdhci_init() — Initialize SDHCI controller and register SD card block devices. */
+void sdhci_init(void);
+
 /* ── Block device flags ─────────────────────────────────────────────────── */
 #define BLKDEV_RO          0x0001u   /* BLKROSET set it; writes return -EPERM */
 #define BLKDEV_ROTATIONAL  0x0002u   /* spinning media (BLKROTATIONAL)        */

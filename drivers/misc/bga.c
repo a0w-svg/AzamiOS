@@ -120,7 +120,7 @@ static s64 bga_ioctl(struct file *filp, u32 cmd, u64 arg)
     (void)filp;
     switch (cmd) {
         case FBIOGET_VSCREENINFO: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
             struct fb_var_screeninfo var;
             __builtin_memset(&var, 0, sizeof(var));
             var.xres = g_bga.width;
@@ -138,7 +138,7 @@ static s64 bga_ioctl(struct file *filp, u32 cmd, u64 arg)
             return 0;
         }
         case FBIOGET_FSCREENINFO: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
             struct fb_fix_screeninfo fix;
             __builtin_memset(&fix, 0, sizeof(fix));
             fix.smem_start = g_bga.fb_phys;
@@ -151,7 +151,7 @@ static s64 bga_ioctl(struct file *filp, u32 cmd, u64 arg)
         }
 
         case FBIOPAN_DISPLAY: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
             struct fb_var_screeninfo var;
             if (copy_from_user(&var, (void *)(uintptr_t)arg, sizeof(var)) != 0) return -(s64)EFAULT;
             u32 buf_idx = var.yoffset / (g_bga.height ? g_bga.height : 1);
@@ -165,7 +165,7 @@ static s64 bga_ioctl(struct file *filp, u32 cmd, u64 arg)
         }
 
         case FBIOAZ_GET_CAPS: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
             struct fb_az_caps caps;
             memset(&caps, 0, sizeof(caps));
             caps.buffers = 2;

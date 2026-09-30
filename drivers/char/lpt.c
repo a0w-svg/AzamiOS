@@ -168,7 +168,7 @@ static s64 lpt_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
         case LPT_GET_STATUS: {
             u8 status = inb(p->port + LPT_REG_STATUS);
             if (arg) {
-                if ((uintptr_t)arg >= 0x8000000000000000ULL) return -EFAULT;
+                if ((uintptr_t)arg >= TASK_SIZE_MAX) return -EFAULT;
                 if (copy_to_user((void *)(uintptr_t)arg, &status, 1) != 0) return -EFAULT;
             }
             return status;

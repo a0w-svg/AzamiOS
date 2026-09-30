@@ -52,6 +52,10 @@
 #define ALIGN_DOWN(v, a) ((v) & ~((__typeof__(v))(a) - 1))
 #define IS_ALIGNED(v, a) (((v) & ((__typeof__(v))(a) - 1)) == 0)
 
+/* Canonical user-space address space limit (128 TB on x86_64 4-level paging) */
+#define TASK_SIZE_MAX    0x0000800000000000ULL
+#define USER_ADDR_MAX    TASK_SIZE_MAX
+
 /* --------------------------------------------------------------------------
  * Container-of — get a pointer to the struct containing a member.
  *   container_of(ptr, type, member)

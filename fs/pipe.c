@@ -327,14 +327,14 @@ static s64 pipe_ioctl(file_t *filp, u32 cmd, u64 arg)
     pipe_t *pipe = (pipe_t *)filp->private_data;
 
     if (cmd == 0x541B /* FIONREAD */) {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         int nbytes = (int)pipe->count;
         if (copy_to_user((void *)(uintptr_t)arg, &nbytes, sizeof(int)) != 0) return -(s64)EFAULT;
         return 0;
     }
 
     if (cmd == 0x5421 /* FIONBIO */) {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         int val = 0;
         if (copy_from_user(&val, (const void *)(uintptr_t)arg, sizeof(int)) != 0) return -(s64)EFAULT;
         if (val) filp->f_flags |= O_NONBLOCK;

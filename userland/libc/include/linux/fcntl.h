@@ -1,0 +1,52 @@
+#pragma once
+
+#include <stdint.h>
+
+#define O_DIRECT    040000
+#define O_LARGEFILE 0100000
+#define O_DIRECTORY 0200000
+#define O_NOFOLLOW  0400000
+#define O_NOATIME   01000000
+#define O_CLOEXEC   02000000
+#define O_PATH      010000000
+#define O_TMPFILE   (020000000 | O_DIRECTORY)
+
+#define F_LINUX_SPECIFIC_BASE 1024
+
+#define F_SETLEASE      (F_LINUX_SPECIFIC_BASE + 0)
+#define F_GETLEASE      (F_LINUX_SPECIFIC_BASE + 1)
+#define F_CANCELLK      (F_LINUX_SPECIFIC_BASE + 5)
+#define F_DUPFD_CLOEXEC (F_LINUX_SPECIFIC_BASE + 6)
+#define F_NOTIFY        (F_LINUX_SPECIFIC_BASE + 2)
+#define F_SETPIPE_SZ    (F_LINUX_SPECIFIC_BASE + 7)
+#define F_GETPIPE_SZ    (F_LINUX_SPECIFIC_BASE + 8)
+#define F_ADD_SEALS     (F_LINUX_SPECIFIC_BASE + 9)
+#define F_GET_SEALS     (F_LINUX_SPECIFIC_BASE + 10)
+#define F_GET_RW_HINT   (F_LINUX_SPECIFIC_BASE + 11)
+#define F_SET_RW_HINT   (F_LINUX_SPECIFIC_BASE + 12)
+#define F_GET_FILE_RW_HINT (F_LINUX_SPECIFIC_BASE + 13)
+#define F_SET_FILE_RW_HINT (F_LINUX_SPECIFIC_BASE + 14)
+
+#define AT_FDCWD            -100
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR        0x200
+#define AT_SYMLINK_FOLLOW   0x400
+#define AT_NO_AUTOMOUNT     0x800
+#define AT_EMPTY_PATH       0x1000
+#define AT_STATX_SYNC_TYPE  0x6000
+#define AT_STATX_SYNC_AS_STAT 0x0000
+#define AT_STATX_FORCE_SYNC   0x2000
+#define AT_STATX_DONT_SYNC    0x4000
+
+#define RESOLVE_NO_XDEV       0x01
+#define RESOLVE_NO_MAGICLINKS 0x02
+#define RESOLVE_NO_SYMLINKS   0x04
+#define RESOLVE_BENEATH       0x08
+#define RESOLVE_IN_ROOT       0x10
+#define RESOLVE_CACHED        0x20
+
+struct open_how {
+    uint64_t flags;
+    uint64_t mode;
+    uint64_t resolve;
+};

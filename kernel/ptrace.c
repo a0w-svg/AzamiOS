@@ -75,6 +75,14 @@ static bool may_trace(process_t *tracer, process_t *target)
     return true;
 }
 
+bool ptrace_may_access(process_t *tracer, process_t *target)
+{
+    if (!tracer || !target) return false;
+    if (tracer == target || tracer->pid == target->pid) return true;
+    if (tracer->euid == 0 || security_check_permission(tracer, CAP_SYS_PTRACE)) return true;
+    return may_trace(tracer, target);
+}
+
 /* Take a counted reference to the process named by @pid so a reaper sweep or a
  * wait4() reap on another CPU cannot free its process_t — its threads, or its
  * address space — while a ptrace request is still walking it. proc_get_by_pid()

@@ -642,6 +642,34 @@ static s64 sys_cachestat_impl(pt_regs_t *r);
 static s64 sys_futex_waitv_impl(pt_regs_t *r);
 static s64 sys_mseal_impl(pt_regs_t *r);
 static s64 sys_setns_impl(pt_regs_t *r);
+static s64 sys_add_key_impl(pt_regs_t *r);
+static s64 sys_request_key_impl(pt_regs_t *r);
+static s64 sys_keyctl_impl(pt_regs_t *r);
+static s64 sys_io_pgetevents_impl(pt_regs_t *r);
+static s64 sys_io_uring_setup_impl(pt_regs_t *r);
+static s64 sys_io_uring_enter_impl(pt_regs_t *r);
+static s64 sys_io_uring_register_impl(pt_regs_t *r);
+static s64 sys_open_tree_impl(pt_regs_t *r);
+static s64 sys_move_mount_impl(pt_regs_t *r);
+static s64 sys_fsopen_impl(pt_regs_t *r);
+static s64 sys_fsconfig_impl(pt_regs_t *r);
+static s64 sys_fsmount_impl(pt_regs_t *r);
+static s64 sys_fspick_impl(pt_regs_t *r);
+static s64 sys_mount_setattr_impl(pt_regs_t *r);
+static s64 sys_quotactl_fd_impl(pt_regs_t *r);
+static s64 sys_landlock_create_ruleset_impl(pt_regs_t *r);
+static s64 sys_landlock_add_rule_impl(pt_regs_t *r);
+static s64 sys_landlock_restrict_self_impl(pt_regs_t *r);
+static s64 sys_memfd_secret_impl(pt_regs_t *r);
+static s64 sys_map_shadow_stack_impl(pt_regs_t *r);
+static s64 sys_statmount_impl(pt_regs_t *r);
+static s64 sys_listmount_impl(pt_regs_t *r);
+static s64 sys_lsm_get_self_attr_impl(pt_regs_t *r);
+static s64 sys_lsm_set_self_attr_impl(pt_regs_t *r);
+static s64 sys_lsm_list_modules_impl(pt_regs_t *r);
+static s64 sys_bpf_impl(pt_regs_t *r);
+static s64 sys_userfaultfd_impl(pt_regs_t *r);
+static s64 sys_kexec_file_load_impl(pt_regs_t *r);
 
 /* POSIX named semaphores (Azami extended ABI) */
 static s64 sys_az_sem_open_impl(pt_regs_t *r);
@@ -1205,6 +1233,34 @@ void syscall_init(void)
     reg(SYS_futex_waitv,       sys_futex_waitv_impl);
     reg(SYS_mseal,             sys_mseal_impl);
     reg(SYS_setns,             sys_setns_impl);
+    reg(SYS_add_key, sys_add_key_impl);
+    reg(SYS_request_key, sys_request_key_impl);
+    reg(SYS_keyctl, sys_keyctl_impl);
+    reg(SYS_io_pgetevents, sys_io_pgetevents_impl);
+    reg(SYS_io_uring_setup, sys_io_uring_setup_impl);
+    reg(SYS_io_uring_enter, sys_io_uring_enter_impl);
+    reg(SYS_io_uring_register, sys_io_uring_register_impl);
+    reg(SYS_open_tree, sys_open_tree_impl);
+    reg(SYS_move_mount, sys_move_mount_impl);
+    reg(SYS_fsopen, sys_fsopen_impl);
+    reg(SYS_fsconfig, sys_fsconfig_impl);
+    reg(SYS_fsmount, sys_fsmount_impl);
+    reg(SYS_fspick, sys_fspick_impl);
+    reg(SYS_mount_setattr, sys_mount_setattr_impl);
+    reg(SYS_quotactl_fd, sys_quotactl_fd_impl);
+    reg(SYS_landlock_create_ruleset, sys_landlock_create_ruleset_impl);
+    reg(SYS_landlock_add_rule, sys_landlock_add_rule_impl);
+    reg(SYS_landlock_restrict_self, sys_landlock_restrict_self_impl);
+    reg(SYS_memfd_secret, sys_memfd_secret_impl);
+    reg(SYS_map_shadow_stack, sys_map_shadow_stack_impl);
+    reg(SYS_statmount, sys_statmount_impl);
+    reg(SYS_listmount, sys_listmount_impl);
+    reg(SYS_lsm_get_self_attr, sys_lsm_get_self_attr_impl);
+    reg(SYS_lsm_set_self_attr, sys_lsm_set_self_attr_impl);
+    reg(SYS_lsm_list_modules, sys_lsm_list_modules_impl);
+    reg(SYS_bpf,              sys_bpf_impl);
+    reg(SYS_userfaultfd,      sys_userfaultfd_impl);
+    reg(SYS_kexec_file_load,  sys_kexec_file_load_impl);
 
     pr_debug("[SYSCALL] Dispatch table ready (%d entries)\n", SYSCALL_TABLE_SIZE);
 }
@@ -1214,7 +1270,7 @@ void syscall_init(void)
 static s64 copy_str_from_user(char *dst, const char *user_src, size_t max_len)
 {
     if (!dst || !user_src || max_len == 0) return -(s64)EINVAL;
-    if ((uintptr_t)user_src >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)user_src >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     size_t copied = 0;
     while (copied < max_len - 1) {
@@ -1319,7 +1375,7 @@ static const char *real_to_vpath(const process_t *proc, const char *real)
 static s64 copy_user_vpath_resolve_at(int dirfd, char *vpath, size_t max_len, const char *user_path)
 {
     if (!user_path) return -(s64)EINVAL;
-    if ((uintptr_t)user_path >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)user_path >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char raw[512];
     __builtin_memset(raw, 0, sizeof(raw));
@@ -1382,7 +1438,7 @@ static s64 sys_read_impl(pt_regs_t *r)
     /* BUG-01: negative count is EINVAL; zero count returns 0 immediately */
     if (count < 0) return -(s64)EINVAL;
     if (count == 0 || !buf) return 0;
-    if ((uintptr_t)buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     file_t *file = fget(proc, fd);
@@ -1442,7 +1498,7 @@ static s64 sys_write_impl(pt_regs_t *r)
     const char *buf = (const char *)r->rsi;
     s64 count = (s64)r->rdx;
     if (count <= 0 || !buf) return 0;
-    if ((uintptr_t)buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     file_t *file = fget(proc, fd);
@@ -1561,11 +1617,36 @@ static s64 sys_close_range_impl(pt_regs_t *r)
 {
     unsigned int first = (unsigned int)r->rdi;
     unsigned int last  = (unsigned int)r->rsi;
+    unsigned int flags = (unsigned int)r->rdx;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
 
+    if (first > last) return -(s64)EINVAL;
+    if (flags & ~(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC))
+        return -(s64)EINVAL;
+
+    /* Each AzamiOS process owns its descriptor table: clone()/fork() copies
+     * descriptors and this kernel has no CLONE_FILES sharing. Consequently
+     * CLOSE_RANGE_UNSHARE is already satisfied and needs no copy-on-write
+     * work. Keep accepting the Linux flag so portable process launchers do
+     * not need a kernel-specific fallback. */
     if (last >= PROC_MAX_FDS) last = PROC_MAX_FDS - 1;
+
+    /* CLOSE_RANGE_CLOEXEC changes descriptor flags without closing the
+     * underlying files. Hold the table lock across the range so execve() and
+     * fcntl(F_SETFD) cannot observe a partially updated slot. */
+    if (flags & CLOSE_RANGE_CLOEXEC) {
+        if (first >= PROC_MAX_FDS) return 0;
+        irqflags_t fl = spinlock_lock_irqsave(&proc->fd_lock);
+        for (unsigned int i = first; i <= last; i++) {
+            if (proc->handle_table[i]) proc->fd_flags[i] |= FD_CLOEXEC;
+        }
+        spinlock_unlock_irqrestore(&proc->fd_lock, fl);
+        return 0;
+    }
+
+    if (first >= PROC_MAX_FDS) return 0;
     for (unsigned int i = first; i <= last && i < PROC_MAX_FDS; i++) {
         file_t *f = fd_detach(proc, (int)i);
         if (f) vfs_close(f);
@@ -1587,7 +1668,7 @@ static s64 sys_readv_impl(pt_regs_t *r)
     int iovcnt = (int)r->rdx;
 
     if (!iov || iovcnt <= 0 || iovcnt > 1024) return -(s64)EINVAL;
-    if ((uintptr_t)iov >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)iov >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     s64 total = 0;
     for (int i = 0; i < iovcnt; i++) {
@@ -1621,7 +1702,7 @@ static s64 sys_writev_impl(pt_regs_t *r)
     int iovcnt = (int)r->rdx;
 
     if (!iov || iovcnt <= 0 || iovcnt > 1024) return -(s64)EINVAL;
-    if ((uintptr_t)iov >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)iov >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     s64 total = 0;
     for (int i = 0; i < iovcnt; i++) {
@@ -1656,7 +1737,7 @@ static s64 sys_pread64_impl(pt_regs_t *r)
     u64 pos = (u64)r->r10;
 
     if (!user_buf || count == 0) return 0;
-    if ((uintptr_t)user_buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)user_buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
@@ -1702,7 +1783,7 @@ static s64 sys_pwrite64_impl(pt_regs_t *r)
     u64 pos = (u64)r->r10;
 
     if (!user_buf || count == 0) return 0;
-    if ((uintptr_t)user_buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)user_buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
@@ -1826,7 +1907,7 @@ static s64 sys_mmap_impl(pt_regs_t *r)
 
     if (!map_fixed) {
         bool need_alloc = false;
-        if (!target_addr || target_addr < g_mmap_min_addr || target_addr + aligned_len >= 0x0000800000000000ULL) {
+        if (!target_addr || target_addr < g_mmap_min_addr || target_addr + aligned_len > TASK_SIZE_MAX) {
             need_alloc = true;
         } else {
             /* Check collision with existing mappings */
@@ -1852,7 +1933,7 @@ static s64 sys_mmap_impl(pt_regs_t *r)
         }
     } else {
         /* Guard against integer overflow and non-canonical address ranges */
-        if (target_addr + aligned_len < target_addr || target_addr + aligned_len >= 0x0000800000000000ULL) {
+        if (target_addr + aligned_len < target_addr || target_addr + aligned_len > TASK_SIZE_MAX) {
             return -(s64)EINVAL;
         }
         /* NULL-pointer dereference prevention: address 0 is strictly forbidden */
@@ -1954,13 +2035,13 @@ static s64 sys_mprotect_impl(pt_regs_t *r)
 
     if (length == 0) return 0;
     if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;
-    if (addr >= 0x0000800000000000ULL || addr < 0x1000) return -(s64)EINVAL;
+    if (addr >= TASK_SIZE_MAX || addr < 0x1000) return -(s64)EINVAL;
 
     process_t *proc = sched_current_process();
     if (!proc || !proc->pml4_phys) return -(s64)EPERM;
 
     size_t aligned_len = ALIGN_UP(length, PAGE_SIZE);
-    if (addr + aligned_len < addr || addr + aligned_len > 0x0000800000000000ULL) return -(s64)EINVAL;
+    if (addr + aligned_len < addr || addr + aligned_len > TASK_SIZE_MAX) return -(s64)EINVAL;
 
     u64 vmm_flags = VMM_F_USER;
     if (prot != PROT_NONE) vmm_flags |= VMM_F_PRESENT;
@@ -2020,7 +2101,7 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
         return 0;
     }
     if (cmd == 0x5421 /* FIONBIO */) {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         int on = 0;
         if (copy_from_user(&on, (void *)arg, sizeof(int)) != 0) return -(s64)EFAULT;
         if (on) file->f_flags |= O_NONBLOCK;
@@ -2028,7 +2109,7 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
         return 0;
     }
     if (cmd == 0x5452 /* FIOASYNC */) {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         int on = 0;
         if (copy_from_user(&on, (void *)arg, sizeof(int)) != 0) return -(s64)EFAULT;
         if (on) file->f_flags |= 0x2000 /* O_ASYNC */;
@@ -2064,7 +2145,7 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
             return -(s64)ENOTTY;
         }
         if (cmd == 0x5413 /* TIOCGWINSZ */) {
-            if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
+            if (arg && (uintptr_t)arg < TASK_SIZE_MAX) {
                 struct winsize ws;
                 ws.ws_row = 24;
                 ws.ws_col = 80;
@@ -2077,7 +2158,7 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
         }
         if (cmd == 0x5414 /* TIOCSWINSZ */) return 0;
         if (cmd == 0x5401 /* TCGETS */) {
-            if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
+            if (arg && (uintptr_t)arg < TASK_SIZE_MAX) {
                 char termios_buf[64];
                 __builtin_memset(termios_buf, 0, sizeof(termios_buf));
                 *(u32 *)&termios_buf[0]  = 0x0100; /* ICRNL */
@@ -2102,14 +2183,14 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
             return -(s64)EINVAL;
         }
         if (cmd == 0x5402 /* TCSETS */ || cmd == 0x5403 /* TCSETSW */ || cmd == 0x5404 /* TCSETSF */) {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
             char dummy[60];
             if (copy_from_user(dummy, (const void *)arg, 60) != 0) return -(s64)EFAULT;
             return 0;
         }
         if (cmd == 0x5409 /* TCSBRK */ || cmd == 0x540A /* TCXONC */ || cmd == 0x540B /* TCFLSH */) return 0;
         if (cmd == 0x540F /* TIOCGPGRP */) {
-            if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
+            if (arg && (uintptr_t)arg < TASK_SIZE_MAX) {
                 int pgid = (int)proc->pgid;
                 if (copy_to_user((void *)arg, &pgid, sizeof(int)) == 0) return 0;
                 return -(s64)EFAULT;
@@ -2117,7 +2198,7 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
             return -(s64)EINVAL;
         }
         if (cmd == 0x5410 /* TIOCSPGRP */) {
-            if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
+            if (arg && (uintptr_t)arg < TASK_SIZE_MAX) {
                 int pgid = 0;
                 if (copy_from_user(&pgid, (const void *)arg, sizeof(int)) != 0) return -(s64)EFAULT;
                 proc->pgid = (u32)pgid;
@@ -2126,7 +2207,7 @@ static s64 sys_ioctl_impl(pt_regs_t *r)
             return -(s64)EINVAL;
         }
         if (cmd == 0x5429 /* TIOCGSID */) {
-            if (arg && (uintptr_t)arg < 0x8000000000000000ULL) {
+            if (arg && (uintptr_t)arg < TASK_SIZE_MAX) {
                 int sid = (int)proc->sid;
                 if (copy_to_user((void *)arg, &sid, sizeof(int)) == 0) return 0;
                 return -(s64)EFAULT;
@@ -2165,7 +2246,7 @@ static s64 sys_stat_impl(pt_regs_t *r)
     const char *user_path = (const char *)r->rdi;
     struct stat *statbuf = (struct stat *)r->rsi;
     if (!user_path || !statbuf) return -(s64)EINVAL;
-    if ((uintptr_t)statbuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)statbuf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char kpath[512];
     s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), user_path);
@@ -2186,7 +2267,7 @@ static s64 sys_lstat_impl(pt_regs_t *r)
     const char *user_path = (const char *)r->rdi;
     struct stat *statbuf = (struct stat *)r->rsi;
     if (!user_path || !statbuf) return -(s64)EINVAL;
-    if ((uintptr_t)statbuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)statbuf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char kpath[512];
     s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), user_path);
@@ -2207,7 +2288,7 @@ static s64 sys_fstat_impl(pt_regs_t *r)
     int fd = (int)(s32)r->rdi;
     struct stat *statbuf = (struct stat *)r->rsi;
     if (!statbuf) return -(s64)EINVAL;
-    if ((uintptr_t)statbuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)statbuf >= TASK_SIZE_MAX) return -(s64)EFAULT;
     
     process_t *proc = sched_current_process();
     if (fd < 0 || fd >= PROC_MAX_FDS || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
@@ -2231,7 +2312,7 @@ static s64 sys_statfs_impl(pt_regs_t *r)
     const char *user_path = (const char *)r->rdi;
     struct statfs *buf = (struct statfs *)r->rsi;
     if (!user_path || !buf) return -(s64)EINVAL;
-    if ((uintptr_t)buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char kpath[512];
     s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), user_path);
@@ -2250,7 +2331,7 @@ static s64 sys_fstatfs_impl(pt_regs_t *r)
     int fd = (int)(s32)r->rdi;
     struct statfs *buf = (struct statfs *)r->rsi;
     if (!buf) return -(s64)EINVAL;
-    if ((uintptr_t)buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (fd < 0 || fd >= PROC_MAX_FDS || !proc || !proc->handle_table[fd]) return -(s64)EBADF;
@@ -2447,7 +2528,7 @@ static s64 sys_poll_impl(pt_regs_t *r)
         if (timeout_ms > 0) sched_sleep((timeout_ms + 9) / 10);
         return 0;
     }
-    if (!user_fds || (uintptr_t)user_fds >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_fds || (uintptr_t)user_fds >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -2515,7 +2596,7 @@ static s64 sys_ppoll_impl(pt_regs_t *r)
     u64 nfds = r->rsi;
     const struct linux_timespec *tmo_p = (const struct linux_timespec *)r->rdx;
     int timeout_ms = -1;
-    if (tmo_p && (uintptr_t)tmo_p < 0x8000000000000000ULL) {
+    if (tmo_p && (uintptr_t)tmo_p < TASK_SIZE_MAX) {
         struct linux_timespec ts;
         if (copy_from_user(&ts, tmo_p, sizeof(ts)) == 0) {
             timeout_ms = (int)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
@@ -2545,18 +2626,18 @@ static s64 sys_select_impl(pt_regs_t *r)
     __builtin_memset(&in_wfds, 0, sizeof(in_wfds));
     __builtin_memset(&in_efds, 0, sizeof(in_efds));
 
-    if (u_rfds && (uintptr_t)u_rfds < 0x8000000000000000ULL) {
+    if (u_rfds && (uintptr_t)u_rfds < TASK_SIZE_MAX) {
         if (copy_from_user(&in_rfds, u_rfds, sizeof(kernel_fd_set_t)) != 0) return -(s64)EFAULT;
     }
-    if (u_wfds && (uintptr_t)u_wfds < 0x8000000000000000ULL) {
+    if (u_wfds && (uintptr_t)u_wfds < TASK_SIZE_MAX) {
         if (copy_from_user(&in_wfds, u_wfds, sizeof(kernel_fd_set_t)) != 0) return -(s64)EFAULT;
     }
-    if (u_efds && (uintptr_t)u_efds < 0x8000000000000000ULL) {
+    if (u_efds && (uintptr_t)u_efds < TASK_SIZE_MAX) {
         if (copy_from_user(&in_efds, u_efds, sizeof(kernel_fd_set_t)) != 0) return -(s64)EFAULT;
     }
 
     int timeout_ms = -1;
-    if (u_tv && (uintptr_t)u_tv < 0x8000000000000000ULL) {
+    if (u_tv && (uintptr_t)u_tv < TASK_SIZE_MAX) {
         struct linux_timeval tv;
         if (copy_from_user(&tv, u_tv, sizeof(tv)) != 0) return -(s64)EFAULT;
         if (tv.tv_sec < 0 || tv.tv_usec < 0) return -(s64)EINVAL;
@@ -2623,9 +2704,9 @@ static s64 sys_select_impl(pt_regs_t *r)
         sched_sleep(1);
     }
 
-    if (u_rfds && (uintptr_t)u_rfds < 0x8000000000000000ULL) copy_to_user(u_rfds, &out_rfds, sizeof(kernel_fd_set_t));
-    if (u_wfds && (uintptr_t)u_wfds < 0x8000000000000000ULL) copy_to_user(u_wfds, &out_wfds, sizeof(kernel_fd_set_t));
-    if (u_efds && (uintptr_t)u_efds < 0x8000000000000000ULL) copy_to_user(u_efds, &out_efds, sizeof(kernel_fd_set_t));
+    if (u_rfds && (uintptr_t)u_rfds < TASK_SIZE_MAX) copy_to_user(u_rfds, &out_rfds, sizeof(kernel_fd_set_t));
+    if (u_wfds && (uintptr_t)u_wfds < TASK_SIZE_MAX) copy_to_user(u_wfds, &out_wfds, sizeof(kernel_fd_set_t));
+    if (u_efds && (uintptr_t)u_efds < TASK_SIZE_MAX) copy_to_user(u_efds, &out_efds, sizeof(kernel_fd_set_t));
 
     return ready_count;
 }
@@ -2640,7 +2721,7 @@ static s64 sys_pselect6_impl(pt_regs_t *r)
 
     struct linux_timeval tv;
     struct linux_timeval *tv_ptr = NULL;
-    if (u_ts && (uintptr_t)u_ts < 0x8000000000000000ULL) {
+    if (u_ts && (uintptr_t)u_ts < TASK_SIZE_MAX) {
         struct linux_timespec ts;
         if (copy_from_user(&ts, u_ts, sizeof(ts)) == 0) {
             tv.tv_sec = ts.tv_sec;
@@ -2786,7 +2867,7 @@ static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int 
      * process that just shares memory until it execs — that falls through to
      * the fork path below, exactly as before. */
     if ((flags & 0x00000100ULL) && (flags & 0x00010000ULL)) {
-        if (!child_stack || (uintptr_t)child_stack >= 0x0000800000000000ULL)
+        if (!child_stack || (uintptr_t)child_stack >= TASK_SIZE_MAX)
             return -(s64)EINVAL;
 
         thread_t *t = thread_create_ex(parent, r->rip, (uintptr_t)child_stack, false, false);
@@ -2804,17 +2885,17 @@ static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int 
             t->user_regs->rflags = 0x202;
         }
         if ((flags & 0x00100000ULL /* CLONE_PARENT_SETTID */) && parent_tidptr &&
-            (uintptr_t)parent_tidptr < 0x0000800000000000ULL) {
+            (uintptr_t)parent_tidptr < TASK_SIZE_MAX) {
             int tid = (int)t->tid;
             copy_to_user(parent_tidptr, &tid, sizeof(int));
         }
         if ((flags & 0x01000000ULL /* CLONE_CHILD_SETTID */) && child_tidptr &&
-            (uintptr_t)child_tidptr < 0x0000800000000000ULL) {
+            (uintptr_t)child_tidptr < TASK_SIZE_MAX) {
             int tid = (int)t->tid;
             copy_to_user(child_tidptr, &tid, sizeof(int));
         }
         if ((flags & 0x00200000ULL /* CLONE_CHILD_CLEARTID */) && child_tidptr &&
-            (uintptr_t)child_tidptr < 0x0000800000000000ULL) {
+            (uintptr_t)child_tidptr < TASK_SIZE_MAX) {
             t->clear_child_tid = (u64)(uintptr_t)child_tidptr;
         }
         sched_enqueue_thread(t);
@@ -2890,17 +2971,17 @@ static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int 
     /* 0x100 is CLONE_VM, not CLONE_PARENT_SETTID — the old constant here meant
      * every CLONE_VM caller got a tid written through whatever rdx happened to
      * hold, and a genuine CLONE_PARENT_SETTID caller got nothing. */
-    if ((flags & 0x00100000ULL /* CLONE_PARENT_SETTID */) && parent_tidptr && (uintptr_t)parent_tidptr < 0x0000800000000000ULL) {
+    if ((flags & 0x00100000ULL /* CLONE_PARENT_SETTID */) && parent_tidptr && (uintptr_t)parent_tidptr < TASK_SIZE_MAX) {
         int tid = (int)child->pid;
         copy_to_user(parent_tidptr, &tid, sizeof(int));
     }
 
-    if ((flags & 0x01000000ULL /* CLONE_CHILD_SETTID */) && child_tidptr && (uintptr_t)child_tidptr < 0x0000800000000000ULL) {
+    if ((flags & 0x01000000ULL /* CLONE_CHILD_SETTID */) && child_tidptr && (uintptr_t)child_tidptr < TASK_SIZE_MAX) {
         int tid = (int)child->pid;
         copy_to_user(child_tidptr, &tid, sizeof(int));
     }
 
-    if ((flags & 0x00200000ULL /* CLONE_CHILD_CLEARTID */) && child_tidptr && (uintptr_t)child_tidptr < 0x0000800000000000ULL) {
+    if ((flags & 0x00200000ULL /* CLONE_CHILD_CLEARTID */) && child_tidptr && (uintptr_t)child_tidptr < TASK_SIZE_MAX) {
         t->clear_child_tid = (u64)(uintptr_t)child_tidptr;
     }
 
@@ -2934,12 +3015,12 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
     if (!kargv) return -(s64)ENOMEM;
 
     int argc = 0;
-    if (user_argv && (uintptr_t)user_argv < 0x8000000000000000ULL) {
+    if (user_argv && (uintptr_t)user_argv < TASK_SIZE_MAX) {
         for (int i = 0; i < 127; i++) {
             const char *arg_ptr = NULL;
             if (copy_from_user(&arg_ptr, &user_argv[i], sizeof(char *)) != 0) break;
             if (!arg_ptr) break;
-            if ((uintptr_t)arg_ptr >= 0x8000000000000000ULL) break;
+            if ((uintptr_t)arg_ptr >= TASK_SIZE_MAX) break;
 
             char *buf = (char *)kmalloc(1024);
             if (!buf) break;
@@ -2964,12 +3045,12 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
     }
 
     int envc = 0;
-    if (user_envp && (uintptr_t)user_envp < 0x8000000000000000ULL) {
+    if (user_envp && (uintptr_t)user_envp < TASK_SIZE_MAX) {
         for (int i = 0; i < 127; i++) {
             const char *env_ptr = NULL;
             if (copy_from_user(&env_ptr, &user_envp[i], sizeof(char *)) != 0) break;
             if (!env_ptr) break;
-            if ((uintptr_t)env_ptr >= 0x8000000000000000ULL) break;
+            if ((uintptr_t)env_ptr >= TASK_SIZE_MAX) break;
 
             char *buf = (char *)kmalloc(1024);
             if (!buf) break;
@@ -3124,7 +3205,7 @@ static s64 sys_execve_impl(pt_regs_t *r)
 {
     const char *user_path = (const char *)r->rdi;
     if (!user_path) return -(s64)EINVAL;
-    if ((uintptr_t)user_path >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)user_path >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char kpath[512];
     s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), user_path);
@@ -3152,7 +3233,7 @@ static s64 sys_execveat_impl(pt_regs_t *r)
     /* AT_EMPTY_PATH with an empty path string: exec whatever `dirfd` points at. */
     char probe = 1;
     bool empty_path = !user_path;
-    if (user_path && (uintptr_t)user_path < 0x8000000000000000ULL) {
+    if (user_path && (uintptr_t)user_path < TASK_SIZE_MAX) {
         if (copy_from_user(&probe, user_path, 1) == 0 && probe == '\0') empty_path = true;
     }
 
@@ -3165,7 +3246,7 @@ static s64 sys_execveat_impl(pt_regs_t *r)
         if (!df || !df->f_dentry) return -(s64)EBADF;
         dentry_build_path(df->f_dentry, kpath, sizeof(kpath));
     } else {
-        if ((uintptr_t)user_path >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_path >= TASK_SIZE_MAX) return -(s64)EFAULT;
         s64 perr = copy_user_path_resolve_at(dirfd, kpath, sizeof(kpath), user_path);
         if (perr < 0) return perr;
     }
@@ -3223,7 +3304,7 @@ static s64 sys_wait4_impl(pt_regs_t *r)
 
     s64 res = sched_waitpid(pid, user_status ? &kstatus : NULL, options);
     if (res >= 0 && user_status) {
-        if ((uintptr_t)user_status < 0x8000000000000000ULL) {
+        if ((uintptr_t)user_status < TASK_SIZE_MAX) {
             copy_to_user(user_status, &kstatus, sizeof(int));
         }
     }
@@ -3240,7 +3321,7 @@ static s64 sys_waitid_impl(pt_regs_t *r)
     s64 res = sched_waitpid(id == 0 ? -1 : id, &status, options);
     if (res < 0) return res;
 
-    if (infop && (uintptr_t)infop < 0x8000000000000000ULL) {
+    if (infop && (uintptr_t)infop < TASK_SIZE_MAX) {
         int siginfo[32];
         __builtin_memset(siginfo, 0, sizeof(siginfo));
         siginfo[0] = 17; /* SIGCHLD */
@@ -3307,7 +3388,7 @@ static s64 sys_kill_impl(pt_regs_t *r)
             sys_exit_impl(r);                    /* default: terminate */
             return 0;
         }
-        return sched_kill_process((u32)pid, sig);
+        return sched_kill_process_permitted(curr, (u32)pid, sig);
     }
 
     /* pid == 0    : every process in the caller's process group
@@ -3333,8 +3414,9 @@ static s64 sys_kill_impl(pt_regs_t *r)
     sched_unlock();
 
     for (u32 i = 0; i < npids; i++) {
-        s64 r2 = sched_kill_process(pids[i], sig);
+        s64 r2 = sched_kill_process_permitted(curr, pids[i], sig);
         if (r2 == 0) ret = 0;
+        else if (ret != 0 && r2 == -(s64)EPERM) ret = -(s64)EPERM;
     }
     if (self_in_group && sig != 0 && sig > 0 && sig < _NSIG) {
         ret = 0;
@@ -3375,13 +3457,13 @@ static s64 sys_rt_sigaction_impl(pt_regs_t *r)
     if (!proc) return -(s64)EPERM;
 
     if (user_oldact) {
-        if ((uintptr_t)user_oldact >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_oldact >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_to_user(user_oldact, &proc->sigactions[signum], sizeof(sigaction_t)) != 0)
             return -(s64)EFAULT;
     }
 
     if (user_act) {
-        if ((uintptr_t)user_act >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_act >= TASK_SIZE_MAX) return -(s64)EFAULT;
         sigaction_t kact;
         if (copy_from_user(&kact, user_act, sizeof(sigaction_t)) != 0)
             return -(s64)EFAULT;
@@ -3393,9 +3475,9 @@ static s64 sys_rt_sigaction_impl(pt_regs_t *r)
         u64 h = (u64)(uintptr_t)kact.sa_handler;
         u64 rst = (u64)(uintptr_t)kact.sa_restorer;
         if (h != (u64)(uintptr_t)SIG_DFL && h != (u64)(uintptr_t)SIG_IGN &&
-            h >= 0x0000800000000000ULL)
+            h >= TASK_SIZE_MAX)
             return -(s64)EFAULT;
-        if (rst != 0 && rst >= 0x0000800000000000ULL)
+        if (rst != 0 && rst >= TASK_SIZE_MAX)
             return -(s64)EFAULT;
 
         proc->sigactions[signum] = kact;
@@ -3417,13 +3499,13 @@ static s64 sys_rt_sigprocmask_impl(pt_regs_t *r)
     if (!proc) return -(s64)EPERM;
 
     if (user_oldset) {
-        if ((uintptr_t)user_oldset >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_oldset >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_to_user(user_oldset, &proc->sig_blocked, sizeof(sigset_t)) != 0)
             return -(s64)EFAULT;
     }
 
     if (user_set) {
-        if ((uintptr_t)user_set >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_set >= TASK_SIZE_MAX) return -(s64)EFAULT;
         sigset_t kset = 0;
         if (copy_from_user(&kset, user_set, sizeof(sigset_t)) != 0)
             return -(s64)EFAULT;
@@ -3554,7 +3636,7 @@ static s64 sys_bind_impl(pt_regs_t *r)
     socklen_t addrlen = (socklen_t)r->rdx;
 
     if (!uaddr || addrlen < sizeof(sa_family_t)) return -(s64)EINVAL;
-    if ((uintptr_t)uaddr >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)uaddr >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
@@ -3589,6 +3671,14 @@ static s64 sys_bind_impl(pt_regs_t *r)
     u16 port = ntohs(sin.sin_port);
     const u8 *ip = (const u8 *)&sin.sin_addr.s_addr;
 
+    /* Linux privileged port protection: ports < 1024 require CAP_NET_BIND_SERVICE or root */
+    process_t *proc = sched_current_process();
+    if (port > 0 && port < 1024) {
+        if (proc && proc->euid != 0 && !security_check_permission(proc, CAP_NET_BIND_SERVICE)) {
+            return -(s64)EACCES;
+        }
+    }
+
     if (sock->type == SOCK_STREAM && sock->tcp) {
         return (s64)tcp_bind(sock->tcp, ip, port);
     } else if (sock->type == SOCK_DGRAM && sock->udp) {
@@ -3605,7 +3695,7 @@ static s64 sys_connect_impl(pt_regs_t *r)
     socklen_t addrlen = (socklen_t)r->rdx;
 
     if (!uaddr || addrlen < sizeof(sa_family_t)) return -(s64)EINVAL;
-    if ((uintptr_t)uaddr >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)uaddr >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
@@ -3828,7 +3918,7 @@ static s64 sys_getsockname_impl(pt_regs_t *r)
     socklen_t *uaddrlen = (socklen_t *)r->rdx;
 
     if (!uaddr || !uaddrlen) return -(s64)EINVAL;
-    if ((uintptr_t)uaddr >= 0x8000000000000000ULL || (uintptr_t)uaddrlen >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)uaddr >= TASK_SIZE_MAX || (uintptr_t)uaddrlen >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
@@ -3871,7 +3961,7 @@ static s64 sys_getpeername_impl(pt_regs_t *r)
     socklen_t *uaddrlen = (socklen_t *)r->rdx;
 
     if (!uaddr || !uaddrlen) return -(s64)EINVAL;
-    if ((uintptr_t)uaddr >= 0x8000000000000000ULL || (uintptr_t)uaddrlen >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)uaddr >= TASK_SIZE_MAX || (uintptr_t)uaddrlen >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
@@ -3928,7 +4018,7 @@ static s64 sys_setsockopt_impl(pt_regs_t *r)
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
 
-    if (!optval || (uintptr_t)optval >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!optval || (uintptr_t)optval >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     if (level == SOL_SOCKET) {
         if (optname == SO_REUSEADDR && optlen >= sizeof(int)) {
@@ -4009,7 +4099,7 @@ static s64 sys_getsockopt_impl(pt_regs_t *r)
     if (ret < 0) return -(s64)ret;
 
     if (!optval || !optlen) return -(s64)EINVAL;
-    if ((uintptr_t)optval >= 0x8000000000000000ULL || (uintptr_t)optlen >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)optval >= TASK_SIZE_MAX || (uintptr_t)optlen >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     if (level == SOL_SOCKET) {
         if (optname == SO_REUSEADDR) {
@@ -4077,7 +4167,7 @@ static s64 sys_sendto_impl(pt_regs_t *r)
     socklen_t uaddrlen = (socklen_t)r->r9;
 
     if (!ubuf || len == 0) return 0;
-    if ((uintptr_t)ubuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)ubuf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
@@ -4214,7 +4304,7 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
     (void)flags;
 
     if (!ubuf || len == 0) return 0;
-    if ((uintptr_t)ubuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)ubuf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
@@ -4453,7 +4543,7 @@ static s64 sys_sendmsg_impl(pt_regs_t *r)
     int flags = (int)r->rdx;
 
     if (!umsg) return -(s64)EFAULT;
-    if ((uintptr_t)umsg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)umsg >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
@@ -4579,7 +4669,7 @@ static s64 sys_recvmsg_impl(pt_regs_t *r)
     int flags = (int)r->rdx;
 
     if (!umsg) return -(s64)EFAULT;
-    if ((uintptr_t)umsg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)umsg >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
@@ -4718,7 +4808,7 @@ static s64 sys_recvmsg_impl(pt_regs_t *r)
 static s64 sys_pipe_impl(pt_regs_t *r)
 {
     int *user_fds = (int *)r->rdi;
-    if (!user_fds || (uintptr_t)user_fds >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_fds || (uintptr_t)user_fds >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -4748,7 +4838,7 @@ static s64 sys_pipe2_impl(pt_regs_t *r)
     int *user_fds = (int *)r->rdi;
     int flags = (int)r->rsi;
     if (flags & ~(O_NONBLOCK | O_CLOEXEC)) return -(s64)EINVAL;
-    if (!user_fds || (uintptr_t)user_fds >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_fds || (uintptr_t)user_fds >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -4881,7 +4971,7 @@ static s64 sys_fcntl_impl(pt_regs_t *r)
         f->f_flags = (f->f_flags & ~(O_APPEND | O_NONBLOCK)) | ((u32)arg & (O_APPEND | O_NONBLOCK));
         return 0;
     case 5: { /* F_GETLK */
-        if (!arg || arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct {
             short l_type;
             short l_whence;
@@ -4904,7 +4994,7 @@ static s64 sys_fcntl_impl(pt_regs_t *r)
     }
     case 6:   /* F_SETLK */
     case 7: { /* F_SETLKW */
-        if (!arg || arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct {
             short l_type;
             short l_whence;
@@ -4941,7 +5031,7 @@ static s64 sys_getcwd_impl(pt_regs_t *r)
     char *user_buf = (char *)r->rdi;
     size_t size    = (size_t)r->rsi;
     if (!user_buf || size == 0) return -(s64)EINVAL;
-    if ((uintptr_t)user_buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)user_buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     const char *cwd = (proc && proc->cwd[0]) ? proc->cwd : "/";
@@ -5137,7 +5227,7 @@ static s64 sys_getdents64_impl(pt_regs_t *r)
     size_t count = (size_t)r->rdx;
     
     if (!dirp || count == 0) return -(s64)EINVAL;
-    if ((uintptr_t)dirp >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)dirp >= TASK_SIZE_MAX) return -(s64)EFAULT;
     if (count > 65536) count = 65536;
     
     process_t *proc = sched_current_process();
@@ -5256,7 +5346,7 @@ static s64 sys_nanosleep_impl(pt_regs_t *r)
     const struct linux_timespec *req = (const struct linux_timespec *)r->rdi;
     struct linux_timespec *rem = (struct linux_timespec *)r->rsi;
     if (!req) return -(s64)EFAULT;
-    if ((uintptr_t)req >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)req >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     struct linux_timespec t;
     if (copy_from_user(&t, req, sizeof(t)) != 0) return -(s64)EFAULT;
@@ -5270,7 +5360,7 @@ static s64 sys_nanosleep_impl(pt_regs_t *r)
 
     u64 left = 0;
     s64 rc = sleep_until_mono(ktime_get_ns() + ns, &left);
-    if (rc == -(s64)EINTR && rem && (uintptr_t)rem < 0x8000000000000000ULL) {
+    if (rc == -(s64)EINTR && rem && (uintptr_t)rem < TASK_SIZE_MAX) {
         struct linux_timespec rts;
         ns_to_timespec(left, &rts);
         if (copy_to_user(rem, &rts, sizeof(rts)) != 0) return -(s64)EFAULT;
@@ -5429,7 +5519,7 @@ static s64 sys_clock_gettime_impl(pt_regs_t *r)
     s64 sec, nsec;
     s64 rc = clock_read_any(clk_id, &sec, &nsec);
     if (rc < 0) return rc;
-    if (!tp || (uintptr_t)tp >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!tp || (uintptr_t)tp >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     struct linux_timespec ts = { .tv_sec = (long)sec, .tv_nsec = (long)nsec };
     if (copy_to_user(tp, &ts, sizeof(ts)) != 0) return -(s64)EFAULT;
@@ -5440,7 +5530,7 @@ static s64 sys_gettimeofday_impl(pt_regs_t *r)
 {
     struct linux_timeval *user_tv = (struct linux_timeval *)r->rdi;
     if (user_tv) {
-        if ((uintptr_t)user_tv >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_tv >= TASK_SIZE_MAX) return -(s64)EFAULT;
         s64 sec, nsec;
         ktime_get_clock(VDSO_CLOCK_REALTIME, &sec, &nsec);
         struct linux_timeval tv = { (long)sec, (long)(nsec / 1000) };
@@ -5449,7 +5539,7 @@ static s64 sys_gettimeofday_impl(pt_regs_t *r)
 
     struct { int tz_minuteswest; int tz_dsttime; } *user_tz = (void *)r->rsi;
     if (user_tz) {
-        if ((uintptr_t)user_tz >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_tz >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct { int tz_minuteswest; int tz_dsttime; } tz;
         timekeeping_get_tz(&tz.tz_minuteswest, &tz.tz_dsttime);
         if (copy_to_user(user_tz, &tz, sizeof(tz)) != 0) return -(s64)EFAULT;
@@ -5464,7 +5554,7 @@ static s64 sys_time_impl(pt_regs_t *r)
     ktime_get_clock(VDSO_CLOCK_REALTIME, &sec, &nsec);
 
     if (user_tloc) {
-        if ((uintptr_t)user_tloc >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_tloc >= TASK_SIZE_MAX) return -(s64)EFAULT;
         long s = (long)sec;
         if (copy_to_user(user_tloc, &s, sizeof(long)) != 0) return -(s64)EFAULT;
     }
@@ -5590,7 +5680,7 @@ static s64 sys_times_impl(pt_regs_t *r)
 {
     struct tms *buf = (struct tms *)r->rdi;
     process_t *proc = sched_current_process();
-    if (buf && (uintptr_t)buf < 0x8000000000000000ULL) {
+    if (buf && (uintptr_t)buf < TASK_SIZE_MAX) {
         /* Clock ticks are the scheduler's, which is what sysconf(_SC_CLK_TCK)
          * reports; children's times are the ones already reaped. */
         struct tms ktms = {
@@ -5669,7 +5759,7 @@ static char g_kernel_domainname[65] = "local";
 static s64 sys_uname_impl(pt_regs_t *r)
 {
     struct utsname *u = (struct utsname *)r->rdi;
-    if (!u || (uintptr_t)u >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!u || (uintptr_t)u >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     struct utsname info;
     memset(&info, 0, sizeof(info));
@@ -5696,7 +5786,8 @@ static s64 sys_reboot_impl(pt_regs_t *r)
     if (cmd == 0x01234567 /* LINUX_REBOOT_CMD_RESTART */) {
         power_reboot();
     } else {
-        power_shutdown();
+        extern __attribute__((noreturn)) void acpi_shutdown(void);
+        acpi_shutdown();
     }
     __builtin_unreachable();
 }
@@ -5709,9 +5800,14 @@ static s64 sys_setuid_impl(pt_regs_t *r)  {
     u32 new_uid = (u32)r->rdi;
     process_t *p = sched_current_process();
     if (!p) return -(s64)EPERM;
-    if (p->euid != 0 && new_uid != p->uid && new_uid != p->euid) return -(s64)EPERM;
+    if (p->no_new_privs && p->euid != 0 && new_uid == 0) return -(s64)EPERM;
+    if (!security_check_permission(p, CAP_SETUID) && p->euid != 0) {
+        if (new_uid != p->uid && new_uid != p->euid && new_uid != p->suid)
+            return -(s64)EPERM;
+    }
     p->uid = new_uid;
     p->euid = new_uid;
+    p->suid = new_uid;
     security_caps_on_setuid(p);
     return 0;
 }
@@ -5719,9 +5815,13 @@ static s64 sys_setgid_impl(pt_regs_t *r)  {
     u32 new_gid = (u32)r->rdi;
     process_t *p = sched_current_process();
     if (!p) return -(s64)EPERM;
-    if (p->euid != 0 && new_gid != p->gid && new_gid != p->egid) return -(s64)EPERM;
+    if (!security_check_permission(p, CAP_SETGID) && p->euid != 0) {
+        if (new_gid != p->gid && new_gid != p->egid && new_gid != p->sgid)
+            return -(s64)EPERM;
+    }
     p->gid = new_gid;
     p->egid = new_gid;
+    p->sgid = new_gid;
     return 0;
 }
 static process_t *proc_by_pid(u32 pid)
@@ -5838,7 +5938,7 @@ static s64 sys_getrlimit_impl(pt_regs_t *r)
 {
     int resource = (int)r->rdi;
     struct rlimit *rlim = (struct rlimit *)r->rsi;
-    if (!rlim || (uintptr_t)rlim >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!rlim || (uintptr_t)rlim >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -5856,7 +5956,7 @@ static s64 sys_setrlimit_impl(pt_regs_t *r)
 {
     int resource = (int)r->rdi;
     const struct rlimit *rlim = (const struct rlimit *)r->rsi;
-    if (!rlim || (uintptr_t)rlim >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!rlim || (uintptr_t)rlim >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -5891,7 +5991,7 @@ static s64 sys_getrusage_impl(pt_regs_t *r)
 {
     int who = (int)r->rdi;
     struct rusage *usage = (struct rusage *)r->rsi;
-    if (!usage || (uintptr_t)usage >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!usage || (uintptr_t)usage >= TASK_SIZE_MAX) return -(s64)EFAULT;
     if (who != 0 /* RUSAGE_SELF */ && who != -1 /* RUSAGE_CHILDREN */ && who != 1 /* RUSAGE_THREAD */) {
         return -(s64)EINVAL;
     }
@@ -5975,7 +6075,7 @@ static s64 sys_fstatat_impl(pt_regs_t *r)
     int flags = (int)r->r10;
 
     if (!statbuf) return -(s64)EINVAL;
-    if ((uintptr_t)statbuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)statbuf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     struct stat kst;
     __builtin_memset(&kst, 0, sizeof(kst));
@@ -6033,7 +6133,7 @@ static s64 sys_faccessat_impl(pt_regs_t *r)
     int flags = (int)r->r10;
 
     if (!user_path) return -(s64)EINVAL;
-    if ((uintptr_t)user_path >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)user_path >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char raw[256];
     __builtin_memset(raw, 0, sizeof(raw));
@@ -6116,7 +6216,7 @@ static s64 sys_readlinkat_impl(pt_regs_t *r)
     size_t bufsiz = (size_t)r->r10;
 
     if (!buf || bufsiz == 0) return -(s64)EINVAL;
-    if ((uintptr_t)buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char kpath[512];
     s64 perr = copy_user_path_resolve_at(dirfd, kpath, sizeof(kpath), user_path);
@@ -6174,7 +6274,7 @@ static s64 sys_az_channel_send(pt_regs_t *r)
     const ipc_msg_t *user_msg = (const ipc_msg_t *)r->rsi;
     bool block = (bool)r->rdx;
 
-    if (!user_msg || (uintptr_t)user_msg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_msg || (uintptr_t)user_msg >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     ipc_channel_t *chan = ipc_channel_find(channel_id);
     if (!chan) return -(s64)EINVAL;
@@ -6196,7 +6296,7 @@ static s64 sys_az_channel_recv(pt_regs_t *r)
     ipc_msg_t *user_msg = (ipc_msg_t *)r->rsi;
     bool block = (bool)r->rdx;
 
-    if (!user_msg || (uintptr_t)user_msg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_msg || (uintptr_t)user_msg >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     ipc_channel_t *chan = ipc_channel_find(channel_id);
     if (!chan) return -(s64)EINVAL;
@@ -6228,7 +6328,7 @@ static s64 sys_az_shmem_map(pt_regs_t *r)
     virt_addr_t virt = (virt_addr_t)r->rsi;
 
     if (virt & (PAGE_SIZE - 1)) return -(s64)EINVAL;
-    if (virt == 0 || virt >= 0x8000000000000000ULL) return -(s64)EINVAL;
+    if (virt == 0 || virt >= TASK_SIZE_MAX) return -(s64)EINVAL;
 
     ipc_shmem_t *shmem = ipc_shmem_find(shmem_id);
     if (!shmem) return -(s64)EINVAL;
@@ -6237,7 +6337,7 @@ static s64 sys_az_shmem_map(pt_regs_t *r)
         ipc_shmem_put(shmem);
         return -(s64)EINVAL;
     }
-    if (virt + shmem->page_count * PAGE_SIZE > 0x8000000000000000ULL ||
+    if (virt + shmem->page_count * PAGE_SIZE > TASK_SIZE_MAX ||
         virt + shmem->page_count * PAGE_SIZE < virt) {
         ipc_shmem_put(shmem);
         return -(s64)EINVAL;
@@ -6277,7 +6377,7 @@ extern virtio_gpu_state_t g_gpu;
 static s64 sys_az_fb_info(pt_regs_t *r)
 {
     az_fb_info_t *user_info = (az_fb_info_t *)r->rdi;
-    if (!user_info || (uintptr_t)user_info >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_info || (uintptr_t)user_info >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     az_fb_info_t info;
     __builtin_memset(&info, 0, sizeof(info));
@@ -6324,7 +6424,7 @@ static s64 sys_az_fb_map(pt_regs_t *r)
 {
     virt_addr_t virt = (virt_addr_t)r->rdi;
     if (virt & (PAGE_SIZE - 1)) return -(s64)EINVAL;
-    if (virt >= 0x8000000000000000ULL) return -(s64)EINVAL;
+    if (virt >= TASK_SIZE_MAX) return -(s64)EINVAL;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -6373,7 +6473,7 @@ static s64 sys_az_fb_flip(pt_regs_t *r)
 static s64 sys_az_spawn(pt_regs_t *r)
 {
     const char *user_path = (const char *)r->rdi;
-    if (!user_path || (uintptr_t)user_path >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_path || (uintptr_t)user_path >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char kpath[512];
     __builtin_memset(kpath, 0, sizeof(kpath));
@@ -6404,7 +6504,7 @@ static s64 sys_az_spawn_arg(pt_regs_t *r)
 {
     const char *user_path = (const char *)r->rdi;
     const char *user_arg  = (const char *)r->rsi;
-    if (!user_path || (uintptr_t)user_path >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_path || (uintptr_t)user_path >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char kpath[512];
     __builtin_memset(kpath, 0, sizeof(kpath));
@@ -6416,7 +6516,7 @@ static s64 sys_az_spawn_arg(pt_regs_t *r)
     char karg[256];
     __builtin_memset(karg, 0, sizeof(karg));
     if (user_arg) {
-        if ((uintptr_t)user_arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         for (int i = 0; i < 255; i++) {
             if (copy_from_user(&karg[i], user_arg + i, 1) != 0) return -(s64)EFAULT;
             if (karg[i] == '\0') break;
@@ -6446,7 +6546,7 @@ static s64 sys_az_thread_create_impl(pt_regs_t *r)
     uintptr_t arg   = (uintptr_t)r->rdx;
 
     if (!entry || !stack) return -(s64)EINVAL;
-    if (entry >= 0x8000000000000000ULL || stack >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (entry >= TASK_SIZE_MAX || stack >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -6478,7 +6578,7 @@ static s64 sys_az_object_create(pt_regs_t *r)
     char kname[64];
     __builtin_memset(kname, 0, sizeof(kname));
     if (user_name) {
-        if ((uintptr_t)user_name >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_name >= TASK_SIZE_MAX) return -(s64)EFAULT;
         for (int i = 0; i < 63; i++) {
             if (copy_from_user(&kname[i], user_name + i, 1) != 0) return -(s64)EFAULT;
             if (kname[i] == '\0') break;
@@ -6502,7 +6602,7 @@ static s64 sys_az_object_create(pt_regs_t *r)
 static s64 sys_az_object_open(pt_regs_t *r)
 {
     const char *user_name = (const char *)r->rdi;
-    if (!user_name || (uintptr_t)user_name >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_name || (uintptr_t)user_name >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char kname[64];
     __builtin_memset(kname, 0, sizeof(kname));
@@ -6607,8 +6707,8 @@ static s64 sys_getfacl_impl(pt_regs_t *r)
     int max_entries = (int)(s32)r->rdx;
 
     if (!user_path || !user_entries || max_entries <= 0) return -(s64)EINVAL;
-    if ((uintptr_t)user_path >= 0x8000000000000000ULL) return -(s64)EFAULT;
-    if ((uintptr_t)user_entries >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)user_path >= TASK_SIZE_MAX) return -(s64)EFAULT;
+    if ((uintptr_t)user_entries >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char kpath[VFS_NAME_MAX];
     s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), user_path);
@@ -6636,8 +6736,8 @@ static s64 sys_setfacl_impl(pt_regs_t *r)
     int count = (int)(s32)r->rdx;
 
     if (!user_path || count < 0 || count > ACL_MAX_ENTRIES) return -(s64)EINVAL;
-    if ((uintptr_t)user_path >= 0x8000000000000000ULL) return -(s64)EFAULT;
-    if (count > 0 && (!user_entries || (uintptr_t)user_entries >= 0x8000000000000000ULL)) return -(s64)EFAULT;
+    if ((uintptr_t)user_path >= TASK_SIZE_MAX) return -(s64)EFAULT;
+    if (count > 0 && (!user_entries || (uintptr_t)user_entries >= TASK_SIZE_MAX)) return -(s64)EFAULT;
 
     char kpath[VFS_NAME_MAX];
     s64 perr = copy_user_path_resolve(kpath, sizeof(kpath), user_path);
@@ -6690,7 +6790,7 @@ static s64 sys_arch_prctl_impl(pt_regs_t *r)
         else wrmsr(MSR_FS_BASE, addr);
         return 0;
     } else if (code == ARCH_GET_FS) {
-        if (!addr || addr >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!addr || addr >= TASK_SIZE_MAX) return -(s64)EFAULT;
         thread_t *self = sched_current_thread();
         u64 cur = (self && self->has_thread_fs_base) ? self->fs_base : proc->fs_base;
         return copy_to_user((void *)addr, &cur, sizeof(u64)) == 0 ? 0 : -(s64)EFAULT;
@@ -6699,7 +6799,7 @@ static s64 sys_arch_prctl_impl(pt_regs_t *r)
         wrmsr(MSR_KERNEL_GS_BASE, addr);
         return 0;
     } else if (code == ARCH_GET_GS) {
-        if (!addr || addr >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!addr || addr >= TASK_SIZE_MAX) return -(s64)EFAULT;
         return copy_to_user((void *)addr, &proc->gs_base, sizeof(u64)) == 0 ? 0 : -(s64)EFAULT;
     }
     return -(s64)EINVAL;
@@ -6715,7 +6815,7 @@ static s64 sys_set_tid_address_impl(pt_regs_t *r)
      * which is what a libc stores as its cached tid — returning the pid is
      * only accidentally right for a single-threaded process. */
     if (t) {
-        t->clear_child_tid = (tidptr < 0x0000800000000000ULL) ? (u64)tidptr : 0;
+        t->clear_child_tid = (tidptr < TASK_SIZE_MAX) ? (u64)tidptr : 0;
         return (s64)t->tid;
     }
     process_t *proc = sched_current_process();
@@ -6754,8 +6854,8 @@ static s64 sys_prlimit64_impl(pt_regs_t *r)
     struct kernel_rlimit64 *old_rlim = (struct kernel_rlimit64 *)r->r10;
 
     if (resource < 0 || resource >= RLIMIT_NLIMITS) return -(s64)EINVAL;
-    if (new_rlim && (uintptr_t)new_rlim >= 0x8000000000000000ULL) return -(s64)EFAULT;
-    if (old_rlim && (uintptr_t)old_rlim >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (new_rlim && (uintptr_t)new_rlim >= TASK_SIZE_MAX) return -(s64)EFAULT;
+    if (old_rlim && (uintptr_t)old_rlim >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *self = sched_current_process();
     if (!self) return -(s64)EPERM;
@@ -6824,7 +6924,7 @@ static s64 sys_clone3_impl(pt_regs_t *r)
 
     s64 ret = do_clone(flags, child_stack, parent_tidptr, child_tidptr, newtls, r);
     if (ret > 0 && (kargs.flags & 0x00001000ULL /* CLONE_PIDFD */) && kargs.pidfd &&
-        (uintptr_t)kargs.pidfd < 0x0000800000000000ULL) {
+        (uintptr_t)kargs.pidfd < TASK_SIZE_MAX) {
         pt_regs_t p_r;
         p_r.rdi = (u64)ret;
         p_r.rsi = 0;
@@ -6851,8 +6951,16 @@ static s64 sys_openat2_impl(pt_regs_t *r)
     size_t size = (size_t)r->r10;
 
     if (!user_path || !user_how || size < sizeof(struct kernel_open_how)) return -(s64)EINVAL;
+
+    /* Do not accept a newer open_how layout without understanding it: unlike
+     * openat(2), openat2(2)'s resolve field is commonly used as a sandbox
+     * boundary. Silently ignoring an extension or a RESOLVE_* flag would make
+     * a program believe it had confined a pathname lookup when it had not. */
+    if (size > sizeof(struct kernel_open_how)) return -(s64)E2BIG;
     struct kernel_open_how how;
     if (copy_from_user(&how, user_how, sizeof(how)) != 0) return -(s64)EFAULT;
+
+    if ((how.flags >> 32) != 0 || how.resolve != 0) return -(s64)EINVAL;
 
     pt_regs_t fake_r;
     fake_r.rdi = (u64)dirfd;
@@ -6877,7 +6985,7 @@ static s64 sys_epoll_pwait2_impl(pt_regs_t *r)
     (void)sigmask;
 
     int timeout = -1;
-    if (ts && (uintptr_t)ts < 0x8000000000000000ULL) {
+    if (ts && (uintptr_t)ts < TASK_SIZE_MAX) {
         struct linux_timespec kts;
         if (copy_from_user(&kts, ts, sizeof(kts)) == 0) {
             timeout = (int)(kts.tv_sec * 1000 + kts.tv_nsec / 1000000);
@@ -6902,10 +7010,10 @@ static s64 sys_getcpu_impl(pt_regs_t *r)
     unsigned int cpu_id = smp_current_cpu_id();
     unsigned int node_id = 0;
 
-    if (user_cpu && (uintptr_t)user_cpu < 0x8000000000000000ULL) {
+    if (user_cpu && (uintptr_t)user_cpu < TASK_SIZE_MAX) {
         if (copy_to_user(user_cpu, &cpu_id, sizeof(unsigned int)) != 0) return -(s64)EFAULT;
     }
-    if (user_node && (uintptr_t)user_node < 0x8000000000000000ULL) {
+    if (user_node && (uintptr_t)user_node < TASK_SIZE_MAX) {
         if (copy_to_user(user_node, &node_id, sizeof(unsigned int)) != 0) return -(s64)EFAULT;
     }
     return 0;
@@ -7019,7 +7127,7 @@ static s64 sys_sched_setattr_impl(pt_regs_t *r)
 {
     u32 pid = (u32)(s32)r->rdi;
     struct sched_attr *uattr = (struct sched_attr *)r->rsi;
-    if (!uattr || (uintptr_t)uattr >= 0x0000800000000000ULL) return -(s64)EINVAL;
+    if (!uattr || (uintptr_t)uattr >= TASK_SIZE_MAX) return -(s64)EINVAL;
 
     /* size-versioned struct: read the leading u32, then the smaller of what
      * the caller offered and what we understand. */
@@ -7068,7 +7176,7 @@ static s64 sys_sched_getattr_impl(pt_regs_t *r)
     u32 pid = (u32)(s32)r->rdi;
     struct sched_attr *uattr = (struct sched_attr *)r->rsi;
     u32 size = (u32)r->rdx;
-    if (!uattr || (uintptr_t)uattr >= 0x0000800000000000ULL) return -(s64)EINVAL;
+    if (!uattr || (uintptr_t)uattr >= TASK_SIZE_MAX) return -(s64)EINVAL;
     if (size < sizeof(struct sched_attr)) return -(s64)EINVAL;
 
     bool put; s64 err;
@@ -7168,15 +7276,23 @@ static s64 sys_pidfd_send_signal_impl(pt_regs_t *r)
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
 
-    if (pidfd < 0 || pidfd >= PROC_MAX_FDS || !proc->handle_table[pidfd]) return -(s64)EBADF;
-    file_t *f = (file_t *)proc->handle_table[pidfd];
-    if (f->f_op != &g_pidfd_fops || !f->private_data) return -(s64)EBADF;
+    /* Hold a file reference while inspecting the pidfd. A concurrent close()
+     * must not be able to free its private data between validation and signal
+     * delivery. */
+    file_t *f = fget(proc, pidfd);
+    if (!f) return -(s64)EBADF;
+    if (f->f_op != &g_pidfd_fops || !f->private_data) {
+        fput(f);
+        return -(s64)EBADF;
+    }
 
     pidfd_ctx_t *ctx = (pidfd_ctx_t *)f->private_data;
-    if (sched_kill_process(ctx->target_pid, 0) < 0) return -(s64)ESRCH;
+    u32 target_pid = ctx->target_pid;
+    fput(f);
+    if (sched_kill_process(target_pid, 0) < 0) return -(s64)ESRCH;
 
     if (sig == 0) return 0;
-    return sched_kill_process(ctx->target_pid, sig);
+    return sched_kill_process(target_pid, sig);
 }
 
 static s64 sys_pidfd_getfd_impl(pt_regs_t *r)
@@ -7303,7 +7419,7 @@ static s64 memfd_ioctl_op(file_t *filp, u32 cmd, u64 arg)
     if (!filp || !filp->private_data) return -(s64)EBADF;
     memfd_ctx_t *ctx = (memfd_ctx_t *)filp->private_data;
     if (cmd == 0x541B /* FIONREAD */) {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         int avail = (filp->f_pos < ctx->size) ? (int)(ctx->size - filp->f_pos) : 0;
         if (copy_to_user((void *)(uintptr_t)arg, &avail, sizeof(int)) != 0) return -(s64)EFAULT;
         return 0;
@@ -7398,7 +7514,7 @@ static s64 sys_getrandom_impl(pt_regs_t *r)
     if ((flags & 0x2u) && (flags & 0x4u)) return -(s64)EINVAL;
     if (!buf && buflen) return -(s64)EFAULT;
     if (buflen == 0) return 0;
-    if ((uintptr_t)buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     /* The kernel CSPRNG is always seeded early in boot, so GRND_NONBLOCK never
      * needs to return EAGAIN and GRND_RANDOM does not block. */
@@ -7441,7 +7557,7 @@ static s64 sys_sendfile_impl(pt_regs_t *r)
     s64 current_off = 0;
     bool use_off = false;
     if (user_offset) {
-        if ((uintptr_t)user_offset >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_offset >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_from_user(&current_off, user_offset, sizeof(s64)) != 0) return -(s64)EFAULT;
         if (current_off < 0) return -(s64)EINVAL;
         use_off = true;
@@ -7507,13 +7623,13 @@ static s64 sys_copy_file_range_impl(pt_regs_t *r)
     s64 cur_in = 0, cur_out = 0;
     bool has_in = false, has_out = false;
     if (off_in) {
-        if ((uintptr_t)off_in >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)off_in >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_from_user(&cur_in, off_in, sizeof(s64)) != 0) return -(s64)EFAULT;
         if (cur_in < 0) return -(s64)EINVAL;
         has_in = true;
     }
     if (off_out) {
-        if ((uintptr_t)off_out >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)off_out >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_from_user(&cur_out, off_out, sizeof(s64)) != 0) return -(s64)EFAULT;
         if (cur_out < 0) return -(s64)EINVAL;
         has_out = true;
@@ -7663,7 +7779,7 @@ static s64 sys_statx_impl(pt_regs_t *r)
     (void)mask;
 
     if (!statxbuf) return -(s64)EINVAL;
-    if ((uintptr_t)statxbuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)statxbuf >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     struct stat kst;
     __builtin_memset(&kst, 0, sizeof(kst));
@@ -7851,7 +7967,7 @@ static s64 sys_msync_impl(pt_regs_t *r)
     if (flags & ~(1 /* MS_ASYNC */ | 2 /* MS_INVALIDATE */ | 4 /* MS_SYNC */)) return -(s64)EINVAL;
     if ((flags & (1 | 4)) == (1 | 4)) return -(s64)EINVAL;
     if ((flags & (1 | 4)) == 0) return -(s64)EINVAL;
-    if (addr >= 0x0000800000000000ULL || addr + length < addr) return -(s64)ENOMEM;
+    if (addr >= TASK_SIZE_MAX || addr + length < addr) return -(s64)ENOMEM;
     if (length == 0) return 0;
 
     process_t *proc = sched_current_process();
@@ -7873,8 +7989,8 @@ static s64 sys_madvise_impl(pt_regs_t *r)
     int   advice = (int)r->rdx;
 
     if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;   /* must be page-aligned */
-    if (length > 0x0000800000000000ULL) return -(s64)EINVAL;
-    if (addr >= 0x0000800000000000ULL || addr + length < addr) return -(s64)EINVAL;
+    if (length > TASK_SIZE_MAX) return -(s64)EINVAL;
+    if (addr >= TASK_SIZE_MAX || addr + length < addr) return -(s64)EINVAL;
 
     /* This kernel maps anonymous memory eagerly and never reclaims a resident
      * page, so every hint that is legal is also a no-op. What matters is
@@ -7936,7 +8052,7 @@ static s64 sys_socketpair_impl(pt_regs_t *r)
 
     (void)protocol;
     if (domain != 1 /* AF_UNIX */) return -(s64)EAFNOSUPPORT;
-    if (!user_sv || (uintptr_t)user_sv >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_sv || (uintptr_t)user_sv >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -7983,13 +8099,13 @@ static s64 sys_prctl_impl(pt_regs_t *r)
         return 0;
     }
     if (option == 2 /* PR_GET_PDEATHSIG */) {
-        if (!arg2 || arg2 >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (!arg2 || arg2 >= TASK_SIZE_MAX) return -(s64)EFAULT;
         int sig = p->pdeath_sig;
         if (copy_to_user((void *)arg2, &sig, sizeof(int)) != 0) return -(s64)EFAULT;
         return 0;
     }
     if (option == 15 /* PR_SET_NAME */) {
-        if (!arg2 || arg2 >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (!arg2 || arg2 >= TASK_SIZE_MAX) return -(s64)EFAULT;
         char name[16];
         if (copy_from_user(name, (const void *)arg2, 15) != 0) return -(s64)EFAULT;
         name[15] = '\0';
@@ -7998,7 +8114,7 @@ static s64 sys_prctl_impl(pt_regs_t *r)
         return 0;
     }
     if (option == 16 /* PR_GET_NAME */) {
-        if (!arg2 || arg2 >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (!arg2 || arg2 >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_to_user((void *)arg2, p->name, strlen(p->name) + 1) != 0) return -(s64)EFAULT;
         return 0;
     }
@@ -8050,7 +8166,7 @@ static s64 sys_prctl_impl(pt_regs_t *r)
         return 0;
     }
     if (option == 37 /* PR_GET_CHILD_SUBREAPER */) {
-        if (!arg2 || arg2 >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (!arg2 || arg2 >= TASK_SIZE_MAX) return -(s64)EFAULT;
         int val = p->child_subreaper ? 1 : 0;
         if (copy_to_user((void *)arg2, &val, sizeof(int)) != 0) return -(s64)EFAULT;
         return 0;
@@ -8064,7 +8180,7 @@ static s64 sys_sched_getaffinity_impl(pt_regs_t *r)
     size_t cpusetsize = (size_t)r->rsi;
     void *mask = (void *)r->rdx;
     if (pid < 0) return -(s64)EINVAL;
-    if (!mask || (uintptr_t)mask >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!mask || (uintptr_t)mask >= TASK_SIZE_MAX) return -(s64)EFAULT;
     if (cpusetsize < sizeof(u64)) return -(s64)EINVAL;
 
     process_t *target = (pid == 0) ? sched_current_process() : proc_get_by_pid((u32)pid);
@@ -8087,7 +8203,7 @@ static s64 sys_sched_setaffinity_impl(pt_regs_t *r)
     const void *mask = (const void *)r->rdx;
 
     if (pid < 0) return -(s64)EINVAL;
-    if (!mask || (uintptr_t)mask >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!mask || (uintptr_t)mask >= TASK_SIZE_MAX) return -(s64)EFAULT;
     if (cpusetsize < sizeof(u64)) return -(s64)EINVAL;
 
     process_t *caller = sched_current_process();
@@ -8126,7 +8242,8 @@ static s64 sys_tkill_impl(pt_regs_t *r)
     s32 tid = (s32)r->rdi;
     int sig = (int)r->rsi;
     if (tid <= 0) return -(s64)EINVAL;
-    return sched_kill_process((u32)tid, sig);
+    process_t *curr = sched_current_process();
+    return sched_kill_process_permitted(curr, (u32)tid, sig);
 }
 
 static s64 sys_tgkill_impl(pt_regs_t *r)
@@ -8135,8 +8252,9 @@ static s64 sys_tgkill_impl(pt_regs_t *r)
     s32 tid = (s32)r->rsi;
     int sig = (int)r->rdx;
     if (tid <= 0) return -(s64)EINVAL;
-    if (tgid > 0) return sched_kill_process((u32)tgid, sig);
-    return sched_kill_process((u32)tid, sig);
+    process_t *curr = sched_current_process();
+    if (tgid > 0) return sched_kill_process_permitted(curr, (u32)tgid, sig);
+    return sched_kill_process_permitted(curr, (u32)tid, sig);
 }
 
 static s64 sys_link_impl(pt_regs_t *r)
@@ -8306,9 +8424,11 @@ static s64 sys_setreuid_impl(pt_regs_t *r)
     u32 euid = (u32)r->rsi;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (proc->euid != 0) {
-        if (ruid != (u32)-1 && ruid != proc->uid && ruid != proc->euid) return -(s64)EPERM;
-        if (euid != (u32)-1 && euid != proc->uid && euid != proc->euid) return -(s64)EPERM;
+    if (proc->no_new_privs && proc->euid != 0 && (ruid == 0 || euid == 0))
+        return -(s64)EPERM;
+    if (!security_check_permission(proc, CAP_SETUID) && proc->euid != 0) {
+        if (ruid != (u32)-1 && ruid != proc->uid && ruid != proc->euid && ruid != proc->suid) return -(s64)EPERM;
+        if (euid != (u32)-1 && euid != proc->uid && euid != proc->euid && euid != proc->suid) return -(s64)EPERM;
     }
     if (ruid != (u32)-1) proc->uid = ruid;
     if (euid != (u32)-1) proc->euid = euid;
@@ -8323,7 +8443,9 @@ static s64 sys_setresuid_impl(pt_regs_t *r)
     u32 suid = (u32)r->rdx;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (proc->euid != 0) {
+    if (proc->no_new_privs && proc->euid != 0 && (ruid == 0 || euid == 0 || suid == 0))
+        return -(s64)EPERM;
+    if (!security_check_permission(proc, CAP_SETUID) && proc->euid != 0) {
         if (ruid != (u32)-1 && ruid != proc->uid && ruid != proc->euid && ruid != proc->suid) return -(s64)EPERM;
         if (euid != (u32)-1 && euid != proc->uid && euid != proc->euid && euid != proc->suid) return -(s64)EPERM;
         if (suid != (u32)-1 && suid != proc->uid && suid != proc->euid && suid != proc->suid) return -(s64)EPERM;
@@ -8342,9 +8464,9 @@ static s64 sys_getresuid_impl(pt_regs_t *r)
     u32 *suid = (u32 *)r->rdx;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (ruid && (uintptr_t)ruid < 0x0000800000000000ULL) copy_to_user(ruid, &proc->uid, sizeof(u32));
-    if (euid && (uintptr_t)euid < 0x0000800000000000ULL) copy_to_user(euid, &proc->euid, sizeof(u32));
-    if (suid && (uintptr_t)suid < 0x0000800000000000ULL) copy_to_user(suid, &proc->suid, sizeof(u32));
+    if (ruid && (uintptr_t)ruid < TASK_SIZE_MAX) copy_to_user(ruid, &proc->uid, sizeof(u32));
+    if (euid && (uintptr_t)euid < TASK_SIZE_MAX) copy_to_user(euid, &proc->euid, sizeof(u32));
+    if (suid && (uintptr_t)suid < TASK_SIZE_MAX) copy_to_user(suid, &proc->suid, sizeof(u32));
     return 0;
 }
 
@@ -8354,9 +8476,9 @@ static s64 sys_setregid_impl(pt_regs_t *r)
     u32 egid = (u32)r->rsi;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (proc->euid != 0) {
-        if (rgid != (u32)-1 && rgid != proc->gid && rgid != proc->egid) return -(s64)EPERM;
-        if (egid != (u32)-1 && egid != proc->gid && egid != proc->egid) return -(s64)EPERM;
+    if (!security_check_permission(proc, CAP_SETGID) && proc->euid != 0) {
+        if (rgid != (u32)-1 && rgid != proc->gid && rgid != proc->egid && rgid != proc->sgid) return -(s64)EPERM;
+        if (egid != (u32)-1 && egid != proc->gid && egid != proc->egid && egid != proc->sgid) return -(s64)EPERM;
     }
     if (rgid != (u32)-1) proc->gid = rgid;
     if (egid != (u32)-1) proc->egid = egid;
@@ -8370,7 +8492,7 @@ static s64 sys_setresgid_impl(pt_regs_t *r)
     u32 sgid = (u32)r->rdx;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (proc->euid != 0) {
+    if (!security_check_permission(proc, CAP_SETGID) && proc->euid != 0) {
         if (rgid != (u32)-1 && rgid != proc->gid && rgid != proc->egid && rgid != proc->sgid) return -(s64)EPERM;
         if (egid != (u32)-1 && egid != proc->gid && egid != proc->egid && egid != proc->sgid) return -(s64)EPERM;
         if (sgid != (u32)-1 && sgid != proc->gid && sgid != proc->egid && sgid != proc->sgid) return -(s64)EPERM;
@@ -8388,9 +8510,9 @@ static s64 sys_getresgid_impl(pt_regs_t *r)
     u32 *sgid = (u32 *)r->rdx;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (rgid && (uintptr_t)rgid < 0x0000800000000000ULL) copy_to_user(rgid, &proc->gid, sizeof(u32));
-    if (egid && (uintptr_t)egid < 0x0000800000000000ULL) copy_to_user(egid, &proc->egid, sizeof(u32));
-    if (sgid && (uintptr_t)sgid < 0x0000800000000000ULL) copy_to_user(sgid, &proc->sgid, sizeof(u32));
+    if (rgid && (uintptr_t)rgid < TASK_SIZE_MAX) copy_to_user(rgid, &proc->gid, sizeof(u32));
+    if (egid && (uintptr_t)egid < TASK_SIZE_MAX) copy_to_user(egid, &proc->egid, sizeof(u32));
+    if (sgid && (uintptr_t)sgid < TASK_SIZE_MAX) copy_to_user(sgid, &proc->sgid, sizeof(u32));
     return 0;
 }
 
@@ -8402,7 +8524,7 @@ static s64 sys_getgroups_impl(pt_regs_t *r)
     if (!proc) return -(s64)EPERM;
     if (size == 0) return proc->ngroups > 0 ? (s64)proc->ngroups : 1;
     if (size < 0) return -(s64)EINVAL;
-    if (!list || (uintptr_t)list >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!list || (uintptr_t)list >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     if (proc->ngroups > 0) {
         if (size < (int)proc->ngroups) return -(s64)EINVAL;
@@ -8423,7 +8545,7 @@ static s64 sys_setgroups_impl(pt_regs_t *r)
     if (!security_check_permission(proc, CAP_SETGID)) return -(s64)EPERM;
     if (size > 32) return -(s64)EINVAL;
     if (size > 0) {
-        if (!list || (uintptr_t)list >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (!list || (uintptr_t)list >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_from_user(proc->groups, list, size * sizeof(u32)) != 0) return -(s64)EFAULT;
     }
     proc->ngroups = (u32)size;
@@ -8447,7 +8569,7 @@ static s64 sys_clock_getres_impl(pt_regs_t *r)
         ns = 1;
     }
     if (res) {
-        if ((uintptr_t)res >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)res >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct linux_timespec ts = { .tv_sec = 0, .tv_nsec = ns };
         if (copy_to_user(res, &ts, sizeof(ts)) != 0) return -(s64)EFAULT;
     }
@@ -8503,7 +8625,7 @@ static s64 sys_clock_nanosleep_impl(pt_regs_t *r)
         break;
     }
 
-    if (!req || (uintptr_t)req >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!req || (uintptr_t)req >= TASK_SIZE_MAX) return -(s64)EFAULT;
     struct linux_timespec t;
     if (copy_from_user(&t, req, sizeof(t)) != 0) return -(s64)EFAULT;
     if (t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1000000000L) return -(s64)EINVAL;
@@ -8523,7 +8645,7 @@ static s64 sys_clock_nanosleep_impl(pt_regs_t *r)
             if (cpu_clock_read(clk, &now) < 0) return -(s64)EINVAL;
             if (now >= target) return 0;
             if (sleep_signal_pending(proc)) {
-                if (!abs && rem && (uintptr_t)rem < 0x8000000000000000ULL) {
+                if (!abs && rem && (uintptr_t)rem < TASK_SIZE_MAX) {
                     struct linux_timespec rts;
                     ns_to_timespec(target - now, &rts);
                     if (copy_to_user(rem, &rts, sizeof(rts)) != 0) return -(s64)EFAULT;
@@ -8542,12 +8664,16 @@ static s64 sys_clock_nanosleep_impl(pt_regs_t *r)
     if (!abs) {
         u64 left = 0;
         s64 rc = sleep_until_mono(ktime_get_ns() + req_ns, &left);
-        if (rc == -(s64)EINTR && rem && (uintptr_t)rem < 0x8000000000000000ULL) {
+        if (rc == -(s64)EINTR && rem && (uintptr_t)rem < TASK_SIZE_MAX) {
             struct linux_timespec rts;
             ns_to_timespec(left, &rts);
             if (copy_to_user(rem, &rts, sizeof(rts)) != 0) return -(s64)EFAULT;
         }
         return rc;
+    }
+
+    if (base == VDSO_CLOCK_MONOTONIC || base == VDSO_CLOCK_MONOTONIC_RAW || base == VDSO_CLOCK_BOOTTIME) {
+        return sleep_until_mono(req_ns, NULL);
     }
 
     for (;;) {
@@ -8578,7 +8704,7 @@ static s64 sys_mremap_impl(pt_regs_t *r)
     int flags = (int)r->r10;
 
     (void)flags;
-    if (old_addr >= 0x0000800000000000ULL || (old_addr & 0xFFF) != 0) return -(s64)EINVAL;
+    if (old_addr >= TASK_SIZE_MAX || (old_addr & 0xFFF) != 0) return -(s64)EINVAL;
     if (new_size == 0) return -(s64)EINVAL;
 
     process_t *proc = sched_current_process();
@@ -8779,7 +8905,7 @@ void thread_clear_child_tid(thread_t *t)
 
     uintptr_t uaddr = (uintptr_t)t->clear_child_tid;
     t->clear_child_tid = 0;
-    if (uaddr >= 0x0000800000000000ULL || (uaddr & 3)) return;
+    if (uaddr >= TASK_SIZE_MAX || (uaddr & 3)) return;
 
     u32 zero = 0;
     if (copy_to_user((void *)uaddr, &zero, sizeof(zero)) != 0) return;
@@ -8796,7 +8922,7 @@ static s64 sys_futex_impl(pt_regs_t *r)
     uintptr_t uaddr2 = (uintptr_t)r->r8;
     u32 val3 = (u32)r->r9;
 
-    if (uaddr >= 0x0000800000000000ULL || (uaddr & 3) != 0) return -(s64)EFAULT;
+    if (uaddr >= TASK_SIZE_MAX || (uaddr & 3) != 0) return -(s64)EFAULT;
 
     int cmd = op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     process_t *proc = sched_current_process();
@@ -8814,7 +8940,7 @@ static s64 sys_futex_impl(pt_regs_t *r)
         if (cur_val != val) return -(s64)11; /* -EAGAIN / -EWOULDBLOCK */
 
         u64 timeout_ticks = 0;
-        if (timeout && (uintptr_t)timeout < 0x0000800000000000ULL) {
+        if (timeout && (uintptr_t)timeout < TASK_SIZE_MAX) {
             struct linux_timespec ts;
             if (copy_from_user(&ts, timeout, sizeof(ts)) == 0) {
                 u64 ms = (u64)ts.tv_sec * 1000 + (u64)ts.tv_nsec / 1000000;
@@ -8836,7 +8962,7 @@ static s64 sys_futex_impl(pt_regs_t *r)
          * uaddr, then — if oldval compares true against cmparg — wake up to
          * @val2 waiters on uaddr2. This is what glibc's pthread_cond_signal /
          * _broadcast and several bounded-queue primitives are built on. */
-        if (uaddr2 >= 0x0000800000000000ULL || (uaddr2 & 3) != 0) return -(s64)EFAULT;
+        if (uaddr2 >= TASK_SIZE_MAX || (uaddr2 & 3) != 0) return -(s64)EFAULT;
 
         u32 nr_wake  = val;
         u32 nr_wake2 = (u32)(uintptr_t)timeout;   /* val2 shares the timeout slot */
@@ -9182,7 +9308,7 @@ static s64 sys_epoll_ctl_impl(pt_regs_t *r)
 
     linux_epoll_event_t kevent;
     if (op != EPOLL_CTL_DEL) {
-        if (!event || (uintptr_t)event >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if (!event || (uintptr_t)event >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_from_user(&kevent, event, sizeof(linux_epoll_event_t)) != 0) return -(s64)EFAULT;
     }
 
@@ -9239,7 +9365,7 @@ static s64 sys_epoll_wait_impl(pt_regs_t *r)
     int timeout_ms = (int)r->r10;
 
     if (maxevents <= 0 || maxevents > 1024) return -(s64)EINVAL;
-    if (!events || (uintptr_t)events >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!events || (uintptr_t)events >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc || epfd < 0 || epfd >= PROC_MAX_FDS || !proc->handle_table[epfd]) return -(s64)EBADF;
@@ -9290,7 +9416,7 @@ static s64 sys_epoll_pwait_impl(pt_regs_t *r)
     
     if (user_sigmask) {
         if (sigsetsize != sizeof(sigset_t)) return -(s64)EINVAL;
-        if ((uintptr_t)user_sigmask >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)user_sigmask >= TASK_SIZE_MAX) return -(s64)EFAULT;
         sigset_t kmask;
         if (copy_from_user(&kmask, user_sigmask, sizeof(sigset_t)) != 0) return -(s64)EFAULT;
         
@@ -9443,7 +9569,7 @@ static s64 sys_timerfd_settime_impl(pt_regs_t *r)
     if (!new_value || copy_from_user(&new_val, new_value, sizeof(struct itimerspec)) != 0) return -(s64)EFAULT;
 
     spinlock_lock(&ctx->lock);
-    if (old_value && (uintptr_t)old_value < 0x0000800000000000ULL) {
+    if (old_value && (uintptr_t)old_value < TASK_SIZE_MAX) {
         struct itimerspec old_val;
         memset(&old_val, 0, sizeof(old_val));
         old_val.it_interval.tv_sec = (long)(ctx->interval_ms / 1000);
@@ -9477,7 +9603,7 @@ static s64 sys_timerfd_gettime_impl(pt_regs_t *r)
     if (f->f_op != &g_timerfd_fops || !f->private_data) return -(s64)EINVAL;
     timerfd_ctx_t *ctx = (timerfd_ctx_t *)f->private_data;
 
-    if (!curr_value || (uintptr_t)curr_value >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!curr_value || (uintptr_t)curr_value >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     struct itimerspec val;
     memset(&val, 0, sizeof(val));
@@ -9750,7 +9876,7 @@ static s64 sys_sched_getparam_impl(pt_regs_t *r)
 {
     u32 pid = (u32)(s32)r->rdi;
     struct sched_param *uparam = (struct sched_param *)r->rsi;
-    if (!uparam || (uintptr_t)uparam >= 0x0000800000000000ULL) return -(s64)EINVAL;
+    if (!uparam || (uintptr_t)uparam >= TASK_SIZE_MAX) return -(s64)EINVAL;
 
     bool put; s64 err;
     process_t *tgt = sched_target(pid, &put, &err);
@@ -9783,7 +9909,7 @@ static s64 sys_sched_rr_get_interval_impl(pt_regs_t *r)
 {
     u32 pid = (u32)(s32)r->rdi;
     struct linux_timespec *tp = (struct linux_timespec *)r->rsi;
-    if (!tp || (uintptr_t)tp >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!tp || (uintptr_t)tp >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     bool put = false;
     s64 err = 0;
@@ -9929,7 +10055,7 @@ static s64 sys_capget_impl(pt_regs_t *r)
 
     cap_user_header_t hdr = { LINUX_CAPABILITY_VERSION_3, 0 };
     if (uhdr) {
-        if ((uintptr_t)uhdr >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)uhdr >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_from_user(&hdr, uhdr, sizeof(hdr)) != 0) return -(s64)EFAULT;
     }
 
@@ -9951,7 +10077,7 @@ static s64 sys_capget_impl(pt_regs_t *r)
     }
 
     if (!udata) return 0;
-    if ((uintptr_t)udata >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)udata >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     cap_user_data_t out[2];
     out[0].effective   = (u32)(target->cap_effective   & 0xFFFFFFFFu);
@@ -9972,8 +10098,8 @@ static s64 sys_capset_impl(pt_regs_t *r)
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
     if (!uhdr || !udata) return -(s64)EFAULT;
-    if ((uintptr_t)uhdr >= 0x0000800000000000ULL ||
-        (uintptr_t)udata >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)uhdr >= TASK_SIZE_MAX ||
+        (uintptr_t)udata >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     cap_user_header_t hdr;
     if (copy_from_user(&hdr, uhdr, sizeof(hdr)) != 0) return -(s64)EFAULT;
@@ -10017,7 +10143,7 @@ static s64 sys_sethostname_impl(pt_regs_t *r)
     size_t len = (size_t)r->rsi;
     process_t *proc = sched_current_process();
     if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
-    if (!name || (uintptr_t)name >= 0x8000000000000000ULL || len >= sizeof(g_kernel_nodename)) return -(s64)EINVAL;
+    if (!name || (uintptr_t)name >= TASK_SIZE_MAX || len >= sizeof(g_kernel_nodename)) return -(s64)EINVAL;
     char buf[65];
     memset(buf, 0, sizeof(buf));
     if (copy_from_user(buf, name, len) != 0) return -(s64)EFAULT;
@@ -10033,7 +10159,7 @@ static s64 sys_setdomainname_impl(pt_regs_t *r)
     size_t len = (size_t)r->rsi;
     process_t *proc = sched_current_process();
     if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
-    if (!name || (uintptr_t)name >= 0x8000000000000000ULL || len >= sizeof(g_kernel_domainname)) return -(s64)EINVAL;
+    if (!name || (uintptr_t)name >= TASK_SIZE_MAX || len >= sizeof(g_kernel_domainname)) return -(s64)EINVAL;
     char buf[65];
     memset(buf, 0, sizeof(buf));
     if (copy_from_user(buf, name, len) != 0) return -(s64)EFAULT;
@@ -10322,8 +10448,8 @@ static s64 sys_name_to_handle_at_impl(pt_regs_t *r)
     int *umount_id           = (int *)r->r10;
     int flags                = (int)r->r8;
 
-    if (!uh || (uintptr_t)uh >= 0x0000800000000000ULL) return -(s64)EFAULT;
-    if (!umount_id || (uintptr_t)umount_id >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!uh || (uintptr_t)uh >= TASK_SIZE_MAX) return -(s64)EFAULT;
+    if (!umount_id || (uintptr_t)umount_id >= TASK_SIZE_MAX) return -(s64)EFAULT;
     if (flags & ~(AT_SYMLINK_FOLLOW_FH | AT_EMPTY_PATH_FH)) return -(s64)EINVAL;
 
     /* handle_bytes is both an input (how much room the caller has) and an
@@ -10419,7 +10545,7 @@ static s64 sys_open_by_handle_at_impl(pt_regs_t *r)
     /* Opening by handle bypasses every path-based permission check on the
      * way to the inode, which is why Linux gates it on this capability. */
     if (!security_check_permission(proc, CAP_DAC_READ_SEARCH)) return -(s64)EPERM;
-    if (!uh || (uintptr_t)uh >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!uh || (uintptr_t)uh >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     /* Copy the whole handle into the kernel: f_handle is variable-length and
      * must not be re-read from userspace after handle_bytes is validated. */
@@ -10469,7 +10595,7 @@ static s64 sys_io_setup_impl(pt_regs_t *r)
     unsigned int nr_events = (unsigned int)r->rdi;
     u64 *uctxp = (u64 *)r->rsi;
 
-    if (!uctxp || (uintptr_t)uctxp >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!uctxp || (uintptr_t)uctxp >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     /* io_setup(2) requires the context word to start out zero — a non-zero
      * one usually means the caller is reusing a variable that still holds a
@@ -10502,7 +10628,7 @@ static s64 sys_io_submit_impl(pt_regs_t *r)
 
     if (nr < 0) return -(s64)EINVAL;
     if (nr == 0) return 0;
-    if (!uiocbs || (uintptr_t)uiocbs >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!uiocbs || (uintptr_t)uiocbs >= TASK_SIZE_MAX) return -(s64)EFAULT;
     return aio_submit(ctx_id, nr, uiocbs);
 }
 
@@ -10514,12 +10640,12 @@ static s64 sys_io_getevents_impl(pt_regs_t *r)
     struct io_event *uev = (struct io_event *)r->r10;
     const void *utimeout = (const void *)r->r8;
 
-    if (nr > 0 && (!uev || (uintptr_t)uev >= 0x0000800000000000ULL)) return -(s64)EFAULT;
+    if (nr > 0 && (!uev || (uintptr_t)uev >= TASK_SIZE_MAX)) return -(s64)EFAULT;
 
     u64 timeout_ns = 0;
     bool have_timeout = false;
     if (utimeout) {
-        if ((uintptr_t)utimeout >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)utimeout >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct { s64 tv_sec; s64 tv_nsec; } ts;
         if (copy_from_user(&ts, utimeout, sizeof(ts)) != 0) return -(s64)EFAULT;
         if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) return -(s64)EINVAL;
@@ -10535,8 +10661,8 @@ static s64 sys_io_cancel_impl(pt_regs_t *r)
     u64 uiocb  = (u64)r->rsi;
     struct io_event *uresult = (struct io_event *)r->rdx;
 
-    if (!uiocb || uiocb >= 0x0000800000000000ULL) return -(s64)EFAULT;
-    if (uresult && (uintptr_t)uresult >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!uiocb || uiocb >= TASK_SIZE_MAX) return -(s64)EFAULT;
+    if (uresult && (uintptr_t)uresult >= TASK_SIZE_MAX) return -(s64)EFAULT;
     return aio_cancel(ctx_id, uiocb, uresult);
 }
 
@@ -11102,7 +11228,7 @@ static s64 sys_p_rw_v(pt_regs_t *r, bool write)
     u64 off = r->r10;                     /* low half of the offset */
 
     if (!iov || iovcnt <= 0 || iovcnt > 1024) return -(s64)EINVAL;
-    if ((uintptr_t)iov >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)iov >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     s64 total = 0;
     for (int i = 0; i < iovcnt; i++) {
@@ -11215,7 +11341,7 @@ static s64 sys_rt_sigpending_impl(pt_regs_t *r)
     if (sz != sizeof(sigset_t)) return -(s64)EINVAL;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (!uset || (uintptr_t)uset >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!uset || (uintptr_t)uset >= TASK_SIZE_MAX) return -(s64)EFAULT;
     sigset_t pend = proc->sig_pending & proc->sig_blocked;
     if (copy_to_user(uset, &pend, sizeof pend) != 0) return -(s64)EFAULT;
     return 0;
@@ -11250,12 +11376,12 @@ static s64 sys_sigaltstack_impl(pt_regs_t *r)
     }
 
     if (uold) {
-        if ((uintptr_t)uold >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)uold >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_to_user(uold, &old_st, sizeof(old_st)) != 0) return -(s64)EFAULT;
     }
 
     if (unew) {
-        if ((uintptr_t)unew >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)unew >= TASK_SIZE_MAX) return -(s64)EFAULT;
         /* Cannot modify alternate signal stack while active on it */
         if (old_st.ss_flags & 1 /* SS_ONSTACK */) return -(s64)EPERM;
 
@@ -11269,7 +11395,7 @@ static s64 sys_sigaltstack_impl(pt_regs_t *r)
         } else {
             /* Minimum size validation: MINSIGSTKSZ is 2048 */
             if (new_st.ss_size < 2048) return -(s64)ENOMEM;
-            if ((uintptr_t)new_st.ss_sp >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if ((uintptr_t)new_st.ss_sp >= TASK_SIZE_MAX) return -(s64)EFAULT;
             p->sas_ss_sp    = new_st.ss_sp;
             p->sas_ss_size  = new_st.ss_size;
             p->sas_ss_flags = new_st.ss_flags & ~1;
@@ -11384,7 +11510,7 @@ static s64 sys_unshare_impl(pt_regs_t *r)
 
 static s64 adjtimex_core(process_t *proc, struct kernel_timex *user_buf)
 {
-    if (!user_buf || (uintptr_t)user_buf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!user_buf || (uintptr_t)user_buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
     struct kernel_timex tx;
     memset(&tx, 0, sizeof(tx));
     if (copy_from_user(&tx, user_buf, TIMEX_COPY_SIZE) != 0) return -(s64)EFAULT;
@@ -11450,7 +11576,7 @@ static s64 sys_mmsg(pt_regs_t *r, bool send)
     u8 *umsgvec = (u8 *)r->rsi;
     unsigned vlen = (unsigned)r->rdx;
     unsigned flags = (unsigned)r->r10;
-    if (!umsgvec || (uintptr_t)umsgvec >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!umsgvec || (uintptr_t)umsgvec >= TASK_SIZE_MAX) return -(s64)EFAULT;
     if (vlen > 1024) vlen = 1024;
 
     /* struct mmsghdr { struct msghdr msg_hdr; unsigned msg_len; }; msghdr is
@@ -11478,7 +11604,7 @@ static s64 sys_recvmmsg_impl(pt_regs_t *r) { return sys_mmsg(r, false); }
 /* process_vm_readv / process_vm_writev — copy between the caller and a target
  * process, page by page, translating the remote virtual addresses through the
  * target's PML4. */
-#define PVM_USER_MAX 0x0000800000000000ULL
+#define PVM_USER_MAX TASK_SIZE_MAX
 
 /* True if [base, base+len) is a non-wrapping range wholly inside the user half. */
 static bool pvm_user_range_ok(u64 base, u64 len)
@@ -11621,7 +11747,7 @@ static s64 sys_semtimedop_impl(pt_regs_t *r)
     const struct linux_timespec *uts = (const struct linux_timespec *)r->r10;
     if (!uts) return sysv_semop((int)r->rdi, (const void *)r->rsi, (size_t)r->rdx);
 
-    if ((uintptr_t)uts >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)uts >= TASK_SIZE_MAX) return -(s64)EFAULT;
     struct linux_timespec ts;
     if (copy_from_user(&ts, uts, sizeof(ts)) != 0) return -(s64)EFAULT;
     if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) return -(s64)EINVAL;
@@ -11690,14 +11816,14 @@ static s64 sys_timer_create_impl(pt_regs_t *r)
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (!utimerid || (uintptr_t)utimerid >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!utimerid || (uintptr_t)utimerid >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     int notify = SIGEV_SIGNAL;
     int signo  = SIGALRM;
     u64 sigval = 0;
 
     if (usev) {
-        if ((uintptr_t)usev >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)usev >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct k_sigevent sev;
         if (copy_from_user(&sev, usev, sizeof(sev)) != 0) return -(s64)EFAULT;
         notify = sev.sigev_notify;
@@ -11726,7 +11852,7 @@ static s64 sys_timer_settime_impl(pt_regs_t *r)
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (!unew || (uintptr_t)unew >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!unew || (uintptr_t)unew >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     struct itimerspec nv;
     if (copy_from_user(&nv, unew, sizeof(nv)) != 0) return -(s64)EFAULT;
@@ -11742,7 +11868,7 @@ static s64 sys_timer_settime_impl(pt_regs_t *r)
                              &old_value, &old_interval);
     if (ret < 0) return ret;
 
-    if (uold && (uintptr_t)uold < 0x8000000000000000ULL) {
+    if (uold && (uintptr_t)uold < TASK_SIZE_MAX) {
         struct itimerspec ov;
         ticks_to_timespec(old_value, &ov.it_value);
         ticks_to_timespec(old_interval, &ov.it_interval);
@@ -11758,7 +11884,7 @@ static s64 sys_timer_gettime_impl(pt_regs_t *r)
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (!ucur || (uintptr_t)ucur >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!ucur || (uintptr_t)ucur >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     u64 value = 0, interval = 0;
     s64 ret = ktimer_gettime(proc, id, &value, &interval);
@@ -11814,7 +11940,7 @@ static s64 sys_setitimer_impl(pt_regs_t *r)
 
     u64 value = 0, interval = 0;
     if (unew) {
-        if ((uintptr_t)unew >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)unew >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct k_itimerval nv;
         if (copy_from_user(&nv, unew, sizeof(nv)) != 0) return -(s64)EFAULT;
         if (nv.it_value.tv_usec < 0 || nv.it_value.tv_usec >= 1000000L ||
@@ -11829,7 +11955,7 @@ static s64 sys_setitimer_impl(pt_regs_t *r)
     s64 ret = ktimer_setitimer(proc, which, value, interval, &old_value, &old_interval);
     if (ret < 0) return ret;
 
-    if (uold && (uintptr_t)uold < 0x8000000000000000ULL) {
+    if (uold && (uintptr_t)uold < TASK_SIZE_MAX) {
         struct k_itimerval ov;
         ticks_to_timeval(old_value, &ov.it_value);
         ticks_to_timeval(old_interval, &ov.it_interval);
@@ -11845,7 +11971,7 @@ static s64 sys_getitimer_impl(pt_regs_t *r)
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (!ucur || (uintptr_t)ucur >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!ucur || (uintptr_t)ucur >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     u64 value = 0, interval = 0;
     s64 ret = ktimer_getitimer(proc, which, &value, &interval);
@@ -11890,7 +12016,7 @@ static s64 sys_rt_sigtimedwait_impl(pt_regs_t *r)
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
     if (sigsetsize != sizeof(sigset_t)) return -(s64)EINVAL;
-    if (!uset || (uintptr_t)uset >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!uset || (uintptr_t)uset >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     sigset_t set;
     if (copy_from_user(&set, uset, sizeof(set)) != 0) return -(s64)EFAULT;
@@ -11900,7 +12026,7 @@ static s64 sys_rt_sigtimedwait_impl(pt_regs_t *r)
     bool have_timeout = false;
     u64  deadline = 0;
     if (utimeout) {
-        if ((uintptr_t)utimeout >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)utimeout >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct linux_timespec ts;
         if (copy_from_user(&ts, utimeout, sizeof(ts)) != 0) return -(s64)EFAULT;
         if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) return -(s64)EINVAL;
@@ -11919,7 +12045,7 @@ static s64 sys_rt_sigtimedwait_impl(pt_regs_t *r)
              * to a handler on the way out. */
             __atomic_and_fetch(&proc->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
 
-            if (uinfo && (uintptr_t)uinfo < 0x8000000000000000ULL) {
+            if (uinfo && (uintptr_t)uinfo < TASK_SIZE_MAX) {
                 struct k_siginfo info;
                 __builtin_memset(&info, 0, sizeof(info));
                 info.si_signo = (s32)sig;
@@ -11948,7 +12074,7 @@ static s64 sys_rt_sigsuspend_impl(pt_regs_t *r)
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
     if (sigsetsize != sizeof(sigset_t)) return -(s64)EINVAL;
-    if (!umask || (uintptr_t)umask >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!umask || (uintptr_t)umask >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     sigset_t mask;
     if (copy_from_user(&mask, umask, sizeof(mask)) != 0) return -(s64)EFAULT;
@@ -11976,7 +12102,7 @@ static s64 sys_rt_sigqueueinfo_impl(pt_regs_t *r)
     void *ui = (void *)r->rdx;
 
     if (sig < 0 || sig >= 64) return -(s64)EINVAL;
-    if (ui && (uintptr_t)ui >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (ui && (uintptr_t)ui >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     /* The accompanying siginfo is validated but not queued: signals here are
      * a pending bitmask, so a value cannot be carried alongside one. */
@@ -11985,7 +12111,8 @@ static s64 sys_rt_sigqueueinfo_impl(pt_regs_t *r)
         if (copy_from_user(&info, ui, sizeof(info)) != 0) return -(s64)EFAULT;
     }
     if (sig == 0) return 0;
-    return sched_kill_process(pid, sig);
+    process_t *curr = sched_current_process();
+    return sched_kill_process_permitted(curr, pid, sig);
 }
 
 static s64 sys_rt_tgsigqueueinfo_impl(pt_regs_t *r)
@@ -11995,9 +12122,10 @@ static s64 sys_rt_tgsigqueueinfo_impl(pt_regs_t *r)
     void *ui = (void *)r->r10;
 
     if (sig < 0 || sig >= 64) return -(s64)EINVAL;
-    if (ui && (uintptr_t)ui >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (ui && (uintptr_t)ui >= TASK_SIZE_MAX) return -(s64)EFAULT;
     if (sig == 0) return 0;
-    return sched_kill_process(tgid, sig);
+    process_t *curr = sched_current_process();
+    return sched_kill_process_permitted(curr, tgid, sig);
 }
 
 /* ============================================================================
@@ -12030,7 +12158,7 @@ static s64 sys_mount_impl(pt_regs_t *r)
      * filesystem here parses it as one, and a non-string caller passes a
      * pointer we must not dereference blindly, so a failed copy is simply
      * "no options" rather than EFAULT. */
-    if (udata && (uintptr_t)udata < 0x0000800000000000ULL)
+    if (udata && (uintptr_t)udata < TASK_SIZE_MAX)
         (void)copy_str_from_user(data, udata, sizeof(data));
 
     return vfs_mount_flags(source[0] ? source : fstype, target,
@@ -12050,7 +12178,7 @@ static s64 sys_umount2_impl(pt_regs_t *r)
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
     if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
-    if (!utarget || (uintptr_t)utarget >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!utarget || (uintptr_t)utarget >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char target[256] = {0};
     if (copy_str_from_user(target, utarget, sizeof(target)) < 0) return -(s64)EFAULT;
@@ -12273,13 +12401,13 @@ static s64 sys_pkey_mprotect_impl(pt_regs_t *r)
 
     if (length == 0) return 0;
     if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;
-    if (addr >= 0x0000800000000000ULL || addr < 0x1000) return -(s64)EINVAL;
+    if (addr >= TASK_SIZE_MAX || addr < 0x1000) return -(s64)EINVAL;
 
     process_t *proc = sched_current_process();
     if (!proc || !proc->pml4_phys) return -(s64)EPERM;
 
     size_t aligned_len = ALIGN_UP(length, PAGE_SIZE);
-    if (addr + aligned_len < addr || addr + aligned_len > 0x0000800000000000ULL)
+    if (addr + aligned_len < addr || addr + aligned_len > TASK_SIZE_MAX)
         return -(s64)EINVAL;
 
     u64 vmm_flags = VMM_F_USER;
@@ -12319,7 +12447,7 @@ static s64 sys_set_robust_list_impl(pt_regs_t *r)
      * which is 24 bytes on x86-64; anything else means the caller and kernel
      * disagree about the layout. */
     if (len != 24) return -(s64)EINVAL;
-    if (head && (uintptr_t)head >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (head && (uintptr_t)head >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     proc->robust_list     = head;
     proc->robust_list_len = len;
@@ -12335,8 +12463,8 @@ static s64 sys_get_robust_list_impl(pt_regs_t *r)
     process_t *caller = sched_current_process();
     if (!caller) return -(s64)EPERM;
     if (!uhead || !ulen) return -(s64)EFAULT;
-    if ((uintptr_t)uhead >= 0x0000800000000000ULL ||
-        (uintptr_t)ulen  >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)uhead >= TASK_SIZE_MAX ||
+        (uintptr_t)ulen  >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     /* pid 0 is the caller (always live). Any other pid is referenced for the
      * duration so it cannot be reaped between the lookup and the field reads. */
@@ -12371,14 +12499,14 @@ static s64 sys_mincore_impl(pt_regs_t *r)
     size_t length   = (size_t)r->rsi;
     unsigned char *vec = (unsigned char *)r->rdx;
 
-    if (start >= 0x0000800000000000ULL || (start & 0xFFF) != 0) return -(s64)EINVAL;
-    if (!vec || (uintptr_t)vec >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (start >= TASK_SIZE_MAX || (start & 0xFFF) != 0) return -(s64)EINVAL;
+    if (!vec || (uintptr_t)vec >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc || !proc->pml4_phys) return -(s64)EPERM;
 
     size_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (start + (u64)pages * PAGE_SIZE > 0x0000800000000000ULL) return -(s64)ENOMEM;
+    if (start + (u64)pages * PAGE_SIZE > TASK_SIZE_MAX) return -(s64)ENOMEM;
 
     /* Batch the answers: one copy_to_user per chunk instead of per page turns
      * a 1 MB query from 256 user-access transitions into one. */
@@ -12414,7 +12542,7 @@ static s64 sys_process_madvise_impl(pt_regs_t *r)
 
     if (flags != 0) return -(s64)EINVAL;
     if (vlen > 1024) return -(s64)EINVAL;
-    if (!uiov || (uintptr_t)uiov >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!uiov || (uintptr_t)uiov >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *caller = sched_current_process();
     if (!caller) return -(s64)EPERM;
@@ -12442,7 +12570,7 @@ static s64 sys_process_madvise_impl(pt_regs_t *r)
     for (unsigned long i = 0; i < vlen; i++) {
         struct iovec kiov;
         if (copy_from_user(&kiov, &uiov[i], sizeof(kiov)) != 0) return -(s64)EFAULT;
-        if ((uintptr_t)kiov.iov_base >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)kiov.iov_base >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (kiov.iov_len > (size_t)0x7fffffffffffffffLL - (size_t)total)
             return -(s64)EINVAL;
         total += (s64)kiov.iov_len;
@@ -12463,8 +12591,8 @@ static s64 sys_cachestat_impl(pt_regs_t *r)
 
     if (flags != 0) return -(s64)EINVAL;
     if (!urange || !ucs) return -(s64)EFAULT;
-    if ((uintptr_t)urange >= 0x0000800000000000ULL ||
-        (uintptr_t)ucs    >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)urange >= TASK_SIZE_MAX ||
+        (uintptr_t)ucs    >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -12513,7 +12641,7 @@ static s64 sys_futex_waitv_impl(pt_regs_t *r)
 
     if (flags != 0) return -(s64)EINVAL;
     if (nr == 0 || nr > FUTEX_WAITV_MAX) return -(s64)EINVAL;
-    if (!uwaiters || (uintptr_t)uwaiters >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (!uwaiters || (uintptr_t)uwaiters >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     thread_t  *curr = sched_current_thread();
@@ -12526,13 +12654,13 @@ static s64 sys_futex_waitv_impl(pt_regs_t *r)
         if (w[i].__reserved != 0) return -(s64)EINVAL;
         /* Only 32-bit futexes exist here; the size field must say so. */
         if ((w[i].flags & 0x0F) != FUTEX2_SIZE_U32) return -(s64)EINVAL;
-        if (w[i].uaddr >= 0x0000800000000000ULL || (w[i].uaddr & 3) != 0)
+        if (w[i].uaddr >= TASK_SIZE_MAX || (w[i].uaddr & 3) != 0)
             return -(s64)EFAULT;
     }
 
     u64 timeout_ticks = 0;
     if (utimeout) {
-        if ((uintptr_t)utimeout >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)utimeout >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct linux_timespec ts;
         if (copy_from_user(&ts, utimeout, sizeof(ts)) != 0) return -(s64)EFAULT;
         if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
@@ -12629,7 +12757,7 @@ static s64 sys_mseal_impl(pt_regs_t *r)
 
     if (flags != 0) return -(s64)EINVAL;
     if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;
-    if (addr + len < addr || addr + len > 0x0000800000000000ULL) return -(s64)EINVAL;
+    if (addr + len < addr || addr + len > TASK_SIZE_MAX) return -(s64)EINVAL;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -12742,7 +12870,7 @@ static s64 sys_futex_wake_impl(pt_regs_t *r)
     s64 rc = futex2_check_flags(flags);
     if (rc < 0) return rc;
     if (mask == 0 || nr < 0) return -(s64)EINVAL;
-    if (uaddr >= 0x0000800000000000ULL || (uaddr & 3) != 0) return -(s64)EFAULT;
+    if (uaddr >= TASK_SIZE_MAX || (uaddr & 3) != 0) return -(s64)EFAULT;
 
     pt_regs_t sub = *r;
     sub.rsi = FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG;
@@ -12763,7 +12891,7 @@ static s64 sys_futex_wait_impl(pt_regs_t *r)
     s64 rc = futex2_check_flags(flags);
     if (rc < 0) return rc;
     if (mask == 0) return -(s64)EINVAL;
-    if (uaddr >= 0x0000800000000000ULL || (uaddr & 3) != 0) return -(s64)EFAULT;
+    if (uaddr >= TASK_SIZE_MAX || (uaddr & 3) != 0) return -(s64)EFAULT;
     /* CLOCK_REALTIME (0) and CLOCK_MONOTONIC (1) are the only clocks the call
      * is defined for; both advance at the same rate here. */
     if (clockid != 0 && clockid != 1) return -(s64)EINVAL;
@@ -12782,7 +12910,7 @@ static s64 sys_futex_wait_impl(pt_regs_t *r)
      * already passed must not block, however long the caller took to get here. */
     u64 timeout_ticks = 0;
     if (utimeout) {
-        if ((uintptr_t)utimeout >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)utimeout >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct linux_timespec ts;
         if (copy_from_user(&ts, utimeout, sizeof(ts)) != 0) return -(s64)EFAULT;
         if (ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) return -(s64)EINVAL;
@@ -12818,7 +12946,7 @@ static s64 sys_futex_requeue_impl(pt_regs_t *r)
 
     if (flags != 0) return -(s64)EINVAL;
     if (nr_wake < 0 || nr_requeue < 0) return -(s64)EINVAL;
-    if (!uwaiters || (uintptr_t)uwaiters >= 0x0000800000000000ULL)
+    if (!uwaiters || (uintptr_t)uwaiters >= TASK_SIZE_MAX)
         return -(s64)EFAULT;
 
     struct futex_waitv w[2];
@@ -12828,7 +12956,7 @@ static s64 sys_futex_requeue_impl(pt_regs_t *r)
         s64 rc = futex2_check_flags(w[i].flags);
         if (rc < 0) return rc;
         if (w[i].__reserved) return -(s64)EINVAL;
-        if (w[i].uaddr >= 0x0000800000000000ULL || (w[i].uaddr & 3) != 0)
+        if (w[i].uaddr >= TASK_SIZE_MAX || (w[i].uaddr & 3) != 0)
             return -(s64)EFAULT;
     }
 
@@ -12998,7 +13126,7 @@ static s64 mempolicy_check_nodemask(const unsigned long *unodes, unsigned long m
     *out_mask = 0;
     if (maxnode > 8 * sizeof(u64) * 16) return -(s64)EINVAL;
     if (!unodes || maxnode == 0) return 0;
-    if ((uintptr_t)unodes >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if ((uintptr_t)unodes >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     /* maxnode counts bits, and the bitmap is an array of unsigned long. */
     unsigned long words = (maxnode + 63) / 64;
@@ -13080,7 +13208,7 @@ static s64 sys_get_mempolicy_impl(pt_regs_t *r)
          * With one node the answer is always 0 — but only for a mapped
          * address, so an unmapped one still has to fault. */
         if (flags & MPOL_F_ADDR) {
-            if (addr >= 0x0000800000000000ULL) return -(s64)EFAULT;
+            if (addr >= TASK_SIZE_MAX) return -(s64)EFAULT;
             if (!vmm_translate(proc->pml4_phys, addr)) return -(s64)EFAULT;
         }
         mode = 0;
@@ -13091,11 +13219,11 @@ static s64 sys_get_mempolicy_impl(pt_regs_t *r)
     }
 
     if (umode) {
-        if ((uintptr_t)umode >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)umode >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (copy_to_user(umode, &mode, sizeof(int)) != 0) return -(s64)EFAULT;
     }
     if (unodes && maxnode) {
-        if ((uintptr_t)unodes >= 0x0000800000000000ULL) return -(s64)EFAULT;
+        if ((uintptr_t)unodes >= TASK_SIZE_MAX) return -(s64)EFAULT;
         unsigned long words = (maxnode + 63) / 64;
         for (unsigned long i = 0; i < words; i++) {
             u64 w = (i == 0) ? mask : 0;
@@ -13139,9 +13267,9 @@ static s64 sys_move_pages_impl(pt_regs_t *r)
     if (count > MOVE_PAGES_MAX) return -(s64)E2BIG;
     if (count == 0) return 0;
     if (!upages || !ustatus) return -(s64)EFAULT;
-    if ((uintptr_t)upages >= 0x0000800000000000ULL || (uintptr_t)ustatus >= 0x0000800000000000ULL)
+    if ((uintptr_t)upages >= TASK_SIZE_MAX || (uintptr_t)ustatus >= TASK_SIZE_MAX)
         return -(s64)EFAULT;
-    if (unodes && (uintptr_t)unodes >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    if (unodes && (uintptr_t)unodes >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     for (unsigned long i = 0; i < count; i++) {
         void *upage_ptr;
@@ -13149,7 +13277,7 @@ static s64 sys_move_pages_impl(pt_regs_t *r)
         uintptr_t addr = (uintptr_t)upage_ptr;
 
         int status;
-        if (addr >= 0x0000800000000000ULL ||
+        if (addr >= TASK_SIZE_MAX ||
             !vmm_translate(proc->pml4_phys, ALIGN_DOWN(addr, PAGE_SIZE))) {
             status = -(s32)ENOENT; /* page not present */
         } else if (unodes) {
@@ -13187,7 +13315,7 @@ static s64 sys_mbind_impl(pt_regs_t *r)
 
     /* The range has to exist even though the policy cannot move anything. */
     u64 end = addr + ALIGN_UP(len, PAGE_SIZE);
-    if (end < addr || end > 0x0000800000000000ULL) return -(s64)EINVAL;
+    if (end < addr || end > TASK_SIZE_MAX) return -(s64)EINVAL;
     return 0;
 }
 
@@ -13221,7 +13349,7 @@ static s64 sys_set_mempolicy_home_node_impl(pt_regs_t *r)
     if (addr & (PAGE_SIZE - 1)) return -(s64)EINVAL;
     if (home_node != 0) return -(s64)EINVAL;   /* node 0 is the only node */
     u64 end = addr + ALIGN_UP(len, PAGE_SIZE);
-    if (end < addr || end > 0x0000800000000000ULL) return -(s64)EINVAL;
+    if (end < addr || end > TASK_SIZE_MAX) return -(s64)EINVAL;
 
     proc->mempolicy_home_node = (u32)home_node;
     return 0;
@@ -13368,6 +13496,181 @@ static s64 sys_process_mrelease_impl(pt_regs_t *r)
      * call would free is already gone. */
     return 0;
 }
+static s64 sys_add_key_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* Linux Keyring: add_key: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_request_key_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* Linux Keyring: request_key: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_keyctl_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* Linux Keyring: keyctl: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_io_pgetevents_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* Aio pgetevents: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_io_uring_setup_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* io_uring_setup: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_io_uring_enter_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* io_uring_enter: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_io_uring_register_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* io_uring_register: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_open_tree_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* New Mount API: open_tree: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_move_mount_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* New Mount API: move_mount: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_fsopen_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* New Mount API: fsopen: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_fsconfig_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* New Mount API: fsconfig: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_fsmount_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* New Mount API: fsmount: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_fspick_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* New Mount API: fspick: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_mount_setattr_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* New Mount API: mount_setattr: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_quotactl_fd_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* quotactl_fd: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_landlock_create_ruleset_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* Landlock LSM: create_ruleset: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_landlock_add_rule_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* Landlock LSM: add_rule: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_landlock_restrict_self_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* Landlock LSM: restrict_self: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_memfd_secret_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* memfd_secret: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_map_shadow_stack_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* map_shadow_stack: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_statmount_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* statmount: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_listmount_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* listmount: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_lsm_get_self_attr_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* lsm_get_self_attr: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_lsm_set_self_attr_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* lsm_set_self_attr: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_lsm_list_modules_impl(pt_regs_t *r)
+{
+    (void)r;
+    /* lsm_list_modules: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
+    return -(s64)ENOSYS;
+}
+
 
 /* ============================================================================
  * POSIX Named Semaphores — Azami extended syscalls 534–541
@@ -13524,7 +13827,7 @@ static s64 sys_az_sem_getvalue_impl(pt_regs_t *r)
 {
     int  fd   = (int)r->rdi;
     int *usval = (int *)r->rsi;
-    if (!usval || (uintptr_t)usval >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!usval || (uintptr_t)usval >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
@@ -13566,7 +13869,7 @@ static s64 sys_az_ktrace_read_impl(pt_regs_t *r)
 {
     void  *ubuf       = (void *)r->rdi;
     size_t max_entries = (size_t)r->rsi;
-    if (!ubuf || (uintptr_t)ubuf >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!ubuf || (uintptr_t)ubuf >= TASK_SIZE_MAX) return -(s64)EFAULT;
     if (max_entries == 0) return 0;
     if (max_entries > 256) max_entries = 256;
 
@@ -13593,3 +13896,41 @@ static s64 sys_az_ktrace_clear_impl(pt_regs_t *r)
     return 0;
 }
 
+/* ============================================================================
+ * bpf(2), userfaultfd(2), kexec_file_load(2) — ENOSYS stubs
+ *
+ * These three syscalls have defined numbers but no handler yet:
+ *
+ *   bpf (321):            Extended BPF VM — a full JIT-compiled in-kernel
+ *                         virtual machine for packet filtering, tracing, and
+ *                         security policy. Extremely complex to implement
+ *                         properly; programs (systemd, containers) probe for
+ *                         support with bpf(BPF_PROG_LOAD, ...) and fall back.
+ *
+ *   userfaultfd (323):    Allocates a file descriptor for handling page faults
+ *                         in userspace. Used primarily by QEMU/KVM live
+ *                         migration and CRIU checkpoint/restore. Programs
+ *                         always check the return value and fall back.
+ *
+ *   kexec_file_load (320): Boot a new kernel from a file descriptor without
+ *                         going through firmware. Requires signed kernel
+ *                         image validation. Only used by kexec(8).
+ * ============================================================================ */
+
+static s64 sys_bpf_impl(pt_regs_t *r)
+{
+    (void)r;
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_userfaultfd_impl(pt_regs_t *r)
+{
+    (void)r;
+    return -(s64)ENOSYS;
+}
+
+static s64 sys_kexec_file_load_impl(pt_regs_t *r)
+{
+    (void)r;
+    return -(s64)ENOSYS;
+}

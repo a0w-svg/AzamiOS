@@ -328,18 +328,112 @@ static void e1000_remove(dm_device_t *dm)
     g_e1000_ready = false;
 }
 
-/* Every Intel Gigabit chip this driver understands (82540EM/82543GC/…/I210). */
+/* Intel Gigabit chips: 8254x, 8257x, 8258x, I210/I211, I350, and PCH I217/I218/I219 */
 static const pci_device_id_t e1000_pci_ids[] = {
-    { PCI_DEVICE(0x8086, 0x100E) },   /* 82540EM */
+    /* Legacy 8254x PCI/PCI-X */
+    { PCI_DEVICE(0x8086, 0x1000) },   /* 82542 */
     { PCI_DEVICE(0x8086, 0x1004) },   /* 82543GC */
+    { PCI_DEVICE(0x8086, 0x1008) },   /* 82544EI */
+    { PCI_DEVICE(0x8086, 0x100E) },   /* 82540EM */
     { PCI_DEVICE(0x8086, 0x100F) },   /* 82545EM */
-    { PCI_DEVICE(0x8086, 0x10D3) },   /* 82574L  */
-    { PCI_DEVICE(0x8086, 0x1079) },   /* 82546GB */
-    { PCI_DEVICE(0x8086, 0x107C) },   /* 82541PI */
+    { PCI_DEVICE(0x8086, 0x1010) },   /* 82546EB */
+    { PCI_DEVICE(0x8086, 0x1013) },   /* 82541EI */
     { PCI_DEVICE(0x8086, 0x1019) },   /* 82547EI */
     { PCI_DEVICE(0x8086, 0x101E) },   /* 82540EP */
+    { PCI_DEVICE(0x8086, 0x1026) },   /* 82545GM */
+    { PCI_DEVICE(0x8086, 0x1075) },   /* 82547GI */
+    { PCI_DEVICE(0x8086, 0x1076) },   /* 82541GI */
+    { PCI_DEVICE(0x8086, 0x1078) },   /* 82541ER */
+    { PCI_DEVICE(0x8086, 0x1079) },   /* 82546GB */
+    { PCI_DEVICE(0x8086, 0x107C) },   /* 82541PI */
+
+    /* PCIe 82571 / 82572 / 82573 / 82574 / 82583 */
+    { PCI_DEVICE(0x8086, 0x105E) },   /* 82571EB */
+    { PCI_DEVICE(0x8086, 0x105F) },   /* 82571EB Fiber */
+    { PCI_DEVICE(0x8086, 0x1060) },   /* 82571EB SerDes */
+    { PCI_DEVICE(0x8086, 0x107D) },   /* 82572EI Copper */
+    { PCI_DEVICE(0x8086, 0x107E) },   /* 82572EI Fiber */
+    { PCI_DEVICE(0x8086, 0x107F) },   /* 82572EI SerDes */
+    { PCI_DEVICE(0x8086, 0x108B) },   /* 82573E */
+    { PCI_DEVICE(0x8086, 0x108C) },   /* 82573E iAMT */
+    { PCI_DEVICE(0x8086, 0x109A) },   /* 82573L */
+    { PCI_DEVICE(0x8086, 0x10A4) },   /* 82571EB Quad */
+    { PCI_DEVICE(0x8086, 0x10BC) },   /* 82571EB Copper */
+    { PCI_DEVICE(0x8086, 0x10D3) },   /* 82574L */
+    { PCI_DEVICE(0x8086, 0x10F6) },   /* 82574LA */
+    { PCI_DEVICE(0x8086, 0x150C) },   /* 82583V */
+
+    /* Server 82575 / 82576 / 82580 / I350 */
+    { PCI_DEVICE(0x8086, 0x10A7) },   /* 82575EB */
+    { PCI_DEVICE(0x8086, 0x10C9) },   /* 82576 Copper */
+    { PCI_DEVICE(0x8086, 0x10E6) },   /* 82576 Fiber */
+    { PCI_DEVICE(0x8086, 0x10E7) },   /* 82576 SerDes */
+    { PCI_DEVICE(0x8086, 0x10E8) },   /* 82576 Quad */
+    { PCI_DEVICE(0x8086, 0x150E) },   /* 82580 Copper */
+    { PCI_DEVICE(0x8086, 0x150F) },   /* 82580 Fiber */
+    { PCI_DEVICE(0x8086, 0x1510) },   /* 82580 SerDes */
+    { PCI_DEVICE(0x8086, 0x1511) },   /* 82580 SGMII */
+    { PCI_DEVICE(0x8086, 0x1521) },   /* I350 Copper */
+    { PCI_DEVICE(0x8086, 0x1522) },   /* I350 Fiber */
+    { PCI_DEVICE(0x8086, 0x1523) },   /* I350 SerDes */
+    { PCI_DEVICE(0x8086, 0x1524) },   /* I350 SGMII */
+
+    /* Desktop/Embedded I210 / I211 */
+    { PCI_DEVICE(0x8086, 0x1533) },   /* I210 Copper */
+    { PCI_DEVICE(0x8086, 0x1534) },   /* I210 Copper OEM */
+    { PCI_DEVICE(0x8086, 0x1536) },   /* I210 Copper IT */
+    { PCI_DEVICE(0x8086, 0x1537) },   /* I210 Fiber */
+    { PCI_DEVICE(0x8086, 0x1538) },   /* I210 SerDes */
+    { PCI_DEVICE(0x8086, 0x1539) },   /* I211-AT (AMD AM4/AM5 & Intel boards) */
+
+    /* PCH / Onboard Motherboard Ethernet: 82579, I217, I218, I219 */
+    { PCI_DEVICE(0x8086, 0x1502) },   /* 82579LM */
+    { PCI_DEVICE(0x8086, 0x1503) },   /* 82579V */
     { PCI_DEVICE(0x8086, 0x153A) },   /* I217-LM */
-    { PCI_DEVICE(0x8086, 0x1533) },   /* I210    */
+    { PCI_DEVICE(0x8086, 0x153B) },   /* I217-V */
+    { PCI_DEVICE(0x8086, 0x1559) },   /* I218-V */
+    { PCI_DEVICE(0x8086, 0x155A) },   /* I218-LM */
+    { PCI_DEVICE(0x8086, 0x15A0) },   /* I218-LM2 */
+    { PCI_DEVICE(0x8086, 0x15A1) },   /* I218-V2 */
+    { PCI_DEVICE(0x8086, 0x15A2) },   /* I218-LM3 */
+    { PCI_DEVICE(0x8086, 0x15A3) },   /* I218-V3 */
+    { PCI_DEVICE(0x8086, 0x156F) },   /* I219-LM (v1) */
+    { PCI_DEVICE(0x8086, 0x1570) },   /* I219-V (v1) */
+    { PCI_DEVICE(0x8086, 0x15B7) },   /* I219-LM (v2) */
+    { PCI_DEVICE(0x8086, 0x15B8) },   /* I219-V (v2) */
+    { PCI_DEVICE(0x8086, 0x15B9) },   /* I219-LM (v3) */
+    { PCI_DEVICE(0x8086, 0x15BB) },   /* I219-LM (v7) */
+    { PCI_DEVICE(0x8086, 0x15BC) },   /* I219-V (v7) */
+    { PCI_DEVICE(0x8086, 0x15BD) },   /* I219-LM (v6) */
+    { PCI_DEVICE(0x8086, 0x15BE) },   /* I219-V (v6) */
+    { PCI_DEVICE(0x8086, 0x15D6) },   /* I219-V (v5) */
+    { PCI_DEVICE(0x8086, 0x15D7) },   /* I219-LM (v4) */
+    { PCI_DEVICE(0x8086, 0x15D8) },   /* I219-V (v4) */
+    { PCI_DEVICE(0x8086, 0x15E3) },   /* I219-LM (v5) */
+    { PCI_DEVICE(0x8086, 0x0D4C) },   /* I219-LM (v9) */
+    { PCI_DEVICE(0x8086, 0x0D4D) },   /* I219-V (v9) */
+    { PCI_DEVICE(0x8086, 0x0D4E) },   /* I219-LM (v8) */
+    { PCI_DEVICE(0x8086, 0x0D4F) },   /* I219-V (v8) */
+    { PCI_DEVICE(0x8086, 0x0D53) },   /* I219-LM (v10) */
+    { PCI_DEVICE(0x8086, 0x0D55) },   /* I219-V (v10) */
+    { PCI_DEVICE(0x8086, 0x15F9) },   /* I219-LM (v11) */
+    { PCI_DEVICE(0x8086, 0x15FA) },   /* I219-V (v11) */
+    { PCI_DEVICE(0x8086, 0x15FB) },   /* I219-LM (v12) */
+    { PCI_DEVICE(0x8086, 0x15FC) },   /* I219-V (v12) */
+    { PCI_DEVICE(0x8086, 0x1A1E) },   /* I219-LM (v16) */
+    { PCI_DEVICE(0x8086, 0x1A1F) },   /* I219-V (v16) */
+
+    /* 2.5GbE I225 / I226 (Intel 12th/13th/14th Gen & AMD AM5 motherboards) */
+    { PCI_DEVICE(0x8086, 0x15F2) },   /* I225-LM */
+    { PCI_DEVICE(0x8086, 0x15F3) },   /* I225-V */
+    { PCI_DEVICE(0x8086, 0x15F8) },   /* I225-I */
+    { PCI_DEVICE(0x8086, 0x15FD) },   /* I225-K */
+    { PCI_DEVICE(0x8086, 0x125B) },   /* I226-LM */
+    { PCI_DEVICE(0x8086, 0x125C) },   /* I226-V */
+    { PCI_DEVICE(0x8086, 0x125D) },   /* I226-IT */
+    { PCI_DEVICE(0x8086, 0x3100) },   /* I225-LM (v2) */
+    { PCI_DEVICE(0x8086, 0x3101) },   /* I225-V (v2) */
+    { PCI_DEVICE(0x8086, 0x5502) },   /* I226-blank */
     { 0 }
 };
 

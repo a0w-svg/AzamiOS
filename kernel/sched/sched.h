@@ -614,6 +614,9 @@ void proc_put(process_t *p);
 /** sched_kill_process(pid, sig) — Send signal to process or terminate it. */
 s64 sched_kill_process(u32 pid, int sig);
 
+/** sched_kill_process_permitted(caller, pid, sig) — Check POSIX permissions and signal process. */
+s64 sched_kill_process_permitted(process_t *caller, u32 pid, int sig);
+
 /** sched_get_process_list() — Return head of global process list. */
 process_t *sched_get_process_list(void);
 

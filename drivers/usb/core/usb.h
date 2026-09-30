@@ -243,3 +243,4 @@ const char *usb_speed_name(u8 speed);
 
 /* ── Class drivers built into the kernel ─────────────────────────────────── */
 extern const usb_class_driver_t usbhid_driver;
+extern const usb_class_driver_t usb_storage_driver;

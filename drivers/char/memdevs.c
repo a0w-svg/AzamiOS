@@ -153,7 +153,7 @@ static s64 console_dev_ioctl(file_t *filp, u32 cmd, u64 arg)
 {
     (void)filp;
     if (cmd == 0x5401 /* TCGETS */) {
-        if (!arg || arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct {
             u32 c_iflag;
             u32 c_oflag;
@@ -179,7 +179,7 @@ static s64 console_dev_ioctl(file_t *filp, u32 cmd, u64 arg)
         return 0;
     }
     if (cmd == 0x5413 /* TIOCGWINSZ */) {
-        if (!arg || arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct {
             u16 ws_row;
             u16 ws_col;

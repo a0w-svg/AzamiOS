@@ -321,7 +321,7 @@ void net_set_dns(const u8 dns_in[4])
 int net_ioctl(u32 cmd, u64 arg)
 {
     if (!arg && cmd != SIOCGIFFLAGS && cmd != SIOCSIFDHCP) return -1;
-    if (cmd != SIOCGIFFLAGS && cmd != SIOCSIFDHCP && (uintptr_t)arg >= 0x8000000000000000ULL) return -1;
+    if (cmd != SIOCGIFFLAGS && cmd != SIOCSIFDHCP && (uintptr_t)arg >= TASK_SIZE_MAX) return -1;
 
     switch (cmd) {
     case SIOCGIFHWADDR:
@@ -507,12 +507,14 @@ void net_process_incoming(const u8 *pkt, size_t len)
 __attribute__((weak)) void e1000_poll_rx(void) {}
 __attribute__((weak)) void virtio_net_poll(void) {}
 __attribute__((weak)) void rtl8139_poll_rx(void) {}
+__attribute__((weak)) void tg3_poll_rx(void) {}
 
 void net_poll(void)
 {
     e1000_poll_rx();
     virtio_net_poll();
     rtl8139_poll_rx();
+    tg3_poll_rx();
 }
 
 s64 net_send_icmp_ping(const u8 target_ip[4], u16 seq)

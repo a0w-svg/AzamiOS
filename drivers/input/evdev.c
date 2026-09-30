@@ -19,6 +19,7 @@
 
 #define DEBUG 1
 #include <azami/debug.h>
+#include <azami/defs.h>
 #include "input.h"
 #include "../../fs/vfs.h"
 #include "../../kernel/uaccess.h"
@@ -331,7 +332,7 @@ static s64 evdev_ioctl(file_t *filp, u32 cmd, u64 arg)
 {
     (void)filp;
     void *uarg = (void *)(uintptr_t)arg;
-    if (!uarg || (uintptr_t)uarg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!uarg || (uintptr_t)uarg >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     switch (cmd) {
     case EVIOCGVERSION: {

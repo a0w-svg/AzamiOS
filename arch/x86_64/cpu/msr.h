@@ -65,6 +65,55 @@ static __attribute__((always_inline)) inline void wrmsr(u32 msr, u64 val)
     __asm__ volatile("wrmsr" : : "c"(msr), "a"(lo), "d"(hi) : "memory");
 }
 
+static __attribute__((always_inline)) inline int rdmsr_safe(u32 msr, u64 *val)
+{
+    u32 lo = 0, hi = 0;
+    int err = 0;
+    __asm__ volatile(
+        "1: rdmsr\n"
+        "2:\n"
+        ".pushsection .extable, \"a\"\n"
+        "   .balign 8\n"
+        "   .quad 1b\n"
+        "   .quad 3f\n"
+        ".popsection\n"
+        "   jmp 4f\n"
+        "3: mov $-1, %0\n"
+        "4:\n"
+        : "+r"(err), "=a"(lo), "=d"(hi)
+        : "c"(msr)
+        : "memory"
+    );
+    if (val) {
+        *val = (err == 0) ? (((u64)hi << 32) | lo) : 0;
+    }
+    return err;
+}
+
+static __attribute__((always_inline)) inline int wrmsr_safe(u32 msr, u64 val)
+{
+    u32 lo = (u32)(val & 0xFFFFFFFFUL);
+    u32 hi = (u32)(val >> 32);
+    int err = 0;
+    __asm__ volatile(
+        "1: wrmsr\n"
+        "2:\n"
+        ".pushsection .extable, \"a\"\n"
+        "   .balign 8\n"
+        "   .quad 1b\n"
+        "   .quad 3f\n"
+        ".popsection\n"
+        "   jmp 4f\n"
+        "3: mov $-1, %0\n"
+        "4:\n"
+        : "+r"(err)
+        : "c"(msr), "a"(lo), "d"(hi)
+        : "memory"
+    );
+    return err;
+}
+
+
 /* ── CPUID wrapper ─────────────────────────────────────────────────────────── */
 
 static inline void cpuid(u32 leaf, u32 subleaf,

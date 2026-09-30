@@ -350,7 +350,7 @@ static int ifreq_device_index(net_device_t *dev)
  * command set. */
 static s64 linux_ifreq_ioctl(u32 cmd, u64 arg)
 {
-    if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+    if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     if (cmd == LX_SIOCGIFCONF) {
         /* struct ifconf { int ifc_len; union { char *ifc_buf; struct ifreq
@@ -491,7 +491,7 @@ static s64 sock_fop_ioctl(struct file *filp, u32 cmd, u64 arg)
     socket_t *sock = (socket_t *)filp->private_data;
 
     if (cmd == 0x5421 /* FIONBIO */) {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         int val = 0;
         if (copy_from_user(&val, (const void *)(uintptr_t)arg, sizeof(int)) != 0) return -(s64)EFAULT;
         if (val) filp->f_flags |= O_NONBLOCK;
@@ -500,7 +500,7 @@ static s64 sock_fop_ioctl(struct file *filp, u32 cmd, u64 arg)
     }
 
     if (cmd == 0x541B /* FIONREAD */) {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         int bytes = 0;
         /* AF_UNIX checked first — sock->tcp/sock->uds alias the same union
          * storage, so `sock->type == SOCK_STREAM && sock->tcp` below would

@@ -170,6 +170,12 @@ void ptrace_report_event(pt_regs_t *r, u32 event, u64 msg);
  */
 void ptrace_release(process_t *p);
 
+/**
+ * ptrace_may_access(tracer, target) — check if tracer is allowed to inspect target's
+ * memory layout (e.g. /proc/<pid>/maps) or attach to target.
+ */
+bool ptrace_may_access(process_t *tracer, process_t *target);
+
 /** ptrace_traced(p) — true when @p currently has a tracer attached. */
 static inline bool ptrace_traced(const process_t *p)
 {

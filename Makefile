@@ -184,6 +184,7 @@ ARCH_C_SRCS := \
     arch/x86_64/cpu/lapic.c \
     arch/x86_64/cpu/smp.c \
     arch/x86_64/cpu/topology.c \
+    arch/x86_64/cpu/cpufreq.c \
     arch/x86_64/mm/vmm.c \
     arch/x86_64/mm/tlb.c \
     arch/x86_64/mm/kprotect.c \
@@ -261,6 +262,7 @@ KERNEL_C_SRCS := \
     drivers/block/ata.c \
     drivers/block/ahci.c \
     drivers/block/nvme.c \
+    drivers/block/sdhci.c \
     drivers/input/input.c \
     drivers/char/uart.c \
     drivers/char/console.c \
@@ -272,6 +274,8 @@ KERNEL_C_SRCS := \
     drivers/acpi/acpi.c \
     drivers/acpi/ioapic.c \
     drivers/acpi/power.c \
+    drivers/acpi/battery.c \
+    drivers/acpi/thermal.c \
     drivers/sound/sound.c \
     drivers/sound/ac97.c \
     drivers/sound/pcspeaker.c \
@@ -350,12 +354,14 @@ KERNEL_C_SRCS := \
     drivers/usb/host/uhci.c \
     drivers/usb/host/xhci.c \
     drivers/usb/class/usbhid.c \
+    drivers/usb/class/usbstorage.c \
     drivers/net/vmxnet3.c \
     drivers/acpi/pm_timer.c \
     drivers/sound/mpu401.c \
     drivers/misc/virtio_9p.c \
     drivers/usb/host/ehci.c \
     drivers/net/e100.c \
+    drivers/net/tg3.c \
     drivers/acpi/piix4_pm.c
 
 # ── Object file lists ─────────────────────────────────────────────────────────

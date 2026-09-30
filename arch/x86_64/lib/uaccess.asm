@@ -21,6 +21,8 @@ section .text
 copy_from_user:
     test rdx, rdx
     jz .success
+    test rsi, rsi
+    jz .fail
 
     ; Check if src + size wraps around or goes above user space limit (0x00007FFFFFFFFFFF)
     mov rax, rsi
@@ -81,6 +83,8 @@ copy_from_user:
 copy_to_user:
     test rdx, rdx
     jz .success
+    test rdi, rdi
+    jz .fail
 
     ; Check if dst + size wraps around or goes above user space limit
     mov rax, rdi
@@ -135,8 +139,8 @@ copy_to_user:
 ; Returns fixup address, or 0 if not found
 ; ----------------------------------------------------------------------------
 search_extable:
-    mov rax, __extable_start
-    mov rcx, __extable_end
+    lea rax, [rel __extable_start]
+    lea rcx, [rel __extable_end]
 .loop:
     cmp rax, rcx
     jae .not_found

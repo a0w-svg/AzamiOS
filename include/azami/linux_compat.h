@@ -241,3 +241,223 @@ static inline void *ERR_PTR(long error) { return (void *)error; }
 static inline long PTR_ERR(const void *ptr) { return (long)ptr; }
 static inline bool IS_ERR(const void *ptr) { return IS_ERR_VALUE((unsigned long)ptr); }
 static inline bool IS_ERR_OR_NULL(const void *ptr) { return !ptr || IS_ERR(ptr); }
+
+/* ── RCU (Read-Copy-Update) stubs ──────────────────────────────────────── */
+/* AzamiOS does not implement RCU; these stubs exist so drivers that use
+ * rcu_read_lock() in non-critical paths compile without changes. */
+#define rcu_read_lock()         do {} while(0)
+#define rcu_read_unlock()       do {} while(0)
+#define rcu_dereference(p)      (p)
+#define rcu_assign_pointer(p,v) do { (p) = (v); } while(0)
+#define synchronize_rcu()       do {} while(0)
+#define call_rcu(head, func)    do { (func)(head); } while(0)
+
+/* ── Kref (kernel reference counting) ──────────────────────────────────── */
+struct kref {
+    atomic_t refcount;
+};
+
+static inline void kref_init(struct kref *kref) {
+    atomic_set(&kref->refcount, 1);
+}
+
+static inline void kref_get(struct kref *kref) {
+    atomic_inc(&kref->refcount);
+}
+
+static inline int kref_put(struct kref *kref, void (*release)(struct kref *)) {
+    if (atomic_dec_and_test(&kref->refcount)) {
+        release(kref);
+        return 1;
+    }
+    return 0;
+}
+
+/* ── Bitmap operations ─────────────────────────────────────────────────── */
+#define BITS_PER_LONG      64
+#ifndef BIT
+#define BIT(nr)            (1UL << (nr))
+#endif
+#define BIT_MASK(nr)       (1UL << ((nr) % BITS_PER_LONG))
+#define BIT_WORD(nr)       ((nr) / BITS_PER_LONG)
+#define BITS_TO_LONGS(nr)  DIV_ROUND_UP(nr, BITS_PER_LONG)
+#define DECLARE_BITMAP(name, bits)  unsigned long name[BITS_TO_LONGS(bits)]
+
+static inline void set_bit(int nr, volatile unsigned long *addr) {
+    __atomic_or_fetch(&addr[BIT_WORD(nr)], BIT_MASK(nr), __ATOMIC_SEQ_CST);
+}
+
+static inline void clear_bit(int nr, volatile unsigned long *addr) {
+    __atomic_and_fetch(&addr[BIT_WORD(nr)], ~BIT_MASK(nr), __ATOMIC_SEQ_CST);
+}
+
+static inline int test_bit(int nr, const volatile unsigned long *addr) {
+    return 1UL & (addr[BIT_WORD(nr)] >> (nr % BITS_PER_LONG));
+}
+
+static inline int test_and_set_bit(int nr, volatile unsigned long *addr) {
+    unsigned long old = __atomic_fetch_or(&addr[BIT_WORD(nr)], BIT_MASK(nr), __ATOMIC_SEQ_CST);
+    return !!(old & BIT_MASK(nr));
+}
+
+static inline int test_and_clear_bit(int nr, volatile unsigned long *addr) {
+    unsigned long old = __atomic_fetch_and(&addr[BIT_WORD(nr)], ~BIT_MASK(nr), __ATOMIC_SEQ_CST);
+    return !!(old & BIT_MASK(nr));
+}
+
+static inline unsigned long find_first_zero_bit(const unsigned long *addr, unsigned long size) {
+    for (unsigned long i = 0; i < BITS_TO_LONGS(size); i++) {
+        if (~addr[i]) {
+            unsigned long bit = i * BITS_PER_LONG + __builtin_ctzl(~addr[i]);
+            return bit < size ? bit : size;
+        }
+    }
+    return size;
+}
+
+static inline unsigned long find_first_bit(const unsigned long *addr, unsigned long size) {
+    for (unsigned long i = 0; i < BITS_TO_LONGS(size); i++) {
+        if (addr[i]) {
+            unsigned long bit = i * BITS_PER_LONG + __builtin_ctzl(addr[i]);
+            return bit < size ? bit : size;
+        }
+    }
+    return size;
+}
+
+/* ── IDR / IDA (integer ID allocator) ──────────────────────────────────── */
+/* Simplified integer ID allocator using a bitmap. Max 1024 IDs. */
+#define IDR_MAX 1024
+typedef struct {
+    DECLARE_BITMAP(bitmap, IDR_MAX);
+    void *ptrs[IDR_MAX];
+    spinlock_t lock;
+} idr_t;
+
+static inline void idr_init(idr_t *idr) {
+    for (int i = 0; i < (int)BITS_TO_LONGS(IDR_MAX); i++) idr->bitmap[i] = 0;
+    for (int i = 0; i < IDR_MAX; i++) idr->ptrs[i] = NULL;
+    spinlock_init(&idr->lock);
+}
+
+static inline int idr_alloc(idr_t *idr, void *ptr) {
+    spinlock_lock(&idr->lock);
+    unsigned long bit = find_first_zero_bit(idr->bitmap, IDR_MAX);
+    if (bit >= IDR_MAX) { spinlock_unlock(&idr->lock); return -1; }
+    set_bit((int)bit, idr->bitmap);
+    idr->ptrs[bit] = ptr;
+    spinlock_unlock(&idr->lock);
+    return (int)bit;
+}
+
+static inline void *idr_find(idr_t *idr, int id) {
+    if (id < 0 || id >= IDR_MAX) return NULL;
+    return test_bit(id, idr->bitmap) ? idr->ptrs[id] : NULL;
+}
+
+static inline void idr_remove(idr_t *idr, int id) {
+    if (id < 0 || id >= IDR_MAX) return;
+    spinlock_lock(&idr->lock);
+    clear_bit(id, idr->bitmap);
+    idr->ptrs[id] = NULL;
+    spinlock_unlock(&idr->lock);
+}
+
+static inline void idr_destroy(idr_t *idr) {
+    for (int i = 0; i < IDR_MAX; i++) idr->ptrs[i] = NULL;
+    for (int i = 0; i < (int)BITS_TO_LONGS(IDR_MAX); i++) idr->bitmap[i] = 0;
+}
+
+/* ── Scatter-gather list ───────────────────────────────────────────────── */
+/* struct scatterlist, sg_table, sg_init_one(), sg_init_table() and
+ * for_each_sg() are already provided by kernel/mm/dma.h (included above
+ * via the DMA API section). The following are additional SG accessors that
+ * Linux drivers may use but dma.h does not currently export. */
+#ifndef sg_dma_address
+#define sg_dma_address(sg) ((sg)->dma_address)
+#endif
+#ifndef sg_dma_len
+#define sg_dma_len(sg)     ((sg)->dma_length)
+#endif
+
+/* ── Notifier chain stubs ──────────────────────────────────────────────── */
+struct notifier_block {
+    int (*notifier_call)(struct notifier_block *, unsigned long, void *);
+    struct notifier_block *next;
+    int priority;
+};
+
+#define NOTIFY_DONE     0x0000
+#define NOTIFY_OK       0x0001
+#define NOTIFY_STOP_MASK 0x8000
+
+static inline int register_reboot_notifier(struct notifier_block *nb) { (void)nb; return 0; }
+static inline int unregister_reboot_notifier(struct notifier_block *nb) { (void)nb; return 0; }
+
+/* ── Power management stubs ────────────────────────────────────────────── */
+#define PM_SUSPEND_ON     0
+#define PM_SUSPEND_MEM    3
+#define PM_SUSPEND_STANDBY 2
+#define pm_runtime_get_sync(dev)    0
+#define pm_runtime_put(dev)         do {} while(0)
+#define pm_runtime_put_sync(dev)    do {} while(0)
+#define pm_runtime_set_active(dev)  do {} while(0)
+#define pm_runtime_enable(dev)      do {} while(0)
+#define pm_runtime_disable(dev)     do {} while(0)
+
+/* ── Misc Linux compat ─────────────────────────────────────────────────── */
+/* Device model stubs */
+typedef struct class { const char *name; } class_t;
+#define class_create(owner, name) ({ static class_t __cls = { .name = name }; &__cls; })
+#define class_destroy(cls) do {} while(0)
+#define device_create(cls, parent, devt, drvdata, fmt, ...) NULL
+#define device_destroy(cls, devt) do {} while(0)
+
+#define MKDEV(ma, mi) (((ma) << 20) | (mi))
+#define MAJOR(dev)    ((unsigned int)((dev) >> 20))
+#define MINOR(dev)    ((unsigned int)((dev) & 0xfffff))
+
+/* Register/character device stubs */
+#define alloc_chrdev_region(dev, baseminor, count, name) 0
+#define unregister_chrdev_region(from, count) do {} while(0)
+
+struct cdev {
+    void *owner;
+};
+#define cdev_init(cdev, fops) do { (cdev)->owner = NULL; } while(0)
+#define cdev_add(cdev, dev, count) 0
+#define cdev_del(cdev) do {} while(0)
+
+/* Refcount (hardened reference counting) */
+typedef atomic_t refcount_t;
+#define REFCOUNT_INIT(n) ATOMIC_INIT(n)
+#define refcount_set(r, n) atomic_set(r, n)
+#define refcount_read(r)   atomic_read(r)
+#define refcount_inc(r)    atomic_inc(r)
+#define refcount_dec_and_test(r) atomic_dec_and_test(r)
+
+/* simple_strtoul and friends */
+static inline unsigned long simple_strtoul(const char *cp, char **endp, unsigned int base) {
+    unsigned long result = 0;
+    if (!cp) return 0;
+    while (*cp == ' ' || *cp == '\t') cp++;
+    if (base == 0) {
+        if (*cp == '0') {
+            cp++;
+            if (*cp == 'x' || *cp == 'X') { base = 16; cp++; }
+            else base = 8;
+        } else base = 10;
+    }
+    while (*cp) {
+        unsigned int digit;
+        if (*cp >= '0' && *cp <= '9') digit = *cp - '0';
+        else if (*cp >= 'a' && *cp <= 'f') digit = *cp - 'a' + 10;
+        else if (*cp >= 'A' && *cp <= 'F') digit = *cp - 'A' + 10;
+        else break;
+        if (digit >= base) break;
+        result = result * base + digit;
+        cp++;
+    }
+    if (endp) *endp = (char *)cp;
+    return result;
+}

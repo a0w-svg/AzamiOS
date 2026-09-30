@@ -16,6 +16,7 @@
 
 #define DEBUG 1
 #include <azami/debug.h>
+#include <azami/defs.h>
 #include "drm_core.h"
 #include "../../../kernel/uaccess.h"
 #include "../../../kernel/lib/string.h"
@@ -983,7 +984,7 @@ s64 drm_ioctl_dispatch(drm_device_t *dev, drm_file_t *file, u32 cmd, u64 arg)
     /* SET_MASTER/DROP_MASTER carry no argument; everything else must point at
      * a user address. */
     bool needs_arg = (cmd != DRM_IOCTL_SET_MASTER && cmd != DRM_IOCTL_DROP_MASTER);
-    if (needs_arg && (!arg || (uintptr_t)arg >= 0x8000000000000000ULL)) {
+    if (needs_arg && (!arg || (uintptr_t)arg >= TASK_SIZE_MAX)) {
         return -(s64)EFAULT;
     }
 

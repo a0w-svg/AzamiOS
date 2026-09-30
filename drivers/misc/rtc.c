@@ -231,14 +231,14 @@ static s64 rtc_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
 {
     switch (cmd) {
         case RTC_RD_TIME: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -EINVAL;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -EINVAL;
             rtc_time_t t;
             rtc_read_time(&t);
             if (copy_to_user((void*)(uintptr_t)arg, &t, sizeof(t)) != 0) return -EFAULT;
             return 0;
         }
         case RTC_SET_TIME: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -EINVAL;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -EINVAL;
             rtc_time_t t;
             if (copy_from_user(&t, (const void*)(uintptr_t)arg, sizeof(t)) != 0) return -EFAULT;
             rtc_set_time(&t);
@@ -256,7 +256,7 @@ static s64 rtc_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
             return rtc_set_rate((u32)arg);
         }
         case RTC_IRQP_READ: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -EINVAL;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -EINVAL;
             u32 rate = g_rtc_irq_rate;
             if (copy_to_user((void*)(uintptr_t)arg, &rate, sizeof(rate)) != 0) return -EFAULT;
             return 0;

@@ -1716,6 +1716,11 @@ int pidfd_send_signal(int pidfd, int sig, const void *info, unsigned int flags)
     return (int)__syscall_ret(syscall4(SYS_pidfd_send_signal, pidfd, sig, (long)info, (long)flags));
 }
 
+int pidfd_getfd(int pidfd, int targetfd, unsigned int flags)
+{
+    return (int)__syscall_ret(syscall3(SYS_pidfd_getfd, pidfd, targetfd, flags));
+}
+
 int memfd_create(const char *name, unsigned int flags)
 {
     return (int)__syscall_ret(syscall2(SYS_memfd_create, (long)name, (long)flags));
@@ -1899,4 +1904,3 @@ long ptrace(int request, pid_t pid, void *addr, void *data)
 {
     return __syscall_ret(syscall4(SYS_ptrace, request, pid, (long)addr, (long)data));
 }
-

@@ -2201,7 +2201,11 @@ void sched_tick(pt_regs_t *regs)
      * CFS thread, which is what they get back if their policy changes. */
     if (!curr->rt_priority) {
         u32 w = curr->priority ? curr->priority : NICE_0_WEIGHT;
-        curr->vruntime += ((u64)NICE_0_WEIGHT * SCHED_VTIME_UNIT) / w;
+        if (likely(w == NICE_0_WEIGHT)) {
+            curr->vruntime += SCHED_VTIME_UNIT;
+        } else {
+            curr->vruntime += ((u64)NICE_0_WEIGHT * SCHED_VTIME_UNIT) / w;
+        }
     }
 
     if (curr->proc == g_kernel_proc || curr == g_idle_threads[cpu->cpu_id]) {
@@ -3456,6 +3460,58 @@ s64 sched_kill_process(u32 pid, int sig)
         __builtin_unreachable();
     }
     return 0;
+}
+
+s64 sched_kill_process_permitted(process_t *caller, u32 pid, int sig)
+{
+    if (pid == 0) return -(s64)EINVAL;
+    if (sig != 0 && (sig < 0 || sig >= _NSIG)) return -(s64)EINVAL;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    process_t *target = NULL;
+    for (process_t *p = g_process_list; p; p = p->next) {
+        if (p->pid == pid) {
+            target = p;
+            break;
+        }
+        for (thread_t *th = p->threads; th; th = th->proc_next) {
+            if (th->tid == pid) {
+                target = p;
+                break;
+            }
+        }
+        if (target) break;
+    }
+
+    if (!target) {
+        spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+        return -(s64)ESRCH;
+    }
+
+    if (caller && caller != target && caller->pid != target->pid) {
+        /* POSIX.1 permission check:
+         * Sender must have CAP_KILL or euid == 0, or
+         * sender's real or effective UID must match target's real or saved UID. */
+        bool allowed = (caller->euid == 0 || security_check_permission(caller, CAP_KILL) ||
+                        caller->euid == target->uid || caller->euid == target->suid ||
+                        caller->uid  == target->uid || caller->uid  == target->suid);
+        if (!allowed) {
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            return -(s64)EPERM;
+        }
+
+        /* PID 1 protection: unhandled signals cannot be sent to init from other processes */
+        if (target->pid == 1 && sig != 0) {
+            sighandler_t h = target->sigactions[sig].sa_handler;
+            if (h == SIG_DFL || h == SIG_IGN || sig == SIGKILL || sig == SIGSTOP) {
+                spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+                return (sig == SIGKILL || sig == SIGSTOP) ? -(s64)EPERM : 0;
+            }
+        }
+    }
+
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    return sched_kill_process(pid, sig);
 }
 
 process_t *sched_kernel_process(void)

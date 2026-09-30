@@ -11,6 +11,7 @@
 
 #define DEBUG 1
 #include <azami/debug.h>
+#include <azami/defs.h>
 #include "i2c.h"
 #include "../../fs/vfs.h"
 #include "../../kernel/uaccess.h"
@@ -265,17 +266,17 @@ static s64 i2cdev_ioctl(file_t *filp, u32 cmd, u64 arg)
 
     case I2C_FUNCS: {
         u64 funcs = cf->adap->algo->functionality ? cf->adap->algo->functionality(cf->adap) : 0;
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         return copy_to_user((void *)(uintptr_t)arg, &funcs, sizeof(funcs)) == 0
                ? 0 : -(s64)EFAULT;
     }
 
     case I2C_RDWR:
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         return i2cdev_ioctl_rdwr(cf, arg);
 
     case I2C_SMBUS:
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         if (!cf->addr_set) return -(s64)EINVAL;
         return i2cdev_ioctl_smbus(cf, arg);
 

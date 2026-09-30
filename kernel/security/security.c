@@ -158,9 +158,9 @@ bool security_validate_user_ptr(const void *ptr, size_t size)
     uintptr_t addr = (uintptr_t)ptr;
     if (!ptr) return false;
     if (addr < g_mmap_min_addr) return false;
-    /* User space must reside below the canonical hole (< 0x0000800000000000ULL) */
-    if (addr >= 0x0000800000000000ULL) return false;
-    if (addr + size < addr || addr + size > 0x0000800000000000ULL) return false;
+    /* User space must reside below the canonical limit (< TASK_SIZE_MAX) */
+    if (addr >= TASK_SIZE_MAX) return false;
+    if (addr + size < addr || addr + size > TASK_SIZE_MAX) return false;
     return true;
 }
 
@@ -186,9 +186,12 @@ bool security_check_permission(process_t *proc, u32 capability)
     if (!proc) return false;
     if (capability > CAP_LAST_CAP) return false;   /* unknown cap: never grant */
 
-    /* pid 0 (kernel) and pid 1 (init) are the trusted base of the system and
-     * predate any credential setup. */
-    if (proc->pid == 0 || proc->pid == 1) return true;
+    /* PID 0 is the kernel context and has no userspace capability set.
+     * PID 1 is an ordinary userspace process for capability checks: it starts
+     * with a full set in security_caps_init(), but must be able to drop
+     * capabilities permanently just like any other process. Unconditionally
+     * trusting PID 1 here would silently undo capset() and bounding-set drops. */
+    if (proc->pid == 0) return true;
 
     return (proc->cap_effective & CAP_TO_MASK(capability)) != 0;
 }

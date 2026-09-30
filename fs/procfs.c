@@ -37,6 +37,7 @@
 #include "../arch/x86_64/cpu/mce.h"
 #include "../arch/x86_64/cpu/mitigations.h"
 #include "../kernel/security/security.h"
+#include "../kernel/ptrace.h"
 #include "../kernel/ipc/mqueue.h"
 
 #define PROCFS_SUPER_MAGIC 0x9FA0
@@ -160,6 +161,7 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
 static s64 procfs_file_write(struct file *filp, const void *buf, size_t len, u64 *offset);
 static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u64 *offset);
 static s64 procfs_readlink(struct dentry *dentry, char *buf, size_t bufsiz);
+static process_t *find_proc_by_pid(u32 pid);
 
 static inode_operations_t g_procfs_inode_ops = {
     .lookup = procfs_lookup,
@@ -182,6 +184,16 @@ static inode_t *procfs_alloc_inode(super_block_t *sb, u64 ino, u32 mode, procfs_
     inode->i_sb = sb;
     inode->i_op = &g_procfs_inode_ops;
     inode->i_fop = &g_procfs_file_ops;
+
+    if (pid != 0) {
+        sched_lock();
+        process_t *target = find_proc_by_pid(pid);
+        if (target) {
+            inode->i_uid = target->euid;
+            inode->i_gid = target->egid;
+        }
+        sched_unlock();
+    }
 
     procfs_priv_t *priv = (procfs_priv_t *)kzalloc(sizeof(procfs_priv_t));
     if (priv) {
@@ -800,10 +812,17 @@ static size_t format_pid_maps(u32 pid, char *buf, size_t max)
 {
     char name[64] = "/bin/app.elf";
     struct maps_ctx c = { buf, max, 0, name };
+    process_t *curr = sched_current_process();
 
     sched_lock();
     process_t *p = find_proc_by_pid(pid);
     if (p) {
+        /* ASLR protection: only the process itself, root/CAP_SYS_PTRACE, or an
+         * authorized tracer may inspect memory layout. */
+        if (!ptrace_may_access(curr, p)) {
+            sched_unlock();
+            return 0;
+        }
         if (p->name[0]) {
             strncpy(name, p->name, sizeof(name) - 1);
             name[sizeof(name) - 1] = '\0';

@@ -351,7 +351,7 @@ static s64 uart_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
             return 0;
         }
         case 0x5401: { /* TCGETS */
-            if (!arg || arg >= 0x8000000000000000ULL) return -1;
+            if (!arg || arg >= TASK_SIZE_MAX) return -1;
             struct {
                 u32 c_iflag;
                 u32 c_oflag;
@@ -378,7 +378,7 @@ static s64 uart_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
         case 0x5414:   /* TIOCSWINSZ */
             return 0;
         case 0x5413: { /* TIOCGWINSZ */
-            if (!arg || arg >= 0x8000000000000000ULL) return -1;
+            if (!arg || arg >= TASK_SIZE_MAX) return -1;
             struct {
                 u16 ws_row;
                 u16 ws_col;

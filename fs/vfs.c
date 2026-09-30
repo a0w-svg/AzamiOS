@@ -31,12 +31,9 @@ dentry_t *dcache_alloc(dentry_t *parent, const char *name)
     dentry_t *d = (dentry_t *)kzalloc(sizeof(dentry_t));
     if (!d) return NULL;
     
-    int i = 0;
-    while (name[i] && i < VFS_NAME_MAX - 1) {
-        d->d_name[i] = name[i];
-        i++;
-    }
-    d->d_name[i] = '\0';
+    size_t len = strnlen(name, VFS_NAME_MAX - 1);
+    memcpy(d->d_name, name, len);
+    d->d_name[len] = '\0';
     
     d->d_parent = parent;
     if (parent) {
@@ -71,8 +68,7 @@ static inline u32 neg_dcache_hash(dentry_t *parent, const char *name)
 {
     uintptr_t pval = (uintptr_t)parent;
     u32 hash = crc32c(0xFFFFFFFFu, &pval, sizeof(pval));
-    size_t len = 0;
-    while (len < VFS_NAME_MAX && name[len]) len++;
+    size_t len = strnlen(name, VFS_NAME_MAX);
     hash = crc32c(hash, name, len) ^ 0xFFFFFFFFu;
     return hash % NEG_DCACHE_SIZE;
 }
@@ -83,7 +79,7 @@ bool neg_dcache_lookup(dentry_t *parent, const char *name)
     u32 idx = neg_dcache_hash(parent, name);
     spinlock_lock(&g_neg_dcache_lock);
     neg_dentry_t *slot = &g_neg_dcache[idx];
-    if (slot->valid && slot->parent == parent && strncmp(slot->name, name, VFS_NAME_MAX) == 0) {
+    if (slot->valid && slot->parent == parent && slot->name[0] == name[0] && strncmp(slot->name, name, VFS_NAME_MAX) == 0) {
         slot->access_count = ++g_neg_dcache_timer;
         spinlock_unlock(&g_neg_dcache_lock);
         return true;
@@ -101,12 +97,9 @@ void neg_dcache_add(dentry_t *parent, const char *name)
     slot->parent = parent;
     slot->valid = true;
     slot->access_count = ++g_neg_dcache_timer;
-    size_t i = 0;
-    while (name[i] && i < VFS_NAME_MAX - 1) {
-        slot->name[i] = name[i];
-        i++;
-    }
-    slot->name[i] = '\0';
+    size_t len = strnlen(name, VFS_NAME_MAX - 1);
+    memcpy(slot->name, name, len);
+    slot->name[len] = '\0';
     spinlock_unlock(&g_neg_dcache_lock);
 }
 
@@ -139,8 +132,7 @@ static inline u32 dcache_hash_fn(dentry_t *parent, const char *name)
 {
     uintptr_t pval = (uintptr_t)parent;
     u32 hash = crc32c(0xFFFFFFFFu, &pval, sizeof(pval));
-    size_t len = 0;
-    while (len < VFS_NAME_MAX && name[len]) len++;
+    size_t len = strnlen(name, VFS_NAME_MAX);
     hash = crc32c(hash, name, len) ^ 0xFFFFFFFFu;
     return hash & (DCACHE_HASH_SIZE - 1);
 }
@@ -150,12 +142,12 @@ void dcache_add(dentry_t *dentry)
     if (!dentry || !dentry->d_parent || !dentry->d_inode) return;
     
     neg_dcache_invalidate(dentry->d_parent, dentry->d_name);
+    u32 bucket = dcache_hash_fn(dentry->d_parent, dentry->d_name);
 
     spinlock_lock(&g_vfs_lock);
     dentry->d_sibling = dentry->d_parent->d_subdirs;
     dentry->d_parent->d_subdirs = dentry;
 
-    u32 bucket = dcache_hash_fn(dentry->d_parent, dentry->d_name);
     dentry->d_hash_next = g_dcache_hash[bucket];
     g_dcache_hash[bucket] = dentry;
     spinlock_unlock(&g_vfs_lock);
@@ -166,6 +158,7 @@ void dcache_remove(dentry_t *dentry)
     if (!dentry || !dentry->d_parent) return;
 
     neg_dcache_invalidate(dentry->d_parent, dentry->d_name);
+    u32 bucket = dcache_hash_fn(dentry->d_parent, dentry->d_name);
 
     spinlock_lock(&g_vfs_lock);
     dentry_t **curr = &dentry->d_parent->d_subdirs;
@@ -178,7 +171,6 @@ void dcache_remove(dentry_t *dentry)
         curr = &(*curr)->d_sibling;
     }
 
-    u32 bucket = dcache_hash_fn(dentry->d_parent, dentry->d_name);
     dentry_t **hcurr = &g_dcache_hash[bucket];
     while (*hcurr) {
         if (*hcurr == dentry) {
@@ -193,13 +185,14 @@ void dcache_remove(dentry_t *dentry)
 
 dentry_t *dcache_lookup(dentry_t *parent, const char *name)
 {
-    if (!parent) return NULL;
+    if (!parent || !name) return NULL;
     
-    spinlock_lock(&g_vfs_lock);
     u32 bucket = dcache_hash_fn(parent, name);
+
+    spinlock_lock(&g_vfs_lock);
     dentry_t *entry = g_dcache_hash[bucket];
     while (entry) {
-        if (entry->d_parent == parent && strncmp(name, entry->d_name, VFS_NAME_MAX) == 0) {
+        if (entry->d_parent == parent && entry->d_name[0] == name[0] && strncmp(name, entry->d_name, VFS_NAME_MAX) == 0) {
             spinlock_unlock(&g_vfs_lock);
             return entry;
         }
@@ -210,7 +203,7 @@ dentry_t *dcache_lookup(dentry_t *parent, const char *name)
      * (e.g. added to d_subdirs but with a negative entry that was never hashed). */
     dentry_t *child = parent->d_subdirs;
     while (child) {
-        if (strncmp(name, child->d_name, VFS_NAME_MAX) == 0) {
+        if (child->d_name[0] == name[0] && strncmp(name, child->d_name, VFS_NAME_MAX) == 0) {
             /* BUG-9: Only promote to the hash if the dentry has an inode — this
              * matches the invariant enforced by dcache_add().  Inserting a
              * negative dentry (no inode) into the hash would create a duplicate
@@ -700,6 +693,26 @@ restart:
                 *out_dentry = next;
                 return 0;
             }
+
+            /* Linux sysctl protected_symlinks:
+             * In sticky, world-writable directories (e.g. /tmp), only allow following
+             * symlinks if:
+             * 1. The follower is root (euid == 0) or holds CAP_DAC_OVERRIDE / CAP_FOWNER, OR
+             * 2. The symlink is owned by the follower (proc->euid == next->d_inode->i_uid), OR
+             * 3. The symlink is owned by the directory owner (curr->d_inode->i_uid == next->d_inode->i_uid). */
+            if (g_protected_symlinks && curr->d_inode &&
+                ((curr->d_inode->i_mode & (S_ISVTX | S_IWOTH)) == (S_ISVTX | S_IWOTH))) {
+                process_t *proc = sched_current_process();
+                if (proc && proc->euid != 0 &&
+                    !security_check_permission(proc, CAP_DAC_OVERRIDE) &&
+                    !security_check_permission(proc, CAP_FOWNER)) {
+                    if (proc->euid != next->d_inode->i_uid &&
+                        curr->d_inode->i_uid != next->d_inode->i_uid) {
+                        return -(s64)EACCES;
+                    }
+                }
+            }
+
             char link_target[512];
             s64 read_res = -1;
             if (next->d_inode->i_op && next->d_inode->i_op->readlink) {
@@ -1146,6 +1159,23 @@ s64 vfs_mknod(const char *path, u32 mode, u64 rdev)
     return 0;
 }
 
+/* POSIX.1-2008 sticky bit check (S_ISVTX):
+ * When a directory has S_ISVTX set, deletion or rename of an entry is only
+ * allowed if:
+ * 1. The caller is root (euid == 0) or holds CAP_FOWNER, OR
+ * 2. The caller owns the entry being deleted/renamed, OR
+ * 3. The caller owns the directory containing the entry. */
+static bool vfs_check_sticky(inode_t *dir, inode_t *victim)
+{
+    if (!dir || !(dir->i_mode & S_ISVTX)) return true;
+    process_t *proc = sched_current_process();
+    if (!proc || proc->euid == 0) return true;
+    if (security_check_permission(proc, CAP_FOWNER)) return true;
+    if (victim && proc->euid == victim->i_uid) return true;
+    if (proc->euid == dir->i_uid) return true;
+    return false;
+}
+
 s64 vfs_unlink(const char *path)
 {
     dentry_t *dentry = NULL;
@@ -1167,6 +1197,9 @@ s64 vfs_unlink(const char *path)
     if (inode_is_rdonly(dentry->d_inode)) return -(s64)EROFS;
     if (!dentry->d_parent || !dentry->d_parent->d_inode ||
         !dentry->d_parent->d_inode->i_op || !dentry->d_parent->d_inode->i_op->unlink) {
+        return -(s64)EPERM;
+    }
+    if (!vfs_check_sticky(dentry->d_parent->d_inode, dentry->d_inode)) {
         return -(s64)EPERM;
     }
     err = dentry->d_parent->d_inode->i_op->unlink(dentry->d_parent->d_inode, dentry);
@@ -1206,6 +1239,9 @@ s64 vfs_rmdir(const char *path)
         !dentry->d_parent->d_inode->i_op || !dentry->d_parent->d_inode->i_op->rmdir) {
         return -(s64)EPERM;
     }
+    if (!vfs_check_sticky(dentry->d_parent->d_inode, dentry->d_inode)) {
+        return -(s64)EPERM;
+    }
     err = dentry->d_parent->d_inode->i_op->rmdir(dentry->d_parent->d_inode, dentry);
     if (err == 0) {
         dcache_remove(dentry);
@@ -1238,6 +1274,15 @@ s64 vfs_rename(const char *oldpath, const char *newpath)
         !old_dentry->d_parent->d_inode->i_op || !old_dentry->d_parent->d_inode->i_op->rename ||
         !new_dentry->d_parent || !new_dentry->d_parent->d_inode) {
         if (!new_dentry->d_inode) kfree(new_dentry);
+        return -(s64)EPERM;
+    }
+
+    /* POSIX sticky bit directory check on source and destination */
+    if (!vfs_check_sticky(old_dentry->d_parent->d_inode, old_dentry->d_inode)) {
+        if (!new_dentry->d_inode) kfree(new_dentry);
+        return -(s64)EPERM;
+    }
+    if (new_dentry->d_inode && !vfs_check_sticky(new_dentry->d_parent->d_inode, new_dentry->d_inode)) {
         return -(s64)EPERM;
     }
     

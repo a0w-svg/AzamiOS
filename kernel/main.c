@@ -167,6 +167,10 @@ static void kernel_init_thread(void *arg)
     extern void block_nvme_init(void);
     block_nvme_init();
 
+    /* SDHCI controllers (PCI class 0x08 subclass 0x05). */
+    extern void sdhci_init(void);
+    sdhci_init();
+
     extern int fdc_init(void);
     fdc_init();
 
@@ -224,18 +228,31 @@ static void kernel_init_thread(void *arg)
     extern void loop_init(void);
     loop_init();
 
-    /* Initialize Network Interface Drivers & Stack. */
     extern void ne2k_pci_init(void);
+    extern void tg3_init(void);
     e1000_init();
     e100_init();
     rtl8139_init();
     rtl8169_init();
     vmxnet3_init();
     ne2k_pci_init();
+    tg3_init();
     net_init();
 
     /* Hardware monitoring: CPU digital thermal sensor */
     coretemp_init();
+
+    /* CPU frequency scaling & autonomous hardware P-states (Intel HWP, AMD CPPC) */
+    extern void cpufreq_init(void);
+    cpufreq_init();
+
+    /* ACPI Power Supply (Battery & AC Adapter) */
+    extern void battery_init(void);
+    battery_init();
+
+    /* ACPI Thermal Zone & Cooling Device Subsystem */
+    extern void thermal_init(void);
+    thermal_init();
 
     /* Wait for all async PCI driver probes to finish */
     extern void wait_for_device_probe(void);

@@ -23,6 +23,7 @@ static bool g_usb_core_initialized = false;
 /* Class drivers tried, in order, for every interface of every device. */
 static const usb_class_driver_t *const g_class_drivers[] = {
     &usbhid_driver,
+    &usb_storage_driver,
 };
 
 int usb_core_init(void)

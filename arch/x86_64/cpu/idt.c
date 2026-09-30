@@ -448,7 +448,7 @@ static void isr_dispatch_inner(pt_regs_t *r)
         uintptr_t fault_addr = 0;
         if (vec == 14) {
             __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
-            if (fault_addr < 0x0000800000000000ULL) {
+            if (fault_addr < TASK_SIZE_MAX) {
                 if (handle_user_page_fault(r, fault_addr))
                     return;
             }
@@ -535,7 +535,7 @@ static void isr_dispatch_inner(pt_regs_t *r)
                     (unsigned long long)r->r12,  (unsigned long long)r->r13,
                     (unsigned long long)r->r14,  (unsigned long long)r->r15);
 
-            if (r->rsp && (uintptr_t)r->rsp < 0x8000000000000000ULL) {
+            if (r->rsp && (uintptr_t)r->rsp < TASK_SIZE_MAX) {
                 u64 stk[32] = {0};
                 if (copy_from_user(stk, (const void *)r->rsp, sizeof(stk)) == 0) {
                     for (int s = 0; s < 32; s += 4) {
@@ -548,7 +548,7 @@ static void isr_dispatch_inner(pt_regs_t *r)
             }
 
             u8 code_bytes[16];
-            if (r->rip && r->rip < 0x8000000000000000ULL && copy_from_user(code_bytes, (const void *)r->rip, sizeof(code_bytes)) == 0) {
+            if (r->rip && r->rip < TASK_SIZE_MAX && copy_from_user(code_bytes, (const void *)r->rip, sizeof(code_bytes)) == 0) {
                 kprintf("  Code at RIP: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
                         code_bytes[0], code_bytes[1], code_bytes[2], code_bytes[3],
                         code_bytes[4], code_bytes[5], code_bytes[6], code_bytes[7],

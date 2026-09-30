@@ -413,7 +413,7 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
 
     switch (cmd) {
         case FBIOGET_VSCREENINFO: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
             struct fb_var_screeninfo var;
             __builtin_memset(&var, 0, sizeof(var));
             var.xres           = g_fb_state.width;
@@ -435,7 +435,7 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
         }
 
         case FBIOPUT_VSCREENINFO: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
             struct fb_var_screeninfo var;
             if (copy_from_user(&var, (void *)(uintptr_t)arg, sizeof(var)) != 0) return -(s64)EFAULT;
 
@@ -450,7 +450,7 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
         }
 
         case FBIOGET_FSCREENINFO: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
             struct fb_fix_screeninfo fix;
             __builtin_memset(&fix, 0, sizeof(fix));
             strncpy(fix.id, "AzamiFB", sizeof(fix.id) - 1);
@@ -468,7 +468,7 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
         }
 
         case FBIOPAN_DISPLAY: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
             struct fb_var_screeninfo var;
             if (copy_from_user(&var, (void *)(uintptr_t)arg, sizeof(var)) != 0) return -(s64)EFAULT;
 
@@ -497,7 +497,7 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
             return 0;
 
         case FBIOGET_CON2FBMAP: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
             struct fb_con2fbmap c2f;
             c2f.console = 0;
             c2f.framebuffer = 0;
@@ -659,7 +659,7 @@ static s64 fbdev_ioctl(struct file *filp, u32 cmd, u64 arg)
         }
 
         case FBIOAZ_GET_CAPS: {
-            if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+            if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
             struct fb_az_caps caps;
             memset(&caps, 0, sizeof(caps));
             caps.buffers = g_fb_state.buffers;

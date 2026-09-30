@@ -71,6 +71,7 @@ ssize_t lseek(int fd, ssize_t offset, int whence);
 int dup(int oldfd);
 int dup2(int oldfd, int newfd);
 int dup3(int oldfd, int newfd, int flags);
+int close_range(unsigned int first, unsigned int last, unsigned int flags);
 int pipe(int pipefd[2]);
 int pipe2(int pipefd[2], int flags);
 int isatty(int fd);
@@ -167,4 +168,8 @@ int usleep(unsigned long usec);
 /* Linux Extensions */
 int pidfd_open(pid_t pid, unsigned int flags);
 int pidfd_send_signal(int pidfd, int sig, const void *info, unsigned int flags);
+int pidfd_getfd(int pidfd, int targetfd, unsigned int flags);
 int memfd_create(const char *name, unsigned int flags);
+struct open_how;
+int openat2(int dirfd, const char *pathname, const struct open_how *how,
+            size_t size);

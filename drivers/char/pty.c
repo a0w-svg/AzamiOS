@@ -139,7 +139,7 @@ static s64 ptm_ioctl(file_t *filp, u32 cmd, u64 arg)
         return 0;
     }
     case TCGETS: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         if (copy_to_user((void *)(uintptr_t)arg, pty->termios, 60) != 0)
             return -(s64)EFAULT;
         return 0;
@@ -147,7 +147,7 @@ static s64 ptm_ioctl(file_t *filp, u32 cmd, u64 arg)
     case TCSETS:
     case TCSETSW:
     case TCSETSF: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         if (copy_from_user(pty->termios, (const void *)(uintptr_t)arg, 60) != 0)
             return -(s64)EFAULT;
         if (cmd == TCSETSF) {
@@ -169,7 +169,7 @@ static s64 ptm_ioctl(file_t *filp, u32 cmd, u64 arg)
         return 0;
     }
     case TIOCSPGRP: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         int pgrp = 0;
         if (copy_from_user(&pgrp, (const void *)(uintptr_t)arg, sizeof(int)) != 0)
             return -(s64)EFAULT;
@@ -177,7 +177,7 @@ static s64 ptm_ioctl(file_t *filp, u32 cmd, u64 arg)
         return 0;
     }
     case TIOCGPGRP: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         process_t *proc = sched_current_process();
         int pgid = pty->pgrp ? (int)pty->pgrp : (proc ? (int)proc->pgid : 1);
         if (copy_to_user((void *)(uintptr_t)arg, &pgid, sizeof(int)) != 0)
@@ -346,7 +346,7 @@ static s64 pts_ioctl(file_t *filp, u32 cmd, u64 arg)
         return 0;
     }
     case TCGETS: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         if (copy_to_user((void *)(uintptr_t)arg, pty->termios, 60) != 0)
             return -(s64)EFAULT;
         return 0;
@@ -354,7 +354,7 @@ static s64 pts_ioctl(file_t *filp, u32 cmd, u64 arg)
     case TCSETS:
     case TCSETSW:
     case TCSETSF: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         if (copy_from_user(pty->termios, (const void *)(uintptr_t)arg, 60) != 0)
             return -(s64)EFAULT;
         if (cmd == TCSETSF) {
@@ -388,7 +388,7 @@ static s64 pts_ioctl(file_t *filp, u32 cmd, u64 arg)
     case TIOCNOTTY:
         return 0;
     case TIOCSPGRP: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         int pgrp = 0;
         if (copy_from_user(&pgrp, (const void *)(uintptr_t)arg, sizeof(int)) != 0)
             return -(s64)EFAULT;
@@ -396,7 +396,7 @@ static s64 pts_ioctl(file_t *filp, u32 cmd, u64 arg)
         return 0;
     }
     case TIOCGPGRP: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) return -(s64)EINVAL;
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) return -(s64)EINVAL;
         process_t *proc = sched_current_process();
         int pgid = pty->pgrp ? (int)pty->pgrp : (proc ? (int)proc->pgid : 1);
         if (copy_to_user((void *)(uintptr_t)arg, &pgid, sizeof(int)) != 0)

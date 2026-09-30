@@ -5,6 +5,7 @@
 
 #define DEBUG 1
 #include <azami/debug.h>
+#include <azami/defs.h>
 #include "loop.h"
 #include "block.h"
 #include "../../fs/vfs.h"
@@ -127,7 +128,7 @@ static s64 loop_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
     }
 
     case LOOP_GET_STATUS64: {
-        if (!arg || arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         spinlock_lock(&ld->lock);
         if (!ld->is_bound) {
             spinlock_unlock(&ld->lock);
@@ -142,7 +143,7 @@ static s64 loop_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
     }
 
     case LOOP_SET_STATUS64: {
-        if (!arg || arg >= 0x8000000000000000ULL) return -(s64)EFAULT;
+        if (!arg || arg >= TASK_SIZE_MAX) return -(s64)EFAULT;
         struct loop_info64 kinfo;
         if (copy_from_user(&kinfo, (const void *)arg, sizeof(kinfo)) != 0)
             return -(s64)EFAULT;

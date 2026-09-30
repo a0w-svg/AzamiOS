@@ -209,9 +209,13 @@ out:
     return rc;
 }
 
-/* Helper to map and load ELF PT_LOAD segments into a virtual address space */
+/* Helper to map and load ELF PT_LOAD segments into a virtual address space.
+ * Reads all program headers in a single batched vfs_read rather than issuing
+ * individual seeks and reads per phdr, eliminating dozens of redundant VFS
+ * round-trips per execve. */
 static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *file, const elf64_ehdr_t *ehdr,
-                             u64 load_bias, u64 *out_phdr_vaddr, u64 *out_max_vaddr)
+                             u64 load_bias, u64 *out_phdr_vaddr, u64 *out_max_vaddr,
+                             u64 *out_interp_offset, u64 *out_interp_filesz, bool *out_exec_stack)
 {
     u64 phdr_user_vaddr = 0;
     u64 max_vaddr = 0;
@@ -220,18 +224,51 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
      * happens to cover that offset. Remember where it lands. */
     u64 phdr_from_load = 0;
 
+    if (out_interp_offset) *out_interp_offset = 0;
+    if (out_interp_filesz) *out_interp_filesz = 0;
+    if (out_exec_stack) *out_exec_stack = false;
+
+    if (ehdr->e_phnum == 0 || ehdr->e_phnum > 256) {
+        return -ENOEXEC;
+    }
+
+    size_t phdr_table_size = (size_t)ehdr->e_phnum * sizeof(elf64_phdr_t);
+    elf64_phdr_t phdr_stack[32];
+    elf64_phdr_t *phdrs = phdr_stack;
+    bool heap_alloc = false;
+    if (ehdr->e_phnum > 32) {
+        phdrs = (elf64_phdr_t *)kmalloc(phdr_table_size);
+        if (!phdrs) return -ENOMEM;
+        heap_alloc = true;
+    }
+
+    file->f_pos = ehdr->e_phoff;
+    s64 nread_hdrs = vfs_read(file, phdrs, phdr_table_size);
+    if (nread_hdrs < (s64)phdr_table_size) {
+        if (heap_alloc) kfree(phdrs);
+        return -ENOEXEC;
+    }
+
+    int ret = 0;
     for (u16 i = 0; i < ehdr->e_phnum; i++) {
-        elf64_phdr_t phdr;
-        file->f_pos = ehdr->e_phoff + (u64)i * sizeof(phdr);
-        if (vfs_read(file, &phdr, sizeof(phdr)) != sizeof(phdr)) {
-            continue;
+        const elf64_phdr_t *phdr = &phdrs[i];
+
+        if (phdr->p_type == PT_INTERP) {
+            if (out_interp_offset) *out_interp_offset = phdr->p_offset;
+            if (out_interp_filesz) *out_interp_filesz = phdr->p_filesz;
         }
 
-        if (phdr.p_type == PT_PHDR) {
-            phdr_user_vaddr = load_bias + phdr.p_vaddr;
+        if (phdr->p_type == PT_GNU_STACK) {
+            if (out_exec_stack && (phdr->p_flags & PF_X)) {
+                *out_exec_stack = true;
+            }
         }
 
-        if (phdr.p_type != PT_LOAD || phdr.p_memsz == 0) continue;
+        if (phdr->p_type == PT_PHDR) {
+            phdr_user_vaddr = load_bias + phdr->p_vaddr;
+        }
+
+        if (phdr->p_type != PT_LOAD || phdr->p_memsz == 0) continue;
 
         /* Does this segment's file image contain the program header table? If
          * so its run-time address is the segment's, shifted by the same amount
@@ -240,48 +277,48 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
          * `load_bias + e_phoff` as the answer hands userspace a near-zero
          * address: musl's __init_tls walks it and faults before main(). */
         if (phdr_from_load == 0 &&
-            ehdr->e_phoff >= phdr.p_offset &&
-            ehdr->e_phoff + (u64)ehdr->e_phnum * ehdr->e_phentsize
-                <= phdr.p_offset + phdr.p_filesz) {
-            phdr_from_load = load_bias + phdr.p_vaddr + (ehdr->e_phoff - phdr.p_offset);
+            ehdr->e_phoff >= phdr->p_offset &&
+            ehdr->e_phoff + phdr_table_size <= phdr->p_offset + phdr->p_filesz) {
+            phdr_from_load = load_bias + phdr->p_vaddr + (ehdr->e_phoff - phdr->p_offset);
         }
 
         /* A segment whose file image is larger than its memory image is
          * malformed — the streaming loop below would run off the mapped range. */
-        if (phdr.p_filesz > phdr.p_memsz) {
-            return -ENOEXEC;
+        if (phdr->p_filesz > phdr->p_memsz) {
+            ret = -ENOEXEC;
+            goto cleanup;
         }
 
-        u64 seg_vaddr = load_bias + phdr.p_vaddr;
+        u64 seg_vaddr = load_bias + phdr->p_vaddr;
 
         /* Prevent Integer Overflow */
-        if (seg_vaddr + phdr.p_memsz < seg_vaddr) {
-            return -EINVAL;
+        if (seg_vaddr + phdr->p_memsz < seg_vaddr) {
+            ret = -EINVAL;
+            goto cleanup;
         }
 
-        if (seg_vaddr + phdr.p_memsz > max_vaddr) {
-            max_vaddr = seg_vaddr + phdr.p_memsz;
+        if (seg_vaddr + phdr->p_memsz > max_vaddr) {
+            max_vaddr = seg_vaddr + phdr->p_memsz;
         }
 
         u64 start_vaddr = ALIGN_DOWN(seg_vaddr, PAGE_SIZE);
-        u64 end_vaddr = ALIGN_UP(seg_vaddr + phdr.p_memsz, PAGE_SIZE);
+        u64 end_vaddr = ALIGN_UP(seg_vaddr + phdr->p_memsz, PAGE_SIZE);
 
-        /* BUG-R fix: exclusive upper bound is 0x0000800000000000 (consistent
-         * with uaccess.asm BUG-O fix); use >= so a segment ending precisely
-         * at the canonical boundary is also rejected. */
-        if (end_vaddr >= 0x0000800000000000ULL) {
-            return -EINVAL;
+        /* Canonical boundary enforcement */
+        if (end_vaddr >= TASK_SIZE_MAX) {
+            ret = -EINVAL;
+            goto cleanup;
         }
 
         u64 vmm_flags = VMM_F_PRESENT | VMM_F_USER;
-        if (phdr.p_flags & PF_W) vmm_flags |= VMM_F_WRITE;
-        if (!(phdr.p_flags & PF_X)) vmm_flags |= VMM_F_NX;
+        if (phdr->p_flags & PF_W) vmm_flags |= VMM_F_WRITE;
+        if (!(phdr->p_flags & PF_X)) vmm_flags |= VMM_F_NX;
 
         if (proc && end_vaddr > start_vaddr) {
             u32 vma_prot = 0;
-            if (phdr.p_flags & PF_R) vma_prot |= VMA_PROT_READ;
-            if (phdr.p_flags & PF_W) vma_prot |= VMA_PROT_WRITE;
-            if (phdr.p_flags & PF_X) vma_prot |= VMA_PROT_EXEC;
+            if (phdr->p_flags & PF_R) vma_prot |= VMA_PROT_READ;
+            if (phdr->p_flags & PF_W) vma_prot |= VMA_PROT_WRITE;
+            if (phdr->p_flags & PF_X) vma_prot |= VMA_PROT_EXEC;
             vma_add(proc, start_vaddr, end_vaddr, vma_prot, VMA_F_FILE);
         }
 
@@ -303,14 +340,17 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
                 page_buf = (void *)PHYS_TO_VIRT(phys);
             } else {
                 phys = pmm_alloc_page();
-                if (!phys) return -ENOMEM;
+                if (!phys) {
+                    ret = -ENOMEM;
+                    goto cleanup;
+                }
                 page_buf = (void *)PHYS_TO_VIRT(phys);
                 vmm_map(user_space, vaddr, phys, vmm_flags);
             }
 
             /* Overlap calculation between this page [vaddr, page_end) and file data [seg_vaddr, file_data_end) */
             u64 page_end = vaddr + PAGE_SIZE;
-            u64 file_data_end = seg_vaddr + phdr.p_filesz;
+            u64 file_data_end = seg_vaddr + phdr->p_filesz;
             u64 file_start = (vaddr < seg_vaddr) ? seg_vaddr : vaddr;
             u64 file_end   = (page_end < file_data_end) ? page_end : file_data_end;
 
@@ -322,12 +362,13 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
                     __builtin_memset(page_buf, 0, (size_t)page_off);
                 }
 
-                file->f_pos = phdr.p_offset + (file_start - seg_vaddr);
+                file->f_pos = phdr->p_offset + (file_start - seg_vaddr);
                 s64 nread = vfs_read(file, (char *)page_buf + page_off, read_bytes);
                 if (nread < (s64)read_bytes) {
                     pr_debug("[ELF] ERROR: Short read on segment %u at vaddr 0x%llx\n",
                              (unsigned int)i, (unsigned long long)vaddr);
-                    return -EIO;
+                    ret = -EIO;
+                    goto cleanup;
                 }
 
                 if (page_off + read_bytes < PAGE_SIZE) {
@@ -346,7 +387,11 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
     }
     if (out_phdr_vaddr) *out_phdr_vaddr = phdr_user_vaddr;
     if (out_max_vaddr) *out_max_vaddr = max_vaddr;
-    return 0;
+    ret = 0;
+
+cleanup:
+    if (heap_alloc) kfree(phdrs);
+    return ret;
 }
 
 
@@ -503,7 +548,12 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     /* Load main executable segments */
     u64 phdr_user_vaddr = 0;
     u64 max_exec_vaddr = 0;
-    int err = load_elf_segments(proc, user_space, file, &ehdr, load_bias, &phdr_user_vaddr, &max_exec_vaddr);
+    u64 interp_offset = 0;
+    u64 interp_filesz = 0;
+    bool exec_stack = false;
+    int err = load_elf_segments(proc, user_space, file, &ehdr, load_bias,
+                                &phdr_user_vaddr, &max_exec_vaddr,
+                                &interp_offset, &interp_filesz, &exec_stack);
     if (err < 0) {
         vmm_destroy_space(user_space);
         vfs_close(file);
@@ -514,75 +564,69 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     u64 final_entry = main_entry;
     u64 interp_base = 0;
 
-    for (u16 i = 0; i < ehdr.e_phnum; i++) {
-        elf64_phdr_t phdr;
-        file->f_pos = ehdr.e_phoff + (u64)i * sizeof(phdr);
-        if (vfs_read(file, &phdr, sizeof(phdr)) != sizeof(phdr)) continue;
+    if (interp_filesz > 0 && interp_filesz < 256) {
+        char interp_path[256];
+        file->f_pos = interp_offset;
+        s64 ilen = vfs_read(file, interp_path, interp_filesz);
+        if (ilen > 0) {
+            if (ilen >= (s64)sizeof(interp_path)) ilen = sizeof(interp_path) - 1;
+            interp_path[ilen] = '\0';
 
-        if (phdr.p_type == PT_INTERP && phdr.p_filesz > 0 && phdr.p_filesz < 256) {
-            char interp_path[256];
-            file->f_pos = phdr.p_offset;
-            s64 ilen = vfs_read(file, interp_path, phdr.p_filesz);
-            if (ilen > 0) {
-                if (ilen >= (s64)sizeof(interp_path)) ilen = sizeof(interp_path) - 1;
-                interp_path[ilen] = '\0';
+            /* Try the path the binary embeds first, then a prioritised list
+             * of well-known locations that covers glibc, musl, and custom
+             * AzamiOS installations.  The loop tries each in order and stops
+             * at the first successful open(). */
+            static const char * const interp_search[] = {
+                /* exact embedded path (first) */
+                NULL,
+                /* standard glibc paths */
+                "/lib64/ld-linux-x86-64.so.2",
+                "/lib/ld-linux-x86-64.so.2",
+                "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                "/usr/lib64/ld-linux-x86-64.so.2",
+                "/usr/lib/ld-linux-x86-64.so.2",
+                /* musl libc */
+                "/lib/ld-musl-x86_64.so.1",
+                "/lib/x86_64-linux-musl/ld-musl-x86_64.so.1",
+                /* AzamiOS-specific fallbacks */
+                "/lib/ld.so",
+                "/lib64/ld.so",
+                "/bin/ld.so",
+                NULL,
+            };
 
-                /* Try the path the binary embeds first, then a prioritised list
-                 * of well-known locations that covers glibc, musl, and custom
-                 * AzamiOS installations.  The loop tries each in order and stops
-                 * at the first successful open(). */
-                static const char * const interp_search[] = {
-                    /* exact embedded path (first) */
-                    NULL,
-                    /* standard glibc paths */
-                    "/lib64/ld-linux-x86-64.so.2",
-                    "/lib/ld-linux-x86-64.so.2",
-                    "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-                    "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-                    "/usr/lib64/ld-linux-x86-64.so.2",
-                    "/usr/lib/ld-linux-x86-64.so.2",
-                    /* musl libc */
-                    "/lib/ld-musl-x86_64.so.1",
-                    "/lib/x86_64-linux-musl/ld-musl-x86_64.so.1",
-                    /* AzamiOS-specific fallbacks */
-                    "/lib/ld.so",
-                    "/lib64/ld.so",
-                    "/bin/ld.so",
-                    NULL,
-                };
+            file_t *ifile = NULL;
+            for (int si = 0; interp_search[si] != NULL || si == 0; si++) {
+                const char *try_path = (si == 0) ? interp_path : interp_search[si];
+                if (!try_path) continue;
+                ifile = vfs_open(try_path, 0, 0);
+                if (ifile) break;
+            }
 
-                file_t *ifile = NULL;
-                for (int si = 0; interp_search[si] != NULL || si == 0; si++) {
-                    const char *try_path = (si == 0) ? interp_path : interp_search[si];
-                    if (!try_path) continue;
-                    ifile = vfs_open(try_path, 0, 0);
-                    if (ifile) break;
-                }
-
-                if (ifile) {
-                    elf64_ehdr_t iehdr;
-                    if (vfs_read(ifile, &iehdr, sizeof(iehdr)) == sizeof(iehdr)) {
-                        if (iehdr.e_ident_magic == ELF_MAGIC && iehdr.e_machine == EM_X86_64) {
-                            interp_base = (iehdr.e_type == ET_DYN)
-                                              ? INTERP_LOAD_BASE + aslr_offset(proc, ASLR_INTERP_RND_PAGES)
-                                              : 0;
-                            u64 iphdr_vaddr = 0;
-                            u64 imax_vaddr = 0;
-                            if (load_elf_segments(proc, user_space, ifile, &iehdr, interp_base, &iphdr_vaddr, &imax_vaddr) == 0) {
-                                final_entry = interp_base + iehdr.e_entry;
-                                pr_debug("[ELF] Loaded dynamic linker %s (Base: 0x%016llx, Entry: 0x%016llx)\n",
-                                         interp_path, (unsigned long long)interp_base, (unsigned long long)final_entry);
-                            }
+            if (ifile) {
+                elf64_ehdr_t iehdr;
+                if (vfs_read(ifile, &iehdr, sizeof(iehdr)) == sizeof(iehdr)) {
+                    if (iehdr.e_ident_magic == ELF_MAGIC && iehdr.e_machine == EM_X86_64) {
+                        interp_base = (iehdr.e_type == ET_DYN)
+                                          ? INTERP_LOAD_BASE + aslr_offset(proc, ASLR_INTERP_RND_PAGES)
+                                          : 0;
+                        u64 iphdr_vaddr = 0;
+                        u64 imax_vaddr = 0;
+                        if (load_elf_segments(proc, user_space, ifile, &iehdr, interp_base,
+                                              &iphdr_vaddr, &imax_vaddr, NULL, NULL, NULL) == 0) {
+                            final_entry = interp_base + iehdr.e_entry;
+                            pr_debug("[ELF] Loaded dynamic linker %s (Base: 0x%016llx, Entry: 0x%016llx)\n",
+                                     interp_path, (unsigned long long)interp_base, (unsigned long long)final_entry);
                         }
                     }
-                    vfs_close(ifile);
-                } else {
-                    pr_debug("[ELF] WARNING: PT_INTERP '%s' not found in VFS; "
-                             "binary will likely crash without a dynamic linker.\n",
-                             interp_path);
                 }
+                vfs_close(ifile);
+            } else {
+                pr_debug("[ELF] WARNING: PT_INTERP '%s' not found in VFS; "
+                         "binary will likely crash without a dynamic linker.\n",
+                         interp_path);
             }
-            break;
         }
     }
 
@@ -603,6 +647,13 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
      * is exactly the fault that triggered this correction. */
 
     /* ── 4. Allocate 16 KB Ring-3 User Stack ──────────────────────────────── */
+    u64 stack_flags = VMM_USER_RW;
+    u32 stack_prot  = VMA_PROT_READ | VMA_PROT_WRITE;
+    if (exec_stack) {
+        stack_flags &= ~VMM_F_NX;
+        stack_prot  |= VMA_PROT_EXEC;
+    }
+
     phys_addr_t top_page_phys = 0;
     for (u64 vaddr = stack_base; vaddr < stack_top; vaddr += PAGE_SIZE) {
         phys_addr_t phys = pmm_alloc_page();
@@ -611,7 +662,7 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
             return -ENOMEM;
         }
         hw_clear_page((void *)PHYS_TO_VIRT(phys));
-        vmm_map(user_space, vaddr, phys, VMM_USER_RW);
+        vmm_map(user_space, vaddr, phys, stack_flags);
         if (vaddr == stack_top - PAGE_SIZE) {
             top_page_phys = phys;
         }
@@ -641,7 +692,7 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     proc->stack_high = stack_top;
     proc->stack_low  = stack_top - USER_STACK_MAX_BYTES;
     vma_add(proc, proc->stack_low, proc->stack_high,
-            VMA_PROT_READ | VMA_PROT_WRITE, VMA_F_ANON | VMA_F_STACK);
+            stack_prot, VMA_F_ANON | VMA_F_STACK);
 
     *out_entry = (uintptr_t)final_entry;
     *out_space = user_space;

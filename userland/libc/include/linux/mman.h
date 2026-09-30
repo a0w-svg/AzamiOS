@@ -1,0 +1,43 @@
+#pragma once
+
+#define MAP_GROWSDOWN  0x0100
+#define MAP_DENYWRITE  0x0800
+#define MAP_EXECUTABLE 0x1000
+#define MAP_LOCKED     0x2000
+#define MAP_NORESERVE  0x4000
+#define MAP_POPULATE   0x08000
+#define MAP_NONBLOCK   0x10000
+#define MAP_STACK      0x20000
+#define MAP_HUGETLB    0x40000
+#define MAP_SYNC       0x80000
+#define MAP_FIXED_NOREPLACE 0x100000
+#define MAP_UNINITIALIZED 0x4000000
+
+#define MADV_NORMAL      0
+#define MADV_RANDOM      1
+#define MADV_SEQUENTIAL  2
+#define MADV_WILLNEED    3
+#define MADV_DONTNEED    4
+#define MADV_FREE        8
+#define MADV_REMOVE      9
+#define MADV_DONTFORK    10
+#define MADV_DOFORK      11
+#define MADV_MERGEABLE   12
+#define MADV_UNMERGEABLE 13
+#define MADV_HUGEPAGE    14
+#define MADV_NOHUGEPAGE  15
+#define MADV_DONTDUMP    16
+#define MADV_DODUMP      17
+#define MADV_WIPEONFORK  18
+#define MADV_KEEPONFORK  19
+#define MADV_COLD        20
+#define MADV_PAGEOUT     21
+#define MADV_POPULATE_READ 22
+#define MADV_POPULATE_WRITE 23
+#define MADV_DONTNEED_LOCKED 24
+#define MADV_COLLAPSE    25
+#define MADV_HWPOISON    100
+
+#define MREMAP_MAYMOVE   1
+#define MREMAP_FIXED     2
+#define MREMAP_DONTUNMAP 4

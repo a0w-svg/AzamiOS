@@ -6,6 +6,7 @@
 /* BUG-1 fix: removed duplicate #define DEBUG 1 */
 #define DEBUG 1
 #include "../../include/azami/debug.h"
+#include "../../include/azami/defs.h"
 #include "ac97.h"
 #include "sound.h"
 #include "../../hal/pci.h"
@@ -115,7 +116,7 @@ static s64 ac97_ioctl(u64 cmd, void *arg)
 
     switch (cmd) {
     case SOUND_PCM_WRITE_VOLUME: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) { spinlock_unlock_irqrestore(&g_ac97_lock, irqf); return -1; }
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) { spinlock_unlock_irqrestore(&g_ac97_lock, irqf); return -1; }
         u32 vol;
         if (copy_from_user(&vol, arg, sizeof(u32)) != 0) { spinlock_unlock_irqrestore(&g_ac97_lock, irqf); return -1; }
         u8 left = (vol & 0xFF) * 31 / 100;
@@ -127,7 +128,7 @@ static s64 ac97_ioctl(u64 cmd, void *arg)
         return 0;
     }
     case SOUND_PCM_WRITE_RATE: {
-        if (!arg || (uintptr_t)arg >= 0x8000000000000000ULL) { spinlock_unlock_irqrestore(&g_ac97_lock, irqf); return -1; }
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX) { spinlock_unlock_irqrestore(&g_ac97_lock, irqf); return -1; }
         u32 rate;
         if (copy_from_user(&rate, arg, sizeof(u32)) != 0) { spinlock_unlock_irqrestore(&g_ac97_lock, irqf); return -1; }
         ac97_outw(g_nam_bar, AC97_NAMBAR_PCM_FRONT_RATE, (u16)rate);

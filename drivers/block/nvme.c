@@ -38,6 +38,7 @@
 #include "../../kernel/lib/string.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../kernel/uaccess.h"
 #include "../../hal/pci.h"
 #include "../../hal/device.h"
 #include "../base/pci_bus.h"
@@ -370,10 +371,6 @@ static s64 nvme_write_sectors(block_dev_t *dev, u64 lba, u32 count, const void *
     return nvme_transfer((nvme_ns_t *)dev->driver_data, lba, count, (void *)buf, true);
 }
 
-static block_ops_t g_nvme_ops = {
-    .read_sectors  = nvme_read_sectors,
-    .write_sectors = nvme_write_sectors,
-};
 
 /* ── Admin commands ──────────────────────────────────────────────────────── */
 
@@ -435,6 +432,137 @@ static int nvme_create_io_queues(nvme_ctrl_t *c)
     }
     return 0;
 }
+
+/* ── Linux NVMe IOCTL & Flush ────────────────────────────────────────────── */
+
+struct nvme_admin_cmd_uapi {
+    u8   opcode;
+    u8   flags;
+    u16  rsvd1;
+    u32  nsid;
+    u32  cdw2;
+    u32  cdw3;
+    u64  metadata;
+    u64  addr;
+    u32  metadata_len;
+    u32  data_len;
+    u32  cdw10;
+    u32  cdw11;
+    u32  cdw12;
+    u32  cdw13;
+    u32  cdw14;
+    u32  cdw15;
+    u32  timeout_ms;
+    u32  result;
+};
+
+#define NVME_IOCTL_ID            0x4E40
+#define NVME_IOCTL_ADMIN_CMD     0xC0484E41
+#define NVME_IOCTL_RESET         0x4E44
+#define NVME_IOCTL_SUBSYS_RESET  0x4E45
+
+static s64 nvme_flush(block_dev_t *dev)
+{
+    nvme_ns_t *ns = (nvme_ns_t *)dev->driver_data;
+    if (!ns || !ns->ctrl) return -(s64)ENODEV;
+    nvme_ctrl_t *c = ns->ctrl;
+
+    nvme_sqe_t cmd;
+    __builtin_memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = 0x00; /* NVMe Flush */
+    cmd.nsid   = ns->nsid;
+
+    spinlock_lock(&c->lock);
+    int rc = queue_submit_sync(c, &c->io, &cmd, NULL);
+    spinlock_unlock(&c->lock);
+    return (rc == 0) ? 0 : -(s64)EIO;
+}
+
+static s64 nvme_ioctl(block_dev_t *bdev, u32 cmd, u64 arg)
+{
+    nvme_ns_t *ns = (nvme_ns_t *)bdev->driver_data;
+    if (!ns || !ns->ctrl) return -(s64)ENODEV;
+    nvme_ctrl_t *c = ns->ctrl;
+
+    switch (cmd) {
+    case NVME_IOCTL_ID:
+        return (s64)ns->nsid;
+
+    case NVME_IOCTL_ADMIN_CMD: {
+        struct nvme_admin_cmd_uapi ucmd;
+        if (copy_from_user(&ucmd, (const void *)arg, sizeof(ucmd)) != 0)
+            return -(s64)EFAULT;
+
+        nvme_sqe_t sqe;
+        __builtin_memset(&sqe, 0, sizeof(sqe));
+        sqe.opcode = ucmd.opcode;
+        sqe.nsid   = ucmd.nsid ? ucmd.nsid : ns->nsid;
+        sqe.cdw10  = ucmd.cdw10;
+        sqe.cdw11  = ucmd.cdw11;
+        sqe.cdw12  = ucmd.cdw12;
+        sqe.cdw13  = ucmd.cdw13;
+        sqe.cdw14  = ucmd.cdw14;
+        sqe.cdw15  = ucmd.cdw15;
+
+        phys_addr_t bounce_phys = 0;
+        void *bounce_virt = NULL;
+        u32 len = ucmd.data_len;
+        if (len > PAGE_SIZE) len = PAGE_SIZE;
+
+        if (len > 0 && ucmd.addr) {
+            bounce_phys = pmm_alloc_page();
+            if (!bounce_phys) return -(s64)ENOMEM;
+            bounce_virt = (void *)PHYS_TO_VIRT(bounce_phys);
+            __builtin_memset(bounce_virt, 0, PAGE_SIZE);
+
+            /* If opcode has bit 0 set to 0 (host to device write), copy from user */
+            if (!(ucmd.opcode & 1)) {
+                if (copy_from_user(bounce_virt, (const void *)(uintptr_t)ucmd.addr, len) != 0) {
+                    pmm_free_page(bounce_phys);
+                    return -(s64)EFAULT;
+                }
+            }
+            sqe.prp1 = bounce_phys;
+        }
+
+        u32 result = 0;
+        spinlock_lock(&c->lock);
+        int rc = queue_submit_sync(c, &c->admin, &sqe, &result);
+        spinlock_unlock(&c->lock);
+
+        if (rc == 0 && len > 0 && ucmd.addr && (ucmd.opcode & 1)) {
+            /* Device to host read: copy data back to user */
+            if (copy_to_user((void *)(uintptr_t)ucmd.addr, bounce_virt, len) != 0) {
+                if (bounce_phys) pmm_free_page(bounce_phys);
+                return -(s64)EFAULT;
+            }
+        }
+
+        if (bounce_phys) pmm_free_page(bounce_phys);
+
+        ucmd.result = result;
+        if (copy_to_user((void *)arg, &ucmd, sizeof(ucmd)) != 0)
+            return -(s64)EFAULT;
+
+        return (rc == 0) ? 0 : -(s64)EIO;
+    }
+    case NVME_IOCTL_RESET:
+    case NVME_IOCTL_SUBSYS_RESET:
+        return 0;
+
+    default:
+        return -(s64)ENOTTY;
+    }
+}
+
+static block_ops_t g_nvme_ops = {
+    .read_sectors  = nvme_read_sectors,
+    .write_sectors = nvme_write_sectors,
+    .flush         = nvme_flush,
+    .trim          = NULL,
+    .ioctl         = nvme_ioctl,
+};
+
 
 /* Register one block device per active namespace. */
 static void nvme_scan_namespaces(nvme_ctrl_t *c, u32 nn)

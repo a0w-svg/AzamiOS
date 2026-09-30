@@ -187,6 +187,9 @@
 #define SYS_tgkill        234
 #define SYS_utimes        235
 #define SYS_waitid        247
+#define SYS_add_key            248
+#define SYS_request_key        249
+#define SYS_keyctl             250
 #define SYS_inotify_init  253
 #define SYS_inotify_add_watch 254
 #define SYS_inotify_rm_watch  255
@@ -243,12 +246,22 @@
 #define SYS_pkey_alloc    330
 #define SYS_pkey_free     331
 #define SYS_statx         332
+#define SYS_io_pgetevents      333
 #define SYS_rseq          334
 #define SYS_process_madvise 440
 #define SYS_futex_waitv   449
 #define SYS_cachestat     451
 #define SYS_mseal         462
 #define SYS_pidfd_send_signal 424
+#define SYS_io_uring_setup     425
+#define SYS_io_uring_enter     426
+#define SYS_io_uring_register  427
+#define SYS_open_tree          428
+#define SYS_move_mount         429
+#define SYS_fsopen             430
+#define SYS_fsconfig           431
+#define SYS_fsmount            432
+#define SYS_fspick             433
 #define SYS_pidfd_open    434
 #define SYS_clone3        435
 #define SYS_close_range   436
@@ -256,6 +269,18 @@
 #define SYS_pidfd_getfd   438
 #define SYS_faccessat2    439
 #define SYS_epoll_pwait2  441
+#define SYS_mount_setattr      442
+#define SYS_quotactl_fd        443
+#define SYS_landlock_create_ruleset 444
+#define SYS_landlock_add_rule      445
+#define SYS_landlock_restrict_self 446
+#define SYS_memfd_secret       447
+
+/* close_range(2) flags from Linux's <linux/close_range.h>.  They live in
+ * this common UAPI header so both the kernel and staged libc headers agree
+ * on the ABI without carrying duplicate numeric definitions. */
+#define CLOSE_RANGE_UNSHARE  (1U << 1)
+#define CLOSE_RANGE_CLOEXEC  (1U << 2)
 
 /* ── Remaining Linux x86_64 syscall numbers. Those with a real handler are
  *    wired up in syscall_init(); the rest resolve to -ENOSYS through the
@@ -354,9 +379,15 @@
 #define SYS_process_mrelease     448
 #define SYS_set_mempolicy_home_node 450
 #define SYS_fchmodat2            452
+#define SYS_map_shadow_stack   453
 #define SYS_futex_wake           454
 #define SYS_futex_wait           455
 #define SYS_futex_requeue        456
+#define SYS_statmount          457
+#define SYS_listmount          458
+#define SYS_lsm_get_self_attr  459
+#define SYS_lsm_set_self_attr  460
+#define SYS_lsm_list_modules   461
 
 /* ioprio_set/get: `which` selects the target, `who` identifies it, and the
  * class/data pair packs into one int as Linux defines it. */
@@ -497,6 +528,93 @@ struct futex_waitv {
 #define MCL_FUTURE      2
 #define MCL_ONFAULT     4
 #define MLOCK_ONFAULT   1
+
+/* ── io_uring structures ──────────────────────────────────────────────────── */
+struct io_uring_params {
+    uint32_t sq_entries;
+    uint32_t cq_entries;
+    uint32_t flags;
+    uint32_t sq_thread_cpu;
+    uint32_t sq_thread_idle;
+    uint32_t features;
+    uint32_t wq_fd;
+    uint32_t resv[3];
+    struct io_sqring_offsets {
+        uint32_t head;
+        uint32_t tail;
+        uint32_t ring_mask;
+        uint32_t ring_entries;
+        uint32_t flags;
+        uint32_t dropped;
+        uint32_t array;
+        uint32_t resv1;
+        uint64_t resv2;
+    } sq_off;
+    struct io_cqring_offsets {
+        uint32_t head;
+        uint32_t tail;
+        uint32_t ring_mask;
+        uint32_t ring_entries;
+        uint32_t overflow;
+        uint32_t cqes;
+        uint32_t flags;
+        uint32_t resv1;
+        uint64_t resv2;
+    } cq_off;
+};
+
+/* ── Landlock structures ──────────────────────────────────────────────────── */
+struct landlock_ruleset_attr {
+    uint64_t handled_access_fs;
+    uint64_t handled_access_net;
+};
+
+#define LANDLOCK_CREATE_RULESET_VERSION  (1U << 0)
+
+struct landlock_path_beneath_attr {
+    uint64_t allowed_access;
+    int32_t  parent_fd;
+}  __attribute__((packed));
+
+struct landlock_net_port_attr {
+    uint64_t allowed_access;
+    uint64_t port;
+};
+
+#define LANDLOCK_RULE_PATH_BENEATH  1
+#define LANDLOCK_RULE_NET_PORT      2
+
+/* ── statmount / listmount structures ─────────────────────────────────────── */
+struct statmount {
+    uint32_t size;
+    uint32_t __spare1;
+    uint64_t mask;
+    uint32_t sb_dev_major;
+    uint32_t sb_dev_minor;
+    uint64_t sb_magic;
+    uint32_t sb_flags;
+    uint32_t fs_type;
+    uint64_t mnt_id;
+    uint64_t mnt_parent_id;
+    uint32_t mnt_id_old;
+    uint32_t mnt_parent_id_old;
+    uint64_t mnt_attr;
+    uint64_t mnt_propagation;
+    uint64_t mnt_peer_group;
+    uint64_t mnt_master;
+    uint64_t propagate_from;
+    uint32_t mnt_root;
+    uint32_t mnt_point;
+    uint64_t __spare2[50];
+    char     str[];
+};
+
+struct mnt_id_req {
+    uint32_t size;
+    uint32_t spare;
+    uint64_t mnt_id;
+    uint64_t param;
+};
 
 /* Azami-specific extended calls (base 512 to avoid Linux conflicts) */
 #define SYS_AZ_CHANNEL_CREATE  512

@@ -331,9 +331,20 @@ static int rtl8169_probe(dm_device_t *dm, const pci_device_id_t *id)
 
 static const pci_device_id_t rtl8169_pci_ids[] = {
     { PCI_DEVICE(0x10EC, 0x8169) },   /* RTL-8169/8110 Gigabit */
-    { PCI_DEVICE(0x10EC, 0x8168) },   /* RTL-8168/8111 PCIe   */
-    { PCI_DEVICE(0x10EC, 0x8167) },   /* RTL-8169SC           */
-    { PCI_DEVICE(0x10EC, 0x8136) },   /* RTL-8101E            */
+    { PCI_DEVICE(0x10EC, 0x8168) },   /* RTL-8168/8111 PCIe Gigabit */
+    { PCI_DEVICE(0x10EC, 0x8167) },   /* RTL-8169SC */
+    { PCI_DEVICE(0x10EC, 0x8161) },   /* RTL-8111G/H PCIe Gigabit */
+    { PCI_DEVICE(0x10EC, 0x8162) },   /* RTL-8111EP PCIe Gigabit */
+    { PCI_DEVICE(0x10EC, 0x8125) },   /* RTL-8125 2.5GbE Controller */
+    { PCI_DEVICE(0x10EC, 0x2502) },   /* RTL-8125B 2.5GbE Controller */
+    { PCI_DEVICE(0x10EC, 0x2600) },   /* RTL-8126 5GbE Controller */
+    { PCI_DEVICE(0x10EC, 0x8136) },   /* RTL-8101E/8102E Fast Ethernet */
+    { PCI_DEVICE(0x10EC, 0x8105) },   /* RTL-8105E Fast Ethernet */
+    { PCI_DEVICE(0x10EC, 0x8106) },   /* RTL-8106E Fast Ethernet */
+    { PCI_DEVICE(0x1186, 0x4300) },   /* D-Link DGE-528T (RTL8169) */
+    { PCI_DEVICE(0x1186, 0x4302) },   /* D-Link DGE-530T (RTL8169) */
+    { PCI_DEVICE(0x1259, 0xC107) },   /* Allied Telesyn AT-2970T */
+    { PCI_DEVICE(0x1737, 0x1032) },   /* Linksys EG1032 */
     { 0 }
 };
 

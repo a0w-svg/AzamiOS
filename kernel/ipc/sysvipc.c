@@ -17,7 +17,9 @@
 
 #define DEBUG 0
 #include <azami/debug.h>
+#include <azami/defs.h>
 #include "sysvipc.h"
+#include "../security/security.h"
 #include "../sched/sched.h"
 #include "../mm/kmalloc.h"
 #include "../mm/pmm.h"
@@ -139,7 +141,8 @@ static inline u32 ipc_want_from_flag(int flag)
 static bool ipc_permitted(const struct ipc64_perm *p, process_t *proc, u32 want)
 {
     if (!proc) return false;
-    if (proc->euid == 0) return true;
+    if (proc->euid == 0 || security_check_permission(proc, CAP_IPC_OWNER) ||
+        security_check_permission(proc, CAP_DAC_OVERRIDE)) return true;
 
     if (proc->euid == p->uid || proc->euid == p->cuid) return ((p->mode >> 6) & want) == want;
     if (proc->egid == p->gid || proc->egid == p->cgid) return ((p->mode >> 3) & want) == want;
@@ -149,7 +152,10 @@ static bool ipc_permitted(const struct ipc64_perm *p, process_t *proc, u32 want)
 /* Only the owner, the creator or a privileged process may destroy or modify. */
 static bool ipc_owner(const struct ipc64_perm *p, process_t *proc)
 {
-    return proc && (proc->euid == 0 || proc->euid == p->uid || proc->euid == p->cuid);
+    if (!proc) return false;
+    if (proc->euid == 0 || security_check_permission(proc, CAP_SYS_ADMIN) ||
+        security_check_permission(proc, CAP_IPC_OWNER)) return true;
+    return (proc->euid == p->uid || proc->euid == p->cuid);
 }
 
 static void ipc_perm_init(struct ipc64_perm *p, s32 key, u32 mode, process_t *proc, u16 seq)
@@ -171,7 +177,7 @@ static bool ipc_wait_tick(process_t *proc)
 
 static bool user_ptr_ok(const void *p)
 {
-    return p != NULL && (uintptr_t)p < 0x8000000000000000ULL;
+    return p != NULL && (uintptr_t)p < TASK_SIZE_MAX;
 }
 
 /* ============================================================================

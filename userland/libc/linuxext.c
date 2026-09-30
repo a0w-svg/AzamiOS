@@ -131,3 +131,16 @@ int process_mrelease(int pidfd, unsigned int flags)
 {
     return (int)__lx_ret(syscall2(SYS_process_mrelease, pidfd, (long)flags));
 }
+
+int close_range(unsigned int first, unsigned int last, unsigned int flags)
+{
+    return (int)__lx_ret(syscall3(SYS_close_range, (long)first, (long)last,
+                                  (long)flags));
+}
+
+int openat2(int dirfd, const char *pathname, const struct open_how *how,
+            size_t size)
+{
+    return (int)__lx_ret(syscall4(SYS_openat2, dirfd, (long)pathname,
+                                  (long)how, (long)size));
+}

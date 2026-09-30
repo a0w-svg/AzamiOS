@@ -23,6 +23,7 @@
 #include "../drivers/char/console.h"
 #include "../fs/vfs.h"
 #include "ipc/ipc.h"
+#include "security/security.h"
 
 static void crash_report(process_t *proc, int sig, pt_regs_t *r)
 {
@@ -59,7 +60,7 @@ static void crash_report(process_t *proc, int sig, pt_regs_t *r)
             (unsigned long long)r->r8, (unsigned long long)r->r9, (unsigned long long)r->r10, (unsigned long long)r->r11);
     kprintf("[CRASH] R12: 0x%016llx  R13: 0x%016llx  R14: 0x%016llx  R15: 0x%016llx\n",
             (unsigned long long)r->r12, (unsigned long long)r->r13, (unsigned long long)r->r14, (unsigned long long)r->r15);
-    if (r->rsp && (uintptr_t)r->rsp < 0x8000000000000000ULL) {
+    if (r->rsp && (uintptr_t)r->rsp < TASK_SIZE_MAX) {
         u64 stk[4] = {0};
         if (copy_from_user(stk, (const void *)r->rsp, sizeof(stk)) == 0) {
             kprintf("[CRASH] STK: [0] 0x%016llx  [1] 0x%016llx  [2] 0x%016llx\n",
@@ -445,7 +446,8 @@ s64 sys_rt_sigreturn_impl(pt_regs_t *r)
      * Force the flat user selectors, clamp RFLAGS to the benign set (+ IF), and
      * range-check RIP/RSP; a corrupt frame kills the process, never the kernel. */
     pt_regs_t nr = f.regs;
-    if (nr.rip >= 0x0000800000000000ULL || nr.rsp >= 0x0000800000000000ULL) {
+    if (nr.rip >= TASK_SIZE_MAX || nr.rsp >= TASK_SIZE_MAX ||
+        nr.rip < g_mmap_min_addr || nr.rsp < g_mmap_min_addr) {
         sched_kill_process(proc->pid, SIGSEGV);
         return -(s64)EFAULT;
     }
