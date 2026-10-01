@@ -10,6 +10,7 @@
 #include "../../kernel/cmdline.h"
 #include "../input/input.h"
 #include "../../kernel/time/timekeeping.h"
+#include "../../kernel/sched/sched.h"
 #include <stdarg.h>
 
 #include "../../arch/x86_64/cpu/spinlock.h"
@@ -118,6 +119,7 @@ static u32  g_drawn_col[CON_MAX_ROWS][CON_MAX_COLS];
 static u64  g_dirty_rows[(CON_MAX_ROWS + 63) / 64];
 static bool g_flush_pending;
 static bool g_flush_sync;
+static bool g_console_async_running;
 static u64  g_last_flush_ns;
 
 static void fb_invalidate_all(void);
@@ -294,10 +296,31 @@ static void fb_flush_kmsg(void)
 void console_tick(void)
 {
     if (!g_flush_pending) return;
-    /* From the timer interrupt: never wait on a CPU that is mid-print. */
+    /* Also used as the early-boot fallback from the timer interrupt. */
     if (!spinlock_try_lock(&g_console_lock)) return;
     fb_flush();
     spinlock_unlock(&g_console_lock);
+}
+
+bool console_async_running(void)
+{
+    return __atomic_load_n(&g_console_async_running, __ATOMIC_ACQUIRE);
+}
+
+static void console_flush_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        console_tick();
+        sched_sleep(1);
+    }
+}
+
+void console_start_async(void)
+{
+    __atomic_store_n(&g_console_async_running, true, __ATOMIC_RELEASE);
+    if (!thread_create(sched_kernel_process(), (uintptr_t)console_flush_thread, 0, true))
+        __atomic_store_n(&g_console_async_running, false, __ATOMIC_RELEASE);
 }
 
 static void fb_scroll(void)

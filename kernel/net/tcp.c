@@ -20,6 +20,8 @@
 #include "../../arch/x86_64/cpu/spinlock.h"
 
 static tcp_sock_t *g_tcp_sockets = NULL;
+#define TCP_HASH_SIZE 256
+static tcp_sock_t *g_tcp_hash[TCP_HASH_SIZE] = {NULL};
 static spinlock_t  g_tcp_lock = SPINLOCK_INIT;
 static u16         g_tcp_ephemeral_port = TCP_PORT_EPHEMERAL_START;
 static u32         g_isn_seed = 0x12345678;
@@ -32,29 +34,28 @@ static u32         g_tcp_ticks = 0;   /* seconds, advanced once per tcp_timer_ti
  * the fix for a real, silent whole-CPU hang.
  *
  * tcp_input() — which takes both locks — is not only called from a socket
- * syscall's thread; sched_tick() calls net_poll() on every timer interrupt,
- * which walks straight down through e1000_poll_rx()/net_process_incoming()
- * into tcp_input() from *interrupt* context, on whichever CPU the timer
- * landed on. A plain spinlock_lock() leaves IF set, so nothing stops that
- * timer interrupt from landing on the very CPU that is, at that instant,
+ * syscall's thread. NIC interrupt handlers may drain RX directly, and the
+ * timer tick retains a polling fallback if the network worker cannot start.
+ * Either path can reach tcp_input() from interrupt context. A plain
+ * spinlock_lock() leaves IF set, so an interrupt can land on a CPU that is
  * inside tcp_connect()/tcp_bind()/tcp_accept()/tcp_recv()/tcp_socket_close()
  * holding sock->lock (or g_tcp_lock) in ordinary process context. The
  * interrupt handler it vectors to then calls tcp_input(), which tries to
  * take that same lock — a ticket spinlock, so the acquire is unconditional,
  * not a try-lock. The thread that already holds it cannot run again until
  * this interrupt returns, and this interrupt cannot return until that thread
- * releases the lock: the CPU spins in the timer ISR forever. Nothing crashes
+ * releases the lock: the CPU spins in the interrupt handler forever. Nothing crashes
  * and nothing times out; the affected CPU just goes silent mid-syscall.
  *
  * A single fast connect()/close() pair rarely loses this race — by the time
  * a reply can arrive, the caller has already reached its sched_block() and
  * dropped the lock. A *second* connect() right after DHCP has already
  * finished (no lease wait to soak up the gap) sends its SYN and can have the
- * SYN-ACK already sitting in the RX ring by the very next timer tick, while
+ * SYN-ACK already sitting in the RX ring by the next receive interrupt, while
  * tcp_connect() is still between tcp_send_packet() and the unlock a few
  * instructions later — exactly the window this lock exists to protect.
  * spinlock_lock_irqsave() closes it by disabling interrupts for the
- * duration: the timer simply cannot land on this CPU while the lock is held,
+ * duration: that interrupt cannot land on this CPU while the lock is held,
  * so tcp_input() can never observe it taken from anywhere but its own,
  * already-non-reentrant call sites. This mirrors the e1000 driver's own
  * tx/rx locks (arch/x86_64 spinlock.h's whole reason for offering the
@@ -125,6 +126,7 @@ void tcp_init(void)
 {
     irqflags_t flags = spinlock_lock_irqsave(&g_tcp_lock);
     g_tcp_sockets = NULL;
+    for (int i = 0; i < TCP_HASH_SIZE; i++) g_tcp_hash[i] = NULL;
     g_tcp_ephemeral_port = TCP_PORT_EPHEMERAL_START;
     spinlock_unlock_irqrestore(&g_tcp_lock, flags);
     pr_debug("[TCP] Full TCP 11-state protocol engine initialized.\n");
@@ -375,6 +377,16 @@ void tcp_socket_close(tcp_sock_t *sock)
         }
         curr = &(*curr)->next;
     }
+    if (sock->bound) {
+        tcp_sock_t **hcurr = &g_tcp_hash[sock->local_port % TCP_HASH_SIZE];
+        while (*hcurr) {
+            if (*hcurr == sock) {
+                *hcurr = sock->hash_next;
+                break;
+            }
+            hcurr = &(*hcurr)->hash_next;
+        }
+    }
     spinlock_unlock_irqrestore(&g_tcp_lock, list_flags);
 
     /* Drops the creator's reference; a concurrent tcp_input() holding its
@@ -393,13 +405,13 @@ static u16 tcp_alloc_ephemeral_port(void)
         }
 
         bool in_use = false;
-        tcp_sock_t *cur = g_tcp_sockets;
+        tcp_sock_t *cur = g_tcp_hash[port % TCP_HASH_SIZE];
         while (cur) {
-            if (cur->bound && cur->local_port == port) {
+            if (cur->local_port == port) {
                 in_use = true;
                 break;
             }
-            cur = cur->next;
+            cur = cur->hash_next;
         }
         if (!in_use) return port;
     }
@@ -413,6 +425,12 @@ int tcp_bind(tcp_sock_t *sock, const u8 ip[4], u16 port)
     irqflags_t list_flags = spinlock_lock_irqsave(&g_tcp_lock);
     irqflags_t sock_flags = spinlock_lock_irqsave(&sock->lock);
 
+    if (sock->bound) {
+        spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+        spinlock_unlock_irqrestore(&g_tcp_lock, list_flags);
+        return -EINVAL;
+    }
+
     if (port == 0) {
         port = tcp_alloc_ephemeral_port();
         if (port == 0) {
@@ -421,14 +439,14 @@ int tcp_bind(tcp_sock_t *sock, const u8 ip[4], u16 port)
             return -EADDRINUSE;
         }
     } else {
-        tcp_sock_t *cur = g_tcp_sockets;
+        tcp_sock_t *cur = g_tcp_hash[port % TCP_HASH_SIZE];
         while (cur) {
-            if (cur != sock && cur->bound && cur->local_port == port) {
+            if (cur != sock && cur->local_port == port) {
                 spinlock_unlock_irqrestore(&sock->lock, sock_flags);
                 spinlock_unlock_irqrestore(&g_tcp_lock, list_flags);
                 return -EADDRINUSE;
             }
-            cur = cur->next;
+            cur = cur->hash_next;
         }
     }
 
@@ -436,6 +454,10 @@ int tcp_bind(tcp_sock_t *sock, const u8 ip[4], u16 port)
     if (ip) memcpy(sock->local_ip, ip, 4);
     else memset(sock->local_ip, 0, 4);
     sock->bound = true;
+
+    int h = port % TCP_HASH_SIZE;
+    sock->hash_next = g_tcp_hash[h];
+    g_tcp_hash[h] = sock;
 
     spinlock_unlock_irqrestore(&sock->lock, sock_flags);
     spinlock_unlock_irqrestore(&g_tcp_lock, list_flags);
@@ -686,10 +708,10 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     irqflags_t list_flags = spinlock_lock_irqsave(&g_tcp_lock);
     tcp_sock_t *sock = NULL;
     tcp_sock_t *listener = NULL;
-    tcp_sock_t *cur = g_tcp_sockets;
+    tcp_sock_t *cur = g_tcp_hash[dst_port % TCP_HASH_SIZE];
 
     while (cur) {
-        if (cur->bound && cur->local_port == dst_port) {
+        if (cur->local_port == dst_port) {
             if (cur->state == TCP_STATE_LISTEN) {
                 listener = cur;
             } else if (cur->remote_port == src_port && memcmp(cur->remote_ip, ip_hdr->src_ip, 4) == 0) {
@@ -697,7 +719,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
                 break;
             }
         }
-        cur = cur->next;
+        cur = cur->hash_next;
     }
     if (!sock) sock = listener;
     /* Taken while g_tcp_lock is still held, on a socket this same lookup
@@ -837,6 +859,12 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
 
                     u16 pm = tcp_parse_mss_option(tcp, header_len);
                     child->peer_mss = pm ? pm : TCP_DEFAULT_MSS_FALLBACK;
+
+                    irqflags_t hflags = spinlock_lock_irqsave(&g_tcp_lock);
+                    int h = child->local_port % TCP_HASH_SIZE;
+                    child->hash_next = g_tcp_hash[h];
+                    g_tcp_hash[h] = child;
+                    spinlock_unlock_irqrestore(&g_tcp_lock, hflags);
 
                     /* Send SYN-ACK */
                     tcp_send_packet(child, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);

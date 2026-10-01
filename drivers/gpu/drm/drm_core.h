@@ -26,6 +26,7 @@
 #include "../../../include/azami/drm.h"
 #include "../../../arch/x86_64/cpu/spinlock.h"
 #include "../../base/base.h"
+#include "../../../kernel/lib/rbtree.h"
 
 struct drm_device;
 struct drm_file;
@@ -106,7 +107,8 @@ typedef struct drm_gem_object {
      */
     u64                driver_private;
 
-    struct drm_gem_object *next;
+    struct rb_node     mmap_rb;         /* Tree ordered by mmap_offset */
+    struct rb_node     name_rb;         /* Tree ordered by name */
 } drm_gem_object_t;
 
 /* ── KMS objects ─────────────────────────────────────────────────────────── */
@@ -339,7 +341,8 @@ typedef struct drm_device {
     drm_connector_t   *connector_list;
     drm_plane_t       *plane_list;
     drm_framebuffer_t *fb_list;
-    drm_gem_object_t  *gem_list;
+    struct rb_root     gem_mmap_tree;
+    struct rb_root     gem_name_tree;
     u32 num_crtc, num_encoder, num_connector, num_plane, num_fb;
 
     /* Atomic modesetting property blobs (drm_atomic.c), e.g. a CRTC's

@@ -16,6 +16,9 @@
 #define UDP_PORT_EPHEMERAL_START 49152
 #define UDP_PORT_EPHEMERAL_END   65535
 #define MAX_UDP_SOCKETS          128
+#define UDP_MAX_PAYLOAD          65507 /* IPv4 length minus IP/UDP headers */
+#define UDP_RX_MAX_PACKETS       128
+#define UDP_RX_MAX_BYTES         (256U * 1024U)
 
 typedef struct __attribute__((packed)) {
     u16 src_port;
@@ -39,10 +42,14 @@ typedef struct udp_sock {
     u8  remote_ip[4];
     bool bound;
     bool connected;
+    bool closed;
+    size_t rx_bytes; /* charged allocation capacity, including net_buf_t */
+    u64 rx_drops;
     net_buf_queue_t rx_queue;
     struct thread  *wait_thread;
     spinlock_t      lock;
     struct udp_sock *next;
+    struct udp_sock *hash_next;
 
     /* Reference count — same reasoning as tcp_sock_t.refcnt (see tcp.h):
      * udp_input() finds a socket by walking g_udp_sockets under the global

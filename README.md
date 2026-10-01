@@ -146,6 +146,7 @@ AzamiOS ships an extensive set of POSIX shell utilities:
 | `curl` | HTTP/HTTPS file transfer |
 | `httpd` | Lightweight HTTP server |
 | `dhcpcd` | DHCP client daemon |
+| `ntpd` | SNTP clock synchronization client ([configuration](docs/NTP.md)) |
 | `nslookup` | DNS name resolution lookup |
 
 ### Filesystem & Permissions

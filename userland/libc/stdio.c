@@ -74,17 +74,15 @@ int puts(const char *s)
 char *fgets(char *s, int n, FILE *stream)
 {
     if (!s || n <= 0) return 0;
-    int fd = _file_fd(stream);
     int i = 0;
     while (i < n - 1) {
-        char c;
-        ssize_t r = sys_read(fd, &c, 1);
-        if (r <= 0) { if (i == 0) return 0; break; }
-        s[i++] = c;
+        int c = fgetc(stream);
+        if (c == EOF) { if (i == 0) return 0; break; }
+        s[i++] = (char)c;
         if (c == '\n') break;
     }
     s[i] = '\0';
-    return (i > 0) ? s : 0;
+    return s;
 }
 
 /* ── printf engine ───────────────────────────────────────────────────────── */
@@ -564,7 +562,7 @@ int ungetc(int c, FILE *stream)
 
 int fgetc(FILE *stream)
 {
-    if (!stream) return -1;
+    /* stdin is the fd-zero sentinel, not an invalid FILE. */
     if (!_file_is_sentinel(stream) && stream->is_memstream) {
         unsigned char uc;
         if (fread(&uc, 1, 1, stream) == 1) return uc;
@@ -1061,13 +1059,22 @@ int fseek(FILE *stream, long offset, int whence)
         return 0;
     }
 
+    if (!_file_is_sentinel(stream) && whence == SEEK_CUR) {
+        long unread = stream->buf_len - stream->buf_pos;
+        if (stream->unget_char != -1) unread++;
+        if (__builtin_sub_overflow(offset, unread, &offset)) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+    }
+    if (sys_lseek(_file_fd(stream), offset, whence) < 0) return -1;
     if (!_file_is_sentinel(stream)) {
         stream->unget_char = -1;
         stream->buf_pos = 0;
         stream->buf_len = 0;
+        stream->eof = 0;
     }
-    long r = syscall3(SYS_lseek, (long)_file_fd(stream), offset, (long)whence);
-    return (r < 0) ? -1 : 0;
+    return 0;
 }
 
 long ftell(FILE *stream)
@@ -1076,7 +1083,13 @@ long ftell(FILE *stream)
     if (!_file_is_sentinel(stream) && stream->is_memstream) {
         return (long)stream->mem_pos;
     }
-    return (long)syscall3(SYS_lseek, (long)_file_fd(stream), 0L, (long)SEEK_CUR);
+    long pos = sys_lseek(_file_fd(stream), 0, SEEK_CUR);
+    if (pos < 0) return -1;
+    if (!_file_is_sentinel(stream)) {
+        pos -= stream->buf_len - stream->buf_pos;
+        if (stream->unget_char != -1) pos--;
+    }
+    return pos;
 }
 
 int fseeko(FILE *stream, off_t offset, int whence)
@@ -1267,6 +1280,4 @@ void funlockfile(FILE *stream)
 {
     (void)stream;
 }
-
-
 

@@ -567,6 +567,7 @@ void kernel_main(void)
 
     /* ── Step 12: CFS Scheduler & Process/Thread Manager ─────────────────── */
     sched_init();
+    console_start_async();
 
     /* Heap reaper: hands fully-free slab pages back to the PMM on a timer.
      * Needs the scheduler — it runs as a kernel thread. */

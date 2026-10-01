@@ -36,6 +36,8 @@ typedef struct {
 /* Buffer lifecycle */
 net_buf_t *net_buf_alloc(size_t size);
 net_buf_t *net_buf_clone(net_buf_t *buf);
+/* References protect lifetime only. Get requires an existing live reference;
+ * callers must still serialize mutation of packet data and queue linkage. */
 net_buf_t *net_buf_ref(net_buf_t *buf);
 void       net_buf_free(net_buf_t *buf);
 

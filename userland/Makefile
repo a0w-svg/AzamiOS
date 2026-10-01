@@ -84,6 +84,7 @@ SBIN_APPS = \
     $(SBIN_DIR)/dmesg.elf \
     $(SBIN_DIR)/netstat.elf \
     $(SBIN_DIR)/dhcpcd.elf \
+    $(SBIN_DIR)/ntpd.elf \
     $(SBIN_DIR)/notifyd.elf \
     $(SBIN_DIR)/lockscreen.elf
 
@@ -683,7 +684,8 @@ etc: skeleton
 	@printf "[theme]\ntheme_id=0\nname=Catppuccin Mocha\nwallpaper=/usr/share/wallpapers/default.raw\n\n[display]\nvsync=1\ncompositing=1\ncursor_aa=1\nfps=60\n\n[panel]\nposition=bottom\nheight=32\nautohide=0\nshow_clock=1\n" > $(BUILD_DIR)/etc/desktop.conf
 	@printf "[terminal]\ntheme=catppuccin\nfont_size=12\nopacity=95\nscrollback=500\ncursor_blink=1\nhistory_size=100\nprompt=root@azamios:\w$$ \n" > $(BUILD_DIR)/etc/terminal.conf
 	@printf "[audio]\nvolume=80\nmaster_mute=0\nsample_rate=44100\nchannels=2\ndefault_sink=/dev/dsp\nmusic_dir=/music\n" > $(BUILD_DIR)/etc/audio.conf
-	@printf "[network]\ninterface=eth0\ndhcp=0\nip=10.0.2.15\nnetmask=255.255.255.0\ngateway=10.0.2.2\ndns=10.0.2.3\n" > $(BUILD_DIR)/etc/network.conf
+	@mkdir -p $(BUILD_DIR)/etc/network
+	@printf "# Generated default network profile\nauto lo\niface lo inet loopback\n\nauto net0\niface net0 inet dhcp\n" > $(BUILD_DIR)/etc/network/interfaces
 	@printf "[power]\nprofile=1\nscreen_timeout=15\nacpi_pm=1\n" > $(BUILD_DIR)/etc/power.conf
 	@printf "# AzamiOS Security & Auto-Accept Configuration\nipc_autoaccept=1\nadmin_autoaccept=1\ndhcp_autoaccept=1\ntrace_autoaccept=1\n" > $(BUILD_DIR)/etc/security.conf
 	@printf "# AzamiOS Desktop Session Configuration\n[services]\nwallpaper=/sbin/wallpaper.elf\ntaskbar=/sbin/taskbar.elf\nnotifyd=/sbin/notifyd.elf\n\n[autostart]\nsettings=/bin/settings.elf\nterminal=/bin/terminal.elf\n" > $(BUILD_DIR)/etc/session.conf

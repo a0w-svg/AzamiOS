@@ -61,7 +61,7 @@ net_buf_t *net_buf_clone(net_buf_t *buf)
 net_buf_t *net_buf_ref(net_buf_t *buf)
 {
     if (buf) {
-        buf->refcount++;
+        __atomic_fetch_add(&buf->refcount, 1, __ATOMIC_RELAXED);
     }
     return buf;
 }
@@ -70,10 +70,7 @@ void net_buf_free(net_buf_t *buf)
 {
     if (!buf) return;
 
-    if (buf->refcount > 1) {
-        buf->refcount--;
-        return;
-    }
+    if (__atomic_sub_fetch(&buf->refcount, 1, __ATOMIC_ACQ_REL) != 0) return;
 
     if (buf->head) {
         kfree(buf->head);
@@ -85,7 +82,9 @@ void net_buf_free(net_buf_t *buf)
 void *net_buf_reserve(net_buf_t *buf, size_t len)
 {
     if (!buf) return NULL;
-    if (buf->data + len > buf->end) return NULL;
+    /* Reserve is only valid before data is appended. Compare lengths,
+     * rather than forming a potentially overflowing pointer first. */
+    if (buf->len || len > (size_t)(buf->end - buf->tail)) return NULL;
 
     buf->data += len;
     buf->tail += len;
@@ -95,7 +94,7 @@ void *net_buf_reserve(net_buf_t *buf, size_t len)
 void *net_buf_put(net_buf_t *buf, size_t len)
 {
     if (!buf) return NULL;
-    if (buf->tail + len > buf->end) return NULL;
+    if (len > (size_t)(buf->end - buf->tail)) return NULL;
 
     void *orig = buf->tail;
     buf->tail += len;
@@ -106,7 +105,7 @@ void *net_buf_put(net_buf_t *buf, size_t len)
 void *net_buf_push(net_buf_t *buf, size_t len)
 {
     if (!buf) return NULL;
-    if (buf->data - len < buf->head) return NULL;
+    if (len > (size_t)(buf->data - buf->head)) return NULL;
 
     buf->data -= len;
     buf->len += len;
@@ -214,15 +213,18 @@ void net_buf_queue_purge(net_buf_queue_t *q)
 
     irqflags_t flags = spinlock_lock_irqsave(&q->lock);
     net_buf_t *cur = q->head;
+    q->head = NULL;
+    q->tail = NULL;
+    q->count = 0;
+    spinlock_unlock_irqrestore(&q->lock, flags);
+
+    /* Detach under the lock; allocator work need not hold the queue lock
+     * or keep interrupts disabled while an arbitrarily long list is freed. */
     while (cur) {
         net_buf_t *next = cur->next;
         net_buf_free(cur);
         cur = next;
     }
-    q->head = NULL;
-    q->tail = NULL;
-    q->count = 0;
-    spinlock_unlock_irqrestore(&q->lock, flags);
 }
 
 size_t net_buf_queue_len(net_buf_queue_t *q)

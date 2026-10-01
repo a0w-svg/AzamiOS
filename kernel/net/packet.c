@@ -21,8 +21,8 @@ static spinlock_t  g_pkt_lock = SPINLOCK_INIT;
 
 /* g_pkt_lock and each pkt_sock_t's own ->lock use spinlock_lock_irqsave()/
  * _irqrestore() throughout this file, for the same reason as kernel/net/
- * socket.c's identical note on g_raw_lock: packet_input() runs from a timer
- * interrupt on any CPU (net_poll() -> ... -> net_process_incoming()), while
+ * socket.c's identical note on g_raw_lock: packet_input() can run from a NIC
+ * interrupt or the timer polling fallback, while
  * packet_socket_create()/packet_socket_close() and a blocked reader take
  * these locks from ordinary process context. See kernel/net/tcp.c for the
  * full writeup of why a plain spinlock_lock() would deadlock here. */

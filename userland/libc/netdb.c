@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <poll.h>
 
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -179,9 +180,18 @@ static int dns_query_server(const char *hostname, const char *dns_ip_str, struct
         return -1;
     }
 
+    /* Bound DNS resolution time. A missing nameserver must not leave an
+     * early-boot service (including ntpd) blocked in recvfrom forever. */
+    struct pollfd pfd = { .fd = sock, .events = POLLIN, .revents = 0 };
+    int ready = poll(&pfd, 1, 2000);
+    if (ready <= 0 || !(pfd.revents & POLLIN)) {
+        close(sock);
+        return -1;
+    }
+
     /* Receive answer */
     unsigned char resp_buf[512];
-    ssize_t resp_len = recvfrom(sock, resp_buf, sizeof(resp_buf), 0, NULL, NULL);
+    ssize_t resp_len = recvfrom(sock, resp_buf, sizeof(resp_buf), MSG_DONTWAIT, NULL, NULL);
     close(sock);
 
     if (resp_len < (ssize_t)sizeof(dns_hdr_t)) {

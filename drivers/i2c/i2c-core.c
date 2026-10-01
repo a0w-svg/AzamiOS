@@ -100,13 +100,14 @@ static s64 i2cdev_read(file_t *filp, void *buf, size_t len, u64 *offset)
 
     const i2c_algorithm_t *algo = cf->adap->algo;
     if (algo->master_xfer) {
-        u8 kbuf[64];
-        size_t n = len < sizeof(kbuf) ? len : sizeof(kbuf);
-        struct i2c_msg msg = { .addr = cf->addr, .flags = I2C_M_RD, .len = (u16)n, .buf = kbuf };
+        /* VFS has already staged a kernel buffer; transfer directly into it. */
+        size_t n = len < 64 ? len : 64;
+        struct i2c_msg msg = { .addr = cf->addr,
+            .flags = I2C_M_RD | (cf->tenbit ? I2C_M_TEN : 0),
+            .len = (u16)n, .buf = buf };
         int ret = algo->master_xfer(cf->adap, &msg, 1);
         if (ret < 0) return (s64)ret;
-        /* Kernel buffer — see fs/vfs.h. */
-        memcpy(buf, kbuf, n);
+        if (ret != 1) return -(s64)EIO;
         return (s64)n;
     }
     if (algo->smbus_xfer) {
@@ -130,13 +131,12 @@ static s64 i2cdev_write(file_t *filp, const void *buf, size_t len, u64 *offset)
 
     const i2c_algorithm_t *algo = cf->adap->algo;
     if (algo->master_xfer) {
-        u8 kbuf[64];
-        size_t n = len < sizeof(kbuf) ? len : sizeof(kbuf);
-        /* Kernel buffer — see fs/vfs.h. */
-        memcpy(kbuf, buf, n);
-        struct i2c_msg msg = { .addr = cf->addr, .flags = 0, .len = (u16)n, .buf = kbuf };
+        size_t n = len < 64 ? len : 64;
+        struct i2c_msg msg = { .addr = cf->addr,
+            .flags = cf->tenbit ? I2C_M_TEN : 0,
+            .len = (u16)n, .buf = (u8 *)buf };
         int ret = algo->master_xfer(cf->adap, &msg, 1);
-        return ret < 0 ? (s64)ret : (s64)n;
+        return ret < 0 ? (s64)ret : ret == 1 ? (s64)n : -(s64)EIO;
     }
     if (algo->smbus_xfer) {
         u8 b;

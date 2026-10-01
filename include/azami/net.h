@@ -133,6 +133,10 @@ typedef struct net_device {
 
 /* Public Network API */
 void          net_init(void);
+/* RX polling and protocol timers run in a kernel thread once it is ready.
+ * The scheduler tick uses net_async_polling() to retain its boot fallback. */
+void          net_poll(void);
+bool          net_async_polling(void);
 int           net_register_device(const net_device_t *dev);
 net_device_t *net_get_default_device(void);
 
@@ -164,4 +168,3 @@ u32           net_checksum_partial(const void *data, size_t len, u32 sum);
 /** net_checksum_fold(sum) → the folded, complemented 16-bit checksum. */
 u16           net_checksum_fold(u32 sum);
 s64           net_send_raw(const void *data, size_t len);
-

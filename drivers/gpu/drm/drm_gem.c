@@ -84,8 +84,19 @@ drm_gem_object_t *drm_gem_object_create(drm_device_t *dev, u32 width, u32 height
     if (dev->next_mmap_offset == 0) dev->next_mmap_offset = DRM_MMAP_OFFSET_BASE;
     obj->mmap_offset = dev->next_mmap_offset;
     dev->next_mmap_offset += ALIGN_UP(size, DRM_MMAP_OFFSET_STEP);
-    obj->next     = dev->gem_list;
-    dev->gem_list = obj;
+    
+    struct rb_node **link = &dev->gem_mmap_tree.rb_node;
+    struct rb_node *parent = NULL;
+    while (*link) {
+        parent = *link;
+        drm_gem_object_t *entry = rb_entry(parent, drm_gem_object_t, mmap_rb);
+        if (obj->mmap_offset < entry->mmap_offset) link = &parent->rb_left;
+        else link = &parent->rb_right;
+    }
+    rb_link_node(&obj->mmap_rb, parent, link);
+    rb_insert_color(&obj->mmap_rb, &dev->gem_mmap_tree);
+    obj->name_rb.rb_parent = NULL; // Mark as not in name tree
+    
     spinlock_unlock(&dev->lock);
 
     return obj;
@@ -107,7 +118,7 @@ void drm_gem_object_put(drm_device_t *dev, drm_gem_object_t *obj)
 
     /*
      * The whole decrement-check-unlink sequence runs under dev->lock, not
-     * just the unlink: dev->gem_list is otherwise only touched under this
+     * just the unlink: dev->gem_mmap_tree and dev->gem_name_tree are otherwise only touched under this
      * lock (drm_gem_object_create()'s append, drm_gem_object_by_mmap_offset()
      * under the caller's lock, drm_gem_object_lookup_by_name()'s own lock),
      * and a plain "if (--obj->refcount > 0) return" here used to run the
@@ -127,11 +138,11 @@ void drm_gem_object_put(drm_device_t *dev, drm_gem_object_t *obj)
 
     spinlock_lock(&dev->lock);
 
-    drm_gem_object_t **pp = &dev->gem_list;
-    while (*pp) {
-        if (*pp == obj) { *pp = obj->next; break; }
-        pp = &(*pp)->next;
+    rb_erase(&obj->mmap_rb, &dev->gem_mmap_tree);
+    if (obj->name != 0) {
+        rb_erase(&obj->name_rb, &dev->gem_name_tree);
     }
+
     spinlock_unlock(&dev->lock);
 
     /* Driver callback and the actual free happen outside the lock: nothing
@@ -242,10 +253,16 @@ void drm_gem_release_all(drm_file_t *file)
 drm_gem_object_t *drm_gem_object_by_mmap_offset(drm_device_t *dev, u64 offset)
 {
     if (!dev) return NULL;
-    for (drm_gem_object_t *o = dev->gem_list; o; o = o->next) {
-        if (o->mmap_offset == offset) return o;
-        /* Tolerate a client mapping partway into an object. */
-        if (offset > o->mmap_offset && offset < o->mmap_offset + o->size) return o;
+    struct rb_node *node = dev->gem_mmap_tree.rb_node;
+    while (node) {
+        drm_gem_object_t *o = rb_entry(node, drm_gem_object_t, mmap_rb);
+        if (offset < o->mmap_offset) {
+            node = node->rb_left;
+        } else if (offset >= o->mmap_offset + o->size) {
+            node = node->rb_right;
+        } else {
+            return o;
+        }
     }
     return NULL;
 }
@@ -256,8 +273,12 @@ drm_gem_object_t *drm_gem_object_lookup_by_name(drm_device_t *dev, u32 name)
 
     spinlock_lock(&dev->lock);
     drm_gem_object_t *obj = NULL;
-    for (drm_gem_object_t *o = dev->gem_list; o; o = o->next) {
-        if (o->name == name) { obj = o; break; }
+    struct rb_node *node = dev->gem_name_tree.rb_node;
+    while (node) {
+        drm_gem_object_t *o = rb_entry(node, drm_gem_object_t, name_rb);
+        if (name < o->name) node = node->rb_left;
+        else if (name > o->name) node = node->rb_right;
+        else { obj = o; break; }
     }
     if (obj) drm_gem_object_get_locked(obj);
     spinlock_unlock(&dev->lock);
@@ -274,7 +295,19 @@ u32 drm_gem_object_flink(drm_device_t *dev, drm_gem_object_t *obj)
      * the same name — after which drm_gem_object_lookup_by_name() would hand
      * either caller's GEM_OPEN the wrong one of the two objects. */
     spinlock_lock(&dev->lock);
-    if (obj->name == 0) obj->name = ++dev->next_gem_name;
+    if (obj->name == 0) {
+        obj->name = ++dev->next_gem_name;
+        struct rb_node **link = &dev->gem_name_tree.rb_node;
+        struct rb_node *parent = NULL;
+        while (*link) {
+            parent = *link;
+            drm_gem_object_t *entry = rb_entry(parent, drm_gem_object_t, name_rb);
+            if (obj->name < entry->name) link = &parent->rb_left;
+            else link = &parent->rb_right;
+        }
+        rb_link_node(&obj->name_rb, parent, link);
+        rb_insert_color(&obj->name_rb, &dev->gem_name_tree);
+    }
     u32 name = obj->name;
     spinlock_unlock(&dev->lock);
     return name;

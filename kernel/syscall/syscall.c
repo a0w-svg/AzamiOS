@@ -4166,12 +4166,13 @@ static s64 sys_sendto_impl(pt_regs_t *r)
     const struct sockaddr *uaddr = (const struct sockaddr *)r->r8;
     socklen_t uaddrlen = (socklen_t)r->r9;
 
-    if (!ubuf || len == 0) return 0;
-    if ((uintptr_t)ubuf >= TASK_SIZE_MAX) return -(s64)EFAULT;
+    if (len && (!ubuf || (uintptr_t)ubuf >= TASK_SIZE_MAX)) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
+    /* UDP zero-length calls send/consume a datagram, not a stream no-op. */
+    if (!len && !(sock->domain == AF_INET && sock->type == SOCK_DGRAM)) return 0;
 
     /* Clamp the bounce buffer the way read()/write() do. `len` is raw user
      * input and went straight to kmalloc(), which serves anything up to 1 GB:
@@ -4184,9 +4185,9 @@ static s64 sys_sendto_impl(pt_regs_t *r)
         len = SOCK_XFER_MAX;
     }
 
-    void *kbuf = kmalloc(len);
+    void *kbuf = kmalloc(len ? len : 1);
     if (!kbuf) return -(s64)ENOMEM;
-    if (copy_from_user(kbuf, ubuf, len) != 0) {
+    if (len && copy_from_user(kbuf, ubuf, len) != 0) {
         kfree(kbuf);
         return -(s64)EFAULT;
     }
@@ -4303,12 +4304,13 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
     socklen_t *uaddrlen = (socklen_t *)r->r9;
     (void)flags;
 
-    if (!ubuf || len == 0) return 0;
-    if ((uintptr_t)ubuf >= TASK_SIZE_MAX) return -(s64)EFAULT;
+    if (len && (!ubuf || (uintptr_t)ubuf >= TASK_SIZE_MAX)) return -(s64)EFAULT;
 
     socket_t *sock = NULL;
     int ret = sock_get_from_fd(fd, &sock);
     if (ret < 0) return -(s64)ret;
+    /* UDP zero-length calls send/consume a datagram, not a stream no-op. */
+    if (!len && !(sock->domain == AF_INET && sock->type == SOCK_DGRAM)) return 0;
 
     process_t *proc = sched_current_process();
     file_t *f = (file_t *)proc->handle_table[fd];
@@ -4426,7 +4428,7 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
      * correct short read here. */
     if (len > SOCK_XFER_MAX) len = SOCK_XFER_MAX;
 
-    void *kbuf = kmalloc(len);
+    void *kbuf = kmalloc(len ? len : 1);
     if (!kbuf) return -(s64)ENOMEM;
 
     if (sock->type == SOCK_STREAM && sock->tcp) {
@@ -4443,8 +4445,8 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
         u8 src_ip[4];
         u16 src_port = 0;
         s64 res = udp_recvfrom(sock->udp, kbuf, len, src_ip, &src_port, nonblock);
-        if (res > 0) {
-            if (copy_to_user(ubuf, kbuf, (size_t)res) != 0) {
+        if (res >= 0) {
+            if (res && copy_to_user(ubuf, kbuf, (size_t)res) != 0) {
                 kfree(kbuf);
                 return -(s64)EFAULT;
             }
@@ -4455,9 +4457,13 @@ static s64 sys_recvfrom_impl(pt_regs_t *r)
                 sin.sin_port = htons(src_port);
                 memcpy(&sin.sin_addr.s_addr, src_ip, 4);
 
-                copy_to_user(uaddr, &sin, sizeof(sin));
-                socklen_t slen = sizeof(sin);
-                copy_to_user(uaddrlen, &slen, sizeof(socklen_t));
+                socklen_t capacity, slen = sizeof(sin);
+                if (copy_from_user(&capacity, uaddrlen, sizeof(capacity)) ||
+                    copy_to_user(uaddr, &sin, capacity < slen ? capacity : slen) ||
+                    copy_to_user(uaddrlen, &slen, sizeof(slen))) {
+                    kfree(kbuf);
+                    return -(s64)EFAULT;
+                }
             }
         }
         kfree(kbuf);

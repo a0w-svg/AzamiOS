@@ -21,13 +21,19 @@
 
 static dhcp_lease_t g_dhcp_lease;
 static spinlock_t   g_dhcp_lock = SPINLOCK_INIT;
+static u32          g_dhcp_ticks;
+static u32          g_dhcp_deadline;
+static u8           g_dhcp_retries;
+
+#define DHCP_RETRY_SECONDS  1
+#define DHCP_MAX_RETRIES    5
 
 /* g_dhcp_lock uses spinlock_lock_irqsave()/_irqrestore() throughout this
  * file, for the same reason as tcp.c's and udp.c's identical note:
- * dhcp_input() is reachable from a timer interrupt on any CPU (via
- * net_poll() -> ... -> udp_input() -> dhcp_input()) and takes this same
+ * dhcp_input() is reachable from a NIC interrupt or the timer polling
+ * fallback (via udp_input() -> dhcp_input()) and takes this same
  * lock. A plain spinlock_lock() in dhcp_start_discovery()/dhcp_get_lease()
- * leaves interrupts enabled, so that timer can land on the CPU already
+ * leaves interrupts enabled, so an interrupt can land on the CPU already
  * holding the lock in ordinary process context, and dhcp_input()'s own
  * acquire then spins forever. See kernel/net/tcp.c for the full writeup.
  * (dhcp_start_discovery()'s net_poll() call in its retry loop is not part
@@ -72,6 +78,8 @@ static u32 generate_dhcp_xid(void)
     return g_dhcp_xid_counter ^ 0x3A5C9B1D;
 }
 
+static void dhcp_send_request(const dhcp_lease_t *lease);
+
 void dhcp_init(void)
 {
     irqflags_t flags = spinlock_lock_irqsave(&g_dhcp_lock);
@@ -93,6 +101,8 @@ int dhcp_start_discovery(void)
 
     g_dhcp_lease.xid = generate_dhcp_xid();
     g_dhcp_lease.state = DHCP_STATE_SELECTING;
+    g_dhcp_retries = 0;
+    g_dhcp_deadline = g_dhcp_ticks + DHCP_RETRY_SECONDS;
 
     dhcp_packet_t pkt;
     memset(&pkt, 0, sizeof(pkt));
@@ -140,47 +150,64 @@ int dhcp_start_discovery(void)
 
     pr_debug("[DHCP] Broadcasting DHCPDISCOVER (xid: 0x%08x)...\n", current_xid);
 
-    /* Broadcast initial discovery packets */
-    for (int attempt = 0; attempt < 2; attempt++) {
-        send_dhcp_udp(&pkt, total_len);
-
-        for (int i = 0; i < 20; i++) {
-            extern void net_poll(void);
-            net_poll();
-
-            flags = spinlock_lock_irqsave(&g_dhcp_lock);
-            if (g_dhcp_lease.state == DHCP_STATE_BOUND) {
-                spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
-                return 0; /* Lease successfully acquired */
-            }
-            spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
-
-            for (volatile int d = 0; d < 2000; d++) {
-                cpu_pause();
-            }
-        }
-    }
-
-    flags = spinlock_lock_irqsave(&g_dhcp_lock);
-    if (g_dhcp_lease.state != DHCP_STATE_BOUND) {
-        static const u8 def_ip[4] = { 10, 0, 2, 15 };
-        static const u8 def_mask[4] = { 255, 255, 255, 0 };
-        static const u8 def_gw[4] = { 10, 0, 2, 2 };
-        static const u8 def_dns[4] = { 10, 0, 2, 3 };
-
-        net_set_ip(def_ip);
-        net_set_netmask(def_mask);
-        net_set_gateway(def_gw);
-        net_set_dns(def_dns);
-    }
-    spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
-
+    /* DHCP is deliberately asynchronous.  This function is called by boot
+     * and SIOCSIFDHCP, both of which must return promptly; offers and retry
+     * deadlines are handled by dhcp_timer_tick() in the background. */
+    send_dhcp_udp(&pkt, total_len);
     return 0;
 }
 
 int dhcp_trigger_renew(void)
 {
     return dhcp_start_discovery();
+}
+
+void dhcp_timer_tick(void)
+{
+    dhcp_lease_t lease;
+    bool send_discover = false, send_request = false, install_fallback = false;
+    u8 retry_count = 0;
+
+    irqflags_t flags = spinlock_lock_irqsave(&g_dhcp_lock);
+    g_dhcp_ticks++;
+    if ((g_dhcp_lease.state == DHCP_STATE_SELECTING ||
+         g_dhcp_lease.state == DHCP_STATE_REQUESTING) &&
+        g_dhcp_ticks >= g_dhcp_deadline) {
+        if (g_dhcp_retries++ < DHCP_MAX_RETRIES) {
+            retry_count = g_dhcp_retries;
+            g_dhcp_deadline = g_dhcp_ticks + DHCP_RETRY_SECONDS;
+            memcpy(&lease, &g_dhcp_lease, sizeof(lease));
+            send_discover = (g_dhcp_lease.state == DHCP_STATE_SELECTING);
+            send_request = (g_dhcp_lease.state == DHCP_STATE_REQUESTING);
+        } else {
+            /* QEMU user networking is usable without a reply, but install
+             * its conventional values only after the background state
+             * machine has actually timed out. */
+            g_dhcp_lease.state = DHCP_STATE_INIT;
+            install_fallback = true;
+        }
+    }
+    spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
+
+    if (send_discover) {
+        /* Start a new transaction only after a complete retry cycle, rather
+         * than spinning in the caller. */
+        dhcp_start_discovery();
+        /* dhcp_start_discovery() creates a fresh XID (which is desirable
+         * after a lost broadcast), but this is still one retry cycle. */
+        flags = spinlock_lock_irqsave(&g_dhcp_lock);
+        g_dhcp_retries = retry_count;
+        spinlock_unlock_irqrestore(&g_dhcp_lock, flags);
+    } else if (send_request) {
+        dhcp_send_request(&lease);
+    }
+    if (install_fallback) {
+        static const u8 ip[4] = { 10, 0, 2, 15 };
+        static const u8 mask[4] = { 255, 255, 255, 0 };
+        static const u8 gw[4] = { 10, 0, 2, 2 };
+        static const u8 dns[4] = { 10, 0, 2, 3 };
+        net_set_ip(ip); net_set_netmask(mask); net_set_gateway(gw); net_set_dns(dns);
+    }
 }
 
 
@@ -334,6 +361,8 @@ void dhcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         memcpy(g_dhcp_lease.server_id, opt_server_id, 4);
         g_dhcp_lease.lease_time = opt_lease;
         g_dhcp_lease.state = DHCP_STATE_REQUESTING;
+        g_dhcp_retries = 0;
+        g_dhcp_deadline = g_dhcp_ticks + DHCP_RETRY_SECONDS;
 
         dhcp_lease_t req_lease;
         memcpy(&req_lease, &g_dhcp_lease, sizeof(dhcp_lease_t));
@@ -345,6 +374,8 @@ void dhcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     } else if (msg_type == DHCPACK && g_dhcp_lease.state == DHCP_STATE_REQUESTING) {
         memcpy(g_dhcp_lease.offered_ip, pkt->yiaddr, 4);
         g_dhcp_lease.state = DHCP_STATE_BOUND;
+        g_dhcp_retries = 0;
+        g_dhcp_deadline = 0;
 
         /* Apply Network Configuration to Kernel */
         net_set_ip(g_dhcp_lease.offered_ip);

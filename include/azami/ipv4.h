@@ -61,7 +61,6 @@ int  ipv4_send(net_buf_t *buf, const u8 dst_ip[4], u8 protocol);
  * also be responsible for keeping it under the path MTU. */
 int  ipv4_send_prebuilt(net_buf_t *buf);
 void ipv4_input(net_buf_t *buf);
-/* Ages out abandoned fragment reassemblies. Call once a second, the same
- * cadence as arp_timer_tick()/tcp_timer_tick() (see sched_tick() in
- * kernel/sched/sched.c). */
+/* Ages out abandoned fragment reassemblies once a second alongside the ARP
+ * and TCP timers in the network worker, or in the scheduler tick fallback. */
 void ipv4_timer_tick(void);

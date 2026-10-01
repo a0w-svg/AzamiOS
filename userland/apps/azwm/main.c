@@ -287,6 +287,185 @@ static void sync_window_surface(az_compositor_t *comp, az_window_t *win)
     az_channel_send_nb((int)win->client_chan, (az_ipc_msg_t *)&rmsg);
 }
 
+/* The tiler keeps each window's floating geometry separately from the
+ * maximize fields, which minimize animations also use. Pool slots can be
+ * recycled, so every saved entry is guarded by its window ID. */
+typedef struct {
+    unsigned int wid;
+    int x, y, saved_x, saved_y;
+    unsigned int w, h, saved_w, saved_h;
+    unsigned char maximized;
+} azwm_tile_saved_t;
+
+typedef struct {
+    int active;
+    azwm_tile_saved_t saved[AZWM_MAX_WINDOWS];
+    unsigned int layout_wids[AZWM_MAX_WINDOWS];
+    int layout_count;
+    int area_x, area_y, area_w, area_h;
+} azwm_tiling_t;
+
+static void tiling_restore(az_compositor_t *comp, azwm_tiling_t *tiling)
+{
+    if (!tiling->active) return;
+    tiling->active = 0;
+    for (int i = 0; i < AZWM_MAX_WINDOWS; i++) {
+        azwm_tile_saved_t *saved = &tiling->saved[i];
+        az_window_t *win = &comp->window_pool[i];
+        if (!saved->wid || win->wid != saved->wid) continue;
+        /* Let a minimize finish; it reads saved_* at its final frame. */
+        bool minimizing = win->anim_state == AZWM_ANIM_MINIMIZE;
+        if (!minimizing) {
+            win->anim_state = AZWM_ANIM_NONE;
+            win->opacity = 255;
+        }
+        win->x = saved->x;
+        win->y = saved->y;
+        win->width = saved->w;
+        win->height = saved->h;
+        win->maximized = saved->maximized;
+        win->saved_x = saved->saved_x;
+        win->saved_y = saved->saved_y;
+        win->saved_w = saved->saved_w;
+        win->saved_h = saved->saved_h;
+        if (minimizing) {
+            win->saved_x = saved->x;
+            win->saved_y = saved->y;
+            win->saved_w = saved->w;
+            win->saved_h = saved->h;
+        }
+        sync_window_surface(comp, win);
+    }
+    memset(tiling->saved, 0, sizeof(tiling->saved));
+    tiling->layout_count = -1;
+    compositor_damage_all(comp);
+}
+
+static bool tiling_reflow(az_compositor_t *comp, const de_comp_state_t *de,
+                          azwm_tiling_t *tiling)
+{
+    if (!tiling->active) return false;
+
+    az_window_t *windows[AZWM_MAX_WINDOWS];
+    unsigned int ids[AZWM_MAX_WINDOWS];
+    int count = 0;
+    for (int i = 0; i < AZWM_MAX_WINDOWS; i++) {
+        az_window_t *win = &comp->window_pool[i];
+        if (!win->wid || !win->visible || !win_has_frame(win) || win->pinned ||
+            de->zorder_hints[i] != AZ_WM_ZORDER_NORMAL ||
+            win->anim_state == AZWM_ANIM_MINIMIZE ||
+            win->anim_state == AZWM_ANIM_CLOSE)
+            continue;
+        windows[count] = win;
+        ids[count++] = win->wid;
+    }
+
+    int left = 0, top = 0, right = 0, bottom = AZWM_TASKBAR_H;
+    for (int i = 0; i < DE_STRUT_MAX_ENTRIES; i++) {
+        const de_strut_t *s = &de->struts[i];
+        if (!s->active) continue;
+        if ((int)s->left > left) left = (int)s->left;
+        if ((int)s->top > top) top = (int)s->top;
+        if ((int)s->right > right) right = (int)s->right;
+        if ((int)s->bottom > bottom) bottom = (int)s->bottom;
+    }
+    int area_w = (int)comp->fb_width - left - right;
+    int area_h = (int)comp->fb_height - top - bottom;
+    if (area_w <= 0 || area_h <= 0) return false;
+
+    int cols = 1;
+    while (cols * cols < count) cols++;
+    int rows = count ? (count + cols - 1) / cols : 0;
+    const int gap = 6;
+    /* A cell must hold the compositor's minimum client surface plus chrome.
+     * If the screen is too small for all windows, keep their current layout. */
+    if (count && (area_w / cols < 100 + 2 * gap + 2 * AZWM_BORDER_W ||
+                  area_h / rows < 60 + 2 * gap + AZWM_TITLEBAR_H + 2 * AZWM_BORDER_W))
+        return false;
+
+    bool changed = count != tiling->layout_count || left != tiling->area_x ||
+                   top != tiling->area_y || area_w != tiling->area_w ||
+                   area_h != tiling->area_h;
+    for (int i = 0; i < count && !changed; i++)
+        changed = ids[i] != tiling->layout_wids[i];
+    if (!changed) return false;
+
+    /* A pinned or panel-band window leaves the grid and regains its floating
+     * geometry. Minimized windows keep their snapshot for later restore. */
+    for (int i = 0; i < AZWM_MAX_WINDOWS; i++) {
+        azwm_tile_saved_t *saved = &tiling->saved[i];
+        az_window_t *win = &comp->window_pool[i];
+        if (!saved->wid || win->wid != saved->wid || !win->visible ||
+            win->anim_state == AZWM_ANIM_MINIMIZE) continue;
+        bool included = false;
+        for (int j = 0; j < count; j++) {
+            if (ids[j] == saved->wid) { included = true; break; }
+        }
+        if (included) continue;
+        win->x = saved->x;
+        win->y = saved->y;
+        win->width = saved->w;
+        win->height = saved->h;
+        win->maximized = saved->maximized;
+        win->saved_x = saved->saved_x;
+        win->saved_y = saved->saved_y;
+        win->saved_w = saved->saved_w;
+        win->saved_h = saved->saved_h;
+        sync_window_surface(comp, win);
+        saved->wid = 0;
+    }
+
+    for (int i = 0; i < count; i++) {
+        az_window_t *win = windows[i];
+        int slot = (int)(win - comp->window_pool);
+        azwm_tile_saved_t *saved = &tiling->saved[slot];
+        if (saved->wid != win->wid) {
+            saved->wid = win->wid;
+            /* A newly created window starts in a zoom animation; its target
+             * is the real floating geometry to restore on exit. */
+            bool opening = win->anim_state == AZWM_ANIM_OPEN ||
+                           win->anim_state == AZWM_ANIM_RESTORE;
+            saved->x = opening ? win->anim_target_x : win->x;
+            saved->y = opening ? win->anim_target_y : win->y;
+            saved->w = opening ? win->anim_target_w : win->width;
+            saved->h = opening ? win->anim_target_h : win->height;
+            saved->maximized = win->maximized;
+            saved->saved_x = win->saved_x;
+            saved->saved_y = win->saved_y;
+            saved->saved_w = win->saved_w;
+            saved->saved_h = win->saved_h;
+        }
+
+        int row = i / cols;
+        int row_start = row * cols;
+        int row_count = count - row_start;
+        if (row_count > cols) row_count = cols;
+        int col = i - row_start;
+        int x0 = left + (area_w * col) / row_count;
+        int x1 = left + (area_w * (col + 1)) / row_count;
+        int y0 = top + (area_h * row) / rows;
+        int y1 = top + (area_h * (row + 1)) / rows;
+
+        win->anim_state = AZWM_ANIM_NONE;
+        win->opacity = 255;
+        win->maximized = 0;
+        win->x = x0 + gap + AZWM_BORDER_W;
+        win->y = y0 + gap + AZWM_TITLEBAR_H + AZWM_BORDER_W;
+        win->width = (unsigned int)(x1 - x0 - 2 * gap - 2 * AZWM_BORDER_W);
+        win->height = (unsigned int)(y1 - y0 - 2 * gap - AZWM_TITLEBAR_H - 2 * AZWM_BORDER_W);
+        sync_window_surface(comp, win);
+    }
+
+    tiling->layout_count = count;
+    tiling->area_x = left;
+    tiling->area_y = top;
+    tiling->area_w = area_w;
+    tiling->area_h = area_h;
+    for (int i = 0; i < count; i++) tiling->layout_wids[i] = ids[i];
+    compositor_damage_all(comp);
+    return true;
+}
+
 /* Reads the Display tab's VSync toggle out of /etc/desktop.conf (the same
  * file userland/apps/settings/main.c writes on every toggle -- see
  * save_display_settings()/apply_theme() there). Defaults to on (matching
@@ -533,6 +712,10 @@ int main(int argc, char **argv)
     de_comp_state_t de_state;
     de_comp_init(&de_state);
     de_log("[azwm] DE compositor extension initialised.");
+
+    azwm_tiling_t tiling;
+    memset(&tiling, 0, sizeof(tiling));
+    tiling.layout_count = -1;
 
     /* NOTE: input is handled inline in the main event loop below via az_input_poll(). */
 
@@ -838,6 +1021,16 @@ int main(int argc, char **argv)
                         int new_x = abs_x - drag_off_x;
                         int new_y = abs_y - drag_off_y;
 
+                        if (tiling.active && (new_x != old_x || new_y != old_y)) {
+                            /* A click only focuses a tile. A real drag returns
+                             * to floating mode and carries this window along. */
+                            tiling_restore(&comp, &tiling);
+                            if (drag_off_x >= (int)dwin->width)
+                                drag_off_x = (int)dwin->width - 16;
+                            new_x = abs_x - drag_off_x;
+                            new_y = abs_y - drag_off_y;
+                        }
+
                         if (old_x != new_x || old_y != new_y) {
                             int margin = 16;
                             compositor_damage(&comp, old_x - AZWM_BORDER_W - margin, old_y - AZWM_TITLEBAR_H - AZWM_BORDER_W - margin,
@@ -956,6 +1149,7 @@ int main(int argc, char **argv)
                                 }
                                 redraw_needed = true;
                             } else if (lclick && hit_maximize_button(hit, abs_x, abs_y)) {
+                                tiling_restore(&comp, &tiling);
                                 if (!hit->maximized) {
                                     hit->saved_x = hit->x;
                                     hit->saved_y = hit->y;
@@ -976,6 +1170,7 @@ int main(int argc, char **argv)
                                 sync_window_surface(&comp, hit);
                                 redraw_needed = true;
                             } else if (lclick && hit_resize_grip(hit, abs_x, abs_y)) {
+                                tiling_restore(&comp, &tiling);
                                 /* Start window resizing */
                                 resize_wid = hit->wid;
                                 resize_start_w = (int)hit->width;
@@ -1007,6 +1202,7 @@ int main(int argc, char **argv)
                                         (abs_x - last_click_x) * (abs_x - last_click_x) +
                                         (abs_y - last_click_y) * (abs_y - last_click_y) < 25) {
                                         /* Double click on titlebar -> Toggle Maximize */
+                                        tiling_restore(&comp, &tiling);
                                         if (!hit->maximized) {
                                             hit->saved_x = hit->x; hit->saved_y = hit->y;
                                             hit->saved_w = hit->width; hit->saved_h = hit->height;
@@ -1198,9 +1394,22 @@ int main(int argc, char **argv)
             } else if (ev.type == AZ_INPUT_EVENT_KEY) {
                 bool is_alt = (ev.flags & AZ_KEY_FLAG_ALT) != 0;
                 bool is_ctrl = (ev.flags & AZ_KEY_FLAG_CTRL) != 0;
+                bool is_shift = (ev.flags & AZ_KEY_FLAG_SHIFT) != 0;
                 bool is_pressed = (ev.flags & AZ_KEY_FLAG_PRESSED) != 0;
 
                 if (is_pressed) {
+                    /* Alt+Shift+T: toggle automatic grid tiling. */
+                    if (is_alt && is_shift && !is_ctrl && ev.scancode == 0x14) {
+                        if (tiling.active) {
+                            tiling_restore(&comp, &tiling);
+                        } else {
+                            tiling.active = 1;
+                            tiling.layout_count = -1;
+                        }
+                        redraw_needed = true;
+                        continue;
+                    }
+
                     /* Alt+Tab: Interactive App Switcher */
                     if (is_alt && (ev.keycode == '\t' || ev.scancode == 0x0F)) {
                         if (!comp.alt_tab_active) {
@@ -1333,6 +1542,7 @@ int main(int argc, char **argv)
 
                     /* Alt+Left: Snap Left Half */
                     if (is_alt && (ev.scancode == 0x4B || ev.keycode == 132) && comp.focused_window && comp.focused_window->title[0] != '\0') {
+                        tiling_restore(&comp, &tiling);
                         az_window_t *fwin = comp.focused_window;
                         if (!fwin->maximized) {
                             fwin->saved_x = fwin->x; fwin->saved_y = fwin->y;
@@ -1350,6 +1560,7 @@ int main(int argc, char **argv)
 
                     /* Alt+Right: Snap Right Half */
                     if (is_alt && (ev.scancode == 0x4D || ev.keycode == 133) && comp.focused_window && comp.focused_window->title[0] != '\0') {
+                        tiling_restore(&comp, &tiling);
                         az_window_t *fwin = comp.focused_window;
                         if (!fwin->maximized) {
                             fwin->saved_x = fwin->x; fwin->saved_y = fwin->y;
@@ -1367,6 +1578,7 @@ int main(int argc, char **argv)
 
                     /* Alt+Up: Maximize */
                     if (is_alt && (ev.scancode == 0x48 || ev.keycode == 134) && comp.focused_window && comp.focused_window->title[0] != '\0') {
+                        tiling_restore(&comp, &tiling);
                         az_window_t *fwin = comp.focused_window;
                         if (!fwin->maximized) {
                             fwin->saved_x = fwin->x; fwin->saved_y = fwin->y;
@@ -1384,6 +1596,7 @@ int main(int argc, char **argv)
 
                     /* Alt+Down: Restore */
                     if (is_alt && (ev.scancode == 0x50 || ev.keycode == 135) && comp.focused_window && comp.focused_window->title[0] != '\0') {
+                        tiling_restore(&comp, &tiling);
                         az_window_t *fwin = comp.focused_window;
                         if (fwin->maximized) {
                             fwin->x = fwin->saved_x; fwin->y = fwin->saved_y;
@@ -1463,9 +1676,16 @@ int main(int argc, char **argv)
             }
         } /* end input poll loop */
 
-        /* ── 2. Process ALL pending IPC messages (non-blocking) ─────────── */
+        /* ── 2. Process a bounded IPC batch (non-blocking) ─────────────── */
         az_wm_msg_t msg;
-        while (az_channel_recv_nb(server_chan, (az_ipc_msg_t *)&msg) == 0) {
+        /* A non-blocking drain must still have a fairness bound: a client
+         * repainting continuously used to keep this loop non-empty forever,
+         * delaying cursor/input polling and frame presentation.  Remaining
+         * messages stay queued for the next pass, while timers, animations,
+         * and every other window continue to run in the background. */
+        int ipc_budget = 64;
+        while (ipc_budget-- > 0 &&
+               az_channel_recv_nb(server_chan, (az_ipc_msg_t *)&msg) == 0) {
             switch (msg.type) {
 
             case AZ_WM_CREATE_WINDOW: {
@@ -1597,6 +1817,10 @@ int main(int argc, char **argv)
                 unsigned int i;
                 for (i = 0; i < AZWM_MAX_WINDOWS; i++) {
                     if (comp.window_pool[i].wid == msg.wid) {
+                        if (tiling.active && tiling.saved[i].wid == msg.wid) {
+                            tiling_restore(&comp, &tiling);
+                            redraw_needed = true;
+                        }
                         int old_x = comp.window_pool[i].x;
                         int old_y = comp.window_pool[i].y;
                         int new_x = msg.move.x;
@@ -1776,6 +2000,9 @@ int main(int argc, char **argv)
                 redraw_needed = true;
             }
         }
+
+        if (tiling_reflow(&comp, &de_state, &tiling))
+            redraw_needed = true;
 
         /* A blanked screen stays black until something wakes it. Clients
          * carry on drawing into their own buffers and sending

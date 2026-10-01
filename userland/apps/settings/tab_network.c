@@ -142,7 +142,7 @@ void draw_network_tab(void)
         if (g_net_status_msg[0]) {
             uk_draw_text(&g_win, px + 4, 384, g_net_status_msg, g_net_status_col);
         } else {
-            uk_draw_text(&g_win, px + 4, 384, "Static settings take effect immediately on net0 and /etc/network.conf", UK_SUBTEXT0);
+            uk_draw_text(&g_win, px + 4, 384, "Static settings take effect immediately on net0 and /etc/network/interfaces", UK_SUBTEXT0);
         }
 
         /* Compact stats row */

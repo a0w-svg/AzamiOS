@@ -1886,6 +1886,7 @@ int main(int argc, char **argv)
 
     /* Spawn Network DHCP Daemon */
     az_spawn("/sbin/dhcpcd.elf");
+    az_spawn("/sbin/ntpd.elf");
 
     puts("[init] Spawning session manager (sessiond.elf)...");
 
@@ -1924,4 +1925,3 @@ int main(int argc, char **argv)
 
     return 0;
 }
-

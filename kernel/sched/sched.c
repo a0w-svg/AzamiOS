@@ -31,7 +31,11 @@
 
 
 static spinlock_t g_sched_lock = SPINLOCK_INIT;
+static spinlock_t g_sleep_lock = SPINLOCK_INIT;
 static process_t *g_process_list = NULL;
+#define PID_HASH_SIZE 1024
+static process_t *g_pid_hash[PID_HASH_SIZE] = {NULL};
+static u32 g_process_count = 0;
 static process_t *g_kernel_proc = NULL;
 static u32 g_next_pid = 1;
 static u32 g_next_pcid = 0;   /* rolls 1..4095 for user address spaces */
@@ -142,13 +146,13 @@ static void enqueue_ready(thread_t *t);
 static void rq_remove_thread_locked(thread_t *t);
 
 /* Sleep queue is kept sorted by sleep_end_ticks (ascending) for O(1) tick scan */
-static thread_t *g_sleep_queue = NULL;
+static struct rb_root g_sleep_tree = RB_ROOT;
 
 /* High-resolution sleepers (sched_sleep_until_ns), sorted ascending by
  * sleep_deadline_ns and protected by g_sched_lock like g_sleep_queue. Kept
  * apart from the tick-ordered queue because the two are keyed differently:
  * a wake-up here is due at a time, not at a tick number. */
-static thread_t *g_hr_sleep_queue = NULL;
+static struct rb_root g_hr_sleep_tree = RB_ROOT;
 u64 g_system_ticks = 0;
 
 static thread_t *g_idle_threads[SMP_MAX_CPUS] = {NULL};
@@ -349,14 +353,18 @@ void sched_post_switch(void)
             } else if (prev->sleep_deadline_ns) {
                 prev->state  = THREAD_SLEEPING;
                 prev->hr_cpu = cpu->cpu_id;
+                spinlock_lock(&g_sleep_lock);
                 hr_queue_insert_sorted(prev);
                 /* This CPU owns the wake-up: it is the one that just went
                  * quiet, and the one the sleeper will most likely run on. */
                 hr_arm_for_deadline(prev->sleep_deadline_ns, now_ns);
+                spinlock_unlock(&g_sleep_lock);
             } else {
                 prev->state = THREAD_SLEEPING;
                 /* Insert into sorted sleep queue (PERF-02) */
+                spinlock_lock(&g_sleep_lock);
                 sleep_queue_insert_sorted(prev);
+                spinlock_unlock(&g_sleep_lock);
             }
         } else if (prev->state == THREAD_BLOCKED_PENDING) {
             if (prev->unblock_pending) {
@@ -376,15 +384,7 @@ static u64 g_cpu_active_ticks[SMP_MAX_CPUS] = {0};
 
 u32 sched_get_process_count(void)
 {
-    u32 count = 0;
-    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
-    process_t *curr = g_process_list;
-    while (curr) {
-        count++;
-        curr = curr->next;
-    }
-    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
-    return count;
+    return __atomic_load_n(&g_process_count, __ATOMIC_RELAXED);
 }
 
 /*
@@ -491,6 +491,7 @@ static inline bool thread_uses_fpu(const thread_t *t)
 
 static inline void fpu_switch(thread_t *prev, thread_t *next)
 {
+    if (prev == next) return;
     if (thread_uses_fpu(prev)) fpu_save(&prev->fpu_state);
     if (thread_uses_fpu(next)) fpu_restore(&next->fpu_state);
 }
@@ -1106,6 +1107,9 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     irqf = spinlock_lock_irqsave(&g_sched_lock);
     proc->next = g_process_list;
     g_process_list = proc;
+    proc->hash_next = g_pid_hash[proc->pid % PID_HASH_SIZE];
+    g_pid_hash[proc->pid % PID_HASH_SIZE] = proc;
+    __atomic_add_fetch(&g_process_count, 1, __ATOMIC_RELAXED);
     spinlock_unlock_irqrestore(&g_sched_lock, irqf);
 
     return proc;
@@ -1199,6 +1203,12 @@ void proc_destroy(process_t *proc)
     while (*pproc) {
         if (*pproc == proc) {
             *pproc = proc->next;
+            process_t **h = &g_pid_hash[proc->pid % PID_HASH_SIZE];
+            while (*h) {
+                if (*h == proc) { *h = proc->hash_next; break; }
+                h = &(*h)->hash_next;
+            }
+            __atomic_sub_fetch(&g_process_count, 1, __ATOMIC_RELAXED);
         } else {
             if ((*pproc)->parent == proc) {
                 (*pproc)->parent = reaper;
@@ -1763,7 +1773,12 @@ static void sched_reaper_loop(void *arg)
 
                 /* Remove process from list */
                 *pproc = proc->next;
-                
+                process_t **h = &g_pid_hash[proc->pid % PID_HASH_SIZE];
+                while (*h) {
+                    if (*h == proc) { *h = proc->hash_next; break; }
+                    h = &(*h)->hash_next;
+                }
+                __atomic_sub_fetch(&g_process_count, 1, __ATOMIC_RELAXED);
                 /* Reparent children to subreaper to prevent dangling parent pointers */
                 process_t *reaper = sched_find_reaper(proc);
                 process_t *child = g_process_list;
@@ -2101,9 +2116,13 @@ static u64 g_load_avg[3] = {0, 0, 0}; /* Q11 fixed-point, like Linux's avenrun[]
 static u32 sched_count_runnable_locked(void)
 {
     u32 count = 0;
-    for (process_t *p = g_process_list; p; p = p->next) {
-        for (thread_t *t = p->threads; t; t = t->proc_next) {
-            if (t->state == THREAD_READY || t->state == THREAD_RUNNING) count++;
+    u32 ncpus = smp_cpu_count();
+    for (u32 i = 0; i < ncpus; i++) {
+        count += __atomic_load_n(&g_cpu_rq[i].nr_running, __ATOMIC_RELAXED);
+        count += __atomic_load_n(&g_cpu_rq[i].rt_nr_running, __ATOMIC_RELAXED);
+        cpu_info_t *cpu = smp_cpu_info(i);
+        if (cpu && cpu->current_thread && cpu->current_thread != g_idle_threads[i]) {
+            count++;
         }
     }
     return count;
@@ -2158,22 +2177,26 @@ void sched_tick(pt_regs_t *regs)
         /* Accumulate the clocksource and republish the vvar page. First,
          * so everything below this tick sees the updated clocks. */
         timekeeping_tick();
-        console_tick();
-        extern void net_poll(void);
-        net_poll();
+        if (!console_async_running()) console_tick();
+        /* RX and protocol maintenance normally run in the network worker.
+         * Keep the old tick path until that worker is ready, or if its
+         * thread allocation failed during boot. */
+        extern bool net_async_polling(void);
+        if (!net_async_polling()) {
+            extern void net_poll(void);
+            net_poll();
+        }
 
-        /* ARP cache expiry/retry, TCP handshake retransmission, and IPv4
-         * fragment reassembly expiry all work in whole seconds (see
-         * ARP_RETRY_TIMEOUT, TCP_RTX_BASE_TIMEOUT, IP_REASSEMBLY_TIMEOUT),
-         * not in LAPIC ticks — calling them on every tick would fire them
-         * ~100x too fast at the 100 Hz lapic_timer_start(100) in
-         * kernel/main.c. Gating on that same 100 recovers "once a second"
-         * without any of them needing to know the tick rate itself. */
-        if (current_ticks % 100 == 0) {
+        /* Keep the once-per-second protocol timer fallback while the
+         * network worker is unavailable. The worker uses the same 100 Hz
+         * scheduler clock, so the cadence does not change on handoff. */
+        if (current_ticks % 100 == 0 && !net_async_polling()) {
             extern void arp_timer_tick(void);
             arp_timer_tick();
             extern void tcp_timer_tick(void);
             tcp_timer_tick();
+            extern void dhcp_timer_tick(void);
+            dhcp_timer_tick();
             extern void ipv4_timer_tick(void);
             ipv4_timer_tick();
         }
@@ -2231,14 +2254,13 @@ void sched_tick(pt_regs_t *regs)
      * re-derives under the lock — so a stale read costs at most one tick of
      * latency, never correctness.
      */
-    thread_t *sq_head = __atomic_load_n(&g_sleep_queue, __ATOMIC_RELAXED);
-    bool wake_due   = sq_head && sq_head->sleep_end_ticks <= current_ticks;
-    /* High-resolution sleepers: due now, or due before this CPU's next tick
-     * (in which case the rearm above just overwrote any early deadline this
-     * CPU had armed for them, and it has to be put back). */
-    thread_t *hr_head = __atomic_load_n(&g_hr_sleep_queue, __ATOMIC_RELAXED);
-    u64 tick_now_ns = hr_head ? ktime_get_ns() : 0;
-    bool hr_due = hr_head && hr_head->sleep_deadline_ns < tick_now_ns + NSEC_PER_SEC / TK_HZ;
+    bool sq_nonempty = __atomic_load_n(&g_sleep_tree.rb_node, __ATOMIC_RELAXED) != NULL;
+    bool hr_nonempty = __atomic_load_n(&g_hr_sleep_tree.rb_node, __ATOMIC_RELAXED) != NULL;
+    /* We can't locklessly find the leftmost node of an rbtree, so if the trees
+     * are non-empty we must take the lock to check if any wakeups are due. */
+    bool wake_due = sq_nonempty;
+    u64 tick_now_ns = hr_nonempty ? ktime_get_ns() : 0;
+    bool hr_due = hr_nonempty;
     u32 my_cpu = (cpu->cpu_id < SMP_MAX_CPUS) ? cpu->cpu_id : 0;
     runqueue_t *my_rq = &g_cpu_rq[my_cpu];
     bool rq_nonempty = __atomic_load_n(&rq_head(my_rq), __ATOMIC_RELAXED) != NULL ||
@@ -2273,19 +2295,24 @@ void sched_tick(pt_regs_t *regs)
         }
     }
 
-    if (wake_due || hr_due || rq_nonempty) {
-        spinlock_lock(&g_sched_lock);
+    if (wake_due || hr_due) {
+        spinlock_lock(&g_sleep_lock);
 
-        /* Wake sleeping threads. Queue is sorted ascending by sleep_end_ticks
-         * so we can early-exit as soon as we see a tick in the future. */
-        while (g_sleep_queue && g_sleep_queue->sleep_end_ticks <= current_ticks) {
-            thread_t *waking = g_sleep_queue;
-            g_sleep_queue = waking->next;
-            waking->next = NULL;
+        while (1) {
+            struct rb_node *first = rb_first(&g_sleep_tree);
+            if (!first) break;
+            thread_t *waking = rb_entry(first, thread_t, sleep_rb);
+            if (waking->sleep_end_ticks > current_ticks) break;
+            rb_erase(first, &g_sleep_tree);
+            first->rb_parent = first->rb_left = first->rb_right = NULL;
             enqueue_ready(waking);
         }
         if (hr_due) hr_expire_locked(cpu->cpu_id, tick_now_ns);
 
+        spinlock_unlock(&g_sleep_lock);
+    }
+
+    if (rq_nonempty) {
         spinlock_lock(&my_rq->lock);
         if (my_rq->rt_head) {
             /* Anything real-time and runnable outranks a CFS thread outright,
@@ -2300,7 +2327,6 @@ void sched_tick(pt_regs_t *regs)
                                rq_head(my_rq)->vruntime < curr->vruntime));
         }
         spinlock_unlock(&my_rq->lock);
-        spinlock_unlock(&g_sched_lock);
     }
 
     /* Pull work from a lopsided neighbour. Deliberately after the preemption
@@ -2486,18 +2512,26 @@ void sched_sleep_until_ns(u64 deadline_ns)
 }
 
 /* Insert into the high-resolution queue, ascending by sleep_deadline_ns.
- * Caller holds g_sched_lock. */
+ * Caller holds g_sleep_lock. */
 static void hr_queue_insert_sorted(thread_t *t)
 {
-    thread_t **pp = &g_hr_sleep_queue;
-    while (*pp && (*pp)->sleep_deadline_ns <= t->sleep_deadline_ns)
-        pp = &(*pp)->next;
-    t->next = *pp;
-    *pp = t;
+    struct rb_node **link = &g_hr_sleep_tree.rb_node;
+    struct rb_node *parent = NULL;
+    while (*link) {
+        parent = *link;
+        thread_t *entry = rb_entry(parent, thread_t, sleep_rb);
+        if (t->sleep_deadline_ns < entry->sleep_deadline_ns)
+            link = &parent->rb_left;
+        else
+            link = &parent->rb_right;
+    }
+    rb_link_node(&t->sleep_rb, parent, link);
+    rb_insert_color(&t->sleep_rb, &g_hr_sleep_tree);
 }
 
 /* Arm the calling CPU's timer for @deadline_ns (a CLOCK_MONOTONIC time), if
- * that is before its next tick; @now_ns is the current time. */
+ * that is before its next tick; @now_ns is the current time. 
+ * Caller holds g_sleep_lock. */
 static void hr_arm_for_deadline(u64 deadline_ns, u64 now_ns)
 {
     if (!lapic_hrtimer_available()) return;
@@ -2511,18 +2545,23 @@ static void hr_arm_for_deadline(u64 deadline_ns, u64 now_ns)
 
 /* Wake every high-resolution sleeper whose deadline has passed, then arm the
  * calling CPU for the earliest remaining one it owns that falls before its
- * next tick. Caller holds g_sched_lock. */
+ * next tick. Caller holds g_sleep_lock. */
 static void hr_expire_locked(u32 cpu_id, u64 now_ns)
 {
-    while (g_hr_sleep_queue && g_hr_sleep_queue->sleep_deadline_ns <= now_ns) {
-        thread_t *t = g_hr_sleep_queue;
-        g_hr_sleep_queue = t->next;
-        t->next = NULL;
+    while (1) {
+        struct rb_node *first = rb_first(&g_hr_sleep_tree);
+        if (!first) break;
+        thread_t *t = rb_entry(first, thread_t, sleep_rb);
+        if (t->sleep_deadline_ns > now_ns) break;
+        rb_erase(first, &g_hr_sleep_tree);
+        first->rb_parent = first->rb_left = first->rb_right = NULL;
         t->sleep_deadline_ns = 0;
         enqueue_ready(t);
     }
     u64 horizon = now_ns + NSEC_PER_SEC / TK_HZ;
-    for (thread_t *t = g_hr_sleep_queue; t && t->sleep_deadline_ns < horizon; t = t->next) {
+    for (struct rb_node *node = rb_first(&g_hr_sleep_tree); node; node = rb_next(node)) {
+        thread_t *t = rb_entry(node, thread_t, sleep_rb);
+        if (t->sleep_deadline_ns >= horizon) break;
         if (t->hr_cpu == cpu_id) {
             hr_arm_for_deadline(t->sleep_deadline_ns, now_ns);
             break;
@@ -2531,19 +2570,22 @@ static void hr_expire_locked(u32 cpu_id, u64 now_ns)
 }
 
 /* Insert thread into sleep queue keeping it sorted ascending by sleep_end_ticks.
- * This lets sched_tick() early-exit as soon as it sees a future wakeup time. */
+ * This lets sched_tick() early-exit as soon as it sees a future wakeup time.
+ * Caller holds g_sleep_lock. */
 static void sleep_queue_insert_sorted(thread_t *t)
 {
-    if (!g_sleep_queue || t->sleep_end_ticks <= g_sleep_queue->sleep_end_ticks) {
-        t->next = g_sleep_queue;
-        g_sleep_queue = t;
-        return;
+    struct rb_node **link = &g_sleep_tree.rb_node;
+    struct rb_node *parent = NULL;
+    while (*link) {
+        parent = *link;
+        thread_t *entry = rb_entry(parent, thread_t, sleep_rb);
+        if (t->sleep_end_ticks < entry->sleep_end_ticks)
+            link = &parent->rb_left;
+        else
+            link = &parent->rb_right;
     }
-    thread_t *curr = g_sleep_queue;
-    while (curr->next && curr->next->sleep_end_ticks <= t->sleep_end_ticks)
-        curr = curr->next;
-    t->next = curr->next;
-    curr->next = t;
+    rb_link_node(&t->sleep_rb, parent, link);
+    rb_insert_color(&t->sleep_rb, &g_sleep_tree);
 }
 
 /* Unlink @t from the sorted sleep queue if it is on it. Caller holds
@@ -2553,19 +2595,17 @@ static void sleep_queue_insert_sorted(thread_t *t)
  * drop a node. */
 static void sleep_queue_remove_locked(thread_t *t)
 {
-    thread_t **head = t->sleep_deadline_ns ? &g_hr_sleep_queue : &g_sleep_queue;
+    spinlock_lock(&g_sleep_lock);
+    struct rb_root *root = t->sleep_deadline_ns ? &g_hr_sleep_tree : &g_sleep_tree;
     t->sleep_deadline_ns = 0;
-    thread_t *curr = *head, *prev = NULL;
-    while (curr) {
-        if (curr == t) {
-            if (prev) prev->next = curr->next;
-            else      *head = curr->next;
-            curr->next = NULL;
-            return;
-        }
-        prev = curr;
-        curr = curr->next;
+    
+    /* Safely check if it's in the tree. We can check if it has a parent or is root. 
+       Actually, since we know it IS in the queue if this is called, we just erase. */
+    if (t->sleep_rb.rb_parent || g_sleep_tree.rb_node == &t->sleep_rb || g_hr_sleep_tree.rb_node == &t->sleep_rb) {
+        rb_erase(&t->sleep_rb, root);
+        t->sleep_rb.rb_parent = t->sleep_rb.rb_left = t->sleep_rb.rb_right = NULL;
     }
+    spinlock_unlock(&g_sleep_lock);
 }
 
 void sched_unblock(thread_t *t)
@@ -3095,6 +3135,12 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
             while (*pp) {
                 if (*pp == zombie_child) {
                     *pp = zombie_child->next;
+                    process_t **h = &g_pid_hash[zombie_child->pid % PID_HASH_SIZE];
+                    while (*h) {
+                        if (*h == zombie_child) { *h = zombie_child->hash_next; break; }
+                        h = &(*h)->hash_next;
+                    }
+                    __atomic_sub_fetch(&g_process_count, 1, __ATOMIC_RELAXED);
                     break;
                 }
                 pp = &(*pp)->next;
@@ -3207,7 +3253,7 @@ process_t *sched_get_process_by_pid(u32 pid)
     if (pid == 0) return NULL;
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
     process_t *target = NULL;
-    for (process_t *p = g_process_list; p; p = p->next) {
+    for (process_t *p = g_pid_hash[pid % PID_HASH_SIZE]; p; p = p->hash_next) {
         if (p->pid == pid) {
             target = p;
             break;
@@ -3222,7 +3268,7 @@ process_t *proc_get_by_pid(u32 pid)
     if (pid == 0) return NULL;
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
     process_t *target = NULL;
-    for (process_t *p = g_process_list; p; p = p->next) {
+    for (process_t *p = g_pid_hash[pid % PID_HASH_SIZE]; p; p = p->hash_next) {
         if (p->pid == pid) { target = p; break; }
     }
     /* A zombie is on its way out; callers that want to act on a process never
@@ -3680,5 +3726,3 @@ int sched_set_proc_affinity(process_t *proc, u64 mask)
     spinlock_unlock_irqrestore(&g_sched_lock, irqf);
     return 0;
 }
-
-

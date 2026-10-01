@@ -95,6 +95,8 @@ phys_addr_t pmm_alloc(u32 order);
  */
 void pmm_free(phys_addr_t phys, u32 order);
 
+phys_addr_t pmm_alloc_zeroed(u32 order);
+
 /** Convenience wrappers for single-page allocation (order 0). */
 static inline phys_addr_t pmm_alloc_page(void) { return pmm_alloc(0); }
 static inline void        pmm_free_page(phys_addr_t p) { pmm_free(p, 0); }

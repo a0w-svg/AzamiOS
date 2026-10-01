@@ -21,16 +21,18 @@
 #include "../../arch/x86_64/cpu/spinlock.h"
 
 static udp_sock_t *g_udp_sockets = NULL;
+#define UDP_HASH_SIZE 256
+static udp_sock_t *g_udp_hash[UDP_HASH_SIZE] = {NULL};
 static spinlock_t  g_udp_lock = SPINLOCK_INIT;
 static u16         g_next_ephemeral_port = UDP_PORT_EPHEMERAL_START;
 
 /* Every lock in this file uses spinlock_lock_irqsave()/_irqrestore(), for the
  * same reason as tcp.c's identical note: udp_input() is reachable from a
- * timer interrupt on any CPU (sched_tick() -> net_poll() ->
- * e1000_poll_rx() -> net_process_incoming() -> ipv4_input() -> udp_input()),
+ * NIC interrupt (or the timer fallback if the network worker cannot start)
+ * through net_process_incoming() -> ipv4_input() -> udp_input(),
  * and it takes both g_udp_lock and a socket's own sock->lock. A plain
  * spinlock_lock() in udp_bind()/udp_connect()/udp_socket_close()/
- * udp_recvfrom() leaves interrupts enabled, so that timer can land on the
+ * udp_recvfrom() leaves interrupts enabled, so that interrupt can land on the
  * very CPU already holding one of those locks in ordinary process context;
  * udp_input()'s attempt to take the same (non-reentrant, ticket) lock then
  * spins forever, and so does the process-context holder once the interrupt
@@ -44,6 +46,7 @@ void udp_init(void)
 {
     irqflags_t flags = spinlock_lock_irqsave(&g_udp_lock);
     g_udp_sockets = NULL;
+    for (int i = 0; i < UDP_HASH_SIZE; i++) g_udp_hash[i] = NULL;
     g_next_ephemeral_port = UDP_PORT_EPHEMERAL_START;
     spinlock_unlock_irqrestore(&g_udp_lock, flags);
     pr_debug("[UDP] User Datagram Protocol engine initialized.\n");
@@ -83,6 +86,7 @@ static void udp_sock_get(udp_sock_t *s)
 static void udp_sock_put(udp_sock_t *s)
 {
     if (__atomic_sub_fetch(&s->refcnt, 1, __ATOMIC_ACQ_REL) != 0) return;
+    net_buf_queue_purge(&s->rx_queue);
     kfree(s);
 }
 
@@ -119,10 +123,20 @@ void udp_socket_close(udp_sock_t *sock)
         }
         curr = &(*curr)->next;
     }
+    if (sock->bound) {
+        udp_sock_t **hcurr = &g_udp_hash[sock->local_port % UDP_HASH_SIZE];
+        while (*hcurr) {
+            if (*hcurr == sock) {
+                *hcurr = sock->hash_next;
+                break;
+            }
+            hcurr = &(*hcurr)->hash_next;
+        }
+    }
     spinlock_unlock_irqrestore(&g_udp_lock, list_flags);
 
     irqflags_t sock_flags = spinlock_lock_irqsave(&sock->lock);
-    net_buf_queue_purge(&sock->rx_queue);
+    sock->closed = true;
     if (sock->wait_thread) {
         sched_unblock(sock->wait_thread);
         sock->wait_thread = NULL;
@@ -146,13 +160,13 @@ static u16 udp_alloc_ephemeral_port(void)
 
         /* Check collision */
         bool in_use = false;
-        udp_sock_t *cur = g_udp_sockets;
+        udp_sock_t *cur = g_udp_hash[port % UDP_HASH_SIZE];
         while (cur) {
-            if (cur->bound && cur->local_port == port) {
+            if (cur->local_port == port) {
                 in_use = true;
                 break;
             }
-            cur = cur->next;
+            cur = cur->hash_next;
         }
         if (!in_use) return port;
     }
@@ -166,6 +180,12 @@ int udp_bind(udp_sock_t *sock, const u8 ip[4], u16 port)
     irqflags_t list_flags = spinlock_lock_irqsave(&g_udp_lock);
     irqflags_t sock_flags = spinlock_lock_irqsave(&sock->lock);
 
+    if (sock->bound || sock->closed) {
+        spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+        spinlock_unlock_irqrestore(&g_udp_lock, list_flags);
+        return -EINVAL;
+    }
+
     if (port == 0) {
         port = udp_alloc_ephemeral_port();
         if (port == 0) {
@@ -175,14 +195,14 @@ int udp_bind(udp_sock_t *sock, const u8 ip[4], u16 port)
         }
     } else {
         /* Check if port is already taken */
-        udp_sock_t *cur = g_udp_sockets;
+        udp_sock_t *cur = g_udp_hash[port % UDP_HASH_SIZE];
         while (cur) {
-            if (cur != sock && cur->bound && cur->local_port == port) {
+            if (cur != sock && cur->local_port == port) {
                 spinlock_unlock_irqrestore(&sock->lock, sock_flags);
                 spinlock_unlock_irqrestore(&g_udp_lock, list_flags);
                 return -EADDRINUSE;
             }
-            cur = cur->next;
+            cur = cur->hash_next;
         }
     }
 
@@ -190,6 +210,10 @@ int udp_bind(udp_sock_t *sock, const u8 ip[4], u16 port)
     if (ip) memcpy(sock->local_ip, ip, 4);
     else memset(sock->local_ip, 0, 4);
     sock->bound = true;
+
+    int h = port % UDP_HASH_SIZE;
+    sock->hash_next = g_udp_hash[h];
+    g_udp_hash[h] = sock;
 
     spinlock_unlock_irqrestore(&sock->lock, sock_flags);
     spinlock_unlock_irqrestore(&g_udp_lock, list_flags);
@@ -217,7 +241,8 @@ int udp_connect(udp_sock_t *sock, const u8 ip[4], u16 port)
 
 s64 udp_sendto(udp_sock_t *sock, const void *data, size_t len, const u8 dst_ip[4], u16 dst_port)
 {
-    if (!sock || !data) return -EINVAL;
+    if (!sock || (!data && len)) return -EINVAL;
+    if (len > UDP_MAX_PAYLOAD) return -EMSGSIZE;
 
     if (!sock->bound) {
         int res = udp_bind(sock, NULL, 0);
@@ -227,14 +252,22 @@ s64 udp_sendto(udp_sock_t *sock, const void *data, size_t len, const u8 dst_ip[4
     u8 target_ip[4];
     u16 target_port = dst_port;
 
+    irqflags_t flags = spinlock_lock_irqsave(&sock->lock);
+    if (sock->closed) {
+        spinlock_unlock_irqrestore(&sock->lock, flags);
+        return -EBADF;
+    }
+    u16 local_port = sock->local_port;
     if (dst_ip && dst_port > 0) {
         memcpy(target_ip, dst_ip, 4);
     } else if (sock->connected) {
         memcpy(target_ip, sock->remote_ip, 4);
         target_port = sock->remote_port;
     } else {
+        spinlock_unlock_irqrestore(&sock->lock, flags);
         return -EDESTADDRREQ;
     }
+    spinlock_unlock_irqrestore(&sock->lock, flags);
 
     net_buf_t *buf = net_buf_alloc(NET_BUF_HEADROOM + sizeof(udp_hdr_t) + len);
     if (!buf) return -ENOMEM;
@@ -243,29 +276,16 @@ s64 udp_sendto(udp_sock_t *sock, const void *data, size_t len, const u8 dst_ip[4
 
     /* 1. Put UDP Header */
     udp_hdr_t *udp = (udp_hdr_t *)net_buf_put(buf, sizeof(udp_hdr_t));
-    udp->src_port = htons(sock->local_port);
+    udp->src_port = htons(local_port);
     udp->dst_port = htons(target_port);
     udp->length = htons((u16)(sizeof(udp_hdr_t) + len));
     udp->checksum = 0;
 
     /* 2. Put Payload Data */
     void *payload = net_buf_put(buf, len);
-    memcpy(payload, data, len);
+    if (len) memcpy(payload, data, len);
 
-    /* 3. Compute UDP Checksum */
-    u8 host_ip[4];
-    net_get_ip(host_ip);
-    ipv4_hdr_t pseudo_ip;
-    if (target_ip[0] == 127) {
-        static const u8 loop_src[4] = { 127, 0, 0, 1 };
-        memcpy(pseudo_ip.src_ip, loop_src, 4);
-    } else {
-        memcpy(pseudo_ip.src_ip, host_ip, 4);
-    }
-    memcpy(pseudo_ip.dst_ip, target_ip, 4);
-    udp->checksum = udp_checksum(udp, &pseudo_ip, payload, len);
-
-    /* 4. Transmit via IPv4 */
+    /* IPv4 computes the checksum once, after choosing the source address. */
     int ret = ipv4_send(buf, target_ip, IP_PROTO_UDP);
     if (ret < 0) return ret;
 
@@ -274,7 +294,7 @@ s64 udp_sendto(udp_sock_t *sock, const void *data, size_t len, const u8 dst_ip[4
 
 s64 udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], u16 *src_port_out, bool nonblock)
 {
-    if (!sock || !buf || max_len == 0) return -EINVAL;
+    if (!sock || (!buf && max_len)) return -EINVAL;
 
     if (!sock->bound) {
         int res = udp_bind(sock, NULL, 0);
@@ -282,7 +302,14 @@ s64 udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], 
     }
 
     for (;;) {
+        irqflags_t flags = spinlock_lock_irqsave(&sock->lock);
+        if (sock->closed) {
+            spinlock_unlock_irqrestore(&sock->lock, flags);
+            return -EBADF;
+        }
         net_buf_t *pkt = net_buf_queue_pop(&sock->rx_queue);
+        if (pkt) sock->rx_bytes -= pkt->capacity + sizeof(*pkt);
+        spinlock_unlock_irqrestore(&sock->lock, flags);
         if (pkt) {
             /* Packet buffer contains: [src_ip 4B][src_port 2B][payload ...] */
             if (pkt->len < 6) {
@@ -299,7 +326,7 @@ s64 udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], 
 
             size_t payload_len = pkt->len - 6;
             size_t copy_len = (payload_len < max_len) ? payload_len : max_len;
-            memcpy(buf, pkt->data + 6, copy_len);
+            if (copy_len) memcpy(buf, pkt->data + 6, copy_len);
 
             net_buf_free(pkt);
             return (s64)copy_len;
@@ -310,7 +337,11 @@ s64 udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], 
         }
 
         /* Sleep waiting for datagram */
-        irqflags_t flags = spinlock_lock_irqsave(&sock->lock);
+        flags = spinlock_lock_irqsave(&sock->lock);
+        if (sock->closed) {
+            spinlock_unlock_irqrestore(&sock->lock, flags);
+            return -EBADF;
+        }
         if (net_buf_queue_len(&sock->rx_queue) == 0) {
             sock->wait_thread = sched_current_thread();
             spinlock_unlock_irqrestore(&sock->lock, flags);
@@ -342,7 +373,7 @@ bool udp_poll(udp_sock_t *sock)
 /* See tcp_format_proc_net()'s comment on the address/port encoding — UDP
  * has no state machine, so Linux's "st" column is always 07 (TCP_CLOSE,
  * reused verbatim by udp4_seq_show — a UDP socket that exists at all is
- * simply "open"). rx_queue counts queued, not-yet-recvfrom()'d datagrams. */
+ * simply "open"). rx_queue reports charged receive memory in bytes. */
 size_t udp_format_proc_net(char *buf, size_t max)
 {
     size_t off = (size_t)scnprintf(buf, max,
@@ -351,18 +382,32 @@ size_t udp_format_proc_net(char *buf, size_t max)
     irqflags_t flags = spinlock_lock_irqsave(&g_udp_lock);
     int sl = 0;
     for (udp_sock_t *s = g_udp_sockets; s; s = s->next) {
+        irqflags_t sock_flags = spinlock_lock_irqsave(&s->lock);
         u32 local_be = (u32)s->local_ip[0] | ((u32)s->local_ip[1] << 8) |
                        ((u32)s->local_ip[2] << 16) | ((u32)s->local_ip[3] << 24);
         u32 rem_be = (u32)s->remote_ip[0] | ((u32)s->remote_ip[1] << 8) |
                      ((u32)s->remote_ip[2] << 16) | ((u32)s->remote_ip[3] << 24);
         off += (size_t)scnprintf(buf + off, max > off ? max - off : 0,
-            "%4d: %08X:%04X %08X:%04X 07 00000000:%08zX 00:00000000 00000000     0        0 0 0 0 0\n",
+            "%4d: %08X:%04X %08X:%04X 07 00000000:%08zX 00:00000000 00000000     0        0 0 0 0 %llu\n",
             sl, local_be, s->local_port, rem_be, s->remote_port,
-            net_buf_queue_len(&s->rx_queue));
+            s->rx_bytes, (unsigned long long)s->rx_drops);
+        spinlock_unlock_irqrestore(&s->lock, sock_flags);
         sl++;
     }
     spinlock_unlock_irqrestore(&g_udp_lock, flags);
     return off;
+}
+
+/* Caller holds sock->lock. A connected UDP endpoint receives only from its
+ * chosen peer; binding an address also restricts the destination address. */
+static bool udp_matches(udp_sock_t *sock, const ipv4_hdr_t *ip,
+                        u16 src_port, u16 dst_port)
+{
+    static const u8 any[4] = { 0 };
+    return !sock->closed && sock->bound && sock->local_port == dst_port &&
+        (!memcmp(sock->local_ip, any, 4) || !memcmp(sock->local_ip, ip->dst_ip, 4)) &&
+        (!sock->connected || (sock->remote_port == src_port &&
+                             !memcmp(sock->remote_ip, ip->src_ip, 4)));
 }
 
 void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
@@ -401,9 +446,7 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             return;
         }
     }
-
-
-
+    net_buf_trim(buf, udp_len);
     /* Check for kernel DHCP client dispatch */
     if (dst_port == DHCP_CLIENT_PORT) {
         net_buf_t *dhcp_clone = net_buf_clone(buf);
@@ -416,13 +459,16 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     /* Find matching socket */
     irqflags_t list_flags = spinlock_lock_irqsave(&g_udp_lock);
     udp_sock_t *target_sock = NULL;
-    udp_sock_t *cur = g_udp_sockets;
+    udp_sock_t *cur = g_udp_hash[dst_port % UDP_HASH_SIZE];
     while (cur) {
-        if (cur->bound && cur->local_port == dst_port) {
+        irqflags_t sock_flags = spinlock_lock_irqsave(&cur->lock);
+        bool matches = udp_matches(cur, ip_hdr, src_port, dst_port);
+        spinlock_unlock_irqrestore(&cur->lock, sock_flags);
+        if (matches) {
             target_sock = cur;
             break;
         }
-        cur = cur->next;
+        cur = cur->hash_next;
     }
     /* Taken while g_udp_lock is still held — see udp_sock_get()'s comment.
      * Dropped below once this packet is done with target_sock, whichever
@@ -431,25 +477,40 @@ void udp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     spinlock_unlock_irqrestore(&g_udp_lock, list_flags);
 
     if (target_sock) {
-        /* Allocate a packet buffer containing [src_ip 4B][src_port 2B][payload] */
-        net_buf_t *rx_buf = net_buf_alloc(6 + payload_len);
-        if (rx_buf) {
-            u8 *p = (u8 *)net_buf_put(rx_buf, 6 + payload_len);
-            memcpy(p, ip_hdr->src_ip, 4);
+        irqflags_t sock_flags = spinlock_lock_irqsave(&target_sock->lock);
+        /* Recheck after lookup: close/connect may have changed the endpoint
+         * while its lifetime reference kept the allocation alive. */
+        if (!udp_matches(target_sock, ip_hdr, src_port, dst_port)) {
+            spinlock_unlock_irqrestore(&target_sock->lock, sock_flags);
+            udp_sock_put(target_sock);
+            net_buf_free(buf);
+            return;
+        }
+        if (buf->capacity > UDP_RX_MAX_BYTES - sizeof(*buf) ||
+            target_sock->rx_bytes > UDP_RX_MAX_BYTES - sizeof(*buf) - buf->capacity ||
+            net_buf_queue_len(&target_sock->rx_queue) >= UDP_RX_MAX_PACKETS) {
+            target_sock->rx_drops++;
+        } else {
+            /* Reuse the eight-byte UDP header as six bytes of sender
+             * metadata. The payload stays in its original allocation. */
+            u8 source_ip[4];
+            memcpy(source_ip, ip_hdr->src_ip, 4);
+            net_buf_pull(buf, sizeof(udp_hdr_t));
+            u8 *p = net_buf_push(buf, 6);
+            memcpy(p, source_ip, 4);
             u16 sp_net = htons(src_port);
             memcpy(p + 4, &sp_net, 2);
-            memcpy(p + 6, payload, payload_len);
-
-            net_buf_queue_push(&target_sock->rx_queue, rx_buf);
+            target_sock->rx_bytes += buf->capacity + sizeof(*buf);
+            net_buf_queue_push(&target_sock->rx_queue, buf);
+            buf = NULL; /* ownership transferred to the receive queue */
 
             /* Wakeup sleeping thread if waiting */
-            irqflags_t sock_flags = spinlock_lock_irqsave(&target_sock->lock);
             if (target_sock->wait_thread) {
                 sched_unblock(target_sock->wait_thread);
                 target_sock->wait_thread = NULL;
             }
-            spinlock_unlock_irqrestore(&target_sock->lock, sock_flags);
         }
+        spinlock_unlock_irqrestore(&target_sock->lock, sock_flags);
         udp_sock_put(target_sock);
     } else if (dst_port != DHCP_CLIENT_PORT) {
         /* Port Unreachable */

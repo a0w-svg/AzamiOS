@@ -100,6 +100,32 @@ static char g_search_query[64] = "";
 static int  g_search_len = 0;
 static int  g_filtered_indices[MAX_APPS];
 static int  g_num_filtered = 0;
+/* The registry deliberately has room for more GUI programs than fit in the
+ * two-row modal.  Keep the viewport in rows so a scroll never starts in the
+ * middle of a row and keyboard navigation remains predictable. */
+static int  g_scroll_row = 0;
+
+static int max_scroll_row(void)
+{
+    int rows = (g_num_filtered + GRID_COLS - 1) / GRID_COLS;
+    int max = rows - GRID_ROWS;
+    return max > 0 ? max : 0;
+}
+
+static void clamp_scroll(void)
+{
+    int max = max_scroll_row();
+    if (g_scroll_row < 0) g_scroll_row = 0;
+    if (g_scroll_row > max) g_scroll_row = max;
+}
+
+static void ensure_visible(int slot)
+{
+    int row = slot / GRID_COLS;
+    if (row < g_scroll_row) g_scroll_row = row;
+    if (row >= g_scroll_row + GRID_ROWS) g_scroll_row = row - GRID_ROWS + 1;
+    clamp_scroll();
+}
 
 static void update_filter(void)
 {
@@ -140,13 +166,14 @@ static void update_filter(void)
     }
     if (g_hovered >= g_num_filtered) g_hovered = (g_num_filtered > 0) ? 0 : -1;
     if (g_hovered >= 0) g_hover_anim_idx = g_hovered;
+    g_scroll_row = 0;
 }
 
 /* ── Cell geometry helpers ────────────────────────────────────────────────── */
 static void cell_rect(int idx, int *cx, int *cy, int *cw, int *ch)
 {
     int col = idx % GRID_COLS;
-    int row = idx / GRID_COLS;
+    int row = idx / GRID_COLS - g_scroll_row;
     int total_grid_w = GRID_COLS * CELL_W;
     int start_x = ((int)g_win.width - total_grid_w) / 2;
     int start_y = HEADER_H + TABS_H + 10;
@@ -161,6 +188,8 @@ static int hit_cell(int mx, int my)
 {
     int slot;
     for (slot = 0; slot < g_num_filtered; slot++) {
+        if (slot / GRID_COLS < g_scroll_row || slot / GRID_COLS >= g_scroll_row + GRID_ROWS)
+            continue;
         int cx, cy, cw, ch;
         cell_rect(slot, &cx, &cy, &cw, &ch);
         if (mx >= cx && mx < cx + cw && my >= cy && my < cy + ch)
@@ -381,8 +410,21 @@ static void draw_launcher(void)
     }
 
     /* ── App grid ─────────────────────────────────────────────────────────── */
-    for (int slot = 0; slot < g_num_filtered; slot++) {
+    int first_slot = g_scroll_row * GRID_COLS;
+    int last_slot = first_slot + GRID_ROWS * GRID_COLS;
+    if (last_slot > g_num_filtered) last_slot = g_num_filtered;
+    for (int slot = first_slot; slot < last_slot; slot++) {
         draw_cell(slot);
+    }
+
+    if (max_scroll_row() > 0) {
+        int track_y = HEADER_H + TABS_H + 10;
+        int track_h = GRID_ROWS * CELL_H - 10;
+        int thumb_h = track_h * GRID_ROWS / ((g_num_filtered + GRID_COLS - 1) / GRID_COLS);
+        if (thumb_h < 20) thumb_h = 20;
+        int thumb_y = track_y + (track_h - thumb_h) * g_scroll_row / max_scroll_row();
+        uk_fill_rounded_rect(&g_win, (int)w - 12, track_y, 4, track_h, 2, UK_SURFACE0);
+        uk_fill_rounded_rect(&g_win, (int)w - 12, thumb_y, 4, thumb_h, 2, UK_MAUVE);
     }
 
     if (g_num_filtered == 0) {
@@ -717,6 +759,14 @@ int main(int argc, char **argv)
             int mx = msg->mouse.abs_x;
             int my = msg->mouse.abs_y;
 
+            if (msg->mouse.wheel) {
+                /* Positive wheel values conventionally mean up. */
+                g_scroll_row -= msg->mouse.wheel > 0 ? 1 : -1;
+                clamp_scroll();
+                draw_launcher();
+                break;
+            }
+
             if (msg->mouse.buttons & AZ_MOUSE_BTN_LEFT) {
                 /* Check Category Tabs click */
                 if (my >= TABS_Y && my <= TABS_Y + 24) {
@@ -772,6 +822,23 @@ int main(int argc, char **argv)
                 if (g_search_len > 0) {
                     g_search_query[--g_search_len] = '\0';
                     update_filter();
+                    draw_launcher();
+                }
+            } else if (msg->key.keycode == 0x25 || msg->key.keycode == 0x26 ||
+                       msg->key.keycode == 0x27 || msg->key.keycode == 0x28) {
+                /* Left/up/right/down work with both a filtered result set
+                 * and an ordinary category view. */
+                if (g_num_filtered > 0) {
+                    int next = g_hovered < 0 ? 0 : g_hovered;
+                    if (msg->key.keycode == 0x25) next--;
+                    if (msg->key.keycode == 0x27) next++;
+                    if (msg->key.keycode == 0x26) next -= GRID_COLS;
+                    if (msg->key.keycode == 0x28) next += GRID_COLS;
+                    if (next < 0) next = 0;
+                    if (next >= g_num_filtered) next = g_num_filtered - 1;
+                    g_hovered = next;
+                    g_hover_anim_idx = next;
+                    ensure_visible(next);
                     draw_launcher();
                 }
             } else if (msg->key.keycode >= 32 && msg->key.keycode <= 126) {

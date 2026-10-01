@@ -20,13 +20,13 @@ static u32         g_arp_ticks = 0;
 
 /* g_arp_lock uses spinlock_lock_irqsave()/_irqrestore() throughout this
  * file, for the same reason as tcp.c's/udp.c's/dhcp.c's/ipv4.c's identical
- * note: arp_input() runs from a timer interrupt on any CPU (net_poll() ->
- * e1000_poll_rx() -> net_process_incoming()), and arp_resolve() — which
+ * note: arp_input() can run from a NIC interrupt or the timer polling
+ * fallback, and arp_resolve() — which
  * takes this same lock — is reached both from ordinary process context
  * (ipv4_send() from a socket syscall) and from that very interrupt path
  * (ipv4_send() from tcp_input()/udp_input() sending a reply). A plain
  * spinlock_lock() left interrupts enabled across arp_resolve()'s critical
- * section, so the timer interrupt could land on the CPU already holding
+ * section, so an interrupt could land on the CPU already holding
  * this lock and spin forever inside arp_input()'s own acquire. See
  * kernel/net/tcp.c for the full writeup. */
 

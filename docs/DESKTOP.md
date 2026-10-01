@@ -44,6 +44,19 @@ Tooltips and toasts float in a transparent strip **above** the panel rather
 than inside it, so they never cover the icon they describe, and they clear
 when the pointer leaves the panel.
 
+### Window tiling
+
+Press **Alt+Shift+T** to arrange visible application windows in a grid. The
+grid uses the screen area above the taskbar and respects other panel struts.
+Rows with fewer windows expand to use the full width. New windows join the
+grid, and closing, minimizing, or restoring a window reflows it. The launcher,
+wallpaper, taskbar, and pinned windows stay outside the grid.
+
+Press **Alt+Shift+T** again to restore each window's original position and
+size. Dragging, resizing, maximizing, snapping, or an application's own move
+request also returns to floating mode. Clicking a title bar just focuses its
+window without leaving tiling mode.
+
 ### Launcher
 
 Shows the applications registered in `/etc/launcher.conf` — an allowlist,

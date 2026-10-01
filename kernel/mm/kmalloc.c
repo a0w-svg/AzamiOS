@@ -585,35 +585,25 @@ void kfree(void *ptr)
 #define KMALLOC_RECLAIM_MAX_PAGES 64            /* per bucket, per call */
 #define KMALLOC_REAP_INTERVAL_TICKS 1000        /* ~10 s at 10 ms/tick */
 
-static free_block_t *fb_merge(free_block_t *a, free_block_t *b)
-{
-    free_block_t dummy;
-    free_block_t *t = &dummy;
-    dummy.next = NULL;
-    while (a && b) {
-        if ((uintptr_t)a <= (uintptr_t)b) { t->next = a; a = a->next; }
-        else                              { t->next = b; b = b->next; }
-        t = t->next;
-    }
-    t->next = a ? a : b;
-    return dummy.next;
-}
-
-static free_block_t *fb_sort(free_block_t *h)
-{
-    if (!h || !h->next) return h;
-    free_block_t *slow = h, *fast = h->next;
-    while (fast && fast->next) { slow = slow->next; fast = fast->next->next; }
-    free_block_t *mid = slow->next;
-    slow->next = NULL;
-    return fb_merge(fb_sort(h), fb_sort(mid));
-}
+#define RECLAIM_HASH_ENTRIES 16384
+static struct {
+    uintptr_t page;
+    u16 count;
+    u16 gen;
+} g_reclaim_hash[RECLAIM_HASH_ENTRIES];
+static u16 g_reclaim_gen = 0;
 
 static size_t bucket_reclaim(bucket_t *b)
 {
     size_t bpp = PAGE_SIZE / b->block_size;     /* objects per page, >= 1 */
     void  *pages[KMALLOC_RECLAIM_MAX_PAGES];
     size_t npages = 0;
+
+    g_reclaim_gen++;
+    if (g_reclaim_gen == 0) {
+        __builtin_memset(g_reclaim_hash, 0, sizeof(g_reclaim_hash));
+        g_reclaim_gen = 1;
+    }
 
     /*
      * Detach the whole free list, then sort and scan it with the lock dropped
@@ -641,33 +631,48 @@ static size_t bucket_reclaim(bucket_t *b)
     b->free_objs  = 0;      /* the whole list left with us */
     spinlock_unlock_irqrestore(&b->lock, flags);
 
-    free_block_t *cur = fb_sort(detached);
-    free_block_t *newhead = NULL, *newtail = NULL;
-    size_t kept = 0;
-
+    free_block_t *cur = detached;
     while (cur) {
         uintptr_t page = (uintptr_t)cur & ~(uintptr_t)(PAGE_SIZE - 1);
-        free_block_t *runend = cur;
-        size_t cnt = 1;
-        while (runend->next &&
-               ((uintptr_t)runend->next & ~(uintptr_t)(PAGE_SIZE - 1)) == page) {
-            runend = runend->next;
-            cnt++;
+        u32 idx = (page >> 12) % RECLAIM_HASH_ENTRIES;
+        u32 start = idx;
+        while (1) {
+            if (g_reclaim_hash[idx].gen != g_reclaim_gen) {
+                g_reclaim_hash[idx].page = page;
+                g_reclaim_hash[idx].count = 1;
+                g_reclaim_hash[idx].gen = g_reclaim_gen;
+                break;
+            } else if (g_reclaim_hash[idx].page == page) {
+                g_reclaim_hash[idx].count++;
+                if (g_reclaim_hash[idx].count == bpp && npages < KMALLOC_RECLAIM_MAX_PAGES) {
+                    pages[npages++] = (void *)page;
+                }
+                break;
+            }
+            idx = (idx + 1) % RECLAIM_HASH_ENTRIES;
+            if (idx == start) break; /* Hash table full, just ignore */
         }
-        free_block_t *after = runend->next;
+        cur = cur->next;
+    }
 
-        if (cnt == bpp && npages < KMALLOC_RECLAIM_MAX_PAGES) {
-            /* Whole page is free — drop the run, remember the page. */
-            pages[npages++] = (void *)page;
-        } else {
-            /* Keep [cur .. runend] on the free list. */
-            runend->next = NULL;
-            if (newtail) newtail->next = cur;
-            else         newhead = cur;
-            newtail = runend;
-            kept += cnt;
+    free_block_t *newhead = NULL, *newtail = NULL;
+    size_t kept = 0;
+    cur = detached;
+    while (cur) {
+        free_block_t *next = cur->next;
+        uintptr_t page = (uintptr_t)cur & ~(uintptr_t)(PAGE_SIZE - 1);
+        bool reclaimed = false;
+        for (size_t i = 0; i < npages; i++) {
+            if (pages[i] == (void *)page) { reclaimed = true; break; }
         }
-        cur = after;
+        if (!reclaimed) {
+            cur->next = NULL;
+            if (newtail) newtail->next = cur;
+            else newhead = cur;
+            newtail = cur;
+            kept++;
+        }
+        cur = next;
     }
 
     /* Splice the survivors back in front of anything freed while we scanned. */

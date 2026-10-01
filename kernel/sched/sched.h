@@ -96,6 +96,7 @@ typedef struct thread {
     struct thread  *rb_parent;
     unsigned char   rb_color;
 
+    struct rb_node  sleep_rb;
     struct thread  *next;            /* Sleep queue / generic list pointer */
     struct thread  *proc_next;       /* Next thread in the same process */
     struct thread  *sem_next;        /* POSIX semaphore wait queue link */
@@ -210,6 +211,7 @@ typedef struct process {
     thread_t       *threads;         /* Head of threads list in this process */
     struct process *parent;          /* Parent process */
     struct process *next;            /* Global process list pointer */
+    struct process *hash_next;       /* PID hash table collision chain */
     void           *handle_table[PROC_MAX_FDS];      /* VFS file descriptor table */
     u8              fd_flags[PROC_MAX_FDS];          /* File descriptor flags (FD_CLOEXEC) */
     az_object_t    *obj_handle_table[PROC_MAX_FDS];  /* Object Manager handle table */

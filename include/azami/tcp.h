@@ -143,6 +143,7 @@ typedef struct tcp_sock {
 
     spinlock_t       lock;
     struct tcp_sock *next;
+    struct tcp_sock *hash_next;
 
     /* Reference count. tcp_input() finds a socket by walking g_tcp_sockets
      * under the global lock, then — after releasing it — locks the socket

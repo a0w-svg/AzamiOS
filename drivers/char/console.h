@@ -25,9 +25,12 @@ void console_setup(void);
  * on screen. Never blocks. */
 int console_getc(void);
 
-/** console_tick() — paint kernel-message output the rate limit deferred.
- * Called from the timer tick; never blocks on the console lock. */
+/** console_tick() — paint kernel-message output the rate limit deferred. */
 void console_tick(void);
+
+/** Start deferred painting in a kernel thread after sched_init(). */
+void console_start_async(void);
+bool console_async_running(void);
 
 /** console_force_verbose() — undo `quiet` so a panic is always visible. */
 void console_force_verbose(void);

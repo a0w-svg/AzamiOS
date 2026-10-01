@@ -28,6 +28,8 @@ typedef struct block_ops {
      * same way — a device untouched by this call still behaves correctly,
      * it just cannot benefit from knowing the range is free. */
     s64 (*trim)(struct block_dev *dev, u64 lba, u32 count);
+    
+    s64 (*ioctl)(struct block_dev *dev, u32 cmd, u64 arg);
 } block_ops_t;
 
 typedef struct block_dev {

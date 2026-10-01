@@ -199,25 +199,10 @@ dentry_t *dcache_lookup(dentry_t *parent, const char *name)
         entry = entry->d_hash_next;
     }
 
-    /* Fallback: check direct child list for dentries not yet in the hash
-     * (e.g. added to d_subdirs but with a negative entry that was never hashed). */
-    dentry_t *child = parent->d_subdirs;
-    while (child) {
-        if (child->d_name[0] == name[0] && strncmp(name, child->d_name, VFS_NAME_MAX) == 0) {
-            /* BUG-9: Only promote to the hash if the dentry has an inode — this
-             * matches the invariant enforced by dcache_add().  Inserting a
-             * negative dentry (no inode) into the hash would create a duplicate
-             * if it was already placed there by a concurrent dcache_add() after
-             * the inode was assigned, leading to double-removal on eviction. */
-            if (child->d_inode) {
-                child->d_hash_next = g_dcache_hash[bucket];
-                g_dcache_hash[bucket] = child;
-            }
-            spinlock_unlock(&g_vfs_lock);
-            return child;
-        }
-        child = child->d_sibling;
-    }
+    /* dcache_add() links positive dentries into both the hash and the child
+     * list under this lock. Negative results live in g_neg_dcache instead.
+     * Scanning d_subdirs here made every miss linear in directory size and
+     * could resurrect covered entries deliberately unhashed by mount(2). */
     spinlock_unlock(&g_vfs_lock);
     return NULL;
 }

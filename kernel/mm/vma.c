@@ -377,13 +377,29 @@ void vma_for_each(struct process *p, void (*fn)(const vm_area_t *, void *), void
     spinlock_unlock_irqrestore(&p->vma_lock, f);
 }
 
+static vm_area_t *vma_find_intersection(struct process *p, u64 start, u64 end)
+{
+    struct rb_node *node = p->vma_tree.rb_node;
+    vm_area_t *best = NULL;
+    while (node) {
+        vm_area_t *v = rb_entry(node, vm_area_t, rb);
+        if (v->end > start) {
+            best = v;
+            if (v->start <= start) break;
+            node = node->rb_left;
+        } else {
+            node = node->rb_right;
+        }
+    }
+    return best && best->start < end ? best : NULL;
+}
+
 bool vma_range_has_flags(struct process *p, u64 start, u64 end, u32 flags)
 {
     if (!p || end <= start) return false;
     irqflags_t f = spinlock_lock_irqsave(&p->vma_lock);
     bool hit = false;
-    for (vm_area_t *v = *vma_head(p); v; v = v->next) {
-        if (v->end <= start || v->start >= end) continue;
+    for (vm_area_t *v = vma_find_intersection(p, start, end); v && v->start < end; v = v->next) {
         if (v->flags & flags) {
             hit = true;
             break;
@@ -398,8 +414,7 @@ bool vma_is_sealed(struct process *p, u64 start, u64 end)
     if (!p || end <= start) return false;
     irqflags_t f = spinlock_lock_irqsave(&p->vma_lock);
     bool sealed = false;
-    for (vm_area_t *v = *vma_head(p); v; v = v->next) {
-        if (v->end <= start || v->start >= end) continue;
+    for (vm_area_t *v = vma_find_intersection(p, start, end); v && v->start < end; v = v->next) {
         if (v->flags & VMA_F_SEALED) {
             sealed = true;
             break;

@@ -56,6 +56,7 @@
 #include "../../kernel/lib/string.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
+#include "../../kernel/wait.h"
 #include "../../hal/pci.h"
 #include "../../hal/device.h"
 #include "../base/pci_bus.h"
@@ -197,18 +198,20 @@ static int port_run_slot0(ahci_drive_t *d)
 
     mw(&p->ci, 1u);
 
-    for (u32 i = 0; i < WAIT_LONG; i++) {
-        u32 ci = mr(&p->ci);
-        u32 is = mr(&p->is);
-        if (is & AHCI_PxIS_ERR_MASK) {
-            mw(&p->is, is);
-            mw(&p->serr, 0xFFFFFFFFu);
-            port_recover(d);
-            return -(s64)EIO;
-        }
-        if ((ci & 1u) == 0) return 0;
-        cpu_pause();
+    int timed_out = !wait_event_timeout(d->wq,
+        !(mr(&p->ci) & 1u) || (mr(&p->is) & AHCI_PxIS_ERR_MASK),
+        2000 /* 2000 ms timeout */);
+
+    u32 is = mr(&p->is);
+    if (is & AHCI_PxIS_ERR_MASK) {
+        mw(&p->is, is);
+        mw(&p->serr, 0xFFFFFFFFu);
+        port_recover(d);
+        return -(s64)EIO;
     }
+    
+    if (!(mr(&p->ci) & 1u)) return 0;
+    
     port_recover(d);           /* timed out — don't leave the port wedged */
     return -(s64)EIO;
 }
@@ -451,39 +454,32 @@ static int ncq_issue_and_wait(ahci_drive_t *d, u32 slot)
     mw(&p->ci,   (1u << slot));
     spinlock_unlock(&d->lock);
 
-    for (u32 i = 0; i < WAIT_LONG; i++) {
-        if (__atomic_load_n(&d->epoch, __ATOMIC_RELAXED) != my_epoch) {
-            /* Some other command on this port failed and reset it while we
-             * were outstanding. Our own SAct bit reads clear now too, but
-             * that is the reset talking, not our command completing — never
-             * treat it as success. */
-            return -1;
-        }
+    int timed_out = !wait_event_timeout(d->wq,
+        (__atomic_load_n(&d->epoch, __ATOMIC_RELAXED) != my_epoch) ||
+        (mr(&p->is) & AHCI_PxIS_ERR_MASK) ||
+        !(mr(&p->sact) & (1u << slot)),
+        2000);
 
-        u32 is = mr(&p->is);
-        if (is & AHCI_PxIS_ERR_MASK) {
-            spinlock_lock(&d->lock);
-            mw(&p->is, is);
-            mw(&p->serr, 0xFFFFFFFFu);
-            __atomic_fetch_add(&d->epoch, 1, __ATOMIC_RELAXED);   /* wake every other waiter */
-            port_recover(d);
-            /* A full reset aborts every queued command on this port, so
-             * every NCQ slot is free again, no matter who thought they
-             * still owned one — those waiters find out via the epoch check
-             * above and must not free their slot a second time. */
-            d->ncq_free = (d->ncq_nslots >= 31) ? 0xFFFFFFFEu
-                                                : (((1u << d->ncq_nslots) - 1u) << 1);
-            spinlock_unlock(&d->lock);
-            return -1;
-        }
-
-        if (!(mr(&p->sact) & (1u << slot))) return 0;   /* this slot's SAct bit cleared: done */
-        cpu_pause();
+    if (__atomic_load_n(&d->epoch, __ATOMIC_RELAXED) != my_epoch) {
+        return -1;
     }
 
-    /* Timed out without ever seeing an error bit: the same conservative
-     * response, since a port that will not retire a queued command is just
-     * as wedged as one reporting an error. */
+    u32 is = mr(&p->is);
+    if (is & AHCI_PxIS_ERR_MASK) {
+        spinlock_lock(&d->lock);
+        mw(&p->is, is);
+        mw(&p->serr, 0xFFFFFFFFu);
+        __atomic_fetch_add(&d->epoch, 1, __ATOMIC_RELAXED);
+        port_recover(d);
+        d->ncq_free = (d->ncq_nslots >= 31) ? 0xFFFFFFFEu
+                                            : (((1u << d->ncq_nslots) - 1u) << 1);
+        spinlock_unlock(&d->lock);
+        return -1;
+    }
+
+    if (!(mr(&p->sact) & (1u << slot))) return 0;
+
+    /* Timeout case */
     spinlock_lock(&d->lock);
     __atomic_fetch_add(&d->epoch, 1, __ATOMIC_RELAXED);
     port_recover(d);
@@ -855,7 +851,7 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 
 
     mw(&port->serr, 0xFFFFFFFFu);
     mw(&port->is,   0xFFFFFFFFu);
-    mw(&port->ie,   0);                        /* polled driver — no port IRQs */
+    mw(&port->ie,   0xFFFFFFFFu); /* Enable all port interrupts for wq wakeups */
 
     port_start(port);
 
@@ -1165,7 +1161,7 @@ static int ahci_probe(dm_device_t *dm, const pci_device_id_t *id)
 
     if (pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_ALL_TYPES) > 0) {
         int irq = pci_irq_vector(dev, 0);
-        request_irq(irq, ahci_interrupt, IRQF_SHARED, "ahci", hba);
+        request_irq(irq, ahci_interrupt, IRQF_SHARED, "ahci", (void *)hba);
     }
 
     /* BIOS/OS handoff (AHCI 1.2+). Ask for ownership and wait for BIOS to

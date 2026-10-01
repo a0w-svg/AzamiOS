@@ -198,14 +198,28 @@ static u64 bitmap_range_clear(u64 frame, u64 count)
  * end of the bitmap reads as allocated, matching bitmap_test(). */
 static bool bitmap_range_is_clear(u64 frame, u64 count)
 {
-    while (count) {
-        if (unlikely(frame >= PMM_MAX_FRAMES)) return false;
-        u64 bit = frame % 64;
-        u64 n   = 64 - bit;
+    if (unlikely(!count)) return true;
+    /* Handle the head partial word */
+    u64 bit = frame % 64;
+    if (bit) {
+        u64 n = 64 - bit;
         if (n > count) n = count;
+        if (unlikely(frame >= PMM_MAX_FRAMES)) return false;
         if (g_bitmap[frame / 64] & word_mask(bit, n)) return false;
         frame += n;
         count -= n;
+    }
+    /* Fast path: whole words */
+    while (count >= 64) {
+        if (unlikely(frame >= PMM_MAX_FRAMES)) return false;
+        if (g_bitmap[frame / 64]) return false;
+        frame += 64;
+        count -= 64;
+    }
+    /* Handle the tail partial word */
+    if (count) {
+        if (unlikely(frame >= PMM_MAX_FRAMES)) return false;
+        if (g_bitmap[frame / 64] & word_mask(0, count)) return false;
     }
     return true;
 }
@@ -499,8 +513,8 @@ static bool zone_free_locked(phys_addr_t phys, u32 order)
  * single-threaded and allocates straight from the zones.
  */
 
-#define PCP_CAP    64               /* frames cached per CPU per zone       */
-#define PCP_BATCH  32               /* moved in/out on a miss / overflow    */
+#define PCP_CAP    128              /* frames cached per CPU per zone       */
+#define PCP_BATCH  64               /* moved in/out on a miss / overflow    */
 
 typedef struct {
     u32         count;
@@ -787,24 +801,27 @@ phys_addr_t pmm_alloc(u32 order)
         }
     }
 
-    if (likely(ret)) {
-        u64 frames = 1ULL << order;
-        for (u64 i = 0; i < frames; i++) {
-            hw_clear_page((void *)PHYS_TO_VIRT(ret + i * PAGE_SIZE));
-        }
-    } else {
+    if (unlikely(!ret)) {
         pr_debug("[PMM] Out of memory (order=%u requested)\n", order);
     }
     return ret;
 }
 
-phys_addr_t pmm_alloc_page_zeroed(void)
+phys_addr_t pmm_alloc_zeroed(u32 order)
 {
-    phys_addr_t p = pmm_alloc(0);
-    if (p) {
-        hw_clear_page((void *)PHYS_TO_VIRT(p));
+    phys_addr_t p = pmm_alloc(order);
+    if (likely(p)) {
+        u64 frames = 1ULL << order;
+        for (u64 i = 0; i < frames; i++) {
+            hw_clear_page((void *)PHYS_TO_VIRT(p + i * PAGE_SIZE));
+        }
     }
     return p;
+}
+
+phys_addr_t pmm_alloc_page_zeroed(void)
+{
+    return pmm_alloc_zeroed(0);
 }
 
 void pmm_free(phys_addr_t phys, u32 order)
@@ -884,12 +901,7 @@ phys_addr_t pmm_alloc_32(u32 order)
         }
     }
 
-    if (likely(ret)) {
-        u64 frames = 1ULL << order;
-        for (u64 i = 0; i < frames; i++) {
-            hw_clear_page((void *)PHYS_TO_VIRT(ret + i * PAGE_SIZE));
-        }
-    } else {
+    if (unlikely(!ret)) {
         pr_debug("[PMM] Out of 32-bit low memory (order=%u requested)\n", order);
     }
     return ret;

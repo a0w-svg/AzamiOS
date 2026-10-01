@@ -92,5 +92,8 @@ typedef struct {
 void dhcp_init(void);
 int  dhcp_start_discovery(void);
 int  dhcp_trigger_renew(void);
+/* Advance the DHCP retry state machine once per second from the network worker
+ * or the scheduler tick fallback. */
+void dhcp_timer_tick(void);
 void dhcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr);
 void dhcp_get_lease(dhcp_lease_t *out_lease);

@@ -29,12 +29,12 @@ static spinlock_t  g_raw_lock = SPINLOCK_INIT;
 
 /* g_raw_lock and each raw_sock_t's own ->lock use spinlock_lock_irqsave()/
  * _irqrestore() throughout this section, for the same reason as
- * kernel/net/tcp.c's identical note: raw_input() runs from a timer
- * interrupt on any CPU (net_poll() -> ... -> ipv4_input() -> raw_input()),
+ * kernel/net/tcp.c's identical note: raw_input() can run from a NIC
+ * interrupt or the timer polling fallback,
  * and takes both locks, while raw_socket_create()/raw_socket_close() and
  * sock_fop_read()'s SOCK_RAW wait path take them from ordinary process
  * context. A plain spinlock_lock() left interrupts enabled across those
- * process-context critical sections, so that timer interrupt could land on
+ * process-context critical sections, so an interrupt could land on
  * the CPU already holding one of these locks and spin forever inside
  * raw_input()'s own acquire. See kernel/net/tcp.c for the full writeup. */
 

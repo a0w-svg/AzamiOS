@@ -11,8 +11,11 @@
 #include "../../include/azami/net_buf.h"
 #include "../../include/azami/ipv4.h"
 #include "../../include/azami/icmp.h"
+#include "../../include/azami/tcp.h"
+#include "../../include/azami/dhcp.h"
 #include "../../kernel/uaccess.h"
 #include "../../kernel/lib/string.h"
+#include "../../kernel/sched/sched.h"
 
 static u8 g_host_ip[4] = { 0, 0, 0, 0 };      /* Unconfigured until DHCP */
 static u8 g_host_netmask[4] = { 0, 0, 0, 0 };
@@ -25,6 +28,35 @@ static net_device_t g_net_devs[MAX_NET_DEVS];
 static int          g_net_dev_count = 0;
 static net_device_t *g_primary_dev = NULL;
 static net_device_t  g_loopback_dev;
+static bool g_net_async_polling;
+
+bool net_async_polling(void)
+{
+    return __atomic_load_n(&g_net_async_polling, __ATOMIC_ACQUIRE);
+}
+
+/* RX processing can allocate memory and invoke socket callbacks. Keep it in
+ * schedulable context instead of doing that work in the LAPIC timer ISR.
+ * One sleep tick preserves the old 100 Hz polling cadence for devices whose
+ * receive path does not have an interrupt. */
+static void net_poll_thread(void *arg)
+{
+    (void)arg;
+    u64 next_timer = (sched_get_ticks() / 100 + 1) * 100;
+    for (;;) {
+        net_poll();
+
+        u64 now = sched_get_ticks();
+        if (now >= next_timer) {
+            arp_timer_tick();
+            tcp_timer_tick();
+            dhcp_timer_tick();
+            ipv4_timer_tick();
+            next_timer = (now / 100 + 1) * 100;
+        }
+        sched_sleep(1);
+    }
+}
 
 static inline u16 htons(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 static inline u16 ntohs(u16 v) { return htons(v); }
@@ -211,8 +243,6 @@ void net_loopback_input(net_buf_t *buf)
 }
 
 #include "../../include/azami/udp.h"
-#include "../../include/azami/tcp.h"
-#include "../../include/azami/dhcp.h"
 
 void net_init(void)
 {
@@ -252,6 +282,16 @@ void net_init(void)
 
     /* Initiate real DHCP lease discovery over the network */
     dhcp_start_discovery();
+
+    /* Publish the handoff before enqueueing the worker, so a timer tick on
+     * another CPU cannot poll the same receive ring concurrently with it. */
+    __atomic_store_n(&g_net_async_polling, true, __ATOMIC_RELEASE);
+    if (!thread_create(sched_kernel_process(), (uintptr_t)net_poll_thread, 0, true)) {
+        __atomic_store_n(&g_net_async_polling, false, __ATOMIC_RELEASE);
+        pr_debug("[NET] Poll worker unavailable; retaining timer fallback\n");
+    } else {
+        pr_debug("[NET] RX polling and protocol timers running in kernel thread\n");
+    }
 }
 
 void net_get_ip(u8 ip_out[4])

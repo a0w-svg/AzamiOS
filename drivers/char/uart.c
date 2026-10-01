@@ -41,6 +41,8 @@
 #define UART_ISR_MAX_ITERS 1024u
 
 #define RING_BUFFER_SIZE 2048
+#define POLLIN  0x0001
+#define POLLOUT 0x0004
 
 typedef struct {
     u16 port;
@@ -281,14 +283,21 @@ static s64 uart_fops_read(struct file *filp, void *buf, size_t len, u64 *offset)
         irqflags_t irqf = spinlock_lock_irqsave(&p->lock);
         
         if (p->rx_head != p->rx_tail) {
-            char ch = p->rx_buf[p->rx_tail];
-            p->rx_tail = (p->rx_tail + 1) % RING_BUFFER_SIZE;
+            size_t chunk = p->rx_head > p->rx_tail ?
+                p->rx_head - p->rx_tail : RING_BUFFER_SIZE - p->rx_tail;
+            if (chunk > len - count) chunk = len - count;
+            __builtin_memcpy(out + count, p->rx_buf + p->rx_tail, chunk);
+            p->rx_tail = (p->rx_tail + chunk) % RING_BUFFER_SIZE;
+            count += chunk;
             spinlock_unlock_irqrestore(&p->lock, irqf);
-            out[count++] = ch;
         } else {
             if (count > 0) {
                 spinlock_unlock_irqrestore(&p->lock, irqf);
                 break; /* Return what we have */
+            }
+            if (filp->f_flags & O_NONBLOCK) {
+                spinlock_unlock_irqrestore(&p->lock, irqf);
+                return -EAGAIN;
             }
             /* BUG-26: set waiter under the lock so any IRQ that fires after
              * unlock will call sched_unblock and mark us READY before we block.
@@ -316,13 +325,22 @@ static s64 uart_fops_write(struct file *filp, const void *buf, size_t len, u64 *
         u32 next = (p->tx_head + 1) % RING_BUFFER_SIZE;
         
         if (next != p->tx_tail) {
-            char ch = src[count];
-            p->tx_buf[p->tx_head] = ch;
-            p->tx_head = next;
-            count++;
+            size_t space = (p->tx_tail + RING_BUFFER_SIZE - p->tx_head - 1)
+                           % RING_BUFFER_SIZE;
+            size_t chunk = RING_BUFFER_SIZE - p->tx_head;
+            if (chunk > space) chunk = space;
+            if (chunk > len - count) chunk = len - count;
+            __builtin_memcpy(p->tx_buf + p->tx_head, src + count, chunk);
+            p->tx_head = (p->tx_head + chunk) % RING_BUFFER_SIZE;
+            count += chunk;
             uart_start_tx(p);
             spinlock_unlock_irqrestore(&p->lock, irqf);
         } else {
+            if (filp->f_flags & O_NONBLOCK) {
+                spinlock_unlock_irqrestore(&p->lock, irqf);
+                if (offset) *offset += count;
+                return count ? (s64)count : -(s64)EAGAIN;
+            }
             /* BUG-27: same lost-wakeup pattern as rx_waiter — set under lock
              * so the IRQ handler sees it and calls sched_unblock before we
              * call sched_block; sched_block aborts if state is already READY. */
@@ -345,9 +363,9 @@ static s64 uart_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
         case UART_SET_BAUD: {
             u32 baud = (u32)arg;
             if (baud == 0 || 115200 % baud != 0) return -1;
-            spinlock_lock(&p->lock);
+            irqflags_t irqf = spinlock_lock_irqsave(&p->lock);
             uart_set_baud(p->port, baud);
-            spinlock_unlock(&p->lock);
+            spinlock_unlock_irqrestore(&p->lock, irqf);
             return 0;
         }
         case 0x5401: { /* TCGETS */
@@ -393,10 +411,22 @@ static s64 uart_fops_ioctl(struct file *filp, u32 cmd, u64 arg)
     }
 }
 
+static int uart_fops_poll(struct file *filp)
+{
+    uart_port_t *p = (uart_port_t *)filp->private_data;
+    irqflags_t irqf = spinlock_lock_irqsave(&p->lock);
+    int events = 0;
+    if (p->rx_head != p->rx_tail) events |= POLLIN;
+    if ((p->tx_head + 1) % RING_BUFFER_SIZE != p->tx_tail) events |= POLLOUT;
+    spinlock_unlock_irqrestore(&p->lock, irqf);
+    return events;
+}
+
 static file_operations_t uart_fops = {
     .read = uart_fops_read,
     .write = uart_fops_write,
     .ioctl = uart_fops_ioctl,
+    .poll = uart_fops_poll,
 };
 
 void uart_register_devfs(void)
