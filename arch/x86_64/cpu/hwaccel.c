@@ -434,6 +434,14 @@ void hwaccel_init(void)
     s_have_crc32     = g_cpu_info.has_sse4_2 ? 1 : 0;
     g_popcnt_enabled = g_cpu_info.has_popcnt ? 1 : 0;
     g_lzcnt_enabled  = g_cpu_info.has_lzcnt  ? 1 : 0;
+    if (g_lzcnt_enabled) {
+        u64 test_res;
+        __asm__("lzcntq %1, %0" : "=r"(test_res) : "rm"(1ULL) : "cc");
+        if (test_res != 63) {
+            /* CPU executed BSR (index 0) instead of genuine LZCNT (63 leading zeroes) */
+            g_lzcnt_enabled = 0;
+        }
+    }
     g_bmi1_enabled   = g_cpu_info.has_bmi1   ? 1 : 0;
     g_bmi2_enabled   = g_cpu_info.has_bmi2   ? 1 : 0;
 

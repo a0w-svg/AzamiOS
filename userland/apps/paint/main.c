@@ -38,6 +38,7 @@
 #define CANVAS_H       400
 
 static uk_window_t g_win;
+static unsigned int g_mouse_buttons;
 
 /* Paint state */
 static unsigned int g_canvas[CANVAS_W * CANVAS_H];
@@ -88,7 +89,6 @@ static void init_canvas(void)
     for (int i = 0; i < CANVAS_W * CANVAS_H; i++) {
         g_canvas[i] = 0xFFFFFFFF; /* Clean white canvas */
     }
-    save_undo();
 }
 
 static void draw_canvas_pixel(int cx, int cy, unsigned int col, int size)
@@ -410,18 +410,28 @@ int main(int argc, char **argv)
             int mx = msg.mouse.abs_x;
             int my = msg.mouse.abs_y;
             int btn = msg.mouse.buttons;
+            unsigned int pressed = uk_mouse_press(&g_mouse_buttons, (unsigned int)btn);
 
             int cox, coy;
             canvas_origin(&cox, &coy);
 
             if (btn & 1) {
-                if (!g_mouse_down) {
-                    save_undo();
+                if (pressed & AZ_MOUSE_BTN_LEFT) {
+                    if (my < 46) {
+                        /* Toolbar clicks must not overwrite the undo snapshot. */
+                        handle_click(mx, my);
+                        render_paint_ui();
+                        continue;
+                    }
+                    int start_x = mx - cox, start_y = my - coy;
+                    if (start_x < 0 || start_x >= CANVAS_W || start_y < 0 || start_y >= CANVAS_H)
+                        continue;
+                    if (g_tool_mode != 6) save_undo();
                     g_mouse_down = 1;
-                    g_drag_start_x = mx - cox;
-                    g_drag_start_y = my - coy;
-                    handle_click(mx, my);
+                    g_drag_start_x = start_x;
+                    g_drag_start_y = start_y;
                 }
+                if (!g_mouse_down) continue;
 
                 int cx = mx - cox;
                 int cy = my - coy;
@@ -445,9 +455,10 @@ int main(int argc, char **argv)
                         g_drag_start_x = cx;
                         g_drag_start_y = cy;
                     } else if (g_tool_mode == 2) { /* Fill */
-                        unsigned int target = g_canvas[cy * CANVAS_W + cx];
-                        flood_fill(cx, cy, target, g_brush_color);
-                        g_mouse_down = 0; /* one-shot */
+                        if (pressed & AZ_MOUSE_BTN_LEFT) {
+                            unsigned int target = g_canvas[cy * CANVAS_W + cx];
+                            flood_fill(cx, cy, target, g_brush_color);
+                        }
                     } else if (g_tool_mode == 3 && g_drag_start_x >= 0) { /* Live Line Preview */
                         memcpy(g_canvas, g_undo_buf, sizeof(g_canvas));
                         draw_canvas_line(g_drag_start_x, g_drag_start_y, cx, cy, g_brush_color, g_brush_size);

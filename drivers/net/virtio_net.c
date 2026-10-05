@@ -105,20 +105,27 @@ void virtio_net_poll(void)
     if (!g_vnet.active || !g_vnet.rx_vq) return;
 
     u32 len = 0;
+    bool replenished = false;
     void *cookie = virtqueue_get_used(g_vnet.rx_vq, &len);
     while (cookie) {
         int idx = (int)(uintptr_t)cookie - 1;
-        if (idx >= 0 && idx < RX_BUFFER_COUNT && len > sizeof(struct virtio_net_hdr)) {
-            u8 *pkt = g_rx_buffers[idx] + sizeof(struct virtio_net_hdr);
-            size_t pkt_len = len - sizeof(struct virtio_net_hdr);
-            net_process_incoming(pkt, pkt_len);
+        if (idx >= 0 && idx < RX_BUFFER_COUNT) {
+            if (len > sizeof(struct virtio_net_hdr)) {
+                u8 *pkt = g_rx_buffers[idx] + sizeof(struct virtio_net_hdr);
+                size_t pkt_len = len - sizeof(struct virtio_net_hdr);
+                net_process_incoming(pkt, pkt_len);
+            }
 
             phys_addr_t phys = vmm_translate(vmm_kernel_space(), (virt_addr_t)g_rx_buffers[idx]);
             virtqueue_add_buf(g_vnet.rx_vq, phys, RX_BUFFER_SIZE, true, cookie);
+            replenished = true;
         }
         cookie = virtqueue_get_used(g_vnet.rx_vq, &len);
     }
-    virtqueue_kick(g_vnet.rx_vq);
+    if (replenished) {
+        virtqueue_kick(g_vnet.rx_vq);
+        virtio_pci_notify(&g_vnet.vpci, 0, g_vnet.rx_vq);
+    }
 }
 
 static s64 net_fops_read(file_t *filp, void *buf, size_t len, u64 *offset)
@@ -228,6 +235,12 @@ static void virtio_net_remove(dm_device_t *dm)
     if (!g_vnet.active) return;
     virtio_pci_set_status(&g_vnet.vpci, 0);
     g_vnet.active = false;
+    for (int i = 0; i < RX_BUFFER_COUNT; i++) {
+        if (g_rx_buffers[i]) {
+            kfree(g_rx_buffers[i]);
+            g_rx_buffers[i] = NULL;
+        }
+    }
 }
 
 /* 1000/1041: transitional and modern (VIRTIO_F_VERSION_1) device ids. */

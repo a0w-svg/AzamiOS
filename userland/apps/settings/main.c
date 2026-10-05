@@ -1,45 +1,21 @@
 /* ============================================================================
- * AzamiOS — Settings Panel (v3.5 with Security, Network, Live Theme & Audio)
+ * AzamiOS — Settings Panel
  * File: userland/apps/settings/main.c
  *
  * Features:
  *  • Display Configuration (Resolution, VSync, Compositing toggles)
- *  • Audio Control (Master Volume slider, Intel AC97 test chime)
+ *  • Audio Control (Master Volume slider, OSS stereo PCM test chime)
  *  • Theme Switcher (file-backed: theme files under /usr/share/themes, /hdd/themes)
  *  • Time & Date Configuration (Timezones, Live clock)
- *  • Network Configuration (eth0 live stats, IP, gateway, DNS, packets)
+ *  • Network Configuration (net0 live stats, IP, gateway, DNS, packets)
  *  • Security & Kernel Mitigations (Interactive sysctl toggles: dmesg_restrict,
  *    kptr_restrict, mmap_min_addr, yama_ptrace_scope, protected hardlinks/symlinks)
  *  • System Architecture & Memory Inspector
  * ============================================================================ */
 
-#include <stdbool.h>
-#include "../../libc/include/az/ipc.h"
-#include "../../libc/include/stdio.h"
-#include "../../libc/include/stdlib.h"
-#include "../../libc/include/string.h"
-#include "../../libc/include/unistd.h"
-#include "../../libc/include/fcntl.h"
-#include "../../libc/include/time.h"
-#include "../../libc/include/sys/syscall.h"
-#include "../../libc/include/sys/sysinfo.h"
-#include "../../libc/include/sys/statvfs.h"
-#include "../../libc/include/sys/reboot.h"
-#include "../../libc/include/dirent.h"
-#include "../../libc/include/sys/ioctl.h"
-#include "../azwm/protocol.h"
-#include "../azwm/de_protocol.h"
-#include "../azwm/de_font.h"
-#if __has_include(<azami/font.h>)
-#include <azami/font.h>
-#elif __has_include("../shared/az_font.h")
-#include "../shared/az_font.h"
-#elif __has_include("../../libc/include/azami/font.h")
-#include "../../libc/include/azami/font.h"
-#endif
-#include "../shared/ui_kit.h"
-#include "../shared/sys_config.h"
 #include "settings.h"
+#include "config.h"
+#include "../../libc/include/errno.h"
 
 #define SERVER_CHAN  1
 #define WIN_W       720
@@ -60,43 +36,73 @@ int g_volume_pct = 75; /* 0..100 */
 
 #define SOUND_PCM_WRITE_VOLUME 0x40045004
 
+static int write_audio(int fd, const void *data, size_t len)
+{
+    const char *bytes = data;
+    while (len) {
+        ssize_t n = write(fd, bytes, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        bytes += n; len -= (size_t)n;
+    }
+    return 0;
+}
+
 void apply_volume(int pct)
 {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
-    g_volume_pct = pct;
+    int fd = open("/dev/dsp", O_WRONLY);
+    unsigned int vol = (unsigned int)pct | ((unsigned int)pct << 8);
+    int ok = fd >= 0 && ioctl(fd, SOUND_PCM_WRITE_VOLUME, (unsigned long)&vol) == 0;
+    if (fd >= 0) close(fd);
+    if (ok) {
+        g_volume_pct = pct;
+        snprintf(g_settings_status, sizeof(g_settings_status), "Master volume: %d%%", pct);
+    } else snprintf(g_settings_status, sizeof(g_settings_status), "Volume failed: audio unavailable or access denied.");
+}
 
-    int fd = sys_open("/dev/dsp", 0, 0);
+static void init_audio_settings(void)
+{
+    int fd = open("/dev/dsp", O_RDONLY);
+    unsigned int volume;
     if (fd >= 0) {
-        unsigned int vol = (unsigned int)pct | ((unsigned int)pct << 8);
-        syscall3(SYS_ioctl, fd, SOUND_PCM_WRITE_VOLUME, (long)&vol);
-        sys_close(fd);
+        if (ioctl(fd, 0x80045004, (unsigned long)&volume) == 0) {
+            unsigned int pct = ((volume & 255) + ((volume >> 8) & 255)) / 2;
+            if (pct <= 100) g_volume_pct = (int)pct;
+        }
+        close(fd);
     }
 }
 
 void play_test_chime(void)
 {
-    int fd = sys_open("/dev/dsp", 0, 0);
-    if (fd < 0) return;
-
+    int fd = open("/dev/dsp", O_WRONLY);
+    if (fd < 0) {
+        snprintf(g_settings_status, sizeof(g_settings_status), "Chime failed: cannot open audio output.");
+        return;
+    }
+    int rate = 44100, channels = 2, format = 0x10;
+    int ok = ioctl(fd, 0xC0045005, (unsigned long)&format) == 0 && format == 0x10 &&
+             ioctl(fd, 0xC0045006, (unsigned long)&channels) == 0 && channels == 2 &&
+             ioctl(fd, 0xC0045002, (unsigned long)&rate) == 0 && rate > 0;
     short buffer[1024];
-    int notes[3] = { 523, 659, 784 }; /* C5, E5, G5 major triad */
-
-    for (int n = 0; n < 3; n++) {
-        int freq = notes[n];
-        int samples_per_cycle = 44100 / freq;
-        int half = samples_per_cycle / 2;
+    const int notes[] = {523, 659, 784};
+    for (int note = 0; ok && note < 3; note++) {
+        int period = rate / notes[note];
+        if (period < 2) { ok = 0; break; }
         int t = 0;
-
-        for (int chunk = 0; chunk < 4; chunk++) {
-            for (int i = 0; i < 1024; i++) {
-                buffer[i] = ((t % samples_per_cycle) < half) ? 12000 : -12000;
-                t++;
+        for (int chunk = 0; ok && chunk < 8; chunk++) {
+            for (int i = 0; i < 1024; i += 2) {
+                short sample = t++ % period < period / 2 ? 12000 : -12000;
+                buffer[i] = buffer[i + 1] = sample;
             }
-            sys_write(fd, buffer, sizeof(buffer));
+            ok = write_audio(fd, buffer, sizeof(buffer)) == 0;
         }
     }
-    sys_close(fd);
+    close(fd);
+    snprintf(g_settings_status, sizeof(g_settings_status), ok
+             ? "Test chime sent to stereo audio output." : "Chime failed: PCM configuration or write rejected.");
 }
 
 /* ── Theme Presets ─────────────────────────────────────────────────────────
@@ -123,44 +129,83 @@ const char *theme_brightness_label(const az_theme_t *t)
  * other's fields with a guessed value -- this used to hardcode
  * "vsync=1\ncompositing=1\ncursor_aa=1" on every theme change, silently
  * discarding whatever the Display tab had actually been set to. */
-static void save_desktop_config(void)
+char g_settings_status[128] = "Select a category to configure your system.";
+
+int settings_write_file(const char *path, const char *data, size_t len)
 {
-    int fd = sys_open("/etc/desktop.conf", 0x42 /* O_CREAT|O_WRONLY */, 0644);
-    if (fd < 0) return;
-    char buf[320];
-    snprintf(buf, sizeof(buf),
-             "[theme]\ntheme_id=%d\nname=%s\nwallpaper=/usr/share/wallpapers/default.raw\n\n"
-             "[display]\nvsync=%d\ncompositing=%d\ncursor_aa=%d\nfps=60\n\n"
-             "[panel]\nposition=bottom\nheight=32\nautohide=0\nshow_clock=1\n",
-             g_theme_selected, az_theme_get(g_theme_selected)->name,
-             g_vsync, g_composit, g_cursor_aa);
-    sys_write(fd, buf, strlen(buf));
-    sys_close(fd);
+    /* Write beside the destination and rename only a complete file. A denied
+     * write or a full disk must leave the user's previous configuration intact. */
+    char temporary[256];
+    static unsigned int serial;
+    if (snprintf(temporary, sizeof(temporary), "%s.settings.%u.%u", path,
+                 (unsigned int)getpid(), ++serial) >= (int)sizeof(temporary)) return -1;
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) return -1;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = write(fd, data + done, len - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); unlink(temporary); return -1; }
+        done += (size_t)n;
+    }
+    if (close(fd) < 0 || rename(temporary, path) < 0) {
+        unlink(temporary);
+        return -1;
+    }
+    return 0;
+}
+
+static int save_desktop_config(void)
+{
+    char input[4096] = "", output[4096], value[32];
+    int fd = open("/etc/desktop.conf", O_RDONLY);
+    if (fd >= 0) {
+        size_t used = 0;
+        for (;;) {
+            ssize_t n = read(fd, input + used, sizeof(input) - 1 - used);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) { close(fd); return -1; }
+            if (!n) break;
+            used += (size_t)n;
+            if (used == sizeof(input) - 1) { close(fd); return -1; }
+        }
+        close(fd);
+        input[used] = '\0';
+    } else if (errno != ENOENT) return -1;
+    const char *sections[] = { "theme", "theme", "display", "display", "display" };
+    const char *keys[] = { "theme_id", "name", "vsync", "compositing", "cursor_aa" };
+    int values[] = { g_theme_selected, 0, g_vsync, g_composit, g_cursor_aa };
+    for (int i = 0; i < 5; i++) {
+        snprintf(value, sizeof(value), "%d", values[i]);
+        const char *v = i == 1 ? az_theme_get(g_theme_selected)->name : value;
+        if (settings_config_set(input, output, sizeof(output), sections[i], keys[i], v) < 0)
+            return -1;
+        strcpy(input, output);
+    }
+    return settings_write_file("/etc/desktop.conf", input, strlen(input));
 }
 
 void apply_theme(int theme_id)
 {
     int count = az_theme_count();
     if (theme_id < 0 || theme_id >= count) return;
+    int previous = g_theme_selected;
     g_theme_selected = theme_id;
-
-    /* Broadcast to Display Server */
+    if (save_desktop_config() < 0) {
+        g_theme_selected = previous;
+        snprintf(g_settings_status, sizeof(g_settings_status), "Could not save desktop theme.");
+        return;
+    }
     az_wm_msg_t tmsg;
     memset(&tmsg, 0, sizeof(tmsg));
     tmsg.type = AZ_WM_SET_THEME;
     AZ_WM_MSG_THEME(&tmsg)->theme_id = (unsigned int)theme_id;
-    az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&tmsg);
-
-    save_desktop_config();
-
-    /* Legacy /etc/theme.conf support */
-    int lfd = sys_open("/etc/theme.conf", 0x42, 0644);
-    if (lfd >= 0) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%d\n", theme_id);
-        sys_write(lfd, buf, strlen(buf));
-        sys_close(lfd);
-    }
+    int sent = az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&tmsg);
+    char legacy[16];
+    snprintf(legacy, sizeof(legacy), "%d\n", theme_id);
+    settings_write_file("/etc/theme.conf", legacy, strlen(legacy));
+    snprintf(g_settings_status, sizeof(g_settings_status), sent < 0
+             ? "Theme saved; desktop notification failed." : "Desktop theme applied and saved.");
 }
 
 /* Persists a Display-tab toggle (VSync/Compositor/Cursor AA) the moment it
@@ -169,7 +214,12 @@ void apply_theme(int theme_id)
  * pure UI state that vanished on the next apply_theme() call or restart. */
 void save_display_settings(void)
 {
-    save_desktop_config();
+    if (save_desktop_config() < 0) {
+        g_vsync ^= 1;
+        snprintf(g_settings_status, sizeof(g_settings_status), "Could not save display settings.");
+    } else {
+        snprintf(g_settings_status, sizeof(g_settings_status), "VSync saved. Restart the desktop to apply.");
+    }
 }
 
 void load_desktop_config(void)
@@ -253,12 +303,12 @@ int hit_toggle_wide(int tx, int ty, int mx, int my, int width)
 
 const tz_setting_item_t g_tz_settings_list[8] = {
     { "Universal Time",       "UTC",                 "UTC+00:00 (Standard)" },
-    { "London / Dublin",      "Europe/London",       "GMT/BST (UTC+01:00)" },
-    { "Warsaw / Central EU",  "Europe/Warsaw",       "CET/CEST (UTC+02:00)" },
-    { "Athens / Helsinki",    "Europe/Athens",       "EET/EEST (UTC+03:00)" },
-    { "New York / Toronto",   "America/New_York",    "EST/EDT (UTC-04:00)" },
-    { "Chicago / Dallas",     "America/Chicago",     "CST/CDT (UTC-05:00)" },
-    { "Los Angeles / SF",     "America/Los_Angeles", "PST/PDT (UTC-07:00)" },
+    { "London / Dublin",      "Europe/London",       "GMT/BST (UTC+00 / +01)" },
+    { "Warsaw / Central EU",  "Europe/Warsaw",       "CET/CEST (UTC+01 / +02)" },
+    { "Athens / Helsinki",    "Europe/Athens",       "EET/EEST (UTC+02 / +03)" },
+    { "New York / Toronto",   "America/New_York",    "EST/EDT (UTC-05 / -04)" },
+    { "Chicago / Dallas",     "America/Chicago",     "CST/CDT (UTC-06 / -05)" },
+    { "Los Angeles / SF",     "America/Los_Angeles", "PST/PDT (UTC-08 / -07)" },
     { "Tokyo / Seoul",        "Asia/Tokyo",          "JST/KST (UTC+09:00)" }
 };
 
@@ -266,15 +316,19 @@ int g_selected_tz_idx = 2; /* Default: Europe/Warsaw / Central EU */
 
 void init_timezone_setting(void)
 {
-    char buf[64] = "";
-    if (az_config_read("timezone", buf, sizeof(buf)) > 0) {
-        for (int i = 0; i < 8; i++) {
-            if (strcmp(buf, g_tz_settings_list[i].tz_id) == 0 ||
-                (strcmp(buf, "Europe/Paris") == 0 && i == 2) ||
-                (strcmp(buf, "Europe/Berlin") == 0 && i == 2)) {
-                g_selected_tz_idx = i;
-                return;
-            }
+    char buf[64];
+    int fd = open("/etc/timezone", O_RDONLY);
+    if (fd < 0) return;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = '\0';
+    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' ')) buf[--n] = '\0';
+    for (int i = 0; i < 8; i++) {
+        if (!strcmp(buf, g_tz_settings_list[i].tz_id) ||
+            (i == 2 && (!strcmp(buf, "Europe/Paris") || !strcmp(buf, "Europe/Berlin")))) {
+            g_selected_tz_idx = i;
+            return;
         }
     }
 }
@@ -282,11 +336,15 @@ void init_timezone_setting(void)
 void apply_timezone(int idx)
 {
     if (idx < 0 || idx >= 8) return;
-    g_selected_tz_idx = idx;
-
     const char *tz = g_tz_settings_list[idx].tz_id;
-    az_config_write("timezone", tz, strlen(tz));
+    if (settings_write_file("/etc/timezone", tz, strlen(tz)) < 0) {
+        snprintf(g_settings_status, sizeof(g_settings_status), "Error: Could not save system timezone.");
+        return;
+    }
+    g_selected_tz_idx = idx;
+    unsetenv("TZ");
     tzset();
+    snprintf(g_settings_status, sizeof(g_settings_status), "Timezone saved. Taskbar updates within one second.");
 }
 
 #define TIME_SEC1_Y    86
@@ -299,34 +357,20 @@ void apply_timezone(int idx)
 
 /* ── Network Tab State & Static Configuration ──────────────────────────────── */
 int g_net_dhcp = 1; /* 1 = DHCP (Automatic), 0 = Static Configuration */
-char g_net_ip[32]      = "10.0.2.15";
-char g_net_netmask[32] = "255.255.255.0";
-char g_net_gateway[32] = "10.0.2.2";
-char g_net_dns[32]     = "10.0.2.3";
+char g_net_ip[32]      = "0.0.0.0";
+char g_net_netmask[32] = "0.0.0.0";
+char g_net_gateway[32] = "0.0.0.0";
+char g_net_dns[32]     = "0.0.0.0";
 int g_net_focus = -1; /* -1 = none, 0 = IP, 1 = Subnet, 2 = GW, 3 = DNS */
 char g_net_status_msg[128] = "";
 unsigned int g_net_status_col = UK_GREEN;
 
-static int parse_net_ipv4(const char *s, unsigned char out[4])
-{
-    unsigned int a, b, c, d;
-    if (sscanf(s, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return -1;
-    if (a > 255 || b > 255 || c > 255 || d > 255) return -1;
-    out[0] = (unsigned char)a;
-    out[1] = (unsigned char)b;
-    out[2] = (unsigned char)c;
-    out[3] = (unsigned char)d;
-    return 0;
-}
 
 /* Keep the Settings UI's state in standard ifupdown syntax.  /etc/network.conf
  * was an Azami-only INI file, so tools expecting the conventional Linux
  * /etc/network/interfaces layout could neither inspect nor reuse a profile. */
-static void save_network_interfaces(int dhcp)
+static int save_network_interfaces(int dhcp)
 {
-    int fd = open("/etc/network/interfaces", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return;
-
     char buf[512];
     int len;
     if (dhcp) {
@@ -343,97 +387,117 @@ static void save_network_interfaces(int dhcp)
             "    dns-nameservers %s\n",
             g_net_ip, g_net_netmask, g_net_gateway, g_net_dns);
     }
-    if (len > 0) write(fd, buf, (size_t)len);
-    close(fd);
+    return len > 0 ? settings_write_file("/etc/network/interfaces", buf, (size_t)len) : -1;
 }
 
 void apply_static_network(void)
 {
     unsigned char ip[4], nm[4], gw[4], dns[4];
-    if (parse_net_ipv4(g_net_ip, ip) != 0) {
+    if (settings_parse_ipv4(g_net_ip, ip) != 0) {
         snprintf(g_net_status_msg, sizeof(g_net_status_msg), "Error: Invalid IP format");
         g_net_status_col = UK_RED;
         return;
     }
-    if (parse_net_ipv4(g_net_netmask, nm) != 0) {
+    if (settings_parse_ipv4(g_net_netmask, nm) != 0) {
         snprintf(g_net_status_msg, sizeof(g_net_status_msg), "Error: Invalid Subnet Mask");
         g_net_status_col = UK_RED;
         return;
     }
-    if (parse_net_ipv4(g_net_gateway, gw) != 0) {
+    if (settings_parse_ipv4(g_net_gateway, gw) != 0) {
         snprintf(g_net_status_msg, sizeof(g_net_status_msg), "Error: Invalid Gateway");
         g_net_status_col = UK_RED;
         return;
     }
-    if (parse_net_ipv4(g_net_dns, dns) != 0) {
+    if (settings_parse_ipv4(g_net_dns, dns) != 0) {
         snprintf(g_net_status_msg, sizeof(g_net_status_msg), "Error: Invalid DNS Server");
         g_net_status_col = UK_RED;
         return;
     }
 
+    unsigned int mask = ((unsigned int)nm[0] << 24) | ((unsigned int)nm[1] << 16) |
+                        ((unsigned int)nm[2] << 8) | nm[3];
+    unsigned int inverse = ~mask;
+    if (!mask || (inverse & (inverse + 1U))) {
+        snprintf(g_net_status_msg, sizeof(g_net_status_msg), "Error: Subnet mask must have contiguous network bits.");
+        g_net_status_col = UK_RED;
+        return;
+    }
     int fd = open("/dev/net0", O_RDWR, 0);
-    if (fd >= 0) {
-        ioctl(fd, 0x8916 /* SIOCSIFADDR */, (unsigned long)ip);
-        ioctl(fd, 0x891c /* SIOCSIFNETMASK */, (unsigned long)nm);
-        ioctl(fd, 0x891e /* SIOCSIFGW */, (unsigned long)gw);
-        ioctl(fd, 0x8921 /* SIOCSIFDNS */, (unsigned long)dns);
-        int flags = 0x4163;
-        ioctl(fd, 0x8914 /* SIOCSIFFLAGS */, (unsigned long)&flags);
-        close(fd);
+    if (fd < 0) {
+        snprintf(g_net_status_msg, sizeof(g_net_status_msg), "Error: Network adapter unavailable or access denied.");
+        g_net_status_col = UK_RED;
+        return;
     }
-
-    save_network_interfaces(0);
-
-    int rfd = open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (rfd >= 0) {
-        char rbuf[256];
-        int len = snprintf(rbuf, sizeof(rbuf),
-            "# Generated by AzamiOS Network Settings\n"
-            "nameserver %s\n",
-            g_net_dns);
-        write(rfd, rbuf, (size_t)len);
-        close(rfd);
+    int flags = 0x1043; /* UP | BROADCAST | RUNNING | MULTICAST */
+    int ok = ioctl(fd, 0x8916, (unsigned long)ip) == 0 &&
+             ioctl(fd, 0x891c, (unsigned long)nm) == 0 &&
+             ioctl(fd, 0x891e, (unsigned long)gw) == 0 &&
+             ioctl(fd, 0x8921, (unsigned long)dns) == 0 &&
+             ioctl(fd, 0x8914, (unsigned long)&flags) == 0;
+    close(fd);
+    if (!ok) {
+        snprintf(g_net_status_msg, sizeof(g_net_status_msg), "Network operation failed; adapter may be partially configured.");
+        g_net_status_col = UK_RED;
+        return;
     }
-
     g_net_dhcp = 0;
-    snprintf(g_net_status_msg, sizeof(g_net_status_msg), "Static IP %s applied & saved to /etc/network/interfaces", g_net_ip);
-    g_net_status_col = UK_GREEN;
+    char rbuf[128];
+    int len = snprintf(rbuf, sizeof(rbuf), "# Generated by AzamiOS Settings\nnameserver %s\n", g_net_dns);
+    int saved = save_network_interfaces(0) == 0;
+    if (settings_write_file("/etc/resolv.conf", rbuf, (size_t)len) < 0) saved = 0;
+    snprintf(g_net_status_msg, sizeof(g_net_status_msg), saved
+             ? "Static IP %s applied and saved." : "Static IP %s applied; configuration could not be saved.", g_net_ip);
+    g_net_status_col = saved ? UK_GREEN : UK_YELLOW;
 }
 
 void apply_dhcp_network(void)
 {
     int fd = open("/dev/net0", O_RDWR, 0);
-    if (fd >= 0) {
-        ioctl(fd, 0x8990 /* SIOCSIFDHCP */, 0);
-        close(fd);
+    if (fd < 0) {
+        snprintf(g_net_status_msg, sizeof(g_net_status_msg), "Error: Network adapter unavailable or access denied.");
+        g_net_status_col = UK_RED;
+        return;
     }
-
-    save_network_interfaces(1);
-
+    int result = ioctl(fd, 0x8990, 0);
+    close(fd);
+    if (result < 0) {
+        snprintf(g_net_status_msg, sizeof(g_net_status_msg), "Error: DHCP request failed.");
+        g_net_status_col = UK_RED;
+        return;
+    }
     g_net_dhcp = 1;
-    snprintf(g_net_status_msg, sizeof(g_net_status_msg), "DHCP lease requested on net0");
-    g_net_status_col = UK_GREEN;
+    g_net_focus = -1;
+    int saved = save_network_interfaces(1) == 0;
+    snprintf(g_net_status_msg, sizeof(g_net_status_msg), saved
+             ? "DHCP requested; waiting for an assigned address." : "DHCP requested; profile could not be saved.");
+    g_net_status_col = saved ? UK_GREEN : UK_YELLOW;
 }
 
-void init_network_settings(void)
+void refresh_network_stats(void)
 {
     int fd = open("/dev/net0", O_RDWR, 0);
     if (fd >= 0) {
         unsigned char ip[4] = {0}, nm[4] = {0}, gw[4] = {0}, dns[4] = {0};
-        if (ioctl(fd, 0x8915 /* SIOCGIFADDR */, (unsigned long)ip) == 0 && (ip[0] != 0 || ip[1] != 0)) {
+        if (ioctl(fd, 0x8915 /* SIOCGIFADDR */, (unsigned long)ip) == 0) {
             snprintf(g_net_ip, sizeof(g_net_ip), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
         }
-        if (ioctl(fd, 0x891b /* SIOCGIFNETMASK */, (unsigned long)nm) == 0 && nm[0] != 0) {
+        if (ioctl(fd, 0x891b /* SIOCGIFNETMASK */, (unsigned long)nm) == 0) {
             snprintf(g_net_netmask, sizeof(g_net_netmask), "%u.%u.%u.%u", nm[0], nm[1], nm[2], nm[3]);
         }
-        if (ioctl(fd, 0x891d /* SIOCGIFGW */, (unsigned long)gw) == 0 && (gw[0] != 0 || gw[1] != 0)) {
+        if (ioctl(fd, 0x891d /* SIOCGIFGW */, (unsigned long)gw) == 0) {
             snprintf(g_net_gateway, sizeof(g_net_gateway), "%u.%u.%u.%u", gw[0], gw[1], gw[2], gw[3]);
         }
-        if (ioctl(fd, 0x891f /* SIOCGIFDNS */, (unsigned long)dns) == 0 && (dns[0] != 0 || dns[1] != 0)) {
+        if (ioctl(fd, 0x891f /* SIOCGIFDNS */, (unsigned long)dns) == 0) {
             snprintf(g_net_dns, sizeof(g_net_dns), "%u.%u.%u.%u", dns[0], dns[1], dns[2], dns[3]);
         }
         close(fd);
     }
+
+}
+
+void init_network_settings(void)
+{
+    refresh_network_stats();
 
     int cfd = open("/etc/network/interfaces", O_RDONLY, 0);
     if (cfd >= 0) {
@@ -487,21 +551,32 @@ static int read_proc_val(const char *path, int def_val)
     return def_val;
 }
 
-void write_proc_val(const char *path, int val)
+int write_proc_val(const char *path, int val)
 {
-    int fd = open(path, 1 /* O_WRONLY */, 0);
-    if (fd >= 0) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%d\n", val);
-        write(fd, buf, strlen(buf));
-        close(fd);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%d\n", val);
+    int ok = write(fd, buf, (size_t)len) == len;
+    if (close(fd) < 0) ok = 0;
+    return ok ? 0 : -1;
+}
+
+void toggle_proc_setting(const char *path, int *value, int enabled_value)
+{
+    int next = !*value;
+    if (write_proc_val(path, next ? enabled_value : 0) < 0) {
+        snprintf(g_settings_status, sizeof(g_settings_status), "Kernel setting failed: unavailable or access denied.");
+        return;
     }
+    *value = next;
+    snprintf(g_settings_status, sizeof(g_settings_status), "Kernel setting applied for this boot.");
 }
 
 /* ── Power & Performance Tab ─────────────────────────────────────────────────── */
 int g_power_profile = 1; /* 0: Performance, 1: Balanced, 2: Power Saver */
-int g_screen_timeout = 15; /* 5, 15, 30, 0 (Never) */
-char g_power_status_msg[128] = "ACPI PIIX4 Power Management active.";
+int g_screen_timeout = 0; /* 5, 15, 30, 0 (Never) */
+char g_power_status_msg[128] = "Display blanking is available. CPU power profiles are unsupported.";
 
 void load_power_config(void)
 {
@@ -515,67 +590,62 @@ void load_power_config(void)
             char *p = strstr(buf, "profile=");
             if (p) g_power_profile = atoi(p + 8);
             char *t = strstr(buf, "screen_timeout=");
-            if (t) g_screen_timeout = atoi(t + 15);
+            if (t) {
+                int timeout = atoi(t + 15);
+                g_screen_timeout = timeout == 5 || timeout == 15 || timeout == 30 ? timeout : 0;
+            }
         }
     }
 }
 
-static void save_power_config(void)
+static int save_power_config(void)
 {
-    int fd = open("/etc/power.conf", 0x42 /* O_CREAT|O_WRONLY */, 0644);
-    if (fd >= 0) {
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "# AzamiOS Power Management Configuration\nprofile=%d\nscreen_timeout=%d\nacpi_pm=1\n",
-                 g_power_profile, g_screen_timeout);
-        write(fd, buf, strlen(buf));
-        close(fd);
-    }
-}
-
-void apply_power_profile(int profile)
-{
-    if (profile < 0 || profile > 2) return;
-    g_power_profile = profile;
-    save_power_config();
-    if (profile == 0) {
-        snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Performance profile active: Max CPU throughput.");
-    } else if (profile == 1) {
-        snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Balanced profile active: Dynamic power & thermals.");
-    } else {
-        snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Power Saver active: Energy conservation enabled.");
-    }
+    char buf[256];
+    int len = snprintf(buf, sizeof(buf),
+             "# AzamiOS Power Management Configuration\nprofile=%d\nscreen_timeout=%d\n",
+             g_power_profile, g_screen_timeout);
+    return settings_write_file("/etc/power.conf", buf, (size_t)len);
 }
 
 void apply_screen_timeout(int mins)
 {
+    if (mins != 0 && mins != 5 && mins != 15 && mins != 30) return;
+    int previous = g_screen_timeout;
     g_screen_timeout = mins;
-    save_power_config();
-    if (mins > 0) {
-        snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Screen blanking timeout set to %d minutes.", mins);
+    if (save_power_config() < 0) {
+        g_screen_timeout = previous;
+        snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Error: Could not save display timeout.");
+    } else if (mins > 0) {
+        snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Display timeout: %d minutes. Desktop reloads within 5 seconds.", mins);
     } else {
-        snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Screen blanking timeout disabled (Never).");
+        snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Display timeout disabled. Desktop reloads within 5 seconds.");
     }
 }
 
 /* ── Disks & Storage Tab ────────────────────────────────────────────────────── */
-char g_disk_status_msg[128] = "All filesystem mounts operating nominally.";
+char g_disk_status_msg[128] = "Usage comes from mounted filesystem statistics.";
 
 void clean_temp_files(void)
 {
     DIR *d = opendir("/tmp");
-    if (d) {
-        struct dirent *de;
-        while ((de = readdir(d)) != NULL) {
-            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-            char path[512];
-            snprintf(path, sizeof(path), "/tmp/%s", de->d_name);
-            unlink(path);
-        }
-        closedir(d);
+    if (!d) {
+        snprintf(g_disk_status_msg, sizeof(g_disk_status_msg), "Error: Cannot open /tmp.");
+        return;
     }
+    unsigned int removed = 0, skipped = 0, failed = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char path[512];
+        snprintf(path, sizeof(path), "/tmp/%s", de->d_name);
+        struct stat st;
+        if (lstat(path, &st) < 0) { failed++; continue; }
+        if (!S_ISREG(st.st_mode)) { skipped++; continue; }
+        if (unlink(path) == 0) removed++; else failed++;
+    }
+    closedir(d);
     sync();
-    snprintf(g_disk_status_msg, sizeof(g_disk_status_msg), "Temporary scratch space cleaned and VFS buffers synced.");
+    snprintf(g_disk_status_msg, sizeof(g_disk_status_msg), "%u files removed; %u non-files kept; %u failures. Buffers synced.", removed, skipped, failed);
 }
 
 void draw_storage_card(int x, int y, int w, int h,
@@ -594,30 +664,23 @@ void draw_storage_card(int x, int y, int w, int h,
         used_mb  = total_mb > free_mb ? (total_mb - free_mb) : 0;
         pct      = total_mb ? (int)((used_mb * 100) / total_mb) : 0;
     } else {
-        /* Fallback synthetic metrics */
-        if (strcmp(path, "/boot") == 0) {
-            total_mb = 64; used_mb = 12; free_mb = 52; pct = 18;
-        } else if (strcmp(path, "/hdd") == 0) {
-            total_mb = 1024; used_mb = 128; free_mb = 896; pct = 12;
-        } else if (strcmp(path, "/tmp") == 0) {
-            total_mb = 128; used_mb = 8; free_mb = 120; pct = 6;
-        } else {
-            total_mb = 512; used_mb = 211; free_mb = 301; pct = 41;
-        }
+        uk_draw_text_clip(&g_win, x + 12, y + 8, title, UK_TEXT, w - 24);
+        uk_draw_text(&g_win, x + 12, y + 28, "Filesystem statistics unavailable.", UK_SUBTEXT0);
+        return;
     }
 
     char title_buf[128];
     snprintf(title_buf, sizeof(title_buf), "%s (%s)", title, mount_point);
-    uk_draw_text(&g_win, x + 12, y + 8, title_buf, UK_TEXT);
+    uk_draw_text_clip(&g_win, x + 12, y + 8, title_buf, UK_TEXT, w - 24 - (fs_type[0] ? 160 : 0));
 
     char type_buf[64];
     snprintf(type_buf, sizeof(type_buf), "Type: %s", fs_type);
-    uk_draw_text(&g_win, x + w - 160, y + 8, type_buf, UK_SUBTEXT0);
+    if (fs_type[0]) uk_draw_text_clip(&g_win, x + w - 160, y + 8, type_buf, UK_SUBTEXT0, 148);
 
     char stat_buf[128];
     snprintf(stat_buf, sizeof(stat_buf), "%lu MB Used of %lu MB  •  %lu MB Free (%d%% full)",
              used_mb, total_mb, free_mb, pct);
-    uk_draw_text(&g_win, x + 12, y + 26, stat_buf, UK_SUBTEXT1);
+    uk_draw_text_clip(&g_win, x + 12, y + 26, stat_buf, UK_SUBTEXT1, w - 24);
 
     /* Progress bar */
     int bar_x = x + 12;
@@ -643,50 +706,6 @@ int g_sec_yama  = 1;
 int g_sec_hlinks= 1;
 int g_sec_slinks= 1;
 
-/* Auto-Accept & Unattended Policies */
-int g_sec_auto_ipc   = 1; /* Auto-Accept SCM_RIGHTS IPC transfers */
-int g_sec_auto_admin = 1; /* Auto-Approve Console Admin Escalations */
-int g_sec_auto_dhcp  = 1; /* Auto-Accept Network DHCP Renewals */
-int g_sec_auto_trace = 1; /* Auto-Accept Debug & Tracing Telemetry */
-
-void load_security_config(void)
-{
-    int fd = open("/etc/security.conf", 0, 0);
-    if (fd >= 0) {
-        char buf[512];
-        ssize_t n = read(fd, buf, sizeof(buf) - 1);
-        close(fd);
-        if (n > 0) {
-            buf[n] = '\0';
-            char *p1 = strstr(buf, "ipc_autoaccept=");
-            if (p1) g_sec_auto_ipc = atoi(p1 + 15);
-            char *p2 = strstr(buf, "admin_autoaccept=");
-            if (p2) g_sec_auto_admin = atoi(p2 + 17);
-            char *p3 = strstr(buf, "dhcp_autoaccept=");
-            if (p3) g_sec_auto_dhcp = atoi(p3 + 16);
-            char *p4 = strstr(buf, "trace_autoaccept=");
-            if (p4) g_sec_auto_trace = atoi(p4 + 17);
-        }
-    }
-}
-
-void save_security_config(void)
-{
-    int fd = open("/etc/security.conf", 0x42 /* O_CREAT|O_WRONLY */, 0644);
-    if (fd >= 0) {
-        char buf[512];
-        snprintf(buf, sizeof(buf),
-                 "# AzamiOS Security & Auto-Accept Configuration\n"
-                 "ipc_autoaccept=%d\n"
-                 "admin_autoaccept=%d\n"
-                 "dhcp_autoaccept=%d\n"
-                 "trace_autoaccept=%d\n",
-                 g_sec_auto_ipc, g_sec_auto_admin, g_sec_auto_dhcp, g_sec_auto_trace);
-        write(fd, buf, strlen(buf));
-        close(fd);
-    }
-}
-
 void init_security_settings(void)
 {
     g_sec_dmesg  = read_proc_val("/proc/sys/kernel/dmesg_restrict", 1) > 0 ? 1 : 0;
@@ -695,66 +714,140 @@ void init_security_settings(void)
     g_sec_yama   = read_proc_val("/proc/sys/kernel/yama/ptrace_scope", 1) > 0 ? 1 : 0;
     g_sec_hlinks = read_proc_val("/proc/sys/fs/protected_hardlinks", 1) > 0 ? 1 : 0;
     g_sec_slinks = read_proc_val("/proc/sys/fs/protected_symlinks", 1) > 0 ? 1 : 0;
-    load_security_config();
 }
 
-#define SEC_HEADER_Y   86
-#define SEC_LCOL_X     20
-#define SEC_RCOL_X     370
-#define SEC_ROW1_Y    114
-#define SEC_ROW2_Y    144
-#define SEC_ROW3_Y    174
+static unsigned int g_mouse_buttons;
+static int g_scroll_x, g_scroll_y, g_slider_drag;
+static unsigned int *g_content_pixels;
+static size_t g_content_capacity;
 
-#define SEC_AUTO_HDR_Y 212
-#define SEC_AUTO1_Y    240
-#define SEC_AUTO2_Y    268
-#define SEC_AUTO3_Y    296
-#define SEC_AUTO4_Y    324
-#define SEC_FOOTER_Y   362
+int settings_content_width(void)
+{
+    return g_win.width < WIN_W ? WIN_W : (int)g_win.width;
+}
 
-/* ── System Tab ────────────────────────────────────────────────────────────── */
-#define SYS_SEC_Y  90
-#define SYS_GRID_Y 122
+static int tab_columns(void)
+{
+    int cols = ((int)g_win.width - 18) / 78;
+    return cols < 1 ? 1 : cols > NTABS ? NTABS : cols;
+}
+
+static int content_top(void)
+{
+    if (g_win.width < 360) return 80;
+    return 44 + ((NTABS + tab_columns() - 1) / tab_columns()) * 36;
+}
+
+static int content_bottom(void)
+{
+    int bottom = (int)g_win.height - 38;
+    return bottom > content_top() ? bottom : content_top();
+}
+
+static int content_height(void)
+{
+    int bottom = 464;
+    if (g_active_tab == 0) bottom = display_content_height();
+    if (g_active_tab == 6) bottom = disks_content_height();
+    if (g_active_tab == 2) {
+        int themes_bottom = 122 + ((az_theme_count() + 1) / 2) * 76;
+        if (themes_bottom > bottom) bottom = themes_bottom;
+    }
+    return bottom;
+}
+
+static void clamp_scroll(void)
+{
+    int max_x = settings_content_width() - (int)g_win.width;
+    int max_y = content_height() - 80 - (content_bottom() - content_top());
+    if (max_y < 0) max_y = 0;
+    if (g_scroll_x > max_x) g_scroll_x = max_x;
+    if (g_scroll_y > max_y) g_scroll_y = max_y;
+    if (g_scroll_x < 0) g_scroll_x = 0;
+    if (g_scroll_y < 0) g_scroll_y = 0;
+}
+
+static void select_tab(int tab)
+{
+    g_active_tab = (tab + NTABS) % NTABS;
+    g_scroll_x = g_scroll_y = g_slider_drag = 0;
+    g_net_focus = -1;
+    draw_settings();
+}
 
 void draw_settings(void)
 {
-    unsigned int w = g_win.width;
-    unsigned int h = g_win.height;
-
-    uk_fill_rect(&g_win, 0, 0, (int)w, (int)h, UK_BASE);
-
-    /* Header */
-    uk_gradient_h(&g_win, 0, 0, (int)w, 44, UK_SURFACE0, UK_BASE);
+    clamp_scroll();
+    int w = (int)g_win.width, h = (int)g_win.height;
+    uk_fill_rect(&g_win, 0, 0, w, h, UK_BASE);
+    uk_gradient_h(&g_win, 0, 0, w, 44, UK_SURFACE0, UK_BASE);
     uk_fill_rect(&g_win, 0, 0, 4, 44, UK_MAUVE);
-    uk_draw_text(&g_win, 16, 6,  "AzamiOS Settings", UK_TEXT);
-    uk_draw_text(&g_win, 16, 24, "System Preferences, Timezones, Themes, Security & Hardware", UK_OVERLAY0);
-    uk_hline(&g_win, 0, 44, (int)w, UK_SURFACE1);
-
-    /* Tab bar */
-    int tab_w = ((int)w - 20) / NTABS;
-    uk_draw_tab_bar(&g_win, 10, 44, tab_w, 36,
-                    g_tab_labels, NTABS, g_active_tab);
-    uk_hline(&g_win, 0, 80, (int)w, UK_SURFACE1);
-
-    /* Tab content */
-    switch (g_active_tab) {
-    case 0: draw_display_tab();  break;
-    case 1: draw_audio_tab();    break;
-    case 2: draw_theme_tab();    break;
-    case 3: draw_time_tab();     break;
-    case 4: draw_network_tab();  break;
-    case 5: draw_power_tab();    break;
-    case 6: draw_disks_tab();    break;
-    case 7: draw_security_tab(); break;
-    case 8: draw_system_tab();   break;
+    uk_draw_text(&g_win, 16, 6, "AzamiOS Settings", UK_TEXT);
+    uk_draw_text(&g_win, 16, 24, "Ctrl+Tab: category | Wheel: scroll | Shift+Arrows: sideways", UK_OVERLAY0);
+    int cols = tab_columns();
+    int tab_w = (w - 20 - (cols - 1) * 2) / cols;
+    if (w < 360) {
+        uk_draw_button(&g_win, 8, 48, 24, 28, "<", UK_BTN_NORMAL);
+        uk_draw_text_clip(&g_win, 40, 56, g_tab_labels[g_active_tab], UK_TEXT, w - 80);
+        uk_draw_button(&g_win, w - 32, 48, 24, 28, ">", UK_BTN_NORMAL);
+    } else for (int i = 0; i < NTABS; i++) {
+        uk_draw_tab_bar(&g_win, 10 + (i % cols) * (tab_w + 2),
+                        44 + (i / cols) * 36, tab_w, 36,
+                        &g_tab_labels[i], 1, i == g_active_tab ? 0 : -1);
     }
-
-    /* Footer */
-    uk_fill_rect(&g_win, 0, (int)h - 38, (int)w, 38, UK_SURFACE0);
-    uk_hline(&g_win, 0, (int)h - 38, (int)w, UK_SURFACE1);
-    uk_draw_text(&g_win, 16, (int)h - 26, "Settings changes take effect immediately.", UK_OVERLAY0);
-    uk_draw_button(&g_win, (int)w - 110, (int)h - 32, 96, 26, "Close", UK_BTN_NORMAL);
-
+    int cw = settings_content_width(), ch = content_height();
+    size_t needed = (size_t)cw * (size_t)ch;
+    if (needed > g_content_capacity) {
+        unsigned int *pixels = realloc(g_content_pixels, needed * sizeof(*pixels));
+        if (pixels) { g_content_pixels = pixels; g_content_capacity = needed; }
+    }
+    if (needed <= g_content_capacity) {
+        uk_window_t actual = g_win;
+        g_win.pixels = g_content_pixels;
+        g_win.width = (unsigned int)cw;
+        g_win.height = (unsigned int)ch;
+        g_win.clip_x0 = g_win.clip_y0 = g_win.clip_depth = 0;
+        g_win.clip_x1 = cw; g_win.clip_y1 = ch;
+        uk_fill_rect(&g_win, 0, 0, cw, ch, UK_BASE);
+        switch (g_active_tab) {
+        case 0: draw_display_tab(); break;
+        case 1: draw_audio_tab(); break;
+        case 2: draw_theme_tab(); break;
+        case 3: draw_time_tab(); break;
+        case 4: draw_network_tab(); break;
+        case 5: draw_power_tab(); break;
+        case 6: draw_disks_tab(); break;
+        case 7: draw_security_tab(); break;
+        case 8: draw_system_tab(); break;
+        }
+        g_win = actual;
+        int top = content_top(), bottom = content_bottom();
+        for (int y = top; y < bottom && y < h; y++) {
+            int source_y = 80 + g_scroll_y + y - top;
+            if (source_y >= ch) break;
+            memcpy(g_win.pixels + (size_t)y * w,
+                   g_content_pixels + (size_t)source_y * cw + g_scroll_x,
+                   (size_t)w * sizeof(*g_content_pixels));
+        }
+        if (ch - 80 > bottom - top && bottom > top) {
+            int track = bottom - top;
+            int thumb = track * track / (ch - 80);
+            if (thumb < 12) thumb = 12;
+            if (thumb > track) thumb = track;
+            int max_y = ch - 80 - track;
+            int thumb_y = top + (track - thumb) * g_scroll_y / max_y;
+            uk_fill_rect(&g_win, w - 5, top, 5, track, UK_SURFACE0);
+            uk_fill_rect(&g_win, w - 5, thumb_y, 5, thumb, UK_OVERLAY0);
+        }
+    } else {
+        uk_draw_text(&g_win, 20, content_top() + 12, "Insufficient memory for settings content.", UK_RED);
+    }
+    uk_fill_rect(&g_win, 0, h - 38, w, 38, UK_SURFACE0);
+    uk_hline(&g_win, 0, h - 38, w, UK_SURFACE1);
+    uk_push_clip(&g_win, 0, h - 38, w - 118, 38);
+    uk_draw_text(&g_win, 16, h - 26, g_settings_status, UK_SUBTEXT0);
+    uk_pop_clip(&g_win);
+    uk_draw_button(&g_win, w - 110, h - 32, 96, 26, "Close", UK_BTN_NORMAL);
     uk_invalidate(&g_win);
 }
 
@@ -767,117 +860,127 @@ int main(int argc, char **argv)
     init_network_settings();
     load_desktop_config();
     load_power_config();
-
+    init_audio_settings();
     az_fb_info_t fb;
     unsigned int sw = 1280, sh = 800;
-    if (az_fb_info(&fb) == 0 && fb.width > 0 && fb.height > 0) {
-        sw = fb.width;
-        sh = fb.height;
-    }
-
-    int ret = uk_window_connect(&g_win, "Settings",
-                                (int)(sw / 2) - WIN_W / 2,
-                                (int)(sh / 2) - WIN_H / 2,
-                                WIN_W, WIN_H, MAP_ADDR, SERVER_CHAN);
-    if (ret < 0) return -1;
-
+    if (az_fb_info(&fb) == 0 && fb.width && fb.height) { sw = fb.width; sh = fb.height; }
+    if (uk_window_connect(&g_win, "Settings", (int)(sw / 2) - WIN_W / 2,
+                          (int)(sh / 2) - WIN_H / 2, WIN_W, WIN_H, MAP_ADDR, SERVER_CHAN) < 0)
+        return -1;
+    az_set_timer(g_win.client_chan, 1000, 0);
     draw_settings();
-
     for (;;) {
         az_wm_msg_t msg;
         int r = az_channel_recv(g_win.client_chan, (az_ipc_msg_t *)&msg);
         if (r < 0) break;
         if (r != 0) continue;
-
-        if (msg.type == AZ_WM_DESTROY_WINDOW) {
-            break;
+        if (msg.type == AZ_WM_DESTROY_WINDOW) break;
+        if (msg.type == AZ_WM_FOCUS_CHANGE && !msg.focus.focused) {
+            g_mouse_buttons = 0;
+            g_slider_drag = 0;
         }
-
         if (msg.type == AZ_WM_WINDOW_RESIZED) {
             if (!uk_handle_resize(&g_win, &msg)) break;
+            g_slider_drag = 0;
             draw_settings();
             continue;
         }
-
-        if (msg.type == AZ_WM_KEY_EVENT) {
-            if (!msg.key.pressed) continue;
-
-            if (g_active_tab == 4 && g_net_dhcp == 0 && g_net_focus >= 0 && g_net_focus <= 3) {
-                char *target = (g_net_focus == 0) ? g_net_ip
-                             : (g_net_focus == 1) ? g_net_netmask
-                             : (g_net_focus == 2) ? g_net_gateway
-                             : g_net_dns;
-                size_t max_len = 31;
-                size_t cur_len = strlen(target);
-
-                if (msg.key.keycode == 0x08) { /* Backspace */
-                    if (cur_len > 0) {
-                        target[cur_len - 1] = '\0';
-                        draw_settings();
-                        continue;
-                    }
-                } else if (msg.key.keycode == '\t') { /* Tab key */
-                    g_net_focus = (g_net_focus + 1) % 4;
-                    draw_settings();
-                    continue;
-                } else if (msg.key.keycode == '\n' || msg.key.keycode == '\r') { /* Enter */
-                    apply_static_network();
-                    draw_settings();
-                    continue;
-                } else if ((msg.key.keycode >= '0' && msg.key.keycode <= '9') || msg.key.keycode == '.') {
-                    if (cur_len < max_len - 1) {
-                        target[cur_len] = (char)msg.key.keycode;
-                        target[cur_len + 1] = '\0';
-                        draw_settings();
-                        continue;
-                    }
-                }
+        if (msg.type == AZ_WM_TIMER_TICK) {
+            if (g_active_tab == 3 || g_active_tab == 4 || g_active_tab == 8) {
+                if (g_active_tab == 4 && g_net_dhcp) refresh_network_stats();
+                draw_settings();
             }
             continue;
         }
-
-        if (msg.type == AZ_WM_MOUSE_EVENT) {
-            int mx = (int)msg.mouse.abs_x;
-            int my = (int)msg.mouse.abs_y;
-            int lclick = (msg.mouse.buttons & AZ_MOUSE_BTN_LEFT) != 0;
-
-            if (lclick) {
-                /* Tab clicks */
-                unsigned int w = g_win.width;
-                int tab_w = ((int)w - 20) / NTABS;
-                if (my >= 44 && my < 80) {
-                    int t = (mx - 10) / (tab_w + 2);
-                    if (t >= 0 && t < NTABS) {
-                        g_active_tab = t;
-                        draw_settings();
-                        continue;
+        if (msg.type == AZ_WM_KEY_EVENT) {
+            if (!msg.key.pressed) continue;
+            unsigned int key = msg.key.keycode;
+            if (key == KEY_ESC) break;
+            if (key == KEY_TAB && (msg.key.modifiers & AZ_MOD_CTRL)) {
+                select_tab(g_active_tab + ((msg.key.modifiers & AZ_MOD_SHIFT) ? -1 : 1));
+                continue;
+            }
+            if (key == KEY_PAGEUP || key == KEY_PAGEDOWN) {
+                g_scroll_y += (key == KEY_PAGEUP ? -1 : 1) * (content_bottom() - content_top());
+                draw_settings(); continue;
+            }
+            if ((msg.key.modifiers & AZ_MOD_SHIFT) && (key == KEY_LEFT || key == KEY_RIGHT)) {
+                g_scroll_x += key == KEY_LEFT ? -80 : 80;
+                draw_settings(); continue;
+            }
+            if (g_active_tab == 4 && !g_net_dhcp) {
+                if (key == KEY_TAB) {
+                    g_net_focus = (g_net_focus + ((msg.key.modifiers & AZ_MOD_SHIFT) ? 3 : 1)) % 4;
+                } else if (key == KEY_ENTER || key == '\r') {
+                    apply_static_network();
+                } else if (g_net_focus >= 0 && g_net_focus < 4) {
+                    char *fields[] = { g_net_ip, g_net_netmask, g_net_gateway, g_net_dns };
+                    char *target = fields[g_net_focus];
+                    size_t len = strlen(target);
+                    if ((msg.key.modifiers & AZ_MOD_CTRL) && (key == 'a' || key == 'A')) target[0] = '\0';
+                    else if (key == KEY_BACKSPACE && len) target[len - 1] = '\0';
+                    else if (((key >= '0' && key <= '9') || key == '.') && len < 31) {
+                        target[len] = (char)key; target[len + 1] = '\0';
                     }
                 }
-
-                /* Display tab toggles and font selection */
-                if (g_active_tab == 0) handle_display_mouse(mx, my);
-                else if (g_active_tab == 1) handle_audio_mouse(mx, my);
-                else if (g_active_tab == 2) handle_theme_mouse(mx, my);
-                else if (g_active_tab == 3) handle_time_mouse(mx, my);
-                else if (g_active_tab == 4) handle_network_mouse(mx, my);
-                else if (g_active_tab == 5) handle_power_mouse(mx, my);
-                else if (g_active_tab == 6) handle_disks_mouse(mx, my);
-                else if (g_active_tab == 7) handle_security_mouse(mx, my);
-                else if (g_active_tab == 8) handle_system_mouse(mx, my);
-
-                /* Footer Close button */
-                unsigned int h = g_win.height;
-                if (mx >= (int)w - 110 && mx <= (int)w - 14 &&
-                    my >= (int)h - 32 && my <= (int)h - 6) {
-                    az_wm_msg_t cmsg;
-                    memset(&cmsg, 0, sizeof(cmsg));
-                    cmsg.type = AZ_WM_DESTROY_WINDOW;
-                    cmsg.wid = g_win.wid;
-                    az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&cmsg);
-                    sys_exit(0);
+                draw_settings();
+            }
+            continue;
+        }
+        if (msg.type == AZ_WM_MOUSE_EVENT) {
+            unsigned int pressed = uk_mouse_press(&g_mouse_buttons, msg.mouse.buttons);
+            int mx = msg.mouse.abs_x, my = msg.mouse.abs_y;
+            if (!(msg.mouse.buttons & AZ_MOUSE_BTN_LEFT)) g_slider_drag = 0;
+            if (msg.mouse.wheel) {
+                if (g_win.width < WIN_W && (g_scroll_y == 0 && content_height() - 80 <= content_bottom() - content_top()))
+                    g_scroll_x += msg.mouse.wheel * 40;
+                else g_scroll_y += msg.mouse.wheel * 40;
+                draw_settings(); continue;
+            }
+            if (pressed & AZ_MOUSE_BTN_LEFT) {
+                int w = (int)g_win.width, h = (int)g_win.height;
+                if (mx >= w - 110 && mx < w - 14 && my >= h - 32 && my < h - 6) break;
+                int cols = tab_columns(), tw = (w - 20 - (cols - 1) * 2) / cols;
+                if (w < 360 && my >= 48 && my < 76) {
+                    if (mx >= 8 && mx < 32) select_tab(g_active_tab - 1);
+                    else if (mx >= w - 32 && mx < w - 8) select_tab(g_active_tab + 1);
+                    continue;
                 }
+                if (w >= 360 && my >= 44 && my < content_top() && mx >= 10) {
+                    int col = (mx - 10) / (tw + 2), row = (my - 44) / 36;
+                    int tab = row * cols + col;
+                    if (col < cols && (mx - 10) % (tw + 2) < tw && tab < NTABS) select_tab(tab);
+                    continue;
+                }
+            }
+            if (my < content_top() || my >= content_bottom() || mx < 0 || mx >= (int)g_win.width) continue;
+            mx += g_scroll_x;
+            my += 80 + g_scroll_y - content_top();
+            if (g_active_tab == 1 && (pressed & AZ_MOUSE_BTN_LEFT) &&
+                mx >= 20 && mx <= settings_content_width() - 160 && my >= 250 && my <= 280)
+                g_slider_drag = 1;
+            if (g_slider_drag && (msg.mouse.buttons & AZ_MOUSE_BTN_LEFT)) {
+                int pct = (mx - 20) * 100 / (settings_content_width() - 180);
+                apply_volume(pct); draw_settings(); continue;
+            }
+            if (!(pressed & AZ_MOUSE_BTN_LEFT)) continue;
+            switch (g_active_tab) {
+            case 0: handle_display_mouse(mx, my); break;
+            case 1: handle_audio_mouse(mx, my); break;
+            case 2: handle_theme_mouse(mx, my); break;
+            case 3: handle_time_mouse(mx, my); break;
+            case 4: handle_network_mouse(mx, my); break;
+            case 5: handle_power_mouse(mx, my); break;
+            case 6: handle_disks_mouse(mx, my); break;
+            case 7: handle_security_mouse(mx, my); break;
             }
         }
     }
-    sys_exit(0);
+    az_wm_msg_t close_msg;
+    memset(&close_msg, 0, sizeof(close_msg));
+    close_msg.type = AZ_WM_DESTROY_WINDOW;
+    close_msg.wid = g_win.wid;
+    az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&close_msg);
+    free(g_content_pixels);
+    return 0;
 }

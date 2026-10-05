@@ -37,34 +37,34 @@ static int g_tab = TAB_CLOCK;
 static bool g_24h_mode = true;
 
 /* Clock state */
-static int g_hours = 12;
+static int g_hours = 0;
 static int g_mins  = 0;
 static int g_secs  = 0;
-static char g_date_str[64] = "Wednesday, Aug 19, 2026";
-static char g_zone_str[64] = "CEST (UTC+02:00)";
-static char g_offset_str[32] = "+0200";
+static char g_date_str[64];
+static char g_zone_str[64];
+static char g_offset_str[32];
+static char g_clock_status[96];
 
 /* World clocks */
 typedef struct {
     const char *city;
     const char *country;
     const char *tz_env;
-    const char *abbr;
-    int offset_hours;
 } world_city_t;
 
 static const world_city_t g_world_cities[6] = {
-    { "Warsaw / Central EU", "Poland / EU",    "Europe/Warsaw",      "CEST",  2 },
-    { "London",              "United Kingdom", "Europe/London",      "BST",   1 },
-    { "New York",            "United States",  "America/New_York",   "EDT",  -4 },
-    { "Los Angeles",         "United States",  "America/Los_Angeles","PDT",  -7 },
-    { "Tokyo",               "Japan",          "Asia/Tokyo",         "JST",   9 },
-    { "Sydney",              "Australia",      "Australia/Sydney",   "AEST", 10 }
+    { "Warsaw / Central EU", "Poland / EU",    "Europe/Warsaw" },
+    { "London",              "United Kingdom", "Europe/London" },
+    { "New York",            "United States",  "America/New_York" },
+    { "Los Angeles",         "United States",  "America/Los_Angeles" },
+    { "Tokyo",               "Japan",          "Asia/Tokyo" },
+    { "Sydney",              "Australia",      "Australia/Sydney" }
 };
 
 /* Stopwatch state */
 static bool g_sw_running = false;
 static unsigned long long g_sw_elapsed_ms = 0;
+static unsigned long long g_sw_base_ms, g_sw_anchor_ms;
 
 #define MAX_LAPS 8
 static unsigned long long g_laps[MAX_LAPS];
@@ -89,27 +89,96 @@ static const int g_cos_table[60] = {
     500,  587,  669,  743,  809,  866,  913,  951,  978,  994
 };
 
-static void update_system_time(void)
+static bool update_system_time(void)
 {
+    /* Follow Settings even when TZ was inherited at launch. */
+    unsetenv("TZ");
+    tzset();
     time_t t = time(NULL);
     struct tm tm_info;
-    localtime_r(&t, &tm_info);
-
-    g_hours = tm_info.tm_hour;
-    g_mins  = tm_info.tm_min;
-    g_secs  = tm_info.tm_sec;
-
-    strftime(g_date_str, sizeof(g_date_str), "%A, %B %e, %Y", &tm_info);
-    strftime(g_offset_str, sizeof(g_offset_str), "%z", &tm_info);
-
+    if (!localtime_r(&t, &tm_info)) return false;
+    char date[64], offset[32], zone[64];
+    strftime(date, sizeof(date), "%A, %B %e, %Y", &tm_info);
+    strftime(offset, sizeof(offset), "%z", &tm_info);
     const char *zname = tm_info.tm_zone ? tm_info.tm_zone : "UTC";
     long off = tm_info.tm_gmtoff;
-    char sign = (off < 0) ? '-' : '+';
+    char sign = off < 0 ? '-' : '+';
     if (off < 0) off = -off;
-    int off_h = (int)(off / 3600);
-    int off_m = (int)((off % 3600) / 60);
+    snprintf(zone, sizeof(zone), "%s (UTC%c%02d:%02d)", zname, sign,
+             (int)(off / 3600), (int)((off % 3600) / 60));
+    bool changed = g_hours != tm_info.tm_hour || g_mins != tm_info.tm_min ||
+        g_secs != tm_info.tm_sec || strcmp(g_date_str, date) || strcmp(g_zone_str, zone);
+    g_hours = tm_info.tm_hour; g_mins = tm_info.tm_min; g_secs = tm_info.tm_sec;
+    strcpy(g_date_str, date); strcpy(g_offset_str, offset); strcpy(g_zone_str, zone);
+    return changed;
+}
 
-    snprintf(g_zone_str, sizeof(g_zone_str), "%s (UTC%c%02d:%02d)", zname, sign, off_h, off_m);
+static bool world_city_time(int city, time_t now, struct tm *out, char *badge, size_t size)
+{
+    if (city < 0 || city >= 6 || setenv("TZ", g_world_cities[city].tz_env, 1) < 0) return false;
+    tzset();
+    bool ok = localtime_r(&now, out) != NULL;
+    if (ok) strftime(badge, size, "%Z (%z)", out);
+    /* tm_zone points at libc's mutable timezone cache: preserve the label
+     * above before restoring the system timezone for the local clock. */
+    out->tm_zone = NULL;
+    unsetenv("TZ");
+    tzset();
+    return ok;
+}
+
+static bool stopwatch_now(unsigned long long *now)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) {
+        snprintf(g_clock_status, sizeof(g_clock_status), "Stopwatch: monotonic clock unavailable.");
+        return false;
+    }
+    *now = (unsigned long long)ts.tv_sec * 1000 + (unsigned long long)ts.tv_nsec / 1000000;
+    g_clock_status[0] = '\0';
+    return true;
+}
+
+static bool stopwatch_update(void)
+{
+    if (!g_sw_running) return true;
+    unsigned long long now;
+    if (!stopwatch_now(&now)) return false;
+    if (now < g_sw_anchor_ms) {
+        snprintf(g_clock_status, sizeof(g_clock_status), "Stopwatch: monotonic clock moved backwards.");
+        return false;
+    }
+    g_sw_elapsed_ms = g_sw_base_ms + now - g_sw_anchor_ms;
+    return true;
+}
+
+static void stopwatch_toggle(void)
+{
+    if (g_sw_running) {
+        if (!stopwatch_update()) return;
+        g_sw_base_ms = g_sw_elapsed_ms;
+        g_sw_running = false;
+    } else {
+        unsigned long long now;
+        if (!stopwatch_now(&now)) return;
+        g_sw_base_ms = g_sw_elapsed_ms;
+        g_sw_anchor_ms = now;
+        g_sw_running = true;
+    }
+}
+
+static void stopwatch_lap(void)
+{
+    if (g_sw_running && g_lap_count < MAX_LAPS && stopwatch_update())
+        g_laps[g_lap_count++] = g_sw_elapsed_ms;
+}
+
+static void stopwatch_reset(void)
+{
+    g_sw_running = false;
+    g_sw_elapsed_ms = g_sw_base_ms = g_sw_anchor_ms = 0;
+    g_lap_count = 0;
+    g_clock_status[0] = '\0';
 }
 
 static void draw_analog_clock(int cx, int cy, int radius, int h, int m, int s)
@@ -216,13 +285,11 @@ static void draw_clock_app(void)
         uk_draw_text(&g_win, card_x + 65, card_y + 265, g_offset_str, UK_TEAL);
 
         uk_draw_text(&g_win, card_x + 18, card_y + 300, "System:", UK_SUBTEXT0);
-        uk_draw_text(&g_win, card_x + 65, card_y + 300, "Hardware RTC (CMOS Sync)", UK_LAVENDER);
+        uk_draw_text(&g_win, card_x + 65, card_y + 300, "System realtime clock", UK_LAVENDER);
 
     } else if (g_tab == TAB_WORLD) {
         /* World Clocks Grid */
         time_t now = time(NULL);
-        struct tm utc_tm;
-        gmtime_r(&now, &utc_tm);
 
         int cols = 2;
         int card_w = ((int)w - 40 - 15) / cols;
@@ -238,9 +305,15 @@ static void draw_clock_app(void)
             uk_draw_rounded_rect_outline(&g_win, cx, cy, card_w, card_h, 8, UK_SURFACE1);
 
             /* Mini analog clock */
-            int city_h = (utc_tm.tm_hour + g_world_cities[i].offset_hours + 24) % 24;
-            int city_m = utc_tm.tm_min;
-            int city_s = utc_tm.tm_sec;
+            struct tm city_tm;
+            char bstr[32];
+            if (!world_city_time(i, now, &city_tm, bstr, sizeof(bstr))) {
+                uk_draw_text(&g_win, cx + 10, cy + 40, "City time unavailable", UK_RED);
+                continue;
+            }
+            int city_h = city_tm.tm_hour;
+            int city_m = city_tm.tm_min;
+            int city_s = city_tm.tm_sec;
             draw_analog_clock(cx + 42, cy + 52, 34, city_h, city_m, city_s);
 
             /* City & Country */
@@ -261,8 +334,6 @@ static void draw_clock_app(void)
             uk_draw_text(&g_win, cx + 88, cy + 54, dstr, UK_GREEN);
 
             /* Badge */
-            char bstr[32];
-            snprintf(bstr, sizeof(bstr), "%s (%+d)", g_world_cities[i].abbr, g_world_cities[i].offset_hours);
             uk_draw_badge(&g_win, cx + 88, cy + 76, bstr, UK_SURFACE0, UK_MAUVE);
         }
 
@@ -284,7 +355,7 @@ static void draw_clock_app(void)
         /* Stopwatch Action Buttons */
         int btn_y = sw_box_y + 155;
         uk_draw_button(&g_win, 40,  btn_y, 145, 36, g_sw_running ? "Pause" : "Start", g_sw_running ? UK_BTN_HOVER : UK_BTN_PRESSED);
-        uk_draw_button(&g_win, 215, btn_y, 145, 36, "Lap", UK_BTN_NORMAL);
+        uk_draw_button(&g_win, 215, btn_y, 145, 36, "Lap", g_sw_running && g_lap_count < MAX_LAPS ? UK_BTN_NORMAL : UK_BTN_DISABLED);
         uk_draw_button(&g_win, 390, btn_y, 145, 36, "Reset", UK_BTN_NORMAL);
 
         /* Laps Table Card */
@@ -313,6 +384,10 @@ static void draw_clock_app(void)
         }
     }
 
+    if (g_clock_status[0]) {
+        uk_fill_rect(&g_win, 0, (int)h - 24, (int)w, 24, UK_MANTLE);
+        uk_draw_text_clip(&g_win, 10, (int)h - 20, g_clock_status, UK_RED, (int)w - 20);
+    }
     uk_invalidate(&g_win);
 }
 
@@ -357,22 +432,16 @@ int main(int argc, char **argv)
         }
 
         if (msg.type == AZ_WM_TIMER_TICK) {
-            /* This timer fires every 100ms so the stopwatch (Timer tab) can
-             * show tenths while running, but the Clock/World tabs only ever
-             * change once a second — so 9 out of 10 ticks used to repaint
-             * the whole window (clock face, both tabs' worth of state, the
-             * stopwatch box, the lap list) for a frame that looks pixel-for-
-             * pixel identical to the one before it. Redraw only when the
-             * displayed second actually rolled over, or the stopwatch is
-             * live and genuinely needs the finer cadence. */
-            int prev_secs = g_secs;
-            update_system_time();
-            if (g_sw_running) {
-                g_sw_elapsed_ms += 100;
+            /* Preference refresh stays at one second. Stopwatch duration
+             * comes from elapsed monotonic time, even after delayed IPC ticks. */
+            static unsigned int ticks;
+            bool changed = false;
+            if (++ticks >= 10) {
+                ticks = 0;
+                changed = update_system_time();
             }
-            if (g_secs != prev_secs || g_sw_running) {
-                draw_clock_app();
-            }
+            if (g_sw_running) stopwatch_update();
+            if (changed || (g_sw_running && g_tab == TAB_STOPWATCH)) draw_clock_app();
         } else if (msg.type == AZ_WM_MOUSE_EVENT) {
             int mx = msg.mouse.abs_x;
             int my = msg.mouse.abs_y;
@@ -412,19 +481,15 @@ int main(int argc, char **argv)
                     if (my >= btn_y && my <= btn_y + 36) {
                         if (mx >= 40 && mx <= 185) {
                             /* Start / Pause Toggle */
-                            g_sw_running = !g_sw_running;
+                            stopwatch_toggle();
                             draw_clock_app();
                         } else if (mx >= 215 && mx <= 360) {
                             /* Lap */
-                            if (g_lap_count < MAX_LAPS) {
-                                g_laps[g_lap_count++] = g_sw_elapsed_ms;
-                                draw_clock_app();
-                            }
+                            stopwatch_lap();
+                            draw_clock_app();
                         } else if (mx >= 390 && mx <= 535) {
                             /* Reset */
-                            g_sw_running = false;
-                            g_sw_elapsed_ms = 0;
-                            g_lap_count = 0;
+                            stopwatch_reset();
                             draw_clock_app();
                         }
                     }

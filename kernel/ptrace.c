@@ -154,12 +154,16 @@ static bool tracee_mem(process_t *tgt, u64 va, void *buf, size_t len, bool write
             if (!priv) return false;
             memcpy(PHYS_TO_VIRT(priv), PHYS_TO_VIRT(old), PAGE_SIZE);
             /* Keep the tracee's own protection: it must not gain write access
-             * to its text just because a debugger patched a byte into it. */
-            if (vmm_map(tgt->pml4_phys, page, priv, fl & ~VMM_F_SHARED) != 0) {
+             * to its text just because a debugger patched a byte into it.
+             * Clear VMM_F_COW so this private copy is not treated as a COW page. */
+            if (vmm_map(tgt->pml4_phys, page, priv, fl & ~(VMM_F_SHARED | VMM_F_COW)) != 0) {
                 pmm_free_page(priv);
                 return false;
             }
             tlb_shootdown_space(tgt->pml4_phys);
+            uint16_t remaining = vmm_page_ref_dec(old);
+            if (remaining == 0)
+                pmm_free_page(old);
         }
 
         phys_addr_t phys = vmm_translate(tgt->pml4_phys, va);
@@ -340,33 +344,44 @@ void ptrace_release(process_t *p)
     p->ptrace_flags = 0;
     p->ptrace_opts  = 0;
 
-    /* As a tracer: a tracee parked in a ptrace-stop is waiting for a resume
-     * that is never coming now. Free it (or kill it, if it asked for that). */
-    sched_lock();
-    process_t *victims[16];
-    u32 nvictims = 0, nkill = 0;
-    u32 killpids[16];
-    for (process_t *q = sched_get_process_list(); q; q = q->next) {
-        if (q->tracer_pid != p->pid) continue;
-        bool kill_it = (q->ptrace_opts & PTRACE_O_EXITKILL) != 0;
-        q->tracer_pid   = 0;
-        q->ptrace_flags = 0;
-        q->ptrace_opts  = 0;
-        /* The kill list travels as pids — sched_kill_process() re-resolves them
-         * under the lock. The resume list keeps raw pointers past this unlock,
-         * so each one takes a reference that proc_put() drops below. */
-        if (kill_it) { if (nkill  < 16) killpids[nkill++] = q->pid; }
-        else if (nvictims < 16) { proc_get_locked(q); victims[nvictims++] = q; }
-    }
-    sched_unlock();
+    /* As a tracer: tracees parked in a ptrace-stop are waiting for a resume
+     * that is never coming now. Free them (or kill them, if EXITKILL was set).
+     * Loop in batches of up to 16 so all tracees are processed without truncation. */
+    while (true) {
+        sched_lock();
+        process_t *victims[16];
+        u32 nvictims = 0, nkill = 0;
+        u32 killpids[16];
+        for (process_t *q = sched_get_process_list(); q; q = q->next) {
+            if (q->tracer_pid != p->pid) continue;
+            bool kill_it = (q->ptrace_opts & PTRACE_O_EXITKILL) != 0;
+            q->tracer_pid   = 0;
+            q->ptrace_flags = 0;
+            q->ptrace_opts  = 0;
+            /* The kill list travels as pids — sched_kill_process() re-resolves them
+             * under the lock. The resume list keeps raw pointers past this unlock,
+             * so each one takes a reference that proc_put() drops below. */
+            if (kill_it) {
+                killpids[nkill++] = q->pid;
+                if (nkill == 16) break;
+            } else {
+                proc_get_locked(q);
+                victims[nvictims++] = q;
+                if (nvictims == 16) break;
+            }
+        }
+        sched_unlock();
 
-    for (u32 i = 0; i < nvictims; i++) {
-        if (victims[i]->stop_state == PROC_STOP_PTRACE)
-            sched_resume_process(victims[i], false);
-        proc_put(victims[i]);
+        if (nvictims == 0 && nkill == 0) break;
+
+        for (u32 i = 0; i < nvictims; i++) {
+            if (victims[i]->stop_state == PROC_STOP_PTRACE)
+                sched_resume_process(victims[i], false);
+            proc_put(victims[i]);
+        }
+        for (u32 i = 0; i < nkill; i++)
+            sched_kill_process(killpids[i], SIGKILL);
     }
-    for (u32 i = 0; i < nkill; i++)
-        sched_kill_process(killpids[i], SIGKILL);
 }
 
 /* ── The syscall ─────────────────────────────────────────────────────────── */

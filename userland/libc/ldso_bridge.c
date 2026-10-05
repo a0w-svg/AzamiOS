@@ -24,6 +24,8 @@
  * expected case rather than an error.
  * ============================================================================ */
 #include <stdint.h>
+#include <errno.h>
+#include "include/internal/elf_hash.h"
 
 #define AT_NULL 0
 #define AT_BASE 7
@@ -32,6 +34,7 @@
 
 #define DT_NULL   0
 #define DT_HASH   4
+#define DT_GNU_HASH 0x6ffffef5
 #define DT_STRTAB 5
 #define DT_SYMTAB 6
 
@@ -86,6 +89,20 @@ typedef struct {
 
 static elf64_auxv_t *g_auxv;
 
+/* Process-entry auxv, shared by static and dynamic libc startup. A zero
+ * value is valid (AT_SECURE, AT_UID); only an absent entry sets errno. */
+unsigned long __libc_getauxval(unsigned long type)
+{
+    if (g_auxv) {
+        for (elf64_auxv_t *a = g_auxv; a->a_type != AT_NULL; a++) {
+            if (a->a_type == type)
+                return (unsigned long)a->a_val;
+        }
+    }
+    errno = ENOENT;
+    return 0;
+}
+
 /* Called once, early, from tls.c's __init_tls() (which has already found
  * the auxv pointer for its own purposes) — before __libc_init() or main(),
  * so every later dlopen()/dlsym()/dlclose() call already has this set. */
@@ -130,6 +147,7 @@ void *__libc_ldso_lookup(const char *name)
     const char   *strtab = 0;
     elf64_sym_t  *symtab = 0;
     uint32_t      nsyms  = 0;
+    const uint32_t *gnu_hash = 0;
     for (elf64_dyn_t *d = dyn; d->d_tag != DT_NULL; d++)
         if (d->d_tag == DT_STRTAB) strtab = (const char *)(uintptr_t)(at_base + d->d_un);
     for (elf64_dyn_t *d = dyn; d->d_tag != DT_NULL; d++) {
@@ -138,9 +156,23 @@ void *__libc_ldso_lookup(const char *name)
         } else if (d->d_tag == DT_HASH) {
             uint32_t *hash = (uint32_t *)(uintptr_t)(at_base + d->d_un);
             nsyms = hash[1];
+        } else if (d->d_tag == DT_GNU_HASH) {
+            gnu_hash = (const uint32_t *)(uintptr_t)(at_base + d->d_un);
         }
     }
     if (!strtab || !symtab) return (void *)0;
+    if (!nsyms && gnu_hash) {
+        uint64_t address = (uint64_t)(uintptr_t)gnu_hash;
+        for (uint16_t i = 0; i < phnum; i++) {
+            uint64_t start = at_base + phdrs[i].p_vaddr;
+            if (phdrs[i].p_type == 1 && address >= start &&
+                address - start < phdrs[i].p_memsz) {
+                nsyms = __elf_gnu_hash_count(gnu_hash,
+                    phdrs[i].p_memsz - (address - start));
+                break;
+            }
+        }
+    }
 
     for (uint32_t s = 0; s < nsyms; s++) {
         elf64_sym_t *sym = &symtab[s];

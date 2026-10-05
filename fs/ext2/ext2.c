@@ -57,6 +57,7 @@ static file_operations_t ext2_file_ops = {
 
 #define EXT2_BCACHE_BUCKETS 256
 #define EXT2_BCACHE_WAYS    4
+static spinlock_t g_ext2_alloc_lock = SPINLOCK_INIT;
 
 /* Every cache slot is one filesystem block, so this is also the largest block
  * size the driver can service. ext2_validate_sb() rejects any superblock that
@@ -1373,13 +1374,21 @@ static s64 ext2_file_read(struct file *filp, void *buf, size_t len, u64 *offset)
                 run_blocks++;
             }
             
-            u64 lba = (u64)pblk * (fs->block_size / fs->bdev->sector_size);
-            u32 sec_count = run_blocks * (fs->block_size / fs->bdev->sector_size);
-            fs->bdev->ops->read_sectors(fs->bdev, lba, sec_count, dst + bytes_read);
+            if (fs->bdev && fs->bdev->ops && fs->bdev->ops->read_sectors &&
+                fs->bdev->sector_size > 0 && fs->bdev->sector_size <= fs->block_size) {
+                u32 ss = fs->bdev->sector_size;
+                u64 lba = (u64)pblk * (fs->block_size / ss);
+                u32 sec_count = run_blocks * (fs->block_size / ss);
+                fs->bdev->ops->read_sectors(fs->bdev, lba, sec_count, dst + bytes_read);
 
-            /* This transfer skipped the cache; patch in any block of the run
-             * that is dirty (newer) in a slot. */
-            ext2_bcache_overlay(fs, pblk, run_blocks, dst + bytes_read);
+                /* This transfer skipped the cache; patch in any block of the run
+                 * that is dirty (newer) in a slot. */
+                ext2_bcache_overlay(fs, pblk, run_blocks, dst + bytes_read);
+            } else {
+                for (u32 b = 0; b < run_blocks; b++) {
+                    ext2_read_block(fs, pblk + b, dst + bytes_read + (size_t)b * fs->block_size);
+                }
+            }
         } else {
             while (run_blocks < max_blocks) {
                 u32 next_pblk = ext2_get_pblk(filp->f_inode, lblk + run_blocks, false);
@@ -1804,7 +1813,13 @@ static s64 ext2_add_dir_entry(struct inode *dir, u32 ino, const char *name, u8 f
     ext2_fs_info_t *fs = (ext2_fs_info_t *)dir->i_sb->s_fs_info;
     
     int name_len = 0;
-    while(name[name_len]) name_len++;
+    while(name[name_len]) {
+        name_len++;
+        /* ext2 names are at most 255 bytes (name_len is a u8 on disk); longer
+         * would truncate name_len and overflow the entry written below. */
+        if (name_len > 255) return -(s64)ENAMETOOLONG;
+    }
+    if (name_len == 0) return -(s64)EINVAL;
     
     u16 rec_len = ALIGN_UP(8 + name_len, 4);
     
@@ -2330,16 +2345,32 @@ static s64 ext2_rename(struct inode *old_dir, struct dentry *old_dentry, struct 
     bool moving_dir  = S_ISDIR(old_dentry->d_inode->i_mode);
     bool cross_dir   = (old_dir->i_ino != new_dir->i_ino);
 
+    /* Renaming a name onto another name of the same inode is a no-op; falling
+     * through would unlink the destination — i.e. the source's own data. */
+    if (new_dentry->d_inode == old_dentry->d_inode ||
+        (new_dentry->d_inode && new_dentry->d_inode->i_ino == old_dentry->d_inode->i_ino &&
+         new_dentry->d_inode->i_sb == old_dentry->d_inode->i_sb))
+        return 0;
+
     /* If destination entry already exists, remove/unlink it first */
     if (new_dentry->d_inode) {
+        s64 rerr;
         if (S_ISDIR(new_dentry->d_inode->i_mode)) {
-            ext2_rmdir(new_dir, new_dentry);
+            rerr = ext2_rmdir(new_dir, new_dentry);
         } else {
-            ext2_unlink(new_dir, new_dentry);
+            rerr = ext2_unlink(new_dir, new_dentry);
         }
+        if (rerr < 0) return rerr;
     }
 
-    u8 ftype = S_ISDIR(old_dentry->d_inode->i_mode) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+    u32 rmode = old_dentry->d_inode->i_mode;
+    u8 ftype = EXT2_FT_REG_FILE;
+    if (S_ISDIR(rmode))       ftype = EXT2_FT_DIR;
+    else if (S_ISLNK(rmode))  ftype = EXT2_FT_SYMLINK;
+    else if (S_ISCHR(rmode))  ftype = EXT2_FT_CHRDEV;
+    else if (S_ISBLK(rmode))  ftype = EXT2_FT_BLKDEV;
+    else if (S_ISFIFO(rmode)) ftype = EXT2_FT_FIFO;
+    else if (S_ISSOCK(rmode)) ftype = EXT2_FT_SOCK;
     s64 err = ext2_add_dir_entry(new_dir, old_dentry->d_inode->i_ino, new_dentry->d_name, ftype);
     if (err < 0) return err;
 
@@ -2451,6 +2482,9 @@ static s64 ext2_readlink(struct dentry *dentry, char *buf, size_t bufsiz)
     if (!fs) return -(s64)EIO;
 
     u64 size = inode->i_size;
+    /* i_size is on-disk data: a slow symlink lives in one block, so a larger
+     * value would copy past the end of blk_buf. */
+    if (size > fs->block_size) size = fs->block_size;
     size_t copy_len = (size < bufsiz) ? (size_t)size : bufsiz;
 
     if (size <= 60) {
@@ -2517,7 +2551,10 @@ static u8 *ext2_get_block_bitmap(ext2_fs_info_t *fs, u32 bg) {
             kfree(bm);
             return NULL;
         }
-        fs->block_bitmaps[bg] = bm;
+        spinlock_lock(&g_ext2_alloc_lock);
+        if (!fs->block_bitmaps[bg]) { fs->block_bitmaps[bg] = bm; bm = NULL; }
+        spinlock_unlock(&g_ext2_alloc_lock);
+        if (bm) kfree(bm);   /* lost the race; keep the published copy */
     }
     return fs->block_bitmaps[bg];
 }
@@ -2531,7 +2568,10 @@ static u8 *ext2_get_inode_bitmap(ext2_fs_info_t *fs, u32 bg) {
             kfree(bm);
             return NULL;
         }
-        fs->inode_bitmaps[bg] = bm;
+        spinlock_lock(&g_ext2_alloc_lock);
+        if (!fs->inode_bitmaps[bg]) { fs->inode_bitmaps[bg] = bm; bm = NULL; }
+        spinlock_unlock(&g_ext2_alloc_lock);
+        if (bm) kfree(bm);   /* lost the race; keep the published copy */
     }
     return fs->inode_bitmaps[bg];
 }
@@ -2590,6 +2630,17 @@ u32 ext2_alloc_block(ext2_fs_info_t *fs) {
          * to the loop that depends on it. */
         u32 total_bits = fs->blocks_per_group;
         if (total_bits > fs->block_size * 8) total_bits = fs->block_size * 8;
+
+        /* The last group is usually partial: bits past s_blocks_count do not
+         * name real blocks, so never hand them out. */
+        u64 group_base = (u64)bg * fs->blocks_per_group + fs->sb->s_first_data_block;
+        if (group_base >= fs->sb->s_blocks_count) continue;
+        if (group_base + total_bits > fs->sb->s_blocks_count)
+            total_bits = (u32)(fs->sb->s_blocks_count - group_base);
+
+        u32 found = 0;
+        bool got = false;
+        spinlock_lock(&g_ext2_alloc_lock);
         u32 bit = 0;
 
         /* Fast 64-bit word skip */
@@ -2602,11 +2653,17 @@ u32 ext2_alloc_block(ext2_fs_info_t *fs) {
         for (; bit < total_bits; bit++) {
             if (!ext2_test_bit(bitmap, bit)) {
                 ext2_set_bit(bitmap, bit);
-                fs->bgdt[bg].bg_free_blocks_count--;
-                fs->sb->s_free_blocks_count--;
-                ext2_sync_bg(fs, bg);
-                return (bg * fs->blocks_per_group) + fs->sb->s_first_data_block + bit;
+                if (fs->bgdt[bg].bg_free_blocks_count) fs->bgdt[bg].bg_free_blocks_count--;
+                if (fs->sb->s_free_blocks_count) fs->sb->s_free_blocks_count--;
+                found = (u32)group_base + bit;
+                got = true;
+                break;
             }
+        }
+        spinlock_unlock(&g_ext2_alloc_lock);
+        if (got) {
+            ext2_sync_bg(fs, bg);
+            return found;
         }
     }
     return 0; // Out of space
@@ -2622,12 +2679,16 @@ void ext2_free_block(ext2_fs_info_t *fs, u32 block) {
 
     u8 *bitmap = ext2_get_block_bitmap(fs, bg);
     if (!bitmap || bit >= fs->block_size * 8) return;
+    bool freed = false;
+    spinlock_lock(&g_ext2_alloc_lock);
     if (ext2_test_bit(bitmap, bit)) {
         ext2_clear_bit(bitmap, bit);
         fs->bgdt[bg].bg_free_blocks_count++;
         fs->sb->s_free_blocks_count++;
-        ext2_sync_bg(fs, bg);
+        freed = true;
     }
+    spinlock_unlock(&g_ext2_alloc_lock);
+    if (freed) ext2_sync_bg(fs, bg);
 }
 
 u32 ext2_alloc_inode(ext2_fs_info_t *fs) {
@@ -2638,6 +2699,16 @@ u32 ext2_alloc_inode(ext2_fs_info_t *fs) {
         if (!bitmap) continue;
         u32 total_bits = fs->inodes_per_group;
         if (total_bits > fs->block_size * 8) total_bits = fs->block_size * 8;
+
+        /* Never return an inode number past s_inodes_count. */
+        u64 group_base = (u64)bg * fs->inodes_per_group;
+        if (group_base >= fs->sb->s_inodes_count) continue;
+        if (group_base + total_bits > fs->sb->s_inodes_count)
+            total_bits = (u32)(fs->sb->s_inodes_count - group_base);
+
+        u32 found = 0;
+        bool got = false;
+        spinlock_lock(&g_ext2_alloc_lock);
         u32 bit = 0;
 
         /* Fast 64-bit word skip */
@@ -2650,11 +2721,17 @@ u32 ext2_alloc_inode(ext2_fs_info_t *fs) {
         for (; bit < total_bits; bit++) {
             if (!ext2_test_bit(bitmap, bit)) {
                 ext2_set_bit(bitmap, bit);
-                fs->bgdt[bg].bg_free_inodes_count--;
-                fs->sb->s_free_inodes_count--;
-                ext2_sync_bg(fs, bg);
-                return (bg * fs->inodes_per_group) + 1 + bit;
+                if (fs->bgdt[bg].bg_free_inodes_count) fs->bgdt[bg].bg_free_inodes_count--;
+                if (fs->sb->s_free_inodes_count) fs->sb->s_free_inodes_count--;
+                found = (u32)group_base + 1 + bit;
+                got = true;
+                break;
             }
+        }
+        spinlock_unlock(&g_ext2_alloc_lock);
+        if (got) {
+            ext2_sync_bg(fs, bg);
+            return found;
         }
     }
     return 0; // Out of inodes
@@ -2671,10 +2748,14 @@ void ext2_free_inode(ext2_fs_info_t *fs, u32 ino) {
 
     u8 *bitmap = ext2_get_inode_bitmap(fs, bg);
     if (!bitmap || bit >= fs->block_size * 8) return;
+    bool freed = false;
+    spinlock_lock(&g_ext2_alloc_lock);
     if (ext2_test_bit(bitmap, bit)) {
         ext2_clear_bit(bitmap, bit);
         fs->bgdt[bg].bg_free_inodes_count++;
         fs->sb->s_free_inodes_count++;
-        ext2_sync_bg(fs, bg);
+        freed = true;
     }
+    spinlock_unlock(&g_ext2_alloc_lock);
+    if (freed) ext2_sync_bg(fs, bg);
 }

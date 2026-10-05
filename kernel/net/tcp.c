@@ -195,7 +195,9 @@ static s64 tcp_send_packet(tcp_sock_t *sock, u8 flags, const void *payload, size
     tcp->ack_num = (flags & TCP_FLAG_ACK) ? htonl(sock->rcv_nxt) : 0;
     tcp->data_offset = (u8)((hdr_len / 4) << 4);
     tcp->flags = flags;
-    tcp->window_size = htons((u16)sock->rcv_wnd);
+    u32 free_rx = (sock->rx_len < TCP_RX_BUF_SIZE) ? (TCP_RX_BUF_SIZE - sock->rx_len) : 0;
+    if (free_rx > 65535) free_rx = 65535;
+    tcp->window_size = htons((u16)free_rx);
     tcp->checksum = 0;
     tcp->urgent_pointer = 0;
 
@@ -486,8 +488,15 @@ tcp_sock_t *tcp_accept(tcp_sock_t *listener, u8 client_ip_out[4], u16 *client_po
 {
     if (!listener || listener->state != TCP_STATE_LISTEN) return NULL;
 
+    tcp_sock_get(listener);
+
     for (;;) {
         irqflags_t flags = spinlock_lock_irqsave(&listener->lock);
+        if (listener->state != TCP_STATE_LISTEN) {
+            spinlock_unlock_irqrestore(&listener->lock, flags);
+            tcp_sock_put(listener);
+            return NULL;
+        }
         if (listener->backlog_count > 0) {
             int ready_idx = -1;
             for (int i = 0; i < listener->backlog_count; i++) {
@@ -507,18 +516,30 @@ tcp_sock_t *tcp_accept(tcp_sock_t *listener, u8 client_ip_out[4], u16 *client_po
                 if (client_port_out) *client_port_out = client->remote_port;
 
                 spinlock_unlock_irqrestore(&listener->lock, flags);
+                tcp_sock_put(listener);
                 return client;
             }
         }
 
         if (nonblock) {
             spinlock_unlock_irqrestore(&listener->lock, flags);
+            tcp_sock_put(listener);
             return NULL;
         }
 
         listener->accept_wait_thread = sched_current_thread();
         spinlock_unlock_irqrestore(&listener->lock, flags);
         sched_block(THREAD_BLOCKED_PENDING);
+
+        process_t *p = sched_current_process();
+        if (p && (p->sig_pending & ~p->sig_blocked)) {
+            flags = spinlock_lock_irqsave(&listener->lock);
+            if (listener->accept_wait_thread == sched_current_thread())
+                listener->accept_wait_thread = NULL;
+            spinlock_unlock_irqrestore(&listener->lock, flags);
+            tcp_sock_put(listener);
+            return NULL;
+        }
     }
 }
 
@@ -582,7 +603,12 @@ s64 tcp_send(tcp_sock_t *sock, const void *data, size_t len, int flags)
 {
     (void)flags;
     if (!sock || !data) return -EINVAL;
-    if (sock->state != TCP_STATE_ESTABLISHED) return -ENOTCONN;
+
+    irqflags_t sflags = spinlock_lock_irqsave(&sock->lock);
+    if (sock->state != TCP_STATE_ESTABLISHED) {
+        spinlock_unlock_irqrestore(&sock->lock, sflags);
+        return -ENOTCONN;
+    }
 
     /* Cap each segment at whatever is smaller: what the peer's SYN/SYN-ACK
      * asked for, or what this side's own device MTU can carry — sending
@@ -598,17 +624,23 @@ s64 tcp_send(tcp_sock_t *sock, const void *data, size_t len, int flags)
     while (remaining > 0) {
         size_t chunk = (remaining > mss) ? mss : remaining;
         s64 res = tcp_send_packet(sock, TCP_FLAG_ACK | TCP_FLAG_PSH, ptr, chunk);
-        if (res < 0) return (len - remaining > 0) ? (s64)(len - remaining) : res;
+        if (res < 0) {
+            spinlock_unlock_irqrestore(&sock->lock, sflags);
+            return (len - remaining > 0) ? (s64)(len - remaining) : res;
+        }
         ptr += chunk;
         remaining -= chunk;
     }
 
+    spinlock_unlock_irqrestore(&sock->lock, sflags);
     return (s64)len;
 }
 
 s64 tcp_recv(tcp_sock_t *sock, void *buf, size_t max_len, bool nonblock)
 {
     if (!sock || !buf || max_len == 0) return -EINVAL;
+
+    tcp_sock_get(sock);
 
     for (;;) {
         irqflags_t flags = spinlock_lock_irqsave(&sock->lock);
@@ -621,17 +653,20 @@ s64 tcp_recv(tcp_sock_t *sock, void *buf, size_t max_len, bool nonblock)
             sock->rx_head = (sock->rx_head + copy_len) % TCP_RX_BUF_SIZE;
             sock->rx_len -= copy_len;
             spinlock_unlock_irqrestore(&sock->lock, flags);
+            tcp_sock_put(sock);
             return (s64)copy_len;
         }
 
         /* If connection was closed by peer and buffer is drained, return EOF */
         if (sock->state == TCP_STATE_CLOSE_WAIT || sock->state == TCP_STATE_CLOSED || sock->state == TCP_STATE_TIME_WAIT) {
             spinlock_unlock_irqrestore(&sock->lock, flags);
+            tcp_sock_put(sock);
             return 0; /* EOF */
         }
 
         if (nonblock) {
             spinlock_unlock_irqrestore(&sock->lock, flags);
+            tcp_sock_put(sock);
             return -(s64)EAGAIN;
         }
 
@@ -645,6 +680,7 @@ s64 tcp_recv(tcp_sock_t *sock, void *buf, size_t max_len, bool nonblock)
             if (sock->rx_wait_thread == sched_current_thread())
                 sock->rx_wait_thread = NULL;
             spinlock_unlock_irqrestore(&sock->lock, flags);
+            tcp_sock_put(sock);
             return -(s64)EINTR;
         }
     }
@@ -654,10 +690,12 @@ int tcp_shutdown(tcp_sock_t *sock, int how)
 {
     (void)how;
     if (!sock) return -EINVAL;
+    irqflags_t sflags = spinlock_lock_irqsave(&sock->lock);
     if (sock->state == TCP_STATE_ESTABLISHED) {
         tcp_send_packet(sock, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
         sock->state = TCP_STATE_FIN_WAIT_1;
     }
+    spinlock_unlock_irqrestore(&sock->lock, sflags);
     return 0;
 }
 
@@ -840,13 +878,25 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
     /* ── State Machine Processing ─────────────────────────────────────────── */
     switch (sock->state) {
     case TCP_STATE_LISTEN:
-        if (flags & TCP_FLAG_SYN) {
+        /* RFC 793: a SYN carrying ACK or RST is not a connection request. */
+        if ((flags & TCP_FLAG_SYN) && !(flags & (TCP_FLAG_ACK | TCP_FLAG_RST))) {
             /* Create new child socket for incoming connection */
             if (sock->backlog_count < sock->backlog_max) {
+                /* The listener's lock must not be held across
+                 * tcp_socket_create()/the hash insert below, which take
+                 * g_tcp_lock: elsewhere (tcp_bind, tcp_timer_tick) the order
+                 * is g_tcp_lock -> sock->lock, so taking g_tcp_lock while
+                 * holding sock->lock here is an ABBA deadlock. Same
+                 * drop-and-retake pattern as TCP_STATE_SYN_RECEIVED. */
+                u16 l_port = sock->local_port;
+                u8  l_ip[4];
+                memcpy(l_ip, sock->local_ip, 4);
+                spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+
                 tcp_sock_t *child = tcp_socket_create();
                 if (child) {
-                    child->local_port = sock->local_port;
-                    memcpy(child->local_ip, sock->local_ip, 4);
+                    child->local_port = l_port;
+                    memcpy(child->local_ip, l_ip, 4);
                     child->remote_port = src_port;
                     memcpy(child->remote_ip, ip_hdr->src_ip, 4);
                     child->bound = true;
@@ -867,17 +917,42 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
                     spinlock_unlock_irqrestore(&g_tcp_lock, hflags);
 
                     /* Send SYN-ACK */
+                    irqflags_t c_flags = spinlock_lock_irqsave(&child->lock);
                     tcp_send_packet(child, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
                     child->rtx_count = 0;
                     child->rtx_deadline = g_tcp_ticks + TCP_RTX_BASE_TIMEOUT;
+                    spinlock_unlock_irqrestore(&child->lock, c_flags);
 
-                    sock->backlog[sock->backlog_count++] = child;
+                    sock_flags = spinlock_lock_irqsave(&sock->lock);
+                    if (sock->state == TCP_STATE_LISTEN && sock->backlog_count < sock->backlog_max) {
+                        sock->backlog[sock->backlog_count++] = child;
+                    } else {
+                        /* Listener closed or filled up meanwhile (a
+                         * concurrent SYN) — do not leak the child. */
+                        spinlock_unlock_irqrestore(&sock->lock, sock_flags);
+                        tcp_socket_close(child);
+                        sock_flags = spinlock_lock_irqsave(&sock->lock);
+                    }
+                } else {
+                    sock_flags = spinlock_lock_irqsave(&sock->lock);
                 }
             }
         }
         break;
 
     case TCP_STATE_SYN_SENT:
+        /* RFC 793: an ACK|RST for our ISS refuses the connection. Without
+         * this the connect() hung until the retransmit timer gave up. */
+        if ((flags & (TCP_FLAG_RST | TCP_FLAG_ACK)) == (TCP_FLAG_RST | TCP_FLAG_ACK) &&
+            ack_num == sock->iss + 1) {
+            sock->state = TCP_STATE_CLOSED;
+            sock->rtx_deadline = 0;
+            if (sock->conn_wait_thread) {
+                sched_unblock(sock->conn_wait_thread);
+                sock->conn_wait_thread = NULL;
+            }
+            break;
+        }
         /* RFC 793: in SYN-SENT the only acceptable ACK is one for our own ISS,
          * and that is the only sequence check available before the connection
          * is synchronised — without it any SYN-ACK for the four-tuple
@@ -937,7 +1012,8 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
         }
         break;
 
-    case TCP_STATE_ESTABLISHED:
+    case TCP_STATE_ESTABLISHED: {
+        bool fin_ok = true;
         /* Process Inbound Data */
         if (payload_len > 0) {
             /* Copy into reception circular buffer */
@@ -951,6 +1027,7 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             }
             sock->rcv_nxt += bytes_stored;  /* BUG fix: advance only by bytes actually buffered,
                                               * not payload_len — dropped bytes must not be ACK'd */
+            fin_ok = (bytes_stored == payload_len);
 
             /* Acknowledge received data */
             tcp_send_packet(sock, TCP_FLAG_ACK, NULL, 0);
@@ -961,8 +1038,9 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             }
         }
 
-        /* Process Remote FIN */
-        if (flags & TCP_FLAG_FIN) {
+        /* Process Remote FIN — only once every payload byte ahead of it was
+         * actually buffered, otherwise rcv_nxt would skip the dropped bytes. */
+        if ((flags & TCP_FLAG_FIN) && fin_ok) {
             sock->rcv_nxt++;
             sock->state = TCP_STATE_CLOSE_WAIT;
             tcp_send_packet(sock, TCP_FLAG_ACK, NULL, 0);
@@ -973,16 +1051,22 @@ void tcp_input(net_buf_t *buf, const ipv4_hdr_t *ip_hdr)
             }
         }
         break;
+    }
 
-    case TCP_STATE_FIN_WAIT_1:
-        if ((flags & (TCP_FLAG_FIN | TCP_FLAG_ACK)) == (TCP_FLAG_FIN | TCP_FLAG_ACK)) {
+    case TCP_STATE_FIN_WAIT_1: {
+        /* Only an ACK that covers our FIN (snd_nxt, since the FIN was the
+         * last sequence byte sent) moves us on — an ACK of earlier data
+         * must not. */
+        bool fin_acked = (flags & TCP_FLAG_ACK) && ack_num == sock->snd_nxt;
+        if ((flags & TCP_FLAG_FIN) && fin_acked) {
             sock->rcv_nxt++;
             tcp_send_packet(sock, TCP_FLAG_ACK, NULL, 0);
             sock->state = TCP_STATE_TIME_WAIT;
-        } else if (flags & TCP_FLAG_ACK) {
+        } else if (fin_acked) {
             sock->state = TCP_STATE_FIN_WAIT_2;
         }
         break;
+    }
 
     case TCP_STATE_FIN_WAIT_2:
         if (flags & TCP_FLAG_FIN) {

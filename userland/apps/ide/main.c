@@ -86,6 +86,7 @@
 #define CLR_LAVENDER    0xFFB4BEFE
 
 static uk_window_t g_win;
+static unsigned int g_mouse_buttons;
 
 /* ── Tabbed Workspace Architecture ────────────────────────────────────────── */
 typedef struct {
@@ -2333,12 +2334,13 @@ int main(int argc, char **argv)
             continue;
         }
         if (msg.type == AZ_WM_MOUSE_EVENT) {
+            unsigned int pressed = uk_mouse_press(&g_mouse_buttons, msg.mouse.buttons);
             if (msg.mouse.wheel != 0) {
                 handle_wheel(msg.mouse.wheel, msg.mouse.abs_x, msg.mouse.abs_y);
                 draw_ide();
                 uk_invalidate(&g_win);
             }
-            if (msg.mouse.buttons & 1) {
+            if (pressed & AZ_MOUSE_BTN_LEFT) {
                 handle_click(msg.mouse.abs_x, msg.mouse.abs_y);
                 draw_ide();
                 uk_invalidate(&g_win);

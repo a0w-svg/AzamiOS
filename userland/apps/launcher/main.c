@@ -86,6 +86,7 @@ static int g_num_apps = 0;
 
 /* ── Global state ─────────────────────────────────────────────────────────── */
 static uk_window_t  g_win;
+static unsigned int g_mouse_buttons;
 static int          g_hovered = -1;   /* index of hovered app slot, -1 = none */
 static int          g_launching = 0;
 
@@ -756,18 +757,19 @@ int main(int argc, char **argv)
 
         switch (msg->type) {
         case AZ_WM_MOUSE_EVENT: {
+            unsigned int pressed = uk_mouse_press(&g_mouse_buttons, msg->mouse.buttons);
             int mx = msg->mouse.abs_x;
             int my = msg->mouse.abs_y;
 
             if (msg->mouse.wheel) {
-                /* Positive wheel values conventionally mean up. */
-                g_scroll_row -= msg->mouse.wheel > 0 ? 1 : -1;
+                /* The protocol defines positive wheel motion as down. */
+                g_scroll_row += msg->mouse.wheel > 0 ? 1 : -1;
                 clamp_scroll();
                 draw_launcher();
                 break;
             }
 
-            if (msg->mouse.buttons & AZ_MOUSE_BTN_LEFT) {
+            if (pressed & AZ_MOUSE_BTN_LEFT) {
                 /* Check Category Tabs click */
                 if (my >= TABS_Y && my <= TABS_Y + 24) {
                     int tx = 24;

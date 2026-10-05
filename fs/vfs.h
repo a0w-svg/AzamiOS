@@ -417,9 +417,16 @@ s64 vfs_mkdir(const char *path, u32 mode);
 /** vfs_mknod() — back mknod(2)/mknodat(2). @mode carries the S_IF* type;
  *  @rdev is the device number for S_IFCHR/S_IFBLK and ignored otherwise. */
 s64 vfs_mknod(const char *path, u32 mode, u64 rdev);
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0) /* Don't overwrite target */
+#define RENAME_EXCHANGE  (1 << 1) /* Exchange source and dest */
+#define RENAME_WHITEOUT  (1 << 2) /* Whiteout source */
+#endif
+
 s64 vfs_rmdir(const char *path);
 s64 vfs_unlink(const char *path);
 s64 vfs_rename(const char *oldpath, const char *newpath);
+s64 vfs_rename_flags(const char *oldpath, const char *newpath, unsigned int flags);
 s64 vfs_truncate(file_t *file, u64 length);
 s64 vfs_symlink(const char *target, const char *linkpath);
 s64 vfs_readlink(const char *path, char *buf, size_t bufsiz);

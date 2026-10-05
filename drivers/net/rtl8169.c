@@ -70,6 +70,8 @@ static u32             g_tx_cur = 0;
 static spinlock_t g_r8169_rx_lock = SPINLOCK_INIT;
 static spinlock_t g_r8169_tx_lock = SPINLOCK_INIT;
 
+static bool       g_r8169_rx_draining = false;
+
 void rtl8169_get_mac(u8 mac_out[6])
 {
     if (mac_out) {
@@ -104,7 +106,9 @@ s64 rtl8169_send_packet(const void *data, size_t len)
     if (cur == RTL8169_NUM_TX_DESC - 1) {
         opts |= RTL8169_DESC_EOR;
     }
+    wmb();
     g_tx_ring[cur].opts1 = opts;
+    wmb();
 
     /* Poll normal priority transmit */
     outb(g_r8169_io_base + REG_TPPOLL, 0x40);
@@ -125,6 +129,7 @@ s64 rtl8169_recv_packet(void *buf, size_t max_len)
         spinlock_unlock_irqrestore(&g_r8169_rx_lock, flags);
         return -(s64)EAGAIN;
     }
+    rmb();
 
     u32 opts = g_rx_ring[cur].opts1;
     u32 len = opts & 0x3FFF;
@@ -139,6 +144,7 @@ s64 rtl8169_recv_packet(void *buf, size_t max_len)
     if (cur == RTL8169_NUM_RX_DESC - 1) {
         new_opts |= RTL8169_DESC_EOR;
     }
+    wmb();
     g_rx_ring[cur].opts1 = new_opts;
 
     g_rx_cur = (cur + 1) % RTL8169_NUM_RX_DESC;
@@ -151,6 +157,14 @@ void rtl8169_poll_rx(void)
 {
     if (!g_r8169_ready) return;
 
+    irqflags_t flags = spinlock_lock_irqsave(&g_r8169_rx_lock);
+    if (g_r8169_rx_draining) {
+        spinlock_unlock_irqrestore(&g_r8169_rx_lock, flags);
+        return;
+    }
+    g_r8169_rx_draining = true;
+    spinlock_unlock_irqrestore(&g_r8169_rx_lock, flags);
+
     u8 local_buf[RTL8169_PKT_BUF_SIZE];
     while (true) {
         s64 r = rtl8169_recv_packet(local_buf, sizeof(local_buf));
@@ -159,6 +173,10 @@ void rtl8169_poll_rx(void)
         extern void net_process_incoming(const u8 *pkt, size_t len);
         net_process_incoming(local_buf, (size_t)r);
     }
+
+    flags = spinlock_lock_irqsave(&g_r8169_rx_lock);
+    g_r8169_rx_draining = false;
+    spinlock_unlock_irqrestore(&g_r8169_rx_lock, flags);
 }
 
 static void rtl8169_irq_handler(pt_regs_t *r, void *ctx)
@@ -200,6 +218,8 @@ static file_operations_t g_rtl8169_fops = {
 static int rtl8169_probe(dm_device_t *dm, const pci_device_id_t *id)
 {
     (void)id;
+    if (g_r8169_ready) return -EBUSY;
+
     pci_device_info_t *info = to_pci_info(dm);
     if (!info) return -ENODEV;
 
@@ -236,7 +256,11 @@ static int rtl8169_probe(dm_device_t *dm, const pci_device_id_t *id)
     /* 4. Allocate RX and TX descriptor rings */
     g_rx_ring_phys = pmm_alloc_page();
     g_tx_ring_phys = pmm_alloc_page();
-    if (!g_rx_ring_phys || !g_tx_ring_phys) return -ENOMEM;
+    if (!g_rx_ring_phys || !g_tx_ring_phys) {
+        if (g_rx_ring_phys) { pmm_free_page(g_rx_ring_phys); g_rx_ring_phys = 0; }
+        if (g_tx_ring_phys) { pmm_free_page(g_tx_ring_phys); g_tx_ring_phys = 0; }
+        return -ENOMEM;
+    }
 
     g_rx_ring = (rtl8169_desc_t *)PHYS_TO_VIRT(g_rx_ring_phys);
     g_tx_ring = (rtl8169_desc_t *)PHYS_TO_VIRT(g_tx_ring_phys);
@@ -246,7 +270,16 @@ static int rtl8169_probe(dm_device_t *dm, const pci_device_id_t *id)
     /* 5. Allocate buffers and populate RX ring */
     for (u32 i = 0; i < RTL8169_NUM_RX_DESC; i++) {
         g_rx_bufs_phys[i] = pmm_alloc_page();
-        if (!g_rx_bufs_phys[i]) return -ENOMEM;
+        if (!g_rx_bufs_phys[i]) {
+            for (u32 j = 0; j < i; j++) {
+                pmm_free_page(g_rx_bufs_phys[j]);
+                g_rx_bufs_phys[j] = 0;
+                g_rx_buffers[j] = NULL;
+            }
+            pmm_free_page(g_rx_ring_phys); g_rx_ring_phys = 0; g_rx_ring = NULL;
+            pmm_free_page(g_tx_ring_phys); g_tx_ring_phys = 0; g_tx_ring = NULL;
+            return -ENOMEM;
+        }
         g_rx_buffers[i] = (u8 *)PHYS_TO_VIRT(g_rx_bufs_phys[i]);
 
         u32 opts = RTL8169_DESC_OWN | RTL8169_PKT_BUF_SIZE;
@@ -260,7 +293,21 @@ static int rtl8169_probe(dm_device_t *dm, const pci_device_id_t *id)
     /* 6. Populate TX ring */
     for (u32 i = 0; i < RTL8169_NUM_TX_DESC; i++) {
         g_tx_bufs_phys[i] = pmm_alloc_page();
-        if (!g_tx_bufs_phys[i]) return -ENOMEM;
+        if (!g_tx_bufs_phys[i]) {
+            for (u32 j = 0; j < i; j++) {
+                pmm_free_page(g_tx_bufs_phys[j]);
+                g_tx_bufs_phys[j] = 0;
+                g_tx_buffers[j] = NULL;
+            }
+            for (u32 j = 0; j < RTL8169_NUM_RX_DESC; j++) {
+                pmm_free_page(g_rx_bufs_phys[j]);
+                g_rx_bufs_phys[j] = 0;
+                g_rx_buffers[j] = NULL;
+            }
+            pmm_free_page(g_rx_ring_phys); g_rx_ring_phys = 0; g_rx_ring = NULL;
+            pmm_free_page(g_tx_ring_phys); g_tx_ring_phys = 0; g_tx_ring = NULL;
+            return -ENOMEM;
+        }
         g_tx_buffers[i] = (u8 *)PHYS_TO_VIRT(g_tx_bufs_phys[i]);
 
         u32 opts = 0;
@@ -329,6 +376,45 @@ static int rtl8169_probe(dm_device_t *dm, const pci_device_id_t *id)
     return 0;
 }
 
+static void rtl8169_remove(dm_device_t *dm)
+{
+    (void)dm;
+    if (!g_r8169_ready) return;
+
+    irqflags_t flags = spinlock_lock_irqsave(&g_r8169_rx_lock);
+    g_r8169_ready = false;
+    outw(g_r8169_io_base + REG_IMR, 0);
+    outw(g_r8169_io_base + REG_ISR, 0xFFFF);
+    outb(g_r8169_io_base + REG_COMMAND, 0);
+    if (g_r8169_irq > 0) hal_irq_disable(g_r8169_irq);
+    spinlock_unlock_irqrestore(&g_r8169_rx_lock, flags);
+
+    for (u32 i = 0; i < RTL8169_NUM_RX_DESC; i++) {
+        if (g_rx_bufs_phys[i]) {
+            pmm_free_page(g_rx_bufs_phys[i]);
+            g_rx_bufs_phys[i] = 0;
+            g_rx_buffers[i] = NULL;
+        }
+    }
+    for (u32 i = 0; i < RTL8169_NUM_TX_DESC; i++) {
+        if (g_tx_bufs_phys[i]) {
+            pmm_free_page(g_tx_bufs_phys[i]);
+            g_tx_bufs_phys[i] = 0;
+            g_tx_buffers[i] = NULL;
+        }
+    }
+    if (g_rx_ring_phys) {
+        pmm_free_page(g_rx_ring_phys);
+        g_rx_ring_phys = 0;
+        g_rx_ring = NULL;
+    }
+    if (g_tx_ring_phys) {
+        pmm_free_page(g_tx_ring_phys);
+        g_tx_ring_phys = 0;
+        g_tx_ring = NULL;
+    }
+}
+
 static const pci_device_id_t rtl8169_pci_ids[] = {
     { PCI_DEVICE(0x10EC, 0x8169) },   /* RTL-8169/8110 Gigabit */
     { PCI_DEVICE(0x10EC, 0x8168) },   /* RTL-8168/8111 PCIe Gigabit */
@@ -352,7 +438,7 @@ static pci_driver_t rtl8169_pci_driver = {
     .drv      = { .name = "rtl8169" },
     .id_table = rtl8169_pci_ids,
     .probe    = rtl8169_probe,
-    .remove   = NULL,
+    .remove   = rtl8169_remove,
 };
 
 void rtl8169_init(void)

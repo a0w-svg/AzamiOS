@@ -91,6 +91,19 @@ s64 rtl8139_send_packet(const void *data, size_t len)
     irqflags_t flags = spinlock_lock_irqsave(&g_rtl_lock);
     u8 tx_idx = g_rtl_tx_cur;
 
+    /* Check if previous transmission on this descriptor has completed (bit 13 TOK or bit 15 OWN) */
+    u32 status = inl(g_rtl_io_base + REG_TSD0 + (tx_idx * 4));
+    if (!(status & ((1 << 13) | (1 << 15)))) {
+        int timeout = 100000;
+        while (!(inl(g_rtl_io_base + REG_TSD0 + (tx_idx * 4)) & ((1 << 13) | (1 << 15))) && --timeout > 0) {
+            cpu_pause();
+        }
+        if (timeout <= 0) {
+            spinlock_unlock_irqrestore(&g_rtl_lock, flags);
+            return -(s64)EBUSY;
+        }
+    }
+
     memcpy(g_rtl_tx_bufs[tx_idx], data, len);
     if (len < 60) {
         memset(g_rtl_tx_bufs[tx_idx] + len, 0, 60 - len);
@@ -313,17 +326,29 @@ static int rtl8139_probe(dm_device_t *dm, const pci_device_id_t *id)
              g_rtl_mac[0], g_rtl_mac[1], g_rtl_mac[2],
              g_rtl_mac[3], g_rtl_mac[4], g_rtl_mac[5]);
 
-    /* Allocate RX buffer */
-    g_rtl_rx_phys = pmm_alloc_pages(3);
-    if (!g_rtl_rx_phys) return -1;
+    /* Allocate RX buffer (must be DMA32 addressable) */
+    g_rtl_rx_phys = pmm_alloc_pages_32(3);
+    if (!g_rtl_rx_phys) return -ENOMEM;
     g_rtl_rx_buf = (u8 *)PHYS_TO_VIRT(g_rtl_rx_phys);
     memset(g_rtl_rx_buf, 0, 3 * PAGE_SIZE);
     outl(io_base + REG_RBSTART, (u32)g_rtl_rx_phys);
 
-    /* Allocate 4 TX buffers */
+    /* Allocate 4 TX buffers (must be DMA32 addressable) */
     for (int i = 0; i < 4; i++) {
-        g_rtl_tx_phys[i] = pmm_alloc_page();
-        if (!g_rtl_tx_phys[i]) return -1;
+        g_rtl_tx_phys[i] = pmm_alloc_32(0);
+        if (!g_rtl_tx_phys[i]) {
+            for (int j = 0; j < i; j++) {
+                if (g_rtl_tx_phys[j]) {
+                    pmm_free_page(g_rtl_tx_phys[j]);
+                    g_rtl_tx_phys[j] = 0;
+                    g_rtl_tx_bufs[j] = NULL;
+                }
+            }
+            pmm_free_pages(g_rtl_rx_phys, 3);
+            g_rtl_rx_phys = 0;
+            g_rtl_rx_buf = NULL;
+            return -ENOMEM;
+        }
         g_rtl_tx_bufs[i] = (u8 *)PHYS_TO_VIRT(g_rtl_tx_phys[i]);
         outl(io_base + REG_TSAD0 + (i * 4), (u32)g_rtl_tx_phys[i]);
     }
@@ -372,9 +397,26 @@ static void rtl8139_remove(dm_device_t *dm)
 {
     (void)dm;
     if (!g_rtl_ready) return;
-    outw(g_rtl_io_base + REG_IMR, 0);
-    if (g_rtl_irq) hal_irq_disable(g_rtl_irq);
+    irqflags_t flags = spinlock_lock_irqsave(&g_rtl_lock);
     g_rtl_ready = false;
+    outw(g_rtl_io_base + REG_IMR, 0);
+    outw(g_rtl_io_base + REG_ISR, 0xFFFF);
+    outb(g_rtl_io_base + REG_CR, 0);
+    if (g_rtl_irq) hal_irq_disable(g_rtl_irq);
+    spinlock_unlock_irqrestore(&g_rtl_lock, flags);
+
+    if (g_rtl_rx_phys) {
+        pmm_free_pages(g_rtl_rx_phys, 3);
+        g_rtl_rx_phys = 0;
+        g_rtl_rx_buf = NULL;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (g_rtl_tx_phys[i]) {
+            pmm_free_page(g_rtl_tx_phys[i]);
+            g_rtl_tx_phys[i] = 0;
+            g_rtl_tx_bufs[i] = NULL;
+        }
+    }
 }
 
 static const pci_device_id_t rtl8139_pci_ids[] = {

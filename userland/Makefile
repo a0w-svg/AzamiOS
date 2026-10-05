@@ -459,7 +459,7 @@ toolchain: skeleton libc libgame
 DYNLINK_CFLAGS = -std=c11 -ffreestanding -fno-stack-protector -fpic -fno-plt \
                  -m64 -Wall -Wextra -O2 -ftls-model=initial-exec $(TOOLCHAIN_CFLAGS)
 
-ldso/ldso.o: ldso/ldso.c libc/include/sys/syscall.h
+ldso/ldso.o: ldso/ldso.c libc/include/sys/syscall.h libc/include/internal/elf_hash.h
 	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
 
 ldso/crt0.o: ldso/crt0.asm

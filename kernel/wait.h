@@ -29,6 +29,7 @@ void wake_up_interruptible(wait_queue_head_t *wq);
 void wake_up_interruptible_all(wait_queue_head_t *wq);
 
 void __wait_event_sleep(wait_queue_head_t *wq);
+void __wait_event_sleep_timeout(wait_queue_head_t *wq, u64 deadline_ns);
 
 /* wait_event - sleep until condition is true */
 #define wait_event(wq, condition) \
@@ -37,11 +38,13 @@ void __wait_event_sleep(wait_queue_head_t *wq);
 #define wait_event_interruptible(wq, condition) \
     ({ int __ret = 0; while (!(condition)) { __wait_event_sleep(&(wq)); } __ret; })
 
+/* timeout is in milliseconds. The deadline uses the monotonic clock because
+ * jiffies is not advanced by the scheduler tick in this kernel. */
 #define wait_event_timeout(wq, condition, timeout) \
-    ({ unsigned long __ret = (timeout); \
-       unsigned long __end = jiffies + __ret; \
-       while (!(condition) && time_before(jiffies, __end)) { __wait_event_sleep(&(wq)); } \
-       (condition) ? (__ret ?: 1) : 0; })
+    ({ u64 __deadline = ktime_get_ns() + (u64)(timeout) * 1000000ULL; \
+       while (!(condition) && ktime_get_ns() < __deadline) \
+           __wait_event_sleep_timeout(&(wq), __deadline); \
+       (condition) ? 1 : 0; })
 
 /* Waitqueue init */
 void wait_queue_init(void);

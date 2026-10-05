@@ -7,6 +7,8 @@
 #include "../../libc/include/string.h"
 #include "../../libc/include/unistd.h"
 #include "../../libc/include/fcntl.h"
+#include "../../libc/include/stdlib.h"
+#include "../../libc/include/errno.h"
 #include "../azwm/protocol.h"
 #include "../azwm/de_protocol.h"
 #include "../azwm/de_font.h"
@@ -19,44 +21,68 @@
 #define MAP_ADDR       ((void *)0x63000000)
 
 static uk_window_t g_win;
+static unsigned int g_mouse_buttons;
 static char g_status_msg[128] = "Screen captured successfully!";
 static int  g_saved = 0;
 
-static int save_screenshot_ppm(const char *filename)
+static unsigned char *g_capture;
+static unsigned int g_capture_width, g_capture_height;
+
+static int capture_screen(void)
 {
     az_fb_info_t fb;
-    if (az_fb_info(&fb) != 0 || fb.width == 0 || fb.height == 0) {
+    if (az_fb_info(&fb) != 0 || !fb.width || !fb.height || fb.bpp != 32 ||
+        fb.pitch < (size_t)fb.width * 4 || az_fb_map((void *)0x40000000) < 0)
         return -1;
+    size_t stride = (size_t)fb.width * 3;
+    if (stride / 3 != fb.width || fb.height > (size_t)-1 / stride) return -1;
+    unsigned char *capture = malloc(stride * fb.height);
+    if (!capture) return -1;
+    const unsigned char *src = (const unsigned char *)0x40000000;
+    for (unsigned int y = 0; y < fb.height; y++) {
+        const unsigned int *line = (const unsigned int *)(src + (size_t)y * fb.pitch);
+        unsigned char *row = capture + (size_t)y * stride;
+        for (unsigned int x = 0; x < fb.width; x++) {
+            unsigned int pixel = line[x];
+            row[x * 3] = (unsigned char)(pixel >> 16);
+            row[x * 3 + 1] = (unsigned char)(pixel >> 8);
+            row[x * 3 + 2] = (unsigned char)pixel;
+        }
     }
+    free(g_capture);
+    g_capture = capture;
+    g_capture_width = fb.width;
+    g_capture_height = fb.height;
+    g_saved = 0;
+    snprintf(g_status_msg, sizeof(g_status_msg), "Captured. Choose Save File to write it.");
+    return 0;
+}
 
-    /* Ensure framebuffer is mapped at 0x40000000 */
-    az_fb_map((void *)0x40000000);
+static int write_all(int fd, const void *data, size_t len)
+{
+    const unsigned char *bytes = data;
+    while (len) {
+        ssize_t n = write(fd, bytes, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        bytes += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
 
+static int save_screenshot_ppm(const char *filename)
+{
+    if (!g_capture) return -1;
     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return -1;
-
     char header[64];
-    int hlen = snprintf(header, sizeof(header), "P6\n%u %u\n255\n", fb.width, fb.height);
-    write(fd, header, hlen);
-
-    /* Write RGB bytes row by row */
-    static unsigned char row_buf[3840 * 3];
-    unsigned int *src = (unsigned int *)0x40000000;
-
-    for (unsigned int y = 0; y < fb.height; y++) {
-        unsigned int *line = src + (y * (fb.pitch / 4));
-        int bpos = 0;
-        for (unsigned int x = 0; x < fb.width; x++) {
-            unsigned int c = line[x];
-            row_buf[bpos++] = (c >> 16) & 0xFF; /* Red */
-            row_buf[bpos++] = (c >> 8) & 0xFF;  /* Green */
-            row_buf[bpos++] = c & 0xFF;         /* Blue */
-        }
-        write(fd, row_buf, bpos);
-    }
-
-    close(fd);
-    return 0;
+    int len = snprintf(header, sizeof(header), "P6\n%u %u\n255\n", g_capture_width, g_capture_height);
+    int result = write_all(fd, header, (size_t)len);
+    if (result == 0) result = write_all(fd, g_capture, (size_t)g_capture_width * 3 * g_capture_height);
+    if (close(fd) < 0) result = -1;
+    if (result < 0) unlink(filename);
+    return result;
 }
 
 static void draw_screenshot_ui(void)
@@ -112,7 +138,7 @@ int main(int argc, char **argv)
 
     /* Auto capture if run with --quick or -q */
     if (argc > 1 && (strcmp(argv[1], "-q") == 0 || strcmp(argv[1], "--quick") == 0)) {
-        if (save_screenshot_ppm("/screenshot.ppm") == 0) {
+        if (capture_screen() == 0 && save_screenshot_ppm("/screenshot.ppm") == 0) {
             de_log("[screenshot] Quick capture saved to /screenshot.ppm");
             sys_exit(0);
         } else {
@@ -121,9 +147,9 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Auto capture initial frame to /screenshot.ppm */
-    save_screenshot_ppm("/screenshot.ppm");
-    g_saved = 1;
+    /* Keep a snapshot before opening the utility; Save writes this frame. */
+    if (capture_screen() < 0)
+        snprintf(g_status_msg, sizeof(g_status_msg), "Error: Could not capture the display.");
 
     az_fb_info_t fb;
     unsigned int sw = 1280, sh = 800;
@@ -160,20 +186,23 @@ int main(int argc, char **argv)
         }
 
         if (msg.type == AZ_WM_MOUSE_EVENT) {
-            if (msg.mouse.buttons & AZ_MOUSE_BTN_LEFT) {
+            unsigned int pressed = uk_mouse_press(&g_mouse_buttons, msg.mouse.buttons);
+            if (pressed & AZ_MOUSE_BTN_LEFT) {
                 int mx = msg.mouse.abs_x;
                 int my = msg.mouse.abs_y;
 
                 /* Save File button: (24, h-55, 140, 34) */
                 if (mx >= 24 && mx <= 164 && my >= (int)g_win.height - 55 && my <= (int)g_win.height - 21) {
-                    save_screenshot_ppm("/screenshot.ppm");
-                    g_saved = 1;
+                    g_saved = save_screenshot_ppm("/screenshot.ppm") == 0;
+                    if (!g_saved) snprintf(g_status_msg, sizeof(g_status_msg), "Error: Could not save /screenshot.ppm.");
                     draw_screenshot_ui();
                 }
                 /* Retake button: (180, h-55, 130, 34) */
                 else if (mx >= 180 && mx <= 310 && my >= (int)g_win.height - 55 && my <= (int)g_win.height - 21) {
-                    save_screenshot_ppm("/screenshot.ppm");
-                    g_saved = 1;
+                    if (capture_screen() < 0) {
+                        g_saved = 0;
+                        snprintf(g_status_msg, sizeof(g_status_msg), "Retake failed; previous capture retained.");
+                    }
                     draw_screenshot_ui();
                 }
                 /* Close button: (w-120, h-55, 96, 34) */
@@ -191,5 +220,6 @@ int main(int argc, char **argv)
     dmsg.wid  = g_win.wid;
     az_channel_send(SERVER_CHAN, (az_ipc_msg_t *)&dmsg);
 
+    free(g_capture);
     sys_exit(0);
 }

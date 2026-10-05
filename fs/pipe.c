@@ -10,8 +10,18 @@
 
 static void pipe_wait_push(thread_t **queue, thread_t *t)
 {
-    t->next = *queue;
-    *queue = t;
+    t->next = NULL;
+    if (!*queue) {
+        *queue = t;
+        return;
+    }
+    thread_t *curr = *queue;
+    while (curr->next) {
+        if (curr == t) return;
+        curr = curr->next;
+    }
+    if (curr == t) return;
+    curr->next = t;
 }
 
 static thread_t *pipe_wait_pop(thread_t **queue)
@@ -67,10 +77,17 @@ static s64 pipe_read(file_t *filp, void *buf, size_t len, u64 *offset)
             bytes_read += to_read;
 
             thread_t *writer = pipe_wait_pop(&pipe->write_wait);
+            thread_t *next_reader = NULL;
+            if (pipe->count > 0 && pipe->read_wait) {
+                next_reader = pipe_wait_pop(&pipe->read_wait);
+            }
             spinlock_unlock(&pipe->lock);
 
             if (writer) {
                 sched_unblock(writer);
+            }
+            if (next_reader) {
+                sched_unblock(next_reader);
             }
             return (s64)bytes_read;
         }
@@ -122,6 +139,10 @@ static s64 pipe_write(file_t *filp, const void *buf, size_t len, u64 *offset)
 
         if (pipe->readers == 0) {
             spinlock_unlock(&pipe->lock);
+            process_t *proc = sched_current_process();
+            if (proc) {
+                sched_kill_process(proc->pid, 13 /* SIGPIPE */);
+            }
             return -(s64)EPIPE;
         }
 
@@ -144,10 +165,17 @@ static s64 pipe_write(file_t *filp, const void *buf, size_t len, u64 *offset)
             bytes_written += to_write;
 
             thread_t *reader = pipe_wait_pop(&pipe->read_wait);
+            thread_t *next_writer = NULL;
+            if (pipe->count < PIPE_BUFFER_SIZE && pipe->write_wait) {
+                next_writer = pipe_wait_pop(&pipe->write_wait);
+            }
             spinlock_unlock(&pipe->lock);
 
             if (reader) {
                 sched_unblock(reader);
+            }
+            if (next_writer) {
+                sched_unblock(next_writer);
             }
             if (bytes_written == len) {
                 return (s64)bytes_written;

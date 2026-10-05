@@ -339,6 +339,13 @@ static net_buf_t *ip_reassembly_input(net_buf_t *buf, const ipv4_hdr_t *ip, u16 
         net_buf_free(buf);
         return NULL;
     }
+    /* A zero-length fragment carries nothing (and a zero-length final one
+     * would leave total_len == 0, the "not yet seen" sentinel); every
+     * non-final fragment must be a multiple of 8 bytes (RFC 791). */
+    if (flen == 0 || (more && (flen & 7))) {
+        net_buf_free(buf);
+        return NULL;
+    }
 
     irqflags_t irqf = spinlock_lock_irqsave(&g_reasm_lock);
 
@@ -383,6 +390,26 @@ static net_buf_t *ip_reassembly_input(net_buf_t *buf, const ipv4_hdr_t *ip, u16 
         ctx->protocol = ip->protocol;
         ctx->nranges = 0;
         ctx->total_len = 0;
+    }
+
+    /* Once the final fragment has fixed total_len, no fragment may extend
+     * past it, and a second "final" fragment must agree with it. */
+    if (ctx->total_len != 0 &&
+        ((offset + flen > ctx->total_len) ||
+         (!more && (u16)(offset + flen) != ctx->total_len))) {
+        spinlock_unlock_irqrestore(&g_reasm_lock, irqf);
+        net_buf_free(buf);
+        return NULL;
+    }
+    if (!more) {
+        /* Data already received beyond this end contradicts it. */
+        for (int i = 0; i < ctx->nranges; i++) {
+            if ((u32)ctx->ranges[i].offset + ctx->ranges[i].len > offset + flen) {
+                spinlock_unlock_irqrestore(&g_reasm_lock, irqf);
+                net_buf_free(buf);
+                return NULL;
+            }
+        }
     }
 
     memcpy(ctx->data + offset, buf->data, flen);
@@ -596,6 +623,11 @@ int ipv4_send(net_buf_t *buf, const u8 dst_ip[4], u8 protocol)
 {
     if (!buf || !dst_ip) return -1;
 
+    if (buf->len + sizeof(ipv4_hdr_t) > IP_MAX_DGRAM_LEN) {
+        net_buf_free(buf);
+        return -1;
+    }
+
     u8 host_ip[4];
     net_get_ip(host_ip);
 
@@ -611,7 +643,7 @@ int ipv4_send(net_buf_t *buf, const u8 dst_ip[4], u8 protocol)
     ip->ihl_version = 0x45; /* IPv4, 20-byte header (IHL 5) */
     ip->tos = 0;
     ip->total_len = htons((u16)buf->len);
-    ip->id = htons(g_ip_id_counter++);
+    ip->id = htons(__atomic_fetch_add(&g_ip_id_counter, 1, __ATOMIC_RELAXED));
     ip->frag_offset = 0;
     ip->ttl = 64;
     ip->protocol = protocol;
@@ -832,6 +864,9 @@ void ipv4_input(net_buf_t *buf)
         net_buf_t *reassembled = ip_reassembly_input(buf, &ip_copy, frag);
         if (!reassembled) return;
         buf = reassembled;
+        ip_copy.total_len = htons((u16)(sizeof(ipv4_hdr_t) + buf->len > 0xFFFF ?
+                                        0xFFFF : sizeof(ipv4_hdr_t) + buf->len));
+        ip_copy.frag_offset = 0;
     }
 
     /* Dispatch copy to RAW sockets */

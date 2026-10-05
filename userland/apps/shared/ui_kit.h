@@ -30,6 +30,7 @@
 #include "../../libc/include/azami/font.h"
 #endif
 #include "de_log.h"
+#include "ui_input.h"
 #if __has_include(<azami/theme.h>)
 #include <azami/theme.h>
 #elif __has_include("../../libc/include/azami/theme.h")
@@ -335,29 +336,32 @@ typedef struct {
  * uk_push_clip(win, x, y, w, h) — intersect the active clip with the given
  * rect (in window-local coordinates) and make the result active; the
  * matching uk_pop_clip() restores whatever was active before this push.
- * Every fill/shape primitive below (uk_put_pixel, uk_fill_rect and anything
- * built on it — rounded rects, gradients, circles, buttons, panels, lines,
- * ...) honours the active clip; text does not, since de_font_draw_char() has
- * no clip-rect parameter of its own — scroll a list of text the way the
- * existing DE apps already do, by drawing only the rows known to be inside
- * the visible range and letting uk_draw_text_clip()'s max_px bound each
- * row's width. uk_draw_line_aa() also writes pixels directly for its
- * antialiasing and is not scissored.
+ * Shape and text primitives honour the active clip. Text renderers receive
+ * a view of the clipped rectangle with the original pixel stride retained.
+ * uk_draw_line_aa() still writes its antialiasing pixels directly.
  *
- * Pushing past UK_CLIP_STACK_MAX or popping an empty stack is a silent
- * no-op rather than corrupting state — an unmatched call just stops
- * narrowing (or fails to widen) the clip instead of crashing.
+ * Extra pushes beyond the saved stack depth leave the clip unchanged; their
+ * matching pops also leave it unchanged. Popping an empty stack is a no-op.
  */
 static inline void uk_push_clip(uk_window_t *w, int x, int y, int cw, int ch)
 {
-    if (w->clip_depth < UK_CLIP_STACK_MAX) {
+    if (w->clip_depth >= UK_CLIP_STACK_MAX) {
+        w->clip_depth++;
+        return;
+    }
+    {
         w->clip_stack[w->clip_depth][0] = w->clip_x0;
         w->clip_stack[w->clip_depth][1] = w->clip_y0;
         w->clip_stack[w->clip_depth][2] = w->clip_x1;
         w->clip_stack[w->clip_depth][3] = w->clip_y1;
         w->clip_depth++;
     }
-    int x0 = x, y0 = y, x1 = x + cw, y1 = y + ch;
+    int64_t right = (int64_t)x + cw, bottom = (int64_t)y + ch;
+    int x0 = x, y0 = y;
+    if (x0 > w->clip_x1) x0 = w->clip_x1;
+    if (y0 > w->clip_y1) y0 = w->clip_y1;
+    int x1 = right > w->clip_x1 ? w->clip_x1 : right < w->clip_x0 ? w->clip_x0 : (int)right;
+    int y1 = bottom > w->clip_y1 ? w->clip_y1 : bottom < w->clip_y0 ? w->clip_y0 : (int)bottom;
     if (x0 < w->clip_x0) x0 = w->clip_x0;
     if (y0 < w->clip_y0) y0 = w->clip_y0;
     if (x1 > w->clip_x1) x1 = w->clip_x1;
@@ -371,6 +375,7 @@ static inline void uk_pop_clip(uk_window_t *w)
 {
     if (w->clip_depth > 0) {
         w->clip_depth--;
+        if (w->clip_depth >= UK_CLIP_STACK_MAX) return;
         w->clip_x0 = w->clip_stack[w->clip_depth][0];
         w->clip_y0 = w->clip_stack[w->clip_depth][1];
         w->clip_x1 = w->clip_stack[w->clip_depth][2];
@@ -548,31 +553,59 @@ static inline void uk_fill_rounded_rect(uk_window_t *w,
  * Text rendering (uses de_font.h)
  * ============================================================================ */
 
+/* Pixel origin of a nonempty scissor view. Pitch remains the window width. */
+static inline unsigned int *uk_text_surface(uk_window_t *w, unsigned int *cw, unsigned int *ch)
+{
+    if (!w || !w->pixels || w->clip_x1 <= w->clip_x0 || w->clip_y1 <= w->clip_y0) return NULL;
+    *cw = (unsigned int)(w->clip_x1 - w->clip_x0);
+    *ch = (unsigned int)(w->clip_y1 - w->clip_y0);
+    return w->pixels + (size_t)w->clip_y0 * w->width + w->clip_x0;
+}
+
+static inline int uk_font_width(const uk_window_t *w)
+{
+    return w && w->font && w->font->glyph_w ? w->font->glyph_w : 8;
+}
+
+static inline int uk_font_height(const uk_window_t *w)
+{
+    return w && w->font && w->font->glyph_h ? w->font->glyph_h : 16;
+}
+
 static inline void uk_draw_char(uk_window_t *w, int x, int y, char c, unsigned int col)
 {
-    if (w && w->font)
-        az_font_draw_char(w->pixels, w->width, w->width, w->height, x, y, c, col, w->font, 1, false);
+    unsigned int cw, ch;
+    unsigned int *surface = uk_text_surface(w, &cw, &ch);
+    if (!surface) return;
+    x -= w->clip_x0; y -= w->clip_y0;
+    if (w->font)
+        az_font_draw_char(surface, w->width, cw, ch, x, y, c, col, w->font, 1, false);
     else
-        de_font_draw_char(w->pixels, w->width, w->width, w->height, x, y, c, col);
+        de_font_draw_char(surface, w->width, cw, ch, x, y, c, col);
 }
 
 static inline void uk_draw_text(uk_window_t *w, int x, int y, const char *s, unsigned int col)
 {
-    if (w && w->font) {
-        az_font_draw_str(w->pixels, w->width, w->width, w->height, x, y, s, col, w->font, 1, false);
-    } else {
-        int i;
-        for (i = 0; s[i]; i++)
-            uk_draw_char(w, x + i * 8, y, s[i], col);
-    }
+    unsigned int cw, ch;
+    unsigned int *surface = uk_text_surface(w, &cw, &ch);
+    if (!surface || !s) return;
+    x -= w->clip_x0; y -= w->clip_y0;
+    if (w->font)
+        az_font_draw_str(surface, w->width, cw, ch, x, y, s, col, w->font, 1, false);
+    else
+        de_font_draw_str(surface, w->width, cw, ch, x, y, s, col);
 }
 
 static inline void uk_draw_text_2x(uk_window_t *w, int x, int y, const char *s, unsigned int col)
 {
-    if (w && w->font)
-        az_font_draw_str(w->pixels, w->width, w->width, w->height, x, y, s, col, w->font, 2, false);
+    unsigned int cw, ch;
+    unsigned int *surface = uk_text_surface(w, &cw, &ch);
+    if (!surface || !s) return;
+    x -= w->clip_x0; y -= w->clip_y0;
+    if (w->font)
+        az_font_draw_str(surface, w->width, cw, ch, x, y, s, col, w->font, 2, false);
     else
-        de_font_draw_str_2x(w->pixels, w->width, w->width, w->height, x, y, s, col);
+        de_font_draw_str_2x(surface, w->width, cw, ch, x, y, s, col);
 }
 
 static inline az_font_t *uk_load_font(const char *path_or_name)
@@ -593,8 +626,10 @@ static inline const az_font_t *uk_get_font(const uk_window_t *w)
 static inline void uk_draw_text_font(uk_window_t *w, int x, int y, const char *s, unsigned int col,
                                      const az_font_t *font, int scale, bool bold)
 {
-    if (!w || !s) return;
-    az_font_draw_str(w->pixels, w->width, w->width, w->height, x, y, s, col, font, scale, bold);
+    unsigned int cw, ch;
+    unsigned int *surface = uk_text_surface(w, &cw, &ch);
+    if (!surface || !s) return;
+    az_font_draw_str(surface, w->width, cw, ch, x - w->clip_x0, y - w->clip_y0, s, col, font, scale, bold);
 }
 
 static inline int uk_text_width_font(const az_font_t *font, const char *s, int scale)
@@ -613,7 +648,10 @@ static inline int uk_text_width_font(const az_font_t *font, const char *s, int s
 static inline void uk_draw_text_ex(uk_window_t *w, int x, int y, const char *s, unsigned int col,
                                    const de_font_t *font, int scale, bool bold)
 {
-    de_font_draw_str_ex(w->pixels, w->width, w->width, w->height, x, y, s, col, font, scale, bold);
+    unsigned int cw, ch;
+    unsigned int *surface = uk_text_surface(w, &cw, &ch);
+    if (!surface || !s) return;
+    de_font_draw_str_ex(surface, w->width, cw, ch, x - w->clip_x0, y - w->clip_y0, s, col, font, scale, bold);
 }
 
 /* Compact companion face (de_font_small, 8x8) for status rows, table cells
@@ -628,16 +666,18 @@ static inline void uk_draw_text_small(uk_window_t *w, int x, int y, const char *
  * pulling in a whole second hand-authored font. */
 static inline void uk_draw_text_bold(uk_window_t *w, int x, int y, const char *s, unsigned int col)
 {
-    uk_draw_text_ex(w, x, y, s, col, &de_font_regular, 1, true);
+    if (w && w->font) uk_draw_text_font(w, x, y, s, col, w->font, 1, true);
+    else uk_draw_text_ex(w, x, y, s, col, &de_font_regular, 1, true);
 }
 
 /* Draw text clipped to max_px width */
 static inline void uk_draw_text_clip(uk_window_t *w, int x, int y,
                                       const char *s, unsigned int col, int max_px)
 {
-    int i;
-    for (i = 0; s[i] && i * 8 + 8 <= max_px; i++)
-        uk_draw_char(w, x + i * 8, y, s[i], col);
+    if (!w || !s || max_px <= 0) return;
+    int advance = uk_font_width(w);
+    for (int i = 0; s[i] && i < max_px / advance; i++)
+        uk_draw_char(w, x + i * advance, y, s[i], col);
 }
 
 /* String length (no strlen in minimal libc) */
@@ -662,7 +702,7 @@ static inline void uk_draw_text_centred(uk_window_t *w, int cx, int y,
                                          const char *s, unsigned int col)
 {
     int len = uk_strlen(s);
-    uk_draw_text(w, cx - (len * 8) / 2, y, s, col);
+    uk_draw_text(w, cx - (len * uk_font_width(w)) / 2, y, s, col);
 }
 
 /* ============================================================================
@@ -707,7 +747,7 @@ static inline void uk_draw_button(uk_window_t *w,
     /* Specular highlight line */
     if (highlight && bh > 4) {
         for (int x = bx + 4; x < bx + bw - 4; x++) {
-            if (x >= 0 && (unsigned int)x < w->width && (by + 1) >= 0 && (unsigned int)(by + 1) < w->height) {
+            if (x >= w->clip_x0 && x < w->clip_x1 && by + 1 >= w->clip_y0 && by + 1 < w->clip_y1) {
                 unsigned int *p = &w->pixels[(by + 1) * w->width + x];
                 *p = uk_blend(*p, 0xFFFFFFFF, (highlight >> 24) & 0xFF);
             }
@@ -726,12 +766,14 @@ static inline void uk_draw_button(uk_window_t *w,
 
     /* Centred label with subtle text drop shadow */
     int len = uk_strlen(label);
-    int tx = bx + bw / 2 - (len * 8) / 2;
-    int ty = by + (bh - 16) / 2;
+    int tx = bx + bw / 2 - (len * uk_font_width(w)) / 2;
+    int ty = by + (bh - uk_font_height(w)) / 2;
+    uk_push_clip(w, bx + 2, by + 2, bw - 4, bh - 4);
     if (state != UK_BTN_PRESSED && state != UK_BTN_DISABLED) {
         uk_draw_text(w, tx + 1, ty + 1, label, 0xFF11111B);
     }
     uk_draw_text(w, tx, ty, label, fg);
+    uk_pop_clip(w);
 }
 
 /* ============================================================================
@@ -2431,4 +2473,3 @@ static inline void uk_draw_divider_text(uk_window_t *w,
         uk_fill_rect(w, x, line_y, width, 1, UK_SURFACE1);
     }
 }
-

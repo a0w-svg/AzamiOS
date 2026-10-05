@@ -51,6 +51,7 @@
 #define CLR_RED         0xFFF38BA8
 
 static uk_window_t g_win;
+static unsigned int g_mouse_buttons;
 
 /* ── AZF In-Memory Representation ─────────────────────────────────────────── */
 typedef struct {
@@ -510,7 +511,8 @@ int main(int argc, char **argv)
             continue;
         }
         if (msg.type == AZ_WM_MOUSE_EVENT) {
-            if (msg.mouse.buttons & 1) {
+            unsigned int pressed = uk_mouse_press(&g_mouse_buttons, msg.mouse.buttons);
+            if (pressed & AZ_MOUSE_BTN_LEFT) {
                 handle_click(msg.mouse.abs_x, msg.mouse.abs_y);
                 draw_fontviewer();
                 uk_invalidate(&g_win);

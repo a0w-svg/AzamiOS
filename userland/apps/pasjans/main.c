@@ -92,6 +92,12 @@ typedef struct {
     unsigned char suit;
     unsigned char rank;      /* 1 = Ace .. 13 = King */
     bool          face_up;
+    bool          sliding;
+    int           slide_x16;
+    int           slide_y16;
+    int           slide_dx16;
+    int           slide_dy16;
+    int           slide_ticks;
 } card_t;
 
 #define P_STOCK  0
@@ -124,6 +130,11 @@ static const char *rank_str(int rank)
                                "8", "9", "10", "J", "Q", "K" };
     return (rank >= 1 && rank <= 13) ? r[rank] : "?";
 }
+
+
+static void compute_layout(void);
+static void card_rect(int pile, int idx, int *x, int *y);
+static void animate_card(card_t *c, int sx, int sy, int ex, int ey, int ticks);
 
 /* ============================================================================
  * Small raster primitives the ui_kit does not carry
@@ -435,7 +446,8 @@ static void draw_card_face(uk_window_t *w, int x, int y, int cw, int ch,
 {
     int rad = cw / 9; if (rad < 3) rad = 3;
 
-    blend_rrect(w, x + 2, y + 3, cw, ch, rad, 0xFF000000, 64);
+    blend_rrect(w, x + 3, y + 4, cw, ch, rad, 0xFF000000, 32);
+    blend_rrect(w, x + 1, y + 2, cw, ch, rad, 0xFF000000, 48);
     uk_fill_rounded_rect(w, x, y, cw, ch, rad, COL_CARD);
     uk_draw_rounded_rect_outline(w, x, y, cw, ch, rad, COL_CARD_EDGE);
 
@@ -483,14 +495,17 @@ static void draw_card_back(uk_window_t *w, int x, int y, int cw, int ch)
 {
     int rad = cw / 9; if (rad < 3) rad = 3;
 
-    blend_rrect(w, x + 2, y + 3, cw, ch, rad, 0xFF000000, 64);
+    blend_rrect(w, x + 3, y + 4, cw, ch, rad, 0xFF000000, 32);
+    blend_rrect(w, x + 1, y + 2, cw, ch, rad, 0xFF000000, 48);
     uk_fill_rounded_rect(w, x, y, cw, ch, rad, 0xFFF3F1EC);
     uk_fill_rounded_rect(w, x + 3, y + 3, cw - 6, ch - 6, rad - 1, COL_BACK_A);
 
     uk_push_clip(w, x + 4, y + 4, cw - 8, ch - 8);
-    for (int d = -ch; d < cw + ch; d += 8) {
+    for (int d = -ch; d < cw + ch; d += 12) {
         uk_line(w, x + d, y,      x + d + ch, y + ch, COL_BACK_B);
+        uk_line(w, x + d + 1, y,  x + d + ch + 1, y + ch, COL_BACK_B);
         uk_line(w, x + d, y + ch, x + d + ch, y,      COL_BACK_B);
+        uk_line(w, x + d + 1, y + ch, x + d + ch + 1, y, COL_BACK_B);
     }
     uk_pop_clip(w);
 
@@ -741,14 +756,35 @@ static int score_for(int from, int to)
 /* Move the top `count` cards of `from` onto `to`, scoring, flipping the card
  * it uncovers and logging the whole thing for undo. Legality is the
  * caller's job — every caller has already asked can_drop(). */
+
+static void animate_card(card_t *c, int sx, int sy, int ex, int ey, int ticks)
+{
+    c->sliding = true;
+    c->slide_x16 = sx * 16;
+    c->slide_y16 = sy * 16;
+    c->slide_ticks = ticks;
+    c->slide_dx16 = ((ex - sx) * 16) / ticks;
+    c->slide_dy16 = ((ey - sy) * 16) / ticks;
+}
 static void do_move(int from, int to, int count)
 {
     pile_t *src = &g_pile[from], *dst = &g_pile[to];
     int base = src->n - count;
 
+    int sx[13], sy[13];
+    for (int k = 0; k < count; k++) card_rect(from, base + k, &sx[k], &sy[k]);
+
     for (int k = 0; k < count; k++)
         dst->c[dst->n++] = src->c[base + k];
     src->n = base;
+
+    compute_layout();
+
+    for (int k = 0; k < count; k++) {
+        int ex, ey;
+        card_rect(to, dst->n - count + k, &ex, &ey);
+        animate_card(dst->c[dst->n - count + k], sx[k], sy[k], ex, ey, 6);
+    }
 
     int delta = score_for(from, to);
     bool flipped = false;
@@ -773,10 +809,18 @@ static void do_draw(void)
         /* Redeal: the waste goes back under the stock in reverse, so the
          * next pass shows the same cards in the same order. */
         int n = w->n;
+        int sx[52], sy[52];
+        for (int i = 0; i < n; i++) card_rect(P_WASTE, i, &sx[i], &sy[i]);
         while (w->n > 0) {
             card_t *c = w->c[--w->n];
             c->face_up = false;
             s->c[s->n++] = c;
+        }
+        compute_layout();
+        for (int i = 0; i < n; i++) {
+            int ex, ey;
+            card_rect(P_STOCK, s->n - 1 - i, &ex, &ey);
+            animate_card(s->c[s->n - 1 - i], sx[i], sy[i], ex, ey, 8);
         }
         g_passes++;
         int delta = (g_draw_count == 1) ? -100 : -20;
@@ -790,10 +834,18 @@ static void do_draw(void)
 
     int take = g_draw_count;
     if (take > s->n) take = s->n;
+    int sx[3], sy[3];
+    for (int i = 0; i < take; i++) card_rect(P_STOCK, s->n - 1 - i, &sx[i], &sy[i]);
     for (int i = 0; i < take; i++) {
         card_t *c = s->c[--s->n];
         c->face_up = true;
         w->c[w->n++] = c;
+    }
+    compute_layout();
+    for (int i = 0; i < take; i++) {
+        int ex, ey;
+        card_rect(P_WASTE, w->n - take + i, &ex, &ey);
+        animate_card(w->c[w->n - take + i], sx[i], sy[i], ex, ey, 6);
     }
     g_moves++;
     clock_start();
@@ -807,28 +859,53 @@ static void do_undo(void)
 
     if (m->kind == MV_DRAW) {
         pile_t *s = &g_pile[P_STOCK], *w = &g_pile[P_WASTE];
+        int sx[3], sy[3];
+        for (int i = 0; i < m->count; i++) card_rect(P_WASTE, w->n - 1 - i, &sx[i], &sy[i]);
         for (int i = 0; i < m->count && w->n > 0; i++) {
             card_t *c = w->c[--w->n];
             c->face_up = false;
             s->c[s->n++] = c;
         }
+        compute_layout();
+        for (int i = 0; i < m->count; i++) {
+            int ex, ey;
+            card_rect(P_STOCK, s->n - 1 - i, &ex, &ey);
+            animate_card(s->c[s->n - 1 - i], sx[i], sy[i], ex, ey, 6);
+        }
     } else if (m->kind == MV_REDEAL) {
         pile_t *s = &g_pile[P_STOCK], *w = &g_pile[P_WASTE];
+        int n = s->n;
+        int sx[52], sy[52];
+        for (int i = 0; i < n; i++) card_rect(P_STOCK, i, &sx[i], &sy[i]);
         while (s->n > 0) {
             card_t *c = s->c[--s->n];
             c->face_up = true;
             w->c[w->n++] = c;
         }
         if (g_passes > 0) g_passes--;
+        compute_layout();
+        for (int i = 0; i < n; i++) {
+            int ex, ey;
+            card_rect(P_WASTE, w->n - 1 - i, &ex, &ey);
+            animate_card(w->c[w->n - 1 - i], sx[i], sy[i], ex, ey, 8);
+        }
     } else {
         pile_t *src = &g_pile[m->from], *dst = &g_pile[m->to];
-        if (m->flipped && src->n > 0)
-            src->c[src->n - 1]->face_up = false;
         int base = dst->n - m->count;
         if (base < 0) base = 0;
+        int sx[13], sy[13];
+        for (int k = base; k < dst->n; k++) card_rect(m->to, k, &sx[k - base], &sy[k - base]);
+        if (m->flipped && src->n > 0)
+            src->c[src->n - 1]->face_up = false;
         for (int k = base; k < dst->n; k++)
             src->c[src->n++] = dst->c[k];
         dst->n = base;
+        compute_layout();
+        for (int k = 0; k < m->count; k++) {
+            int ex, ey;
+            card_rect(m->from, src->n - m->count + k, &ex, &ey);
+            animate_card(src->c[src->n - m->count + k], sx[k], sy[k], ex, ey, 6);
+        }
     }
 
     score_add(-m->score_delta);
@@ -1465,8 +1542,9 @@ static void render(void)
         for (int i = 0; i < vis; i++) {
             int idx = g_pile[P_WASTE].n - vis + i;
             if (card_hidden_by_drag(P_WASTE, idx)) continue;
-            draw_card(&g_win, L.waste_x + i * L.waste_fan, L.top_y, cw, ch,
-                      g_pile[P_WASTE].c[idx]);
+            if (!g_pile[P_WASTE].c[idx]->sliding)
+                draw_card(&g_win, L.waste_x + i * L.waste_fan, L.top_y, cw, ch,
+                          g_pile[P_WASTE].c[idx]);
         }
     }
 
@@ -1475,9 +1553,12 @@ static void render(void)
         pile_t *p = &g_pile[P_FOUND + f];
         int shown = p->n;
         if (card_hidden_by_drag(P_FOUND + f, p->n - 1)) shown--;
-        if (shown <= 0) draw_slot(&g_win, L.found_x[f], L.top_y, cw, ch, 'A');
-        else            draw_card(&g_win, L.found_x[f], L.top_y, cw, ch,
-                                  p->c[shown - 1]);
+        if (shown <= 0) {
+            draw_slot(&g_win, L.found_x[f], L.top_y, cw, ch, 'A');
+        } else {
+            if (!p->c[shown - 1]->sliding)
+                draw_card(&g_win, L.found_x[f], L.top_y, cw, ch, p->c[shown - 1]);
+        }
     }
 
     /* Tableau */
@@ -1492,9 +1573,11 @@ static void render(void)
             if (card_hidden_by_drag(P_TAB + t, i)) break;
             int step = p->c[i]->face_up ? L.fan_up : L.fan_down;
             bool covered = (i + 1 < p->n) && !card_hidden_by_drag(P_TAB + t, i + 1);
-            if (covered) uk_push_clip(&g_win, L.col_x[t] - 4, cy, cw + 10, step + 8);
-            draw_card(&g_win, L.col_x[t], cy, cw, ch, p->c[i]);
-            if (covered) uk_pop_clip(&g_win);
+            if (!p->c[i]->sliding) {
+                if (covered) uk_push_clip(&g_win, L.col_x[t] - 4, cy, cw + 10, step + 8);
+                draw_card(&g_win, L.col_x[t], cy, cw, ch, p->c[i]);
+                if (covered) uk_pop_clip(&g_win);
+            }
             cy += step;
         }
     }
@@ -1521,6 +1604,16 @@ static void render(void)
         for (int i = g_press_idx; i < p->n; i++) {
             draw_card(&g_win, dx, dy, cw, ch, p->c[i]);
             dy += L.fan_up;
+        }
+    }
+
+    /* Sliding cards on top */
+    for (int p = 0; p < NPILES; p++) {
+        pile_t *pile = &g_pile[p];
+        for (int i = 0; i < pile->n; i++) {
+            if (pile->c[i]->sliding) {
+                draw_card(&g_win, pile->c[i]->slide_x16 / 16, pile->c[i]->slide_y16 / 16, cw, ch, pile->c[i]);
+            }
         }
     }
 
@@ -1674,6 +1767,14 @@ static void on_release(int mx, int my)
     if (to >= 0 && to != g_press_pile && can_drop(to, p->c[g_press_idx], count)) {
         do_move(g_press_pile, to, count);
         after_change();
+    } else {
+        for (int i = g_press_idx; i < p->n; i++) {
+            int ex, ey;
+            card_rect(g_press_pile, i, &ex, &ey);
+            int dx = g_mx - g_grab_ox;
+            int dy = g_my - g_grab_oy + (i - g_press_idx) * L.fan_up;
+            animate_card(p->c[i], dx, dy, ex, ey, 5);
+        }
     }
 
     g_drag_active = false;
@@ -1756,6 +1857,20 @@ int main(int argc, char **argv)
 
         if (msg.type == AZ_WM_TIMER_TICK) {
             bool dirty = false;
+
+            bool sliding_dirty = false;
+            for (int i = 0; i < 52; i++) {
+                if (g_deck[i].sliding) {
+                    g_deck[i].slide_x16 += g_deck[i].slide_dx16;
+                    g_deck[i].slide_y16 += g_deck[i].slide_dy16;
+                    g_deck[i].slide_ticks--;
+                    if (g_deck[i].slide_ticks <= 0) {
+                        g_deck[i].sliding = false;
+                    }
+                    sliding_dirty = true;
+                }
+            }
+            if (sliding_dirty) dirty = true;
 
             if (g_state == ST_WIN_ANIM) {
                 if (!win_anim_step()) g_state = ST_WIN_PANEL;

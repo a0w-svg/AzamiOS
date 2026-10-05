@@ -74,14 +74,25 @@ void vmm_page_ref_inc(phys_addr_t p)
 {
     size_t f = pfn(p);
     if (f >= VMM_MAX_PHYS_PAGES) return;
-    __atomic_add_fetch(&g_page_refcounts[f], 1, __ATOMIC_RELAXED);
+    uint16_t cur = __atomic_load_n(&g_page_refcounts[f], __ATOMIC_ACQUIRE);
+    while (cur < 0xFFFF) {
+        if (__atomic_compare_exchange_n(&g_page_refcounts[f], &cur, cur + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return;
+        }
+    }
 }
 
 uint16_t vmm_page_ref_dec(phys_addr_t p)
 {
     size_t f = pfn(p);
     if (f >= VMM_MAX_PHYS_PAGES) return 0;
-    return __atomic_sub_fetch(&g_page_refcounts[f], 1, __ATOMIC_ACQ_REL);
+    uint16_t cur = __atomic_load_n(&g_page_refcounts[f], __ATOMIC_ACQUIRE);
+    while (cur > 0) {
+        if (__atomic_compare_exchange_n(&g_page_refcounts[f], &cur, cur - 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return cur - 1;
+        }
+    }
+    return 0;
 }
 
 /* Pull @p's refcount line toward this core ahead of an increment that will

@@ -128,7 +128,9 @@ static void vma_remove_locked(struct process *p, u64 start, u64 end)
         if (v->start < start) {
             v->end = start;
         } else {
+            rb_erase(&v->rb, &p->vma_tree);
             v->start = end;
+            vma_rb_insert(p, v);
         }
         pp = &v->next;
     }
@@ -276,6 +278,8 @@ bool vma_probe(struct process *p, u64 addr, u32 *out_prot)
 {
     if (!p) return false;
 
+    irqflags_t f = spinlock_lock_irqsave(&p->vma_lock);
+
     struct thread *t = sched_current_thread();
     if (t && t->vmacache_seqnum != p->vmacache_seqnum) {
         for (int i = 0; i < 4; i++) t->vmacache[i] = NULL;
@@ -287,12 +291,12 @@ bool vma_probe(struct process *p, u64 addr, u32 *out_prot)
             vm_area_t *cv = t->vmacache[i];
             if (cv && addr >= cv->start && addr < cv->end) {
                 if (out_prot) *out_prot = cv->prot;
+                spinlock_unlock_irqrestore(&p->vma_lock, f);
                 return true;
             }
         }
     }
 
-    irqflags_t f = spinlock_lock_irqsave(&p->vma_lock);
     bool hit = false;
     vm_area_t *found = NULL;
     
@@ -310,8 +314,6 @@ bool vma_probe(struct process *p, u64 addr, u32 *out_prot)
             break;
         }
     }
-    
-    spinlock_unlock_irqrestore(&p->vma_lock, f);
 
     if (hit && t) {
         t->vmacache[3] = t->vmacache[2];
@@ -320,6 +322,7 @@ bool vma_probe(struct process *p, u64 addr, u32 *out_prot)
         t->vmacache[0] = found;
     }
 
+    spinlock_unlock_irqrestore(&p->vma_lock, f);
     return hit;
 }
 

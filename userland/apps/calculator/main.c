@@ -52,6 +52,7 @@ static int g_hist_count = 0;
 #define BTN_OY 130
 
 static uk_window_t g_win;
+static unsigned int g_mouse_buttons;
 static int g_hovered = -1;
 
 /* Button grid geometry for the window's current size.
@@ -374,11 +375,12 @@ int main(int argc, char **argv)
                 draw_calc();
             }
         } else if (msg.type == AZ_WM_MOUSE_EVENT) {
+            unsigned int pressed = uk_mouse_press(&g_mouse_buttons, msg.mouse.buttons);
             int mx = msg.mouse.abs_x;
             int my = msg.mouse.abs_y;
             int hit = hit_button(mx, my);
 
-            if (msg.mouse.buttons & 1) {
+            if (pressed & AZ_MOUSE_BTN_LEFT) {
                 if (hit >= 0) {
                     calc_handle(g_buttons[hit].action);
                     draw_calc();

@@ -102,6 +102,7 @@ static int  g_folder_index = -1;
 static char g_current_path[512] = "";
 
 static uk_window_t g_win;
+static unsigned int g_mouse_buttons;
 
 /* ── Toolbar Buttons ───────────────────────────────────────────────────────── */
 typedef struct {
@@ -931,6 +932,7 @@ int main(int argc, char **argv)
         }
 
         if (msg.type == AZ_WM_MOUSE_EVENT) {
+            unsigned int pressed = uk_mouse_press(&g_mouse_buttons, msg.mouse.buttons);
             int mx = msg.mouse.abs_x;
             int my = msg.mouse.abs_y;
             unsigned int btns = msg.mouse.buttons;
@@ -952,7 +954,7 @@ int main(int argc, char **argv)
                 uk_invalidate(&g_win);
             }
 
-            if ((btns & 1) && !g_dragging) {
+            if ((pressed & AZ_MOUSE_BTN_LEFT) && !g_dragging) {
                 if (my < TOOLBAR_H && g_hovered_btn >= 0) {
                     int btn_id = g_buttons[g_hovered_btn].id;
                     switch (btn_id) {

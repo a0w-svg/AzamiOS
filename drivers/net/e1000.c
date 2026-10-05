@@ -124,7 +124,16 @@ static int e1000_init_rx(void)
 
     for (int i = 0; i < E1000_NUM_RX_DESC; i++) {
         phys_addr_t buf_phys = pmm_alloc_page();
-        if (!buf_phys) return -1;
+        if (!buf_phys) {
+            for (int j = 0; j < i; j++) {
+                pmm_free_page((phys_addr_t)g_e1000_dev.rx_descs[j].addr);
+                g_e1000_dev.rx_buffers[j] = NULL;
+            }
+            pmm_free_page(rx_phys);
+            g_e1000_dev.rx_descs = NULL;
+            g_e1000_dev.rx_descs_phys = 0;
+            return -1;
+        }
         g_e1000_dev.rx_buffers[i] = (u8 *)PHYS_TO_VIRT(buf_phys);
         g_e1000_dev.rx_descs[i].addr = (u64)buf_phys;
         g_e1000_dev.rx_descs[i].status = 0;
@@ -161,7 +170,16 @@ static int e1000_init_tx(void)
 
     for (int i = 0; i < E1000_NUM_TX_DESC; i++) {
         phys_addr_t buf_phys = pmm_alloc_page();
-        if (!buf_phys) return -1;
+        if (!buf_phys) {
+            for (int j = 0; j < i; j++) {
+                pmm_free_page((phys_addr_t)g_e1000_dev.tx_descs[j].addr);
+                g_e1000_dev.tx_buffers[j] = NULL;
+            }
+            pmm_free_page(tx_phys);
+            g_e1000_dev.tx_descs = NULL;
+            g_e1000_dev.tx_descs_phys = 0;
+            return -1;
+        }
         g_e1000_dev.tx_buffers[i] = (u8 *)PHYS_TO_VIRT(buf_phys);
         g_e1000_dev.tx_descs[i].addr = (u64)buf_phys;
         g_e1000_dev.tx_descs[i].status = E1000_TXD_STAT_DD; /* Ready for transmit */
@@ -268,6 +286,17 @@ static int e1000_probe(dm_device_t *dm, const pci_device_id_t *id)
     /* Initialize RX and TX rings */
     if (e1000_init_rx() < 0 || e1000_init_tx() < 0) {
         pr_debug("[E1000] Failed to initialize RX/TX descriptor rings\n");
+        for (int i = 0; i < E1000_NUM_RX_DESC; i++) {
+            if (g_e1000_dev.rx_descs && g_e1000_dev.rx_descs[i].addr) {
+                pmm_free_page((phys_addr_t)g_e1000_dev.rx_descs[i].addr);
+                g_e1000_dev.rx_buffers[i] = NULL;
+            }
+        }
+        if (g_e1000_dev.rx_descs_phys) {
+            pmm_free_page(g_e1000_dev.rx_descs_phys);
+            g_e1000_dev.rx_descs = NULL;
+            g_e1000_dev.rx_descs_phys = 0;
+        }
         return -1;
     }
 
@@ -326,6 +355,30 @@ static void e1000_remove(dm_device_t *dm)
     e1000_write32(E1000_IMC, 0xFFFFFFFF);
     if (g_e1000_dev.irq) hal_irq_disable(g_e1000_dev.irq);
     g_e1000_ready = false;
+
+    for (int i = 0; i < E1000_NUM_RX_DESC; i++) {
+        if (g_e1000_dev.rx_descs && g_e1000_dev.rx_descs[i].addr) {
+            pmm_free_page((phys_addr_t)g_e1000_dev.rx_descs[i].addr);
+            g_e1000_dev.rx_buffers[i] = NULL;
+        }
+    }
+    if (g_e1000_dev.rx_descs_phys) {
+        pmm_free_page(g_e1000_dev.rx_descs_phys);
+        g_e1000_dev.rx_descs = NULL;
+        g_e1000_dev.rx_descs_phys = 0;
+    }
+
+    for (int i = 0; i < E1000_NUM_TX_DESC; i++) {
+        if (g_e1000_dev.tx_descs && g_e1000_dev.tx_descs[i].addr) {
+            pmm_free_page((phys_addr_t)g_e1000_dev.tx_descs[i].addr);
+            g_e1000_dev.tx_buffers[i] = NULL;
+        }
+    }
+    if (g_e1000_dev.tx_descs_phys) {
+        pmm_free_page(g_e1000_dev.tx_descs_phys);
+        g_e1000_dev.tx_descs = NULL;
+        g_e1000_dev.tx_descs_phys = 0;
+    }
 }
 
 /* Intel Gigabit chips: 8254x, 8257x, 8258x, I210/I211, I350, and PCH I217/I218/I219 */

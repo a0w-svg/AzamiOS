@@ -6,6 +6,7 @@
 
 #include "protocol.h"
 #include "region.h"
+#include <linux/fb.h>
 
 #define AZWM_MAX_WINDOWS   32
 #define AZWM_TITLEBAR_H    24
@@ -76,6 +77,8 @@ typedef struct {
     int           active_vram_buf; /* 0 or 1 — the one currently being scanned out */
     int           fb_fd;        /* /dev/fb0, held open for FBIOPAN_DISPLAY */
     unsigned int  fb_yres;      /* rows in one VRAM buffer */
+    struct fb_var_screeninfo pan_var; /* mode cached for page flips */
+    int           pan_var_valid;
     unsigned int  fb_width;
     unsigned int  fb_height;
     unsigned int  fb_pitch;   /* In bytes */
@@ -266,4 +269,3 @@ void compositor_set_window_pinned(az_compositor_t *comp, az_window_t *win, unsig
  * pacing can measure against the same clock compositor.c's own animation
  * timing and FPS counter use, instead of a second reimplementation. */
 long long compositor_now_ns(void);
-

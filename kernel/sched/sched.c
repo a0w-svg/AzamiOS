@@ -28,6 +28,7 @@
 #include "../../fs/vfs.h"
 #include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../time/timekeeping.h"
+#include "../lib/string.h"
 
 
 static spinlock_t g_sched_lock = SPINLOCK_INIT;
@@ -149,8 +150,9 @@ static void rq_remove_thread_locked(thread_t *t);
 static struct rb_root g_sleep_tree = RB_ROOT;
 
 /* High-resolution sleepers (sched_sleep_until_ns), sorted ascending by
- * sleep_deadline_ns and protected by g_sched_lock like g_sleep_queue. Kept
- * apart from the tick-ordered queue because the two are keyed differently:
+ * sleep_deadline_ns. Both sleep trees are protected by g_sleep_lock; paths
+ * that also hold g_sched_lock acquire it first. Kept apart from the
+ * tick-ordered queue because the two are keyed differently:
  * a wake-up here is due at a time, not at a tick number. */
 static struct rb_root g_hr_sleep_tree = RB_ROOT;
 u64 g_system_ticks = 0;
@@ -1037,10 +1039,46 @@ u32 sched_cpu_of(const thread_t *t)
     return t ? t->cpu_id : (u32)-1;
 }
 
+static uts_namespace_t init_uts_ns = {
+    .refcnt = 1,
+    .nodename = "azamios",
+    .domainname = "local",
+};
+
+uts_namespace_t *uts_ns_get(uts_namespace_t *ns)
+{
+    if (ns) {
+        __atomic_add_fetch(&ns->refcnt, 1, __ATOMIC_SEQ_CST);
+    }
+    return ns;
+}
+
+void uts_ns_put(uts_namespace_t *ns)
+{
+    if (ns && ns != &init_uts_ns) {
+        if (__atomic_sub_fetch(&ns->refcnt, 1, __ATOMIC_SEQ_CST) == 0) {
+            kfree(ns);
+        }
+    }
+}
+
+uts_namespace_t *uts_ns_create(const char *nodename, const char *domainname)
+{
+    uts_namespace_t *ns = (uts_namespace_t *)kzalloc(sizeof(uts_namespace_t));
+    if (!ns) return NULL;
+    ns->refcnt = 1;
+    strncpy(ns->nodename, nodename ? nodename : "azamios", sizeof(ns->nodename) - 1);
+    strncpy(ns->domainname, domainname ? domainname : "local", sizeof(ns->domainname) - 1);
+    return ns;
+}
+
 process_t *proc_create(const char *name, phys_addr_t pml4_phys)
 {
     process_t *proc = (process_t *)kzalloc(sizeof(process_t));
     if (!proc) return NULL;
+
+    proc->uts_ns = uts_ns_get(&init_uts_ns);
+    proc->new_pid_ns = false;
 
     proc->pml4_phys = pml4_phys ? pml4_phys : vmm_kernel_space();
     proc->vma_lock = (spinlock_t)SPINLOCK_INIT;
@@ -1175,7 +1213,7 @@ static process_t *sched_find_reaper(process_t *child)
     }
     process_t *curr = g_process_list;
     while (curr) {
-        if ((curr->pid == 1 || curr->pid == 2) && !curr->is_zombie) return curr;
+        if (curr != child && (curr->pid == 1 || curr->pid == 2) && !curr->is_zombie) return curr;
         curr = curr->next;
     }
     return NULL;
@@ -1294,6 +1332,10 @@ void proc_destroy(process_t *proc)
     if (proc->io_bitmap) {
         kfree(proc->io_bitmap);
         proc->io_bitmap = NULL;
+    }
+    if (proc->uts_ns) {
+        uts_ns_put(proc->uts_ns);
+        proc->uts_ns = NULL;
     }
     kfree(proc);
 }
@@ -2117,9 +2159,11 @@ static u32 sched_count_runnable_locked(void)
 {
     u32 count = 0;
     u32 ncpus = smp_cpu_count();
+    if (ncpus > SMP_MAX_CPUS) ncpus = SMP_MAX_CPUS;
     for (u32 i = 0; i < ncpus; i++) {
+        /* nr_running already includes the real-time threads (see
+         * rt_enqueue_locked()); adding rt_nr_running would count them twice. */
         count += __atomic_load_n(&g_cpu_rq[i].nr_running, __ATOMIC_RELAXED);
-        count += __atomic_load_n(&g_cpu_rq[i].rt_nr_running, __ATOMIC_RELAXED);
         cpu_info_t *cpu = smp_cpu_info(i);
         if (cpu && cpu->current_thread && cpu->current_thread != g_idle_threads[i]) {
             count++;
@@ -2159,7 +2203,11 @@ void sched_tick(pt_regs_t *regs)
         lapic_timer_rearm_tick();
         if (!cpu || !cpu->current_thread) return;
         irqflags_t f = spinlock_lock_irqsave(&g_sched_lock);
+        /* The regular tick and wakeup paths also mutate both sleep trees.
+         * Serialize this early timer with them before rb_erase() runs. */
+        spinlock_lock(&g_sleep_lock);
         hr_expire_locked(cpu->cpu_id, ktime_get_ns());
+        spinlock_unlock(&g_sleep_lock);
         spinlock_unlock_irqrestore(&g_sched_lock, f);
         return;
     }
@@ -2296,6 +2344,11 @@ void sched_tick(pt_regs_t *regs)
     }
 
     if (wake_due || hr_due) {
+        /* enqueue_ready() is documented as g_sched_lock-protected; take it
+         * ahead of g_sleep_lock (the order used everywhere else) so a wake
+         * here cannot interleave with sched_unblock()/sched_kill_process()
+         * state transitions on the same thread. */
+        irqflags_t wf = spinlock_lock_irqsave(&g_sched_lock);
         spinlock_lock(&g_sleep_lock);
 
         while (1) {
@@ -2310,6 +2363,7 @@ void sched_tick(pt_regs_t *regs)
         if (hr_due) hr_expire_locked(cpu->cpu_id, tick_now_ns);
 
         spinlock_unlock(&g_sleep_lock);
+        spinlock_unlock_irqrestore(&g_sched_lock, wf);
     }
 
     if (rq_nonempty) {
@@ -2438,7 +2492,9 @@ static void sched_sleep_common(u64 ticks, u64 deadline_ns)
     thread_t *prev = cpu->current_thread;
     /* Don't let a sleep request bury a pending kill — see sched_yield. */
     if (prev->state != THREAD_DYING) {
-        prev->sleep_end_ticks   = deadline_ns ? ~0ULL : g_system_ticks + ticks;
+        u64 now_ticks = g_system_ticks;
+        prev->sleep_end_ticks   = deadline_ns ? ~0ULL
+                                : (ticks > ~0ULL - now_ticks ? ~0ULL : now_ticks + ticks);
         prev->sleep_deadline_ns = deadline_ns;
         prev->state = THREAD_SLEEPING_PENDING;
         prev->unblock_pending = false;
@@ -2503,9 +2559,14 @@ void sched_sleep_until_ns(u64 deadline_ns)
     }
     if (!lapic_hrtimer_available()) {
         /* No one-shot timer: the first tick at or after the deadline. */
-        u64 rem = deadline_ns - ktime_get_ns();
+        u64 now_ns = ktime_get_ns();
+        if (now_ns >= deadline_ns) {
+            sched_yield();
+            return;
+        }
+        u64 rem = deadline_ns - now_ns;
         u64 tick_ns = NSEC_PER_SEC / TK_HZ;
-        sched_sleep((rem + tick_ns - 1) / tick_ns);
+        sched_sleep(rem / tick_ns + ((rem % tick_ns) ? 1 : 0));
         return;
     }
     sched_sleep_common(0, deadline_ns);
@@ -3057,7 +3118,7 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
                 bool match;
                 if (target_pid == -1)      match = true;
                 else if (target_pid == 0)  match = (p->pgid == curr_proc->pgid);
-                else if (target_pid < -1)  match = (p->pgid == (u32)(-target_pid));
+                else if (target_pid < -1)  match = (p->pgid == (u32)(-(s64)target_pid));
                 else                       match = ((s32)p->pid == target_pid);
 
                 if (match) {
@@ -3244,6 +3305,10 @@ s64 sched_waitpid(s32 target_pid, int *status, int options)
         if (curr_proc->wait_thread == curr_thread) {
             curr_proc->wait_thread = NULL;
         }
+        if (curr_proc->sig_pending & ~curr_proc->sig_blocked) {
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            return -(s64)EINTR;
+        }
         spinlock_unlock_irqrestore(&g_sched_lock, irqf);
     }
 }
@@ -3293,6 +3358,9 @@ void proc_put(process_t *p)
 s64 sched_kill_process(u32 pid, int sig)
 {
     if (pid == 0) return -(s64)EINVAL;
+    /* An out-of-range signal would skip every disposition check below and
+     * land on the fatal path, killing the target. */
+    if (sig < 0 || sig >= _NSIG) return -(s64)EINVAL;
 
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
     process_t *target = NULL;
@@ -3313,6 +3381,13 @@ s64 sched_kill_process(u32 pid, int sig)
     if (!target) {
         spinlock_unlock_irqrestore(&g_sched_lock, irqf);
         return -(s64)ESRCH;
+    }
+
+    /* The kernel process owns the idle threads and the reaper; zombifying
+     * them would leave a CPU with nothing to run. */
+    if (target == g_kernel_proc && sig != 0) {
+        spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+        return -(s64)EPERM;
     }
 
     if (sig == 0) {

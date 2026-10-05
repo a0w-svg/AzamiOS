@@ -17,9 +17,9 @@
 #define RTL8169_DESC_LS       (1U << 28)  /* Last segment descriptor  */
 
 typedef struct __attribute__((packed, aligned(16))) {
-    u32 opts1;
-    u32 opts2;
-    u64 buf_addr;
+    volatile u32 opts1;
+    volatile u32 opts2;
+    volatile u64 buf_addr;
 } rtl8169_desc_t;
 
 void rtl8169_init(void);

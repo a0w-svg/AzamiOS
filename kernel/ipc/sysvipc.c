@@ -321,7 +321,7 @@ s64 sysv_shmat(int shmid, virt_addr_t shmaddr, int shmflg)
         va = shmaddr;
         if (shmflg & SHM_RND) va = ALIGN_DOWN(va, PAGE_SIZE);
         if (va & (PAGE_SIZE - 1)) { spinlock_unlock(&g_ipc_lock); return -(s64)EINVAL; }
-        if (va < 0x1000 || va + len >= 0x0000800000000000ULL) {
+        if (va < 0x1000 || va + len < va || va + len >= 0x0000800000000000ULL) {
             spinlock_unlock(&g_ipc_lock);
             return -(s64)EINVAL;
         }
@@ -1056,7 +1056,10 @@ s64 sysv_msgsnd(int msqid, const void *msgp, size_t msgsz, int msgflg)
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
     if (msgsz > MSG_MAX_SIZE) return -(s64)EINVAL;
-    if (!user_ptr_ok(msgp)) return -(s64)EFAULT;
+    if (!user_ptr_ok(msgp) ||
+        (uintptr_t)msgp + sizeof(s64) + msgsz < (uintptr_t)msgp ||
+        (uintptr_t)msgp + sizeof(s64) + msgsz > TASK_SIZE_MAX)
+        return -(s64)EFAULT;
 
     /* The user buffer is `struct msgbuf { long mtype; char mtext[]; }`. */
     s64 mtype;
@@ -1109,7 +1112,10 @@ s64 sysv_msgrcv(int msqid, void *msgp, size_t msgsz, s64 msgtyp, int msgflg)
 {
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (!user_ptr_ok(msgp)) return -(s64)EFAULT;
+    if (!user_ptr_ok(msgp) ||
+        (uintptr_t)msgp + sizeof(s64) + msgsz < (uintptr_t)msgp ||
+        (uintptr_t)msgp + sizeof(s64) + msgsz > TASK_SIZE_MAX)
+        return -(s64)EFAULT;
 
     for (;;) {
         spinlock_lock(&g_ipc_lock);

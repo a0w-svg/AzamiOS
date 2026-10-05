@@ -149,8 +149,11 @@ int dm_bus_probe_device(dm_device_t *dev)
                 args->dev = dev;
                 args->drv = drv;
                 __atomic_add_fetch(&g_async_probes_pending, 1, __ATOMIC_SEQ_CST);
-                thread_create(sched_kernel_process(), (uintptr_t)async_probe_thread, (uintptr_t)args, true);
-                return 1;
+                if (thread_create(sched_kernel_process(), (uintptr_t)async_probe_thread,
+                                  (uintptr_t)args, true))
+                    return 1;
+                __atomic_sub_fetch(&g_async_probes_pending, 1, __ATOMIC_SEQ_CST);
+                kfree(args);
             }
         }
         
@@ -199,12 +202,16 @@ int dm_driver_register(dm_driver_t *drv)
                 args->dev = dev;
                 args->drv = drv;
                 __atomic_add_fetch(&g_async_probes_pending, 1, __ATOMIC_SEQ_CST);
-                thread_create(sched_kernel_process(), (uintptr_t)async_probe_thread, (uintptr_t)args, true);
-                bound++;
+                if (thread_create(sched_kernel_process(), (uintptr_t)async_probe_thread,
+                                  (uintptr_t)args, true)) {
+                    bound++;
+                    continue;
+                }
+                __atomic_sub_fetch(&g_async_probes_pending, 1, __ATOMIC_SEQ_CST);
+                kfree(args);
             }
-        } else {
-            if (dm_really_probe(dev, drv) == 0) bound++;
         }
+        if (dm_really_probe(dev, drv) == 0) bound++;
     }
 
     pr_debug("[DEVCORE] driver '%s' registered on bus '%s' (async: %d, %u device%s bound/queued)\n",

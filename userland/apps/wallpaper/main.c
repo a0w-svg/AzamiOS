@@ -36,6 +36,9 @@
 #include "../azwm/de_font.h"
 #include "../shared/de_log.h"
 #include "../shared/png_decode.h"
+#include "../../libc/include/time.h"
+#include "../../libc/include/sys/sysinfo.h"
+
 
 /* ── Build-time defaults ───────────────────────────────────────────────────── */
 #define DEFAULT_WIDTH   1280
@@ -153,7 +156,7 @@ static void wp_render_animated_gradient(unsigned int *px, unsigned int w, unsign
         tr_r = clamp_u8(0x4A + s2); tr_g = clamp_u8(0x22 + s1); tr_b = 0x24;
         bl_r = 0x18; bl_g = 0x0C; bl_b = 0x22;
         br_r = clamp_u8(0x34 + s1); br_g = 0x12; br_b = 0x1C;
-    } else {
+    } else if (g_wallpaper_theme == 4) {
         /* Theme 4: Midnight Ocean */
         int s1 = tri_wave(phase, 130, 14);
         int s2 = tri_wave(phase + 65, 150, 16);
@@ -161,6 +164,85 @@ static void wp_render_animated_gradient(unsigned int *px, unsigned int w, unsign
         tr_r = 0x0A; tr_g = clamp_u8(0x26 + s2); tr_b = clamp_u8(0x48 + s1);
         bl_r = 0x04; bl_g = 0x0A; bl_b = 0x18;
         br_r = 0x06; br_g = clamp_u8(0x14 + s1); br_b = clamp_u8(0x28 + s2);
+    } else if (g_wallpaper_theme == 5) {
+        /* Theme 5: Matrix Digital Rain */
+        /* Base background is pure black */
+        for (unsigned int y = 0; y < h; y++) {
+            unsigned int *line = &px[y * w];
+            for (unsigned int x = 0; x < w; x++) line[x] = 0xFF050505;
+        }
+        
+        /* Draw the rain */
+        unsigned int rng = 0x1337C0DE;
+        int num_drops = w / 20;
+        for (int i = 0; i < num_drops; i++) {
+            rng = xorshift32(&rng);
+            int col = (rng % (w / 16)) * 16;
+            rng = xorshift32(&rng);
+            int speed = (rng % 8) + 2;
+            int drop_y = (phase * speed + (rng % h)) % h;
+            rng = xorshift32(&rng);
+            int length = (rng % 40) + 10;
+            
+            for (int dy = 0; dy < length; dy++) {
+                int py = drop_y - dy;
+                if (py < 0) py += h;
+                
+                int r = 0, g = 0, b = 0;
+                if (dy == 0) {
+                    r = 200; g = 255; b = 200;
+                } else {
+                    g = 255 - (dy * 255 / length);
+                }
+                
+                // Draw a random character block
+                rng = xorshift32(&rng);
+                if (rng % 100 < 5) {
+                    px[py * w + col] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                    if (col + 1 < w) px[py * w + col + 1] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+        return;
+    } else if (g_wallpaper_theme == 6) {
+        /* Theme 6: Winter Snowfall */
+        /* Base background */
+        int tl_r = 0x0F, tl_g = 0x17, tl_b = 0x2A;
+        int bl_r = 0x1E, bl_g = 0x29, bl_b = 0x3B;
+        for (unsigned int y = 0; y < h; y++) {
+            int r = tl_r + (bl_r - tl_r) * (int)y / h;
+            int g = tl_g + (bl_g - tl_g) * (int)y / h;
+            int b = tl_b + (bl_b - tl_b) * (int)y / h;
+            unsigned int *line = &px[y * w];
+            for (unsigned int x = 0; x < w; x++) line[x] = 0xFF000000 | (r << 16) | (g << 8) | b;
+        }
+        
+        /* Draw the snow */
+        unsigned int rng = 0x50005000;
+        for (int i = 0; i < 400; i++) {
+            rng = xorshift32(&rng);
+            int speed_y = (rng % 4) + 1;
+            int speed_x = (rng % 3) - 1;
+            
+            int sy = (phase * speed_y + (rng % h)) % h;
+            rng = xorshift32(&rng);
+            int sx = (phase * speed_x + (rng % w)) % w;
+            if (sx < 0) sx += w;
+            
+            rng = xorshift32(&rng);
+            int size = (rng % 3); // 0..2
+            
+            for (int dy = 0; dy <= size; dy++) {
+                for (int dx = 0; dx <= size; dx++) {
+                    int py = sy + dy;
+                    int px_x = sx + dx;
+                    if (py < h && px_x < w) {
+                        px[py * w + px_x] = 0xFFFFFFFF;
+                    }
+                }
+            }
+        }
+        return;
     }
 
     int div_h = (h > 1) ? (int)(h - 1) : 1;
@@ -342,12 +424,14 @@ static int  g_marquee_y1 = 0;
 static int  g_marquee_x2 = 0;
 static int  g_marquee_y2 = 0;
 
-static const char *g_theme_names[5] = {
+static const char *g_theme_names[7] = {
     "Catppuccin Mocha",
     "Cyberpunk Neon",
     "Emerald Aurora",
     "Sunset Horizon",
-    "Midnight Ocean"
+    "Midnight Ocean",
+    "Matrix Digital Rain",
+    "Winter Snowfall"
 };
 
 /* Context Menu Items */
@@ -743,7 +827,7 @@ static void wp_draw_context_menu(unsigned int *pixels, unsigned int w, unsigned 
         if (i == hover) {
             wp_fill_rect(pixels, w, h, x + 4, iy, menu_w - 8, 24, 0xFF45475A);
         }
-        const char *item_text = (!is_icon_ctx && i == 11 && g_wallpaper_theme >= 0 && g_wallpaper_theme < 5)
+        const char *item_text = (!is_icon_ctx && i == 11 && g_wallpaper_theme >= 0 && g_wallpaper_theme < 7)
                                 ? g_theme_names[g_wallpaper_theme]
                                 : items[i];
         for (int j = 0; item_text[j]; j++) {
@@ -875,6 +959,96 @@ static void wp_draw_marquee(unsigned int *pixels, unsigned int w, unsigned int h
     }
 }
 
+
+/* ============================================================================
+ * Desktop Widgets (Clock & System Stats)
+ * ============================================================================ */
+
+static void wp_draw_clock_widget(unsigned int *pixels, unsigned int w, unsigned int h)
+{
+    time_t t = time(NULL);
+    struct tm tm_info;
+    localtime_r(&t, &tm_info);
+    char time_buf[16];
+    char date_buf[64];
+    snprintf(time_buf, sizeof(time_buf), "%02d:%02d", tm_info.tm_hour, tm_info.tm_min);
+    
+    const char *days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    snprintf(date_buf, sizeof(date_buf), "%s, %d %s %d", days[tm_info.tm_wday], tm_info.tm_mday, months[tm_info.tm_mon], 1900 + tm_info.tm_year);
+    
+    int time_scale = 10;
+    int time_w = 5 * 8 * time_scale;
+    int x = (w - time_w) / 2;
+    int y = h / 5;
+
+    // Drop shadow
+    de_font_draw_str_ex(pixels, w, w, h, x + 8, y + 8, time_buf, 0xAA000000, &de_font_regular, time_scale, false);
+    // Main text (White with slight transparency)
+    de_font_draw_str_ex(pixels, w, w, h, x, y, time_buf, 0xFFFFFFFF, &de_font_regular, time_scale, false);
+
+    int date_scale = 3;
+    int date_len = strlen(date_buf);
+    int date_w = date_len * 8 * date_scale;
+    int date_x = (w - date_w) / 2;
+    int date_y = y + 16 * time_scale + 20;
+    
+    de_font_draw_str_ex(pixels, w, w, h, date_x + 4, date_y + 4, date_buf, 0xAA000000, &de_font_regular, date_scale, false);
+    de_font_draw_str_ex(pixels, w, w, h, date_x, date_y, date_buf, 0xFFCDD6F4, &de_font_regular, date_scale, false);
+}
+
+static az_sysstat_t g_last_sysstat;
+static bool g_have_sysstat = false;
+static int g_cpu_pct = 0;
+
+static void wp_update_sysstat(void)
+{
+    az_sysstat_t cur;
+    syscall1(SYS_AZ_SYSSTAT, (long)&cur);
+    if (g_have_sysstat) {
+        unsigned long long d_idle = 0, d_active = 0;
+        for (int cc = 0; cc < 4; cc++) {
+            d_idle   += cur.idle_ticks[cc]   - g_last_sysstat.idle_ticks[cc];
+            d_active += cur.active_ticks[cc] - g_last_sysstat.active_ticks[cc];
+        }
+        unsigned long long total = d_idle + d_active;
+        if (total > 0) {
+            g_cpu_pct = (int)((d_active * 100ULL) / total);
+            if (g_cpu_pct > 100) g_cpu_pct = 100;
+        }
+    }
+    g_last_sysstat = cur;
+    g_have_sysstat = true;
+}
+
+static void wp_draw_sys_widget(unsigned int *pixels, unsigned int w, unsigned int h)
+{
+    struct sysinfo info;
+    sysinfo(&info);
+    int mem_pct = 0;
+    if (info.totalram > 0) {
+        mem_pct = (int)(((info.totalram - info.freeram) * 100ULL) / info.totalram);
+    }
+    
+    int scale = 2;
+    char buf1[64], buf2[64];
+    snprintf(buf1, sizeof(buf1), "CPU: %3d%%", g_cpu_pct);
+    snprintf(buf2, sizeof(buf2), "RAM: %3d%%", mem_pct);
+    int len1 = strlen(buf1);
+    int text_w = len1 * 8 * scale;
+    int x = w - text_w - 60;
+    int y = 60;
+    
+    // Glassy background
+    wp_fill_rect(pixels, w, h, x - 20, y - 20, text_w + 40, 32 * scale + 40, 0x7711111B);
+    
+    de_font_draw_str_ex(pixels, w, w, h, x + 2, y + 2, buf1, 0x88000000, &de_font_regular, scale, false);
+    de_font_draw_str_ex(pixels, w, w, h, x, y, buf1, 0xFFF38BA8, &de_font_regular, scale, false);
+    
+    de_font_draw_str_ex(pixels, w, w, h, x + 2, y + 16 * scale + 2, buf2, 0x88000000, &de_font_regular, scale, false);
+    de_font_draw_str_ex(pixels, w, w, h, x, y + 16 * scale, buf2, 0xFFA6E3A1, &de_font_regular, scale, false);
+}
+
 /* The private frame buffer, or NULL if it could not be allocated. */
 static unsigned int *g_frame_buf = 0;
 
@@ -893,6 +1067,9 @@ static void wallpaper_render_frame(unsigned int *pixels, unsigned int w, unsigne
     wp_render_stars_animated(pixels, w, h, phase);
     wp_render_logo(pixels, w, h);
 
+        wp_draw_clock_widget(pixels, w, h);
+    wp_draw_sys_widget(pixels, w, h);
+    
     /* Draw desktop icons */
     for (int i = 0; i < g_num_desktop_icons; i++) {
         wp_draw_icon(pixels, w, h, &g_desktop_icons[i], (g_selected_icon == i), (g_hovered_icon == i));
@@ -1078,6 +1255,7 @@ int main(int argc, char **argv)
 
         switch (msg.type) {
         case AZ_WM_TIMER_TICK:
+            if (phase % 10 == 0) wp_update_sysstat();
             phase++;
             rescan_counter++;
             /* Periodic filesystem re-scan every ~3 seconds (15 ticks) */

@@ -122,6 +122,14 @@ void unix_socket_close(unix_sock_t *u)
     if (tx) pipe_close_end(tx, false);
     if (rx) pipe_close_end(rx, true);
 
+    if (u->last_recv_msg) {
+        for (int i = 0; i < u->last_recv_msg->nfds; i++) {
+            if (u->last_recv_msg->fds[i]) vfs_close(u->last_recv_msg->fds[i]);
+        }
+        kfree(u->last_recv_msg);
+        u->last_recv_msg = NULL;
+    }
+
     /* Drops the creator's reference; a concurrent connect()/sendmsg() that
      * looked this socket up in the registry and is still holding its own
      * (see unix_sock_get()) keeps it alive until that's done with it. */
@@ -397,6 +405,12 @@ s64 unix_socket_recvmsg(unix_sock_t *u, void *buf, size_t len, char *src_path_ou
     if (msg->nfds == 0) {
         kfree(msg);
     } else {
+        if (u->last_recv_msg) {
+            for (int i = 0; i < u->last_recv_msg->nfds; i++) {
+                if (u->last_recv_msg->fds[i]) vfs_close(u->last_recv_msg->fds[i]);
+            }
+            kfree(u->last_recv_msg);
+        }
         u->last_recv_msg = msg;
     }
 
@@ -431,6 +445,12 @@ int unix_socket_poll(unix_sock_t *u)
     if (!u) return 0;
     int mask = 0;
     if (u->type == SOCK_STREAM) {
+        if (u->state == UNIX_ST_LISTENING) {
+            spinlock_lock(&u->lock);
+            if (u->msg_head) mask |= 0x0001 /* POLLIN */;
+            spinlock_unlock(&u->lock);
+            return mask;
+        }
         if (u->state != UNIX_ST_CONNECTED) return 0;
         if (u->rx_pipe && u->rx_pipe->count > 0) mask |= 0x0001 /* POLLIN */;
         if (u->rx_pipe && u->rx_pipe->writers == 0) mask |= 0x0010 /* POLLHUP */ | 0x0001;

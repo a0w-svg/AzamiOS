@@ -1764,16 +1764,8 @@ int prctl(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4
 
 unsigned long getauxval(unsigned long type)
 {
-    switch (type) {
-    case 6:  /* AT_PAGESZ */ return 4096;
-    case 11: /* AT_UID */    return (unsigned long)getuid();
-    case 12: /* AT_EUID */   return (unsigned long)geteuid();
-    case 13: /* AT_GID */    return (unsigned long)getgid();
-    case 14: /* AT_EGID */   return (unsigned long)getegid();
-    case 17: /* AT_CLKTCK */ return 100;
-    case 23: /* AT_SECURE */ return 0;
-    default: return 0;
-    }
+    extern unsigned long __libc_getauxval(unsigned long type);
+    return __libc_getauxval(type);
 }
 
 /* adjtimex()/ntp_adjtime() used to ignore `buf` entirely and always report

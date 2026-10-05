@@ -125,11 +125,11 @@ static void draw_tab_widgets(void)
     /* Buttons row */
     uk_btn_state_t btn1_state = (g_mx >= 24 && g_mx <= 134 && g_my >= 280 && g_my <= 312)
                                  ? (g_mouse_down ? UK_BTN_PRESSED : UK_BTN_HOVER) : UK_BTN_NORMAL;
-    uk_draw_button(&g_win, 24, 280, 110, 32, "Primary", btn1_state);
+    uk_draw_button(&g_win, 24, 280, 110, 32, "Notify", btn1_state);
 
     uk_btn_state_t btn2_state = (g_mx >= 148 && g_mx <= 258 && g_my >= 280 && g_my <= 312)
                                  ? (g_mouse_down ? UK_BTN_PRESSED : UK_BTN_HOVER) : UK_BTN_NORMAL;
-    uk_draw_button(&g_win, 148, 280, 110, 32, "Action", btn2_state);
+    uk_draw_button(&g_win, 148, 280, 110, 32, "Terminal", btn2_state);
 
     uk_draw_button(&g_win, 272, 280, 110, 32, "Disabled", UK_BTN_DISABLED);
 
@@ -511,6 +511,16 @@ static void handle_click(int mx, int my)
     }
 
     if (g_tab == 0) {
+        if (my >= 280 && my < 312) {
+            if (mx >= 24 && mx < 134) {
+                uk_notify(&g_win, "Widget Studio", "Notification button activated.");
+                return;
+            }
+            if (mx >= 148 && mx < 258) {
+                uk_launch_app(&g_win, "/bin/terminal.elf");
+                return;
+            }
+        }
         /* Search bar click */
         if (mx >= 24 && mx <= 340 && my >= 204 && my <= 236) {
             if (mx >= 340 - 24) {

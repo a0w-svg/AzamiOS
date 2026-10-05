@@ -725,7 +725,6 @@ restart:
                 /* Follow the link by restarting the walk, not by recursing. */
                 path          = next_path;
                 symlink_depth = symlink_depth + 1;
-                follow_final  = true;
                 goto restart;
             }
         }
@@ -1065,7 +1064,7 @@ s64 vfs_ioctl(file_t *file, u32 cmd, u64 arg)
 s64 vfs_mkdir(const char *path, u32 mode)
 {
     dentry_t *dentry = NULL;
-    s64 err = vfs_path_lookup(path, &dentry);
+    s64 err = vfs_path_lookup_nofollow(path, &dentry);
     if (err == -(s64)ENOENT && dentry) {
         if (dentry->d_parent && inode_is_rdonly(dentry->d_parent->d_inode)) {
             if (!dentry->d_inode) kfree(dentry);
@@ -1234,20 +1233,37 @@ s64 vfs_rmdir(const char *path)
     return err;
 }
 
-s64 vfs_rename(const char *oldpath, const char *newpath)
+s64 vfs_rename_flags(const char *oldpath, const char *newpath, unsigned int flags)
 {
+    if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
+        return -(s64)EINVAL;
+    if ((flags & RENAME_NOREPLACE) && (flags & RENAME_EXCHANGE))
+        return -(s64)EINVAL;
+    if ((flags & RENAME_WHITEOUT) && (flags & RENAME_EXCHANGE))
+        return -(s64)EINVAL;
+    if (flags & (RENAME_EXCHANGE | RENAME_WHITEOUT))
+        return -(s64)EINVAL;
+
     dentry_t *old_dentry = NULL, *new_dentry = NULL;
-    s64 err = vfs_path_lookup(oldpath, &old_dentry);
+    /* POSIX: rename() does not follow symbolic links on either oldpath or
+     * newpath. If oldpath is a symlink, the link itself is moved; if newpath
+     * is a symlink, it is replaced rather than followed. */
+    s64 err = vfs_path_lookup_nofollow(oldpath, &old_dentry);
     if (err < 0 || !old_dentry || !old_dentry->d_inode) {
         if (old_dentry && !old_dentry->d_inode) kfree(old_dentry);
         return -(s64)ENOENT;
     }
-    err = vfs_path_lookup(newpath, &new_dentry);
+    err = vfs_path_lookup_nofollow(newpath, &new_dentry);
     if (err < 0 && err != -(s64)ENOENT) {
         if (new_dentry && !new_dentry->d_inode) kfree(new_dentry);
         return err;
     }
     if (!new_dentry) return -(s64)ENOENT;
+
+    /* Linux renameat2: RENAME_NOREPLACE returns -EEXIST if target exists */
+    if ((flags & RENAME_NOREPLACE) && new_dentry->d_inode) {
+        return -(s64)EEXIST;
+    }
 
     if (inode_is_rdonly(old_dentry->d_inode) ||
         (new_dentry->d_parent && inode_is_rdonly(new_dentry->d_parent->d_inode))) {
@@ -1286,6 +1302,11 @@ s64 vfs_rename(const char *oldpath, const char *newpath)
     return err;
 }
 
+s64 vfs_rename(const char *oldpath, const char *newpath)
+{
+    return vfs_rename_flags(oldpath, newpath, 0);
+}
+
 s64 vfs_truncate(file_t *file, u64 length)
 {
     if (!file || !file->f_inode) return -(s64)EBADF;
@@ -1310,7 +1331,7 @@ s64 vfs_truncate(file_t *file, u64 length)
 s64 vfs_symlink(const char *target, const char *linkpath)
 {
     dentry_t *dentry = NULL;
-    s64 err = vfs_path_lookup(linkpath, &dentry);
+    s64 err = vfs_path_lookup_nofollow(linkpath, &dentry);
     if (err == -(s64)ENOENT && dentry) {
         if (dentry->d_parent && inode_is_rdonly(dentry->d_parent->d_inode)) {
             if (!dentry->d_inode) kfree(dentry);
@@ -1628,8 +1649,12 @@ s64 vfs_flock(file_t *file, int operation)
                 spinlock_unlock(&g_vfs_lock);
                 return -(s64)11; /* -EWOULDBLOCK / -EAGAIN */
             }
+            if (proc && (proc->sig_pending & ~proc->sig_blocked)) {
+                spinlock_unlock(&g_vfs_lock);
+                return -(s64)EINTR;
+            }
             spinlock_unlock(&g_vfs_lock);
-            sched_yield();
+            sched_sleep(1);
             spinlock_lock(&g_vfs_lock);
         }
         ino->i_flock_type = LOCK_SH;
@@ -1646,8 +1671,12 @@ s64 vfs_flock(file_t *file, int operation)
                 spinlock_unlock(&g_vfs_lock);
                 return -(s64)11; /* -EWOULDBLOCK / -EAGAIN */
             }
+            if (proc && (proc->sig_pending & ~proc->sig_blocked)) {
+                spinlock_unlock(&g_vfs_lock);
+                return -(s64)EINTR;
+            }
             spinlock_unlock(&g_vfs_lock);
-            sched_yield();
+            sched_sleep(1);
             spinlock_lock(&g_vfs_lock);
         }
         ino->i_flock_type = LOCK_EX;

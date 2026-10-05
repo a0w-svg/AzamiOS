@@ -32,6 +32,8 @@
 #define MAP_ADDR    ((void *)0x64000000)
 
 static uk_window_t g_win;
+static unsigned int g_mouse_buttons;
+static char g_task_status[80];
 static unsigned int g_tick = 0;
 
 /* ── System Telemetry ───────────────────────────────────────────────────── */
@@ -283,7 +285,7 @@ static void draw_sysmon(void)
      * table above is, so trading Regular's size for a line that fits the
      * 34px action bar with room to spare (and centres cleanly in it,
      * unlike Regular's 16px cell) reads as tidier without losing anything. */
-    uk_draw_text_small(&g_win, 12, (int)h - 21, foot, UK_OVERLAY0);
+    uk_draw_text_small(&g_win, 12, (int)h - 21, g_task_status[0] ? g_task_status : foot, UK_OVERLAY0);
 
     /* End Process Button */
     uk_draw_button(&g_win, (int)w - 110, (int)h - 29, 98, 24, "End Task", UK_BTN_PRESSED);
@@ -293,14 +295,19 @@ static void draw_sysmon(void)
 
 static void kill_selected_process(void)
 {
-    if (g_selected_proc >= 0 && g_selected_proc < g_proc_count) {
+    if (g_selected_proc < 0 || g_selected_proc >= g_proc_count) {
+        snprintf(g_task_status, sizeof(g_task_status), "Select a process first.");
+    } else {
         int pid = g_proc_list[g_selected_proc].pid;
-        if (pid > 1) {
-            sys_kill(pid, 9 /* SIGKILL */);
+        if (pid <= 1) snprintf(g_task_status, sizeof(g_task_status), "System process cannot be ended here.");
+        else if (sys_kill(pid, 9 /* SIGKILL */) < 0)
+            snprintf(g_task_status, sizeof(g_task_status), "Could not end PID %d: access denied or process exited.", pid);
+        else {
+            snprintf(g_task_status, sizeof(g_task_status), "Termination requested for PID %d.", pid);
             refresh_processes();
-            draw_sysmon();
         }
     }
+    draw_sysmon();
 }
 
 static void update_telemetry(void)
@@ -422,15 +429,15 @@ int main(int argc, char **argv)
 
             if (msg->key.keycode == 'q' || msg->key.keycode == 0x1B) { /* ESC or q */
                 sys_exit(0);
-            } else if (msg->key.keycode == 'k' || msg->key.keycode == 127) { /* Delete or k */
+            } else if (msg->key.keycode == 'k' || msg->key.keycode == KEY_DELETE) { /* Delete or k */
                 kill_selected_process();
-            } else if (msg->key.keycode == 0xE2) { /* Up */
+            } else if (msg->key.keycode == KEY_UP) { /* Up */
                 if (g_selected_proc > 0) {
                     g_selected_proc--;
                     if (g_selected_proc < g_proc_scroll) g_proc_scroll = g_selected_proc;
                     draw_sysmon();
                 }
-            } else if (msg->key.keycode == 0xE3) { /* Down */
+            } else if (msg->key.keycode == KEY_DOWN) { /* Down */
                 if (g_selected_proc < g_proc_count - 1) {
                     g_selected_proc++;
                     if (g_selected_proc >= g_proc_scroll + 13) g_proc_scroll = g_selected_proc - 12;
@@ -441,9 +448,10 @@ int main(int argc, char **argv)
         }
 
         case AZ_WM_MOUSE_EVENT: {
+            unsigned int pressed = uk_mouse_press(&g_mouse_buttons, msg->mouse.buttons);
             int mx = msg->mouse.abs_x;
             int my = msg->mouse.abs_y;
-            if (msg->mouse.buttons & AZ_MOUSE_BTN_LEFT) {
+            if (pressed & AZ_MOUSE_BTN_LEFT) {
                 /* End Task Button */
                 if (mx >= (int)g_win.width - 110 && mx <= (int)g_win.width - 12 &&
                     my >= (int)g_win.height - 29 && my <= (int)g_win.height - 5) {

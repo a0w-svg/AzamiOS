@@ -115,24 +115,15 @@ xsave_probe_asm:
     ret
 
 ; int mwait_probe_asm(void *scratch);
-; Returns 0 if MONITOR/MWAIT executed, 1 if either faulted.
-;
-; Arming the monitor and then storing to the watched line means the following
-; MWAIT has a break event waiting for it and returns immediately, so the probe
-; cannot park the boot CPU. (MWAIT with no armed monitor is also architecturally
-; a NOP, so this is belt and braces.) Both instructions carry .extable fixups
-; because a hypervisor may advertise MONITOR in CPUID and still fault on them.
+; Returns 0 if MONITOR executed without fault, 1 if faulted (#UD/#GP).
+; We only probe MONITOR and do not execute MWAIT while interrupts are disabled,
+; because in single-core or emulated environments (e.g. QEMU TCG) MWAIT halts the core.
 mwait_probe_asm:
     mov  rax, rdi
     xor  ecx, ecx
     xor  edx, edx
 .probe_monitor:
     monitor
-    mov  qword [rdi], 1
-    xor  eax, eax
-    xor  ecx, ecx
-.probe_mwait:
-    mwait
     xor  eax, eax
     ret
 .probe_fault:
@@ -224,7 +215,4 @@ align 8
     dq xsave_probe_asm.probe_fault
 
     dq mwait_probe_asm.probe_monitor
-    dq mwait_probe_asm.probe_fault
-
-    dq mwait_probe_asm.probe_mwait
     dq mwait_probe_asm.probe_fault

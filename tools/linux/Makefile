@@ -13,15 +13,16 @@
 #   make -C tools/linux toolchain  — build musl and its musl-gcc wrapper only
 #   make -C tools/linux busybox    — build BusyBox, static, against musl
 #   make -C tools/linux probe      — build the Linux-ABI conformance probe
+#   make -C tools/linux shared-musl — build the stock musl ELF interpreter
 #   make -C tools/linux install    — stage the results into the initrd tree
 #   make -C tools/linux ports      — build the ported third-party software
 #                                    (see ports.mk; not part of `all`)
 #   make -C tools/linux clean      — drop build output, keep the tarballs
 #   make -C tools/linux distclean  — drop everything, including the tarballs
 #
-# Static linking is deliberate. A dynamic binary would need ld-linux plus the
-# shared libc on the image and would exercise the loader's PT_INTERP path; the
-# static case is the one that isolates "does the kernel's ABI hold up".
+# BusyBox and the ABI probe stay static to isolate the syscall ABI. The
+# optional shared-musl target supplies the interpreter for dynamic Linux
+# binaries; install stages it when built, alongside the native libc/loader.
 # ==============================================================================
 
 MUSL_VER    := 1.2.5
@@ -46,6 +47,7 @@ BUSYBOX_SRC := $(SRC_DIR)/busybox-$(BUSYBOX_VER)
 MUSL_GCC   := $(MUSL_DIR)/bin/musl-gcc
 BUSYBOX    := $(OUT_DIR)/bin/busybox
 PROBE      := $(OUT_DIR)/bin/azami-abi-probe
+MUSL_SHARED_BUILD := $(SRC_DIR)/musl-shared-$(MUSL_VER)
 
 # Where `install` stages the binaries. The initrd is built from this tree by
 # the top-level `iso` target.
@@ -95,7 +97,7 @@ LZIP := $(shell command -v lzip 2>/dev/null || \
                echo lzip-not-found)
 export PATH := $(HOME)/.local/bin:$(PATH)
 
-.PHONY: all toolchain busybox probe install clean distclean fetch
+.PHONY: all toolchain busybox probe shared-musl install clean distclean fetch
 
 all: toolchain busybox probe
 	@echo ""
@@ -147,6 +149,20 @@ $(MUSL_GCC): $(MUSL_SRC)/configure
 	@echo "  ✓  musl-gcc: $(MUSL_GCC)"
 
 # ── BusyBox ──────────────────────────────────────────────────────────────────
+# Build the upstream musl interpreter separately from the static toolchain.
+# Do not run musl's install-libs here: its default syslibdir is the host /lib.
+shared-musl: $(MUSL_DIR)/lib/libc.so
+
+$(MUSL_DIR)/lib/libc.so: $(MUSL_GCC) $(MUSL_SRC)/configure Makefile
+	@mkdir -p $(MUSL_SHARED_BUILD) $(LOG_DIR)
+	@echo "  ⚙  Building shared musl (log: $(LOG_DIR)/musl-shared.log)"
+	@cd $(MUSL_SHARED_BUILD) && CC=gcc $(MUSL_SRC)/configure \
+	    --prefix=$(MUSL_DIR) --syslibdir=/lib --enable-shared \
+	    > $(LOG_DIR)/musl-shared.log 2>&1
+	@$(MAKE) -C $(MUSL_SHARED_BUILD) -j$(NPROC) CC="$(HOST_CC)" \
+	    lib/libc.so >> $(LOG_DIR)/musl-shared.log 2>&1
+	@cp $(MUSL_SHARED_BUILD)/lib/libc.so $@
+
 busybox: $(BUSYBOX)
 
 $(BUSYBOX): $(MUSL_GCC) $(BUSYBOX_SRC)/Makefile
@@ -190,6 +206,10 @@ install: $(BUSYBOX)
 	@mkdir -p $(DESTDIR)/bin $(DESTDIR)/usr/bin $(DESTDIR)/usr/sbin
 	@cp $(BUSYBOX) $(DESTDIR)/bin/busybox
 	@if [ -x $(PROBE) ]; then cp $(PROBE) $(DESTDIR)/usr/bin/azami-abi-probe; fi
+	@if [ -f $(MUSL_DIR)/lib/libc.so ]; then \
+	    mkdir -p $(DESTDIR)/lib; \
+	    cp $(MUSL_DIR)/lib/libc.so $(DESTDIR)/lib/ld-musl-x86_64.so.1; \
+	fi
 	@$(BUSYBOX) --list-full | while read -r applet; do \
 	    name=$${applet##*/}; \
 	    case "$$applet" in \

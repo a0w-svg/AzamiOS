@@ -17,10 +17,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <limits.h>
+#include <errno.h>
+
+/* Filesystems and interrupted reads may return less than requested. */
+static int font_read_full(int fd, void *buffer, size_t length)
+{
+    unsigned char *bytes = buffer;
+    while (length) {
+        ssize_t n = read(fd, bytes, length);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        bytes += n;
+        length -= (size_t)n;
+    }
+    return 0;
+}
 
 /* ── In-Memory Fallback 8x16 VGA Font (ASCII 0x20..0x7E) ──────────────────── */
 static const unsigned char s_fallback_glyphs[95][16] = {
@@ -153,11 +170,12 @@ az_font_t *az_font_load(const char *path)
 
     size_t file_size = (size_t)st.st_size;
     unsigned char header_buf[128];
-    ssize_t nread = read(fd, header_buf, sizeof(header_buf));
-    if (nread < 4) {
+    size_t header_bytes = file_size < sizeof(header_buf) ? file_size : sizeof(header_buf);
+    if (font_read_full(fd, header_buf, header_bytes) < 0) {
         close(fd);
         return NULL;
     }
+    ssize_t nread = (ssize_t)header_bytes;
 
     az_font_t *font = NULL;
 
@@ -169,7 +187,11 @@ az_font_t *az_font_load(const char *path)
             return NULL;
         }
         azf_header_t *hdr = (azf_header_t *)header_buf;
-        if (hdr->version != 1 || hdr->glyph_w == 0 || hdr->glyph_h == 0) {
+        if (hdr->version != AZF_VERSION || hdr->glyph_w == 0 || hdr->glyph_h == 0 ||
+            hdr->header_sz < sizeof(*hdr) || hdr->num_glyphs == 0 ||
+            hdr->last_char < hdr->first_char ||
+            (unsigned int)(hdr->last_char - hdr->first_char + 1) > hdr->num_glyphs ||
+            hdr->bytes_per_glyph < ((hdr->glyph_w + 7) / 8) * hdr->glyph_h) {
             close(fd);
             return NULL;
         }
@@ -186,7 +208,7 @@ az_font_t *az_font_load(const char *path)
         }
 
         if (lseek(fd, hdr->header_sz, SEEK_SET) < 0 ||
-            read(fd, data, glyph_bytes) != (ssize_t)glyph_bytes) {
+            font_read_full(fd, data, glyph_bytes) < 0) {
             free(data);
             close(fd);
             return NULL;
@@ -223,6 +245,17 @@ az_font_t *az_font_load(const char *path)
             return NULL;
         }
         psf2_header_t *hdr = (psf2_header_t *)header_buf;
+        /* The runtime stores dimensions in eight bits and counts in sixteen.
+         * Reject dimensions that would truncate or let rasterization overread. */
+        if (hdr->version != 0 || hdr->headersize < sizeof(*hdr) ||
+            hdr->length == 0 || hdr->length > UINT16_MAX ||
+            hdr->width == 0 || hdr->width > UINT8_MAX ||
+            hdr->height == 0 || hdr->height > UINT8_MAX ||
+            hdr->charsize > UINT16_MAX ||
+            hdr->charsize < ((hdr->width + 7) / 8) * hdr->height) {
+            close(fd);
+            return NULL;
+        }
         size_t glyph_bytes = (size_t)hdr->length * hdr->charsize;
         if (hdr->headersize + glyph_bytes > file_size) {
             close(fd);
@@ -236,7 +269,7 @@ az_font_t *az_font_load(const char *path)
         }
 
         if (lseek(fd, hdr->headersize, SEEK_SET) < 0 ||
-            read(fd, data, glyph_bytes) != (ssize_t)glyph_bytes) {
+            font_read_full(fd, data, glyph_bytes) < 0) {
             free(data);
             close(fd);
             return NULL;
@@ -277,7 +310,7 @@ az_font_t *az_font_load(const char *path)
         psf1_header_t *hdr = (psf1_header_t *)header_buf;
         uint16_t count = (hdr->mode & PSF1_MODE512) ? 512 : 256;
         size_t glyph_bytes = (size_t)count * hdr->charsize;
-        if (sizeof(psf1_header_t) + glyph_bytes > file_size) {
+        if (hdr->charsize == 0 || sizeof(psf1_header_t) + glyph_bytes > file_size) {
             close(fd);
             return NULL;
         }
@@ -289,7 +322,7 @@ az_font_t *az_font_load(const char *path)
         }
 
         if (lseek(fd, sizeof(psf1_header_t), SEEK_SET) < 0 ||
-            read(fd, data, glyph_bytes) != (ssize_t)glyph_bytes) {
+            font_read_full(fd, data, glyph_bytes) < 0) {
             free(data);
             close(fd);
             return NULL;
@@ -466,6 +499,9 @@ az_font_t *az_font_load_by_name(const char *name)
 int az_font_set_default_font(const char *font_path)
 {
     if (!font_path) return -1;
+    az_font_t *font = az_font_load(font_path);
+    if (!font) return -1;
+    az_font_free(font);
 
     char conf_data[256];
     snprintf(conf_data, sizeof(conf_data),
@@ -482,17 +518,19 @@ int az_font_set_default_font(const char *font_path)
         snprintf(user_conf, sizeof(user_conf), "%s/.config/font.conf", home);
         int ufd = open(user_conf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (ufd >= 0) {
-            write(ufd, conf_data, strlen(conf_data));
-            close(ufd);
-        }
+            ssize_t n = write(ufd, conf_data, strlen(conf_data));
+            int result = close(ufd);
+            if (n != (ssize_t)strlen(conf_data) || result < 0) return -1;
+        } else return -1;
     }
 
     /* Write to system /etc/font.conf */
     int fd = open(AZ_FONT_CONFIG_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
-        write(fd, conf_data, strlen(conf_data));
-        close(fd);
-    }
+        ssize_t n = write(fd, conf_data, strlen(conf_data));
+        int result = close(fd);
+        if (n != (ssize_t)strlen(conf_data) || result < 0) return -1;
+    } else return -1;
 
     /* Also write to /hdd/etc/font.conf if persistent drive is present */
     struct stat st;
@@ -592,58 +630,54 @@ void az_font_draw_char(
     int px, int py, char c, uint32_t color,
     const az_font_t *font, int scale, bool bold)
 {
-    if (!buf || buf_w == 0 || buf_h == 0) return;
+    if (!buf || buf_w == 0 || buf_h == 0 || pitch_px < buf_w) return;
     if (!font) font = &s_builtin_font_regular;
     if (scale < 1) scale = 1;
 
     int gw = font->glyph_w;
     int gh = font->glyph_h;
+    int row_stride = (gw + 7) / 8;
+    if (!gw || !gh || !font->glyph_data || !font->num_glyphs ||
+        font->bytes_per_glyph < row_stride * gh ||
+        scale > INT_MAX / gw || scale > INT_MAX / gh) return;
     int dw = gw * scale;
     int dh = gh * scale;
-
-    /* Complete quick rejection if offscreen */
-    if (px + dw <= 0 || py + dh <= 0 || px >= (int)buf_w || py >= (int)buf_h) return;
+    int64_t right = (int64_t)px + dw;
+    int64_t bottom = (int64_t)py + dh;
+    if (right <= 0 || bottom <= 0 || (int64_t)px >= buf_w || (int64_t)py >= buf_h) return;
 
     const unsigned char *glyph = az_font_get_glyph(font, (unsigned char)c);
-    int row_stride = (gw + 7) / 8;
-
-    /* Fast path: fully in bounds */
-    if (px >= 0 && py >= 0 && (unsigned int)(px + dw) <= buf_w && (unsigned int)(py + dh) <= buf_h) {
-        uint32_t *dst_base = buf + (unsigned int)py * pitch_px + (unsigned int)px;
-        for (int r = 0; r < gh; r++, dst_base += (size_t)scale * pitch_px) {
-            unsigned char bits = glyph[r * row_stride];
-            if (bold) bits |= (unsigned char)(bits >> 1);
-            if (!bits) continue;
-
-            for (int b = 0; b < gw; b++) {
-                if (!(bits & (0x80 >> b))) continue;
-                unsigned int fx = (unsigned int)b * scale;
-                for (int sy = 0; sy < scale; sy++) {
-                    uint32_t *drow = dst_base + (size_t)sy * pitch_px;
-                    for (int sx = 0; sx < scale; sx++) {
-                        drow[fx + sx] = color;
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    /* Clipped path */
+    bool inside = px >= 0 && py >= 0 && right <= buf_w && bottom <= buf_h;
     for (int r = 0; r < gh; r++) {
-        unsigned char bits = glyph[r * row_stride];
-        if (bold) bits |= (unsigned char)(bits >> 1);
-        if (!bits) continue;
-
-        for (int b = 0; b < gw; b++) {
-            if (!(bits & (0x80 >> b))) continue;
-            for (int sy = 0; sy < scale; sy++) {
-                int fy = py + r * scale + sy;
-                if (fy < 0 || (unsigned int)fy >= buf_h) continue;
-                for (int sx = 0; sx < scale; sx++) {
-                    int fx = px + b * scale + sx;
-                    if (fx < 0 || (unsigned int)fx >= buf_w) continue;
-                    buf[(unsigned int)fy * pitch_px + (unsigned int)fx] = color;
+        unsigned char previous = 0;
+        for (int byte = 0; byte < row_stride; byte++) {
+            unsigned char original = glyph[r * row_stride + byte];
+            unsigned char bits = original;
+            /* Carry the final pixel into the next byte when thickening. */
+            if (bold) bits |= (unsigned char)((original >> 1) | ((previous & 1) << 7));
+            previous = original;
+            if (!bits) continue;
+            for (int b = 0; b < 8 && byte * 8 + b < gw; b++) {
+                if (!(bits & (0x80 >> b))) continue;
+                int64_t fx = (int64_t)px + (byte * 8 + b) * scale;
+                int64_t fy = (int64_t)py + r * scale;
+                if (inside) {
+                    uint32_t *dst = buf + (size_t)fy * pitch_px + (size_t)fx;
+                    for (int sy = 0; sy < scale; sy++) {
+                        for (int sx = 0; sx < scale; sx++) dst[sx] = color;
+                        dst += pitch_px;
+                    }
+                } else {
+                    /* Clip before expanding: large scales cannot spend billions
+                     * of iterations on pixels outside the visible buffer. */
+                    int64_t x0 = fx < 0 ? 0 : fx;
+                    int64_t y0 = fy < 0 ? 0 : fy;
+                    int64_t x1 = fx + scale < buf_w ? fx + scale : buf_w;
+                    int64_t y1 = fy + scale < buf_h ? fy + scale : buf_h;
+                    for (int64_t y = y0; y < y1; y++) {
+                        uint32_t *dst = buf + (size_t)y * pitch_px;
+                        for (int64_t x = x0; x < x1; x++) dst[x] = color;
+                    }
                 }
             }
         }

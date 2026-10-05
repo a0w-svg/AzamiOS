@@ -26,5 +26,6 @@
 #define AT_RANDOM   25
 #define AT_HWCAP2   26
 #define AT_EXECFN   31
+#define AT_SYSINFO_EHDR 33
 
 unsigned long getauxval(unsigned long type);

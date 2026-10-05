@@ -115,6 +115,7 @@ void compositor_init(az_compositor_t *comp,
     comp->hw_page_flip = 0;
     comp->fb_fd        = -1;
     comp->fb_yres      = h;
+    comp->pan_var_valid = 0;
     comp->vram_buf[0]  = frontbuf;
     comp->vram_buf[1]  = frontbuf;
     comp->active_vram_buf = 0;
@@ -1984,6 +1985,7 @@ void compositor_enable_page_flip(az_compositor_t *comp, int fb_fd,
 
     comp->fb_fd           = fb_fd;
     comp->fb_yres         = yres;
+    comp->pan_var_valid   = ioctl(fb_fd, FBIOGET_VSCREENINFO, &comp->pan_var) == 0;
     comp->vram_buf[0]     = vram;
     comp->vram_buf[1]     = vram + (size_t)yres * pitch_px;
     comp->active_vram_buf = 0;
@@ -2027,13 +2029,18 @@ void compositor_enable_hw_cursor(az_compositor_t *comp, int fb_fd)
 /* Move the scanout to @buf.  The kernel waits for the frame boundary. */
 static int display_pan(az_compositor_t *comp, int buf)
 {
-    struct fb_var_screeninfo var;
-
-    if (comp->fb_fd >= 0 && ioctl(comp->fb_fd, FBIOGET_VSCREENINFO, &var) == 0) {
-        var.xoffset  = 0;
-        var.yoffset  = (unsigned int)buf * comp->fb_yres;
-        var.activate = FB_ACTIVATE_VBL;
-        if (ioctl(comp->fb_fd, FBIOPAN_DISPLAY, &var) == 0) return 0;
+    if (comp->fb_fd >= 0) {
+        /* The mode is fixed while this framebuffer is mapped. A failed read
+         * can recover on a later frame, but successful reads are cached. */
+        if (!comp->pan_var_valid)
+            comp->pan_var_valid = ioctl(comp->fb_fd, FBIOGET_VSCREENINFO,
+                                        &comp->pan_var) == 0;
+        if (comp->pan_var_valid) {
+            comp->pan_var.xoffset  = 0;
+            comp->pan_var.yoffset  = (unsigned int)buf * comp->fb_yres;
+            comp->pan_var.activate = FB_ACTIVATE_VBL;
+            if (ioctl(comp->fb_fd, FBIOPAN_DISPLAY, &comp->pan_var) == 0) return 0;
+        }
     }
     /* Older kernels only have the direct flip call. */
     return az_fb_flip((unsigned int)buf);
@@ -2552,4 +2559,3 @@ void compositor_set_window_pinned(az_compositor_t *comp, az_window_t *win, unsig
     compositor_damage(comp, win->x - AZWM_BORDER_W, win->y - AZWM_TITLEBAR_H - AZWM_BORDER_W,
                       (int)win->width + 2 * AZWM_BORDER_W, AZWM_TITLEBAR_H + AZWM_BORDER_W);
 }
-

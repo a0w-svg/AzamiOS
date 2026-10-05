@@ -30,14 +30,9 @@ void draw_network_tab(void)
     }
 
     /* Telemetry strings */
-    char rx_info[64] = "RX: 128 packets (14.2 KB)";
-    char tx_info[64] = "TX: 64 packets (8.4 KB)";
-    /* Drops/errors below are real (see the sscanf below); link speed/duplex
-     * has no real source anywhere in this kernel -- no NIC driver reports a
-     * negotiated speed -- so that part stays a fixed, honestly-labeled
-     * description of the emulated link rather than a fabricated dynamic
-     * reading. */
-    char link_info[48] = "0 drops \xe2\x80\xa2 0 errors";
+    char rx_info[64] = "RX: unavailable";
+    char tx_info[64] = "TX: unavailable";
+    char link_info[48] = "Counters unavailable";
     int nfd = open("/proc/net/dev", O_RDONLY, 0);
     if (nfd >= 0) {
         char nbuf[512];
@@ -71,8 +66,8 @@ void draw_network_tab(void)
         /* DHCP View */
         uk_draw_panel(&g_win, px, 146, (int)w - 40, 102, UK_SURFACE0);
         uk_draw_text(&g_win, px + 14, 156, "Adapter:", UK_SUBTEXT0);
-        uk_draw_text(&g_win, px + 100, 156, "Intel 82540EM / virtio-net (PCI 00:02.0)", UK_TEXT);
-        uk_draw_badge(&g_win, (int)w - 145, 154, "Connected (DHCP)", UK_SURFACE1, UK_GREEN);
+        uk_draw_text(&g_win, px + 100, 156, "Network interface net0 (/dev/net0)", UK_TEXT);
+        uk_draw_badge(&g_win, (int)w - 145, 154, "Automatic IPv4", UK_SURFACE1, UK_GREEN);
 
         char ip_line[80];
         snprintf(ip_line, sizeof(ip_line), "%s (net0)", g_net_ip);
@@ -96,7 +91,7 @@ void draw_network_tab(void)
         uk_draw_text(&g_win, px + 120, 326, rx_info, UK_TEXT);
         uk_draw_text(&g_win, px + 360, 326, tx_info, UK_TEXT);
         char quality_line[80];
-        snprintf(quality_line, sizeof(quality_line), "1000 Mbps Full Duplex \xe2\x80\xa2 %s", link_info);
+        snprintf(quality_line, sizeof(quality_line), "%s", link_info);
         uk_draw_text(&g_win, px + 14, 350, "Link Quality:", UK_SUBTEXT0);
         uk_draw_text(&g_win, px + 120, 350, quality_line, UK_GREEN);
 
@@ -147,7 +142,7 @@ void draw_network_tab(void)
 
         /* Compact stats row */
         char stats_line[128];
-        snprintf(stats_line, sizeof(stats_line), "Telemetry: %s  •  %s  •  1000 Mbps", rx_info, tx_info);
+        snprintf(stats_line, sizeof(stats_line), "Telemetry: %s  •  %s", rx_info, tx_info);
         uk_draw_text(&g_win, px + 4, 408, stats_line, UK_BLUE);
     }
 }
@@ -163,6 +158,7 @@ void handle_network_mouse(int mx, int my)
                     }
                     if (mx >= 225 && mx <= 445 && my >= 112 && my <= 138) {
                         g_net_dhcp = 0;
+                        g_net_focus = -1;
                         draw_settings();
                         return;
                     }

@@ -18,7 +18,7 @@ void draw_audio_tab(void)
 
     uk_draw_panel(&g_win, px, AUDIO_DEV_Y, (int)w - 40, 40, UK_SURFACE0);
     uk_draw_text(&g_win, px + 12, AUDIO_DEV_Y + 5,  "Active Audio Controller", UK_SUBTEXT0);
-    uk_draw_text(&g_win, px + 12, AUDIO_DEV_Y + 21, "Intel 82801AA AC97 Audio Device (/dev/dsp)", UK_TEXT);
+    uk_draw_text(&g_win, px + 12, AUDIO_DEV_Y + 21, "OSS-compatible PCM output (/dev/dsp)", UK_TEXT);
 
     uk_draw_panel(&g_win, px, AUDIO_FMT_Y, (int)w - 40, 40, UK_SURFACE0);
     uk_draw_text(&g_win, px + 12, AUDIO_FMT_Y + 5,  "Sample Format", UK_SUBTEXT0);
@@ -46,7 +46,7 @@ void draw_audio_tab(void)
 
 void handle_audio_mouse(int mx, int my)
 {
-    unsigned int w = g_win.width, h = g_win.height;
+    unsigned int w = (unsigned int)settings_content_width(), h = g_win.height;
     (void)w; (void)h;
     int slider_w = (int)w - 180;
                     if (mx >= 20 && mx <= 20 + slider_w && my >= AUDIO_SLIDER_Y - 6 && my <= AUDIO_SLIDER_Y + 24) {
@@ -58,6 +58,7 @@ void handle_audio_mouse(int mx, int my)
                     /* Play chime button */
                     if (mx >= 20 && mx <= 150 && my >= AUDIO_BTN_Y && my <= AUDIO_BTN_Y + 28) {
                         play_test_chime();
+                        draw_settings();
                         return;
                     }
 }

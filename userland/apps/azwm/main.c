@@ -2020,15 +2020,14 @@ int main(int argc, char **argv)
             compositor_update_cursor(&comp);
         }
 
-        if (!redraw_needed && !cursor_moved && !comp.has_animating_windows) {
-            /* Nothing to do: short poll sleep, not the frame cap below —
-             * this path cares about input latency, not throughput. */
+        if (!redraw_needed && (!cursor_moved || comp.hw_cursor) &&
+            !comp.has_animating_windows) {
+            /* An idle loop or a hardware cursor move needs only a short
+             * input poll sleep; neither has composed a new frame. */
             usleep(2000);
             last_frame_ns = compositor_now_ns();
         } else {
-            /* Did a present (or a cursor-only move) this iteration: hold to
-             * AZWM_FRAME_INTERVAL_NS instead of looping straight back into
-             * another one. */
+            /* A redraw or software cursor present needs the frame cap. */
             long long now_ns = compositor_now_ns();
             long long elapsed = now_ns - last_frame_ns;
             if (elapsed >= 0 && elapsed < AZWM_FRAME_INTERVAL_NS) {

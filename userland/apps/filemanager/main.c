@@ -1079,8 +1079,9 @@ int main(int argc, char **argv)
             int mx = msg->mouse.abs_x;
             int my = msg->mouse.abs_y;
             unsigned int buttons = msg->mouse.buttons;
-            bool lclick = (buttons & AZ_MOUSE_BTN_LEFT) && !(prev_buttons & AZ_MOUSE_BTN_LEFT);
-            bool rclick = (buttons & AZ_MOUSE_BTN_RIGHT) && !(prev_buttons & AZ_MOUSE_BTN_RIGHT);
+            unsigned int pressed = uk_mouse_press(&prev_buttons, buttons);
+            bool lclick = (pressed & AZ_MOUSE_BTN_LEFT) != 0;
+            bool rclick = (pressed & AZ_MOUSE_BTN_RIGHT) != 0;
 
             /* Wheel scroll works anywhere over the file list, regardless of
              * button state, and closes any open popups it scrolls under. */
@@ -1228,7 +1229,6 @@ int main(int argc, char **argv)
                     }
                 }
             }
-            prev_buttons = buttons;
             break;
         }
 

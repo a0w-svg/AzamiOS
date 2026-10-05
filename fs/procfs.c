@@ -94,6 +94,8 @@ typedef enum {
     PROCFS_TYPE_PID_CWD_SYMLINK,
     PROCFS_TYPE_PID_FD_DIR,
     PROCFS_TYPE_PID_FD_ENTRY,
+    PROCFS_TYPE_PID_NS_DIR,
+    PROCFS_TYPE_PID_NS_ENTRY,
 
     /* /proc/sysvipc — the System V IPC objects currently in existence */
     PROCFS_TYPE_SYSVIPC_DIR,
@@ -284,6 +286,16 @@ static s64 procfs_readlink(struct dentry *dentry, char *buf, size_t bufsiz)
         }
         sched_unlock();
         tmp[sizeof(tmp) - 1] = '\0';
+    } else if (priv->type == PROCFS_TYPE_PID_NS_ENTRY) {
+        const char *ns = (dentry && dentry->d_name[0]) ? dentry->d_name : "uts";
+        u32 inum = 4026531838U;
+        if (strcmp(ns, "ipc") == 0) inum = 4026531839U;
+        else if (strcmp(ns, "mnt") == 0) inum = 4026531840U;
+        else if (strcmp(ns, "net") == 0) inum = 4026531841U;
+        else if (strcmp(ns, "pid") == 0 || strcmp(ns, "pid_for_children") == 0) inum = 4026531842U;
+        else if (strcmp(ns, "user") == 0) inum = 4026531843U;
+        else if (strcmp(ns, "cgroup") == 0) inum = 4026531844U;
+        scnprintf(tmp, sizeof(tmp), "%s:[%u]", ns, inum);
     }
 
     size_t len = strlen(tmp);
@@ -1194,6 +1206,16 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2000 + pid * 10 + 6, S_IFLNK | 0777, PROCFS_TYPE_PID_CWD_SYMLINK, pid);
         } else if (strcmp(name, "fd") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2000 + pid * 10 + 7, S_IFDIR | 0555, PROCFS_TYPE_PID_FD_DIR, pid);
+        } else if (strcmp(name, "ns") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2200 + pid * 10 + 0, S_IFDIR | 0555, PROCFS_TYPE_PID_NS_DIR, pid);
+        }
+    } else if (dir_priv->type == PROCFS_TYPE_PID_NS_DIR) {
+        u32 pid = dir_priv->pid;
+        if (strcmp(name, "uts") == 0 || strcmp(name, "pid") == 0 ||
+            strcmp(name, "mnt") == 0 || strcmp(name, "net") == 0 ||
+            strcmp(name, "ipc") == 0 || strcmp(name, "user") == 0 ||
+            strcmp(name, "cgroup") == 0 || strcmp(name, "pid_for_children") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 2210 + pid * 10, S_IFLNK | 0777, PROCFS_TYPE_PID_NS_ENTRY, pid);
         }
     } else if (dir_priv->type == PROCFS_TYPE_PID_FD_DIR) {
         u32 pid = dir_priv->pid;
@@ -1958,14 +1980,39 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
             idx++;
         }
     } else if (priv->type == PROCFS_TYPE_PID_DIR) {
-        const char *pid_entries[] = { ".", "..", "status", "cmdline", "stat", "maps", "exe", "cwd", "fd", "limits", "io", "mounts", "mountinfo" };
-        u64 total_entries = 11;
+        const char *pid_entries[] = { ".", "..", "status", "cmdline", "stat", "maps", "exe", "cwd", "fd", "limits", "io", "mounts", "mountinfo", "ns" };
+        u64 total_entries = sizeof(pid_entries) / sizeof(pid_entries[0]);
 
         while (idx < total_entries) {
             const char *name = pid_entries[idx];
             u8 dtype = DT_REG;
-            if (idx < 2 || strcmp(name, "fd") == 0) dtype = DT_DIR;
+            if (idx < 2 || strcmp(name, "fd") == 0 || strcmp(name, "ns") == 0) dtype = DT_DIR;
             else if (strcmp(name, "exe") == 0 || strcmp(name, "cwd") == 0) dtype = DT_LNK;
+
+            size_t nlen = strlen(name);
+            size_t reclen = ALIGN_UP(sizeof(struct linux_dirent64) + nlen + 1, 8);
+            if (written + reclen > len) {
+                if (written == 0) return -(s64)EINVAL;
+                break;
+            }
+
+            struct linux_dirent64 *d = (struct linux_dirent64 *)(out_ptr + written);
+            d->d_ino = idx + 1;
+            d->d_off = idx + 1;
+            d->d_reclen = (unsigned short)reclen;
+            d->d_type = dtype;
+            memcpy(d->d_name, name, nlen + 1);
+
+            written += reclen;
+            idx++;
+        }
+    } else if (priv->type == PROCFS_TYPE_PID_NS_DIR) {
+        const char *ns_entries[] = { ".", "..", "cgroup", "ipc", "mnt", "net", "pid", "pid_for_children", "user", "uts" };
+        u64 total_entries = sizeof(ns_entries) / sizeof(ns_entries[0]);
+
+        while (idx < total_entries) {
+            const char *name = ns_entries[idx];
+            u8 dtype = (idx < 2) ? DT_DIR : DT_LNK;
 
             size_t nlen = strlen(name);
             size_t reclen = ALIGN_UP(sizeof(struct linux_dirent64) + nlen + 1, 8);

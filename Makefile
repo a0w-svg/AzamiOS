@@ -224,6 +224,14 @@ KERNEL_C_SRCS := \
     kernel/mm/vma.c \
     kernel/mm/dma.c \
     kernel/syscall/syscall.c \
+    kernel/syscall/sys_fs.c \
+    kernel/syscall/sys_mm.c \
+    kernel/syscall/sys_proc.c \
+    kernel/syscall/sys_signal.c \
+    kernel/syscall/sys_net.c \
+    kernel/syscall/sys_time.c \
+    kernel/syscall/sys_ipc.c \
+    kernel/syscall/sys_misc.c \
     kernel/sched/sched.c \
     kernel/sched/elf.c \
     kernel/ipc/ipc.c \
@@ -490,6 +498,11 @@ doc:
 	@python3 scripts/autodoc.py
 
 # ── Compilation rules ─────────────────────────────────────────────────────────
+kernel/syscall/syscall_table.h: kernel/syscall/syscalls.tbl scripts/gensyscalltbl.py
+	@python3 scripts/gensyscalltbl.py
+
+$(OBJ_DIR)/kernel/syscall/%.o: kernel/syscall/syscall_table.h
+
 $(OBJ_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@

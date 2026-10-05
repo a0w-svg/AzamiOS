@@ -46,3 +46,21 @@ tools/linux/log/
 # disk image input digest (scripts/create_disk.py)
 *.img.inputs
 hdd.vdi
+patch_themes.py
+patch_themes2.py
+patch_wp.py
+patch.py
+patch2.py
+
+# Skills
+skills
+skills/
+.skills
+.skills/
+.agents/skills/
+skills-lock.json
+docs/USERSPACE-UI-AUDIT.md
+.gitignore
+docs/CODEX_EXECUTION_PLAN.md
+docs/SYSCALL-STATUS.md
+docs/USERSPACE_IMPROVEMENT_PLAN.md

@@ -28,10 +28,13 @@
 
 extern uk_window_t g_win;
 extern int g_active_tab;
+extern char g_settings_status[128];
+int settings_write_file(const char *path, const char *data, size_t len);
 
 #define SERVER_CHAN 1
 
 void draw_settings(void);
+int settings_content_width(void);
 int hit_toggle(int tx, int ty, int mx, int my);
 int hit_toggle_wide(int tx, int ty, int mx, int my, int width);
 void draw_toggle(int x, int y, int on, const char *label);
@@ -44,7 +47,6 @@ extern int g_theme_selected;
 extern int g_selected_tz_idx;
 extern int g_net_focus;
 extern char g_net_ip[32];
-extern char g_net_gw[32];
 extern char g_net_dns[32];
 extern char g_power_status_msg[128];
 extern int g_sec_dmesg;
@@ -53,12 +55,9 @@ extern int g_sec_mmap;
 extern int g_sec_yama;
 extern int g_sec_hlinks;
 extern int g_sec_slinks;
-extern int g_sec_auto_ipc;
-extern int g_sec_auto_admin;
-extern int g_sec_auto_dhcp;
-extern int g_sec_auto_trace;
 
 void draw_display_tab(void);
+int display_content_height(void);
 void handle_display_mouse(int mx, int my);
 void draw_audio_tab(void);
 void handle_audio_mouse(int mx, int my);
@@ -71,6 +70,7 @@ void handle_network_mouse(int mx, int my);
 void draw_power_tab(void);
 void handle_power_mouse(int mx, int my);
 void draw_disks_tab(void);
+int disks_content_height(void);
 void handle_disks_mouse(int mx, int my);
 void draw_security_tab(void);
 void handle_security_mouse(int mx, int my);
@@ -87,12 +87,10 @@ void apply_timezone(int idx);
 void refresh_network_stats(void);
 void apply_static_network(void);
 void apply_dhcp_network(void);
-void apply_power_profile(int profile_idx);
 void apply_screen_timeout(int mins);
 void clean_temp_files(void);
-void load_security_config(void);
-void save_security_config(void);
-void write_proc_val(const char *path, int val);
+int write_proc_val(const char *path, int val);
+void toggle_proc_setting(const char *path, int *value, int enabled_value);
 
 extern int g_net_dhcp;
 extern char g_net_netmask[32];

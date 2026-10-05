@@ -301,14 +301,24 @@ s64 udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], 
         if (res < 0) return res;
     }
 
+    udp_sock_get(sock);
+
     for (;;) {
         irqflags_t flags = spinlock_lock_irqsave(&sock->lock);
         if (sock->closed) {
             spinlock_unlock_irqrestore(&sock->lock, flags);
+            udp_sock_put(sock);
             return -EBADF;
         }
         net_buf_t *pkt = net_buf_queue_pop(&sock->rx_queue);
-        if (pkt) sock->rx_bytes -= pkt->capacity + sizeof(*pkt);
+        if (pkt) {
+            size_t charged = pkt->capacity + sizeof(*pkt);
+            if (sock->rx_bytes >= charged) {
+                sock->rx_bytes -= charged;
+            } else {
+                sock->rx_bytes = 0;
+            }
+        }
         spinlock_unlock_irqrestore(&sock->lock, flags);
         if (pkt) {
             /* Packet buffer contains: [src_ip 4B][src_port 2B][payload ...] */
@@ -329,10 +339,12 @@ s64 udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], 
             if (copy_len) memcpy(buf, pkt->data + 6, copy_len);
 
             net_buf_free(pkt);
+            udp_sock_put(sock);
             return (s64)copy_len;
         }
 
         if (nonblock) {
+            udp_sock_put(sock);
             return -(s64)EAGAIN;
         }
 
@@ -340,6 +352,7 @@ s64 udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], 
         flags = spinlock_lock_irqsave(&sock->lock);
         if (sock->closed) {
             spinlock_unlock_irqrestore(&sock->lock, flags);
+            udp_sock_put(sock);
             return -EBADF;
         }
         if (net_buf_queue_len(&sock->rx_queue) == 0) {
@@ -356,6 +369,7 @@ s64 udp_recvfrom(udp_sock_t *sock, void *buf, size_t max_len, u8 src_ip_out[4], 
                 if (sock->wait_thread == sched_current_thread())
                     sock->wait_thread = NULL;
                 spinlock_unlock_irqrestore(&sock->lock, flags);
+                udp_sock_put(sock);
                 return -(s64)EINTR;
             }
         } else {

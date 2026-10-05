@@ -30,6 +30,7 @@
 #include "../azwm/de_protocol.h"
 #include "../azwm/de_font.h"
 #include "../shared/de_log.h"
+#include "../../libc/include/azami/font.h"
 
 /* ── Configuration ─────────────────────────────────────────────────────────── */
 #define SERVER_CHAN        1
@@ -63,14 +64,14 @@
 #define SB_H   40
 
 /* Tray zone width (clock + date + wifi + sound + lock + sysmon icon, right-aligned) */
-#define TRAY_W  226
+#define TRAY_W  (tb_tray_width())
 #define TRAY_M    8   /* tray right margin */
 
 /* System Monitor tray widget: "C: XX%" / "M: XX%" stacked labels, click
  * launches sysmon.elf. Sits right after the Lock icon (which ends at
  * tray_start_x + 68) and before the clock. */
 #define SYSMON_ZONE_X0   68
-#define SYSMON_ZONE_W    46
+#define SYSMON_ZONE_W    (5 * tb_font_width() + 6)
 
 /* Window button geometry (pill-shaped) */
 #define WB_W       140
@@ -236,6 +237,57 @@ static void tb_show_toast(const char *msg)
     g_toast_ticks = 25; /* 2.5 seconds display */
 }
 
+/* Preferences are process-local in libc. The panel refreshes them on its
+ * existing one-second tick; font files are loaded only when config changes. */
+static az_font_t *g_panel_font;
+static unsigned int g_font_config_hash;
+static bool g_preferences_ready;
+static char g_last_clock[6], g_last_date[20];
+
+static unsigned int tb_hash_config(unsigned int hash, const char *path)
+{
+    int fd = sys_open(path, O_RDONLY, 0);
+    hash = (hash ^ (fd >= 0 ? 1U : 0U)) * 16777619U;
+    if (fd < 0) return hash;
+    char buffer[256];
+    ssize_t count;
+    while ((count = sys_read(fd, buffer, sizeof(buffer))) > 0) {
+        for (ssize_t i = 0; i < count; i++)
+            hash = (hash ^ (unsigned char)buffer[i]) * 16777619U;
+    }
+    sys_close(fd);
+    return hash;
+}
+
+static unsigned int tb_font_config_hash(void)
+{
+    unsigned int hash = 2166136261U;
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        char path[256];
+        int n = snprintf(path, sizeof(path), "%s/.config/font.conf", home);
+        if (n > 0 && n < (int)sizeof(path)) hash = tb_hash_config(hash, path);
+    }
+    hash = tb_hash_config(hash, AZ_FONT_CONFIG_FILE);
+    return tb_hash_config(hash, AZ_FONT_CONFIG_HDD);
+}
+
+static int tb_font_width(void)
+{
+    return g_panel_font && g_panel_font->glyph_w ? g_panel_font->glyph_w : 8;
+}
+
+static int tb_font_height(void)
+{
+    return g_panel_font && g_panel_font->glyph_h ? g_panel_font->glyph_h : 16;
+}
+
+static int tb_tray_width(void)
+{
+    int width = SYSMON_ZONE_X0 + SYSMON_ZONE_W + 10 * tb_font_width() + 16;
+    return width > 226 ? width : 226;
+}
+
 /* ── Real-time clock (Bug 3 fix) ─────────────────────────────────────────── */
 #include "../../libc/include/time.h"
 
@@ -255,6 +307,35 @@ static void tb_build_date(char *buf, int max)
     struct tm tm_info;
     localtime_r(&t, &tm_info);
     strftime(buf, max, "%a %b %e", &tm_info);
+}
+
+static bool tb_refresh_preferences(void)
+{
+    /* Desktop clock follows the system timezone, even if the panel inherited
+     * TZ from an old session environment. tzset() reopens the current file,
+     * including when Settings replaced it through an atomic rename. */
+    unsetenv("TZ");
+    tzset();
+    char clock[6], date[20];
+    tb_build_clock(clock);
+    tb_build_date(date, sizeof(date));
+    bool dirty = !g_preferences_ready || strcmp(clock, g_last_clock) || strcmp(date, g_last_date);
+    strcpy(g_last_clock, clock);
+    strcpy(g_last_date, date);
+
+    unsigned int hash = tb_font_config_hash();
+    if (!g_preferences_ready || hash != g_font_config_hash) {
+        az_font_t *font = az_font_load_default();
+        if (font) {
+            az_font_t *previous = g_panel_font;
+            g_panel_font = font;
+            if (previous && previous != font) az_font_free(previous);
+            g_font_config_hash = hash;
+            dirty = true;
+        }
+    }
+    g_preferences_ready = true;
+    return dirty;
 }
 
 /* Refresh g_cpu_pct/g_mem_pct. CPU% is the same idle/active-tick delta
@@ -370,20 +451,22 @@ static void tb_fill_grad_h(int rx, int ry, int rw, int rh,
 /* Text helpers */
 static void tb_char(int x, int y, char c, unsigned int col)
 {
-    de_font_draw_char(g_px, g_w, g_w, g_h, x, y, c, col);
+    if (g_panel_font)
+        az_font_draw_char(g_px, g_w, g_w, g_h, x, y, c, col, g_panel_font, 1, false);
+    else de_font_draw_char(g_px, g_w, g_w, g_h, x, y, c, col);
 }
 
 static void tb_str(int x, int y, const char *s, unsigned int col)
 {
     int i;
-    for (i = 0; s[i]; i++) tb_char(x + i * 8, y, s[i], col);
+    for (i = 0; s[i]; i++) tb_char(x + i * tb_font_width(), y, s[i], col);
 }
 
 static void tb_str_clip(int x, int y, const char *s, unsigned int col, int max_w_px)
 {
     int i;
-    for (i = 0; s[i] && i * 8 + 8 <= max_w_px; i++)
-        tb_char(x + i * 8, y, s[i], col);
+    for (i = 0; s[i] && (i + 1) * tb_font_width() <= max_w_px; i++)
+        tb_char(x + i * tb_font_width(), y, s[i], col);
 }
 
 static int tb_strlen(const char *s) { int i = 0; while (s[i]) i++; return i; }
@@ -756,17 +839,17 @@ static void draw_clock_only(void)
     char clk[6];
     tb_build_clock(clk);
     int clk_len = tb_strlen(clk);
-    int clk_x = tray_start_x + TRAY_W - clk_len * 8 - 8;
+    int clk_x = tray_start_x + TRAY_W - clk_len * tb_font_width() - 8;
     int clk_y = SB_Y + 2;
 
-    tb_fill_rect(clk_x, clk_y, clk_len * 8, 16, C_TRAY_BG);
+    tb_fill_rect(clk_x, clk_y, clk_len * tb_font_width(), tb_font_height(), C_TRAY_BG);
     tb_char(clk_x,      clk_y, clk[0], C_CLOCK);
-    tb_char(clk_x + 8,  clk_y, clk[1], C_CLOCK);
-    tb_char(clk_x + 16, clk_y, ':',    g_colon_on ? C_CLOCK : tb_blend(C_TRAY_BG, C_CLOCK, 90));
-    tb_char(clk_x + 24, clk_y, clk[3], C_CLOCK);
-    tb_char(clk_x + 32, clk_y, clk[4], C_CLOCK);
+    tb_char(clk_x + tb_font_width(),  clk_y, clk[1], C_CLOCK);
+    tb_char(clk_x + 2 * tb_font_width(), clk_y, ':',    g_colon_on ? C_CLOCK : tb_blend(C_TRAY_BG, C_CLOCK, 90));
+    tb_char(clk_x + 3 * tb_font_width(), clk_y, clk[3], C_CLOCK);
+    tb_char(clk_x + 4 * tb_font_width(), clk_y, clk[4], C_CLOCK);
 
-    taskbar_invalidate_rect(clk_x, clk_y, clk_len * 8, 16);
+    taskbar_invalidate_rect(clk_x, clk_y, clk_len * tb_font_width(), tb_font_height());
 }
 
 /* ============================================================================
@@ -838,7 +921,7 @@ static void taskbar_draw(void)
     tb_fill_rect(ib + 7, iy_top + 7, 5, 5, C_SB_ICON);
 
     /* "Apps" label */
-    tb_str(SB_X + 26, SB_Y + (SB_H - 16) / 2, "Apps", C_SB_TEXT);
+    tb_str(SB_X + 26, SB_Y + (SB_H - tb_font_height()) / 2, "Apps", C_SB_TEXT);
 
     /* Separator after start button */
     tb_separator(SB_X + SB_W + 6);
@@ -861,7 +944,7 @@ static void taskbar_draw(void)
             /* No shipped icon file for this app — fall back to its
              * single-letter glyph in its assigned colour. */
             char glyph_s[2] = { e->glyph, '\0' };
-            tb_str(dx + (DOCK_BTN_W - 8) / 2, dy + (DOCK_BTN_H - 16) / 2, glyph_s, e->color);
+            tb_str(dx + (DOCK_BTN_W - tb_font_width()) / 2, dy + (DOCK_BTN_H - tb_font_height()) / 2, glyph_s, e->color);
         }
 
         /* Active-app indicator: a thin accent bar under the icon that grows
@@ -939,7 +1022,7 @@ static void taskbar_draw(void)
 
         /* Title text (clipped to pill interior, leaving room for left bar) */
         int text_x = bx + (is_foc ? 9 : 6);
-        int text_y = SB_Y + (WB_H - 16) / 2;
+        int text_y = SB_Y + (WB_H - tb_font_height()) / 2;
         int max_px = wb_w - 12;
         tb_str_clip(text_x, text_y, g_wins[i].title, fg, max_px);
 
@@ -962,7 +1045,7 @@ static void taskbar_draw(void)
                 ovf[2] = '0' + (char)(rem%10); ovf[3] = '\0';
             }
             tb_fill_rounded(bx, SB_Y, 32, WB_H, WB_RADIUS, C_WB_BG);
-            tb_str(bx + 4, SB_Y + (WB_H - 16) / 2, ovf, C_OVERFLOW);
+            tb_str(bx + 4, SB_Y + (WB_H - tb_font_height()) / 2, ovf, C_OVERFLOW);
         }
     }
 
@@ -1015,27 +1098,27 @@ static void taskbar_draw(void)
     char clk[6];
     tb_build_clock(clk);
     int clk_len = tb_strlen(clk);
-    int clk_x = tray_start_x + TRAY_W - clk_len * 8 - 8;
+    int clk_x = tray_start_x + TRAY_W - clk_len * tb_font_width() - 8;
     int clk_y = SB_Y + 2;
     tb_char(clk_x,      clk_y, clk[0], C_CLOCK);
-    tb_char(clk_x + 8,  clk_y, clk[1], C_CLOCK);
-    tb_char(clk_x + 16, clk_y, ':',    g_colon_on ? C_CLOCK : tb_blend(C_TRAY_BG, C_CLOCK, 90));
-    tb_char(clk_x + 24, clk_y, clk[3], C_CLOCK);
-    tb_char(clk_x + 32, clk_y, clk[4], C_CLOCK);
+    tb_char(clk_x + tb_font_width(),  clk_y, clk[1], C_CLOCK);
+    tb_char(clk_x + 2 * tb_font_width(), clk_y, ':',    g_colon_on ? C_CLOCK : tb_blend(C_TRAY_BG, C_CLOCK, 90));
+    tb_char(clk_x + 3 * tb_font_width(), clk_y, clk[3], C_CLOCK);
+    tb_char(clk_x + 4 * tb_font_width(), clk_y, clk[4], C_CLOCK);
 
     /* Date string "Mon Jan 14" (small, below clock) */
     char date_buf[20];
     tb_build_date(date_buf, 20);
     int date_len = tb_strlen(date_buf);
-    int date_x = tray_start_x + TRAY_W - date_len * 8 - 8;
-    int date_y = clk_y + 18;
-    if (date_y + 16 < (int)g_h)
+    int date_x = tray_start_x + TRAY_W - date_len * tb_font_width() - 8;
+    int date_y = clk_y + tb_font_height() + 2;
+    if (date_y + tb_font_height() <= (int)g_h)
         tb_str(date_x, date_y, date_buf, C_DATE);
 
     /* Toast notification / overlay (Volume, WiFi, etc.) */
     if (g_toast_ticks > 0 && g_toast_msg[0]) {
         int tlen = tb_strlen(g_toast_msg);
-        int tw = tlen * 8 + 24;
+        int tw = tlen * tb_font_width() + 24;
         int tx = tray_start_x - tw - 12;
         if (tx < (int)g_w / 2) tx = (int)g_w / 2;
         int ty = 0;                      /* in the transparent strip */
@@ -1045,7 +1128,7 @@ static void taskbar_draw(void)
         tb_str(tx + 12, ty + 10, g_toast_msg, 0xFFCDD6F4);
     } else if (g_hover_tooltip[0] != '\0') {
         int tlen = tb_strlen(g_hover_tooltip);
-        int tw = tlen * 8 + 16;
+        int tw = tlen * tb_font_width() + 16;
         int tx = g_hover_x - tw / 2;
         if (tx < 10) tx = 10;
         if (tx + tw > (int)g_w - 10) tx = (int)g_w - tw - 10;
@@ -1372,6 +1455,7 @@ int main(int argc, char **argv)
 
     tb_init_dock();
     tb_load_volume();
+    tb_refresh_preferences();
 
     /* ── Screen geometry ──────────────────────────────────────────────────── */
     az_fb_info_t fb;
@@ -1492,7 +1576,10 @@ int main(int argc, char **argv)
             /* System Monitor widget: refresh once a second, not every 100ms
              * tick — a CPU/RAM percentage that only changes a handful of
              * times a second doesn't need finer sampling than that. */
-            if (g_tick_count % 10 == 0 && tb_update_sysstat()) other_dirty = true;
+            if (g_tick_count % 10 == 0) {
+                if (tb_refresh_preferences()) other_dirty = true;
+                if (tb_update_sysstat()) other_dirty = true;
+            }
 
             int sb_target = g_sb_hot ? 256 : 0;
             if (g_sb_hover_level != sb_target) {
@@ -1595,5 +1682,6 @@ int main(int argc, char **argv)
         }
     }
 
+    if (g_panel_font) az_font_free(g_panel_font);
     sys_exit(0);
 }

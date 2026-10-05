@@ -43,6 +43,8 @@
 #include "../../hal/device.h"
 #include "../base/pci_bus.h"
 #include "../../kernel/cmdline.h"
+#include "../../kernel/sched/sched.h"
+#include "../../kernel/security/security.h"
 
 /* ── Controller register offsets (NVMe 1.4 §3.1) ─────────────────────────── */
 #define NVME_REG_CAP      0x00   /* u64 Controller Capabilities   */
@@ -489,8 +491,19 @@ static s64 nvme_ioctl(block_dev_t *bdev, u32 cmd, u64 arg)
         return (s64)ns->nsid;
 
     case NVME_IOCTL_ADMIN_CMD: {
+        process_t *proc = sched_current_process();
+        if (proc && proc->euid != 0 && !security_check_permission(proc, CAP_SYS_ADMIN)) {
+            return -(s64)EACCES;
+        }
+
+        if (!arg || (uintptr_t)arg >= TASK_SIZE_MAX ||
+            (uintptr_t)arg + sizeof(struct nvme_admin_cmd_uapi) > TASK_SIZE_MAX ||
+            (uintptr_t)arg + sizeof(struct nvme_admin_cmd_uapi) < (uintptr_t)arg) {
+            return -(s64)EFAULT;
+        }
+
         struct nvme_admin_cmd_uapi ucmd;
-        if (copy_from_user(&ucmd, (const void *)arg, sizeof(ucmd)) != 0)
+        if (copy_from_user(&ucmd, (const void *)(uintptr_t)arg, sizeof(ucmd)) != 0)
             return -(s64)EFAULT;
 
         nvme_sqe_t sqe;
@@ -510,6 +523,12 @@ static s64 nvme_ioctl(block_dev_t *bdev, u32 cmd, u64 arg)
         if (len > PAGE_SIZE) len = PAGE_SIZE;
 
         if (len > 0 && ucmd.addr) {
+            if ((uintptr_t)ucmd.addr >= TASK_SIZE_MAX ||
+                (uintptr_t)ucmd.addr + len > TASK_SIZE_MAX ||
+                (uintptr_t)ucmd.addr + len < (uintptr_t)ucmd.addr) {
+                return -(s64)EFAULT;
+            }
+
             bounce_phys = pmm_alloc_page();
             if (!bounce_phys) return -(s64)ENOMEM;
             bounce_virt = (void *)PHYS_TO_VIRT(bounce_phys);
@@ -746,7 +765,7 @@ static void nvme_controller_init(device_t *dev, pci_device_info_t *pci)
 
     if (nvme_identify(c, 0, NVME_CNS_CONTROLLER) != 0) {
         pr_debug("[NVME]  Identify Controller failed\n");
-        return;
+        goto fail_dma;
     }
 
     /* Identify Controller: model string at byte 24 (40 chars, space padded),
@@ -760,10 +779,18 @@ static void nvme_controller_init(device_t *dev, pci_device_info_t *pci)
 
     pr_debug("[NVME]  model '%s', %u namespace(s)\n", model, nn);
 
-    if (nvme_create_io_queues(c) != 0) return;
+    if (nvme_create_io_queues(c) != 0) goto fail_dma;
 
     g_ctrl_count++;             /* commit only once the controller is usable */
     nvme_scan_namespaces(c, nn);
+    return;
+
+fail_dma:
+    if (c->ident_phys)  { pmm_free_page(c->ident_phys); c->ident_phys = 0; }
+    if (c->prp_phys)    { pmm_free_page(c->prp_phys); c->prp_phys = 0; }
+    if (c->bounce_phys) { pmm_free_pages(c->bounce_phys, NVME_BOUNCE_PAGES); c->bounce_phys = 0; }
+    queue_free(&c->admin);
+    queue_free(&c->io);
 }
 
 static int nvme_probe(dm_device_t *dm, const pci_device_id_t *id)

@@ -80,6 +80,7 @@ static bool g_small_font = false;
 static bool g_show_templates = false;
 
 static uk_window_t g_win;
+static unsigned int g_mouse_buttons;
 
 /* ── Templates ────────────────────────────────────────────────────────────── */
 typedef struct {
@@ -336,11 +337,11 @@ int main(int argc, char **argv)
         }
 
         if (msg.type == AZ_WM_MOUSE_EVENT) {
+            unsigned int pressed = uk_mouse_press(&g_mouse_buttons, msg.mouse.buttons);
             int mx = msg.mouse.abs_x;
             int my = msg.mouse.abs_y;
-            unsigned int btns = msg.mouse.buttons;
 
-            if (btns & 1) {
+            if (pressed & AZ_MOUSE_BTN_LEFT) {
                 /* Check templates popup click */
                 if (g_show_templates) {
                     int tx = 20;

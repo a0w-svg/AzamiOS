@@ -10,12 +10,12 @@ void draw_power_tab(void)
 
     /* 3 Profile Cards */
     const char *pnames[3] = { "Performance", "Balanced", "Power Saver" };
-    const char *pdescs[3] = { "Max clock & I/O speed", "Adaptive energy balance", "Max battery conservation" };
+    const char *pdescs[3] = { "Unsupported by kernel", "Unsupported by kernel", "Unsupported by kernel" };
     int card_w = ((int)w - 40 - 24) / 3;
     for (int i = 0; i < 3; i++) {
         int cx = px + i * (card_w + 12);
         int cy = 114;
-        bool is_sel = (g_power_profile == i);
+        bool is_sel = false;
         unsigned int bg_col = is_sel ? UK_SURFACE1 : UK_SURFACE0;
         unsigned int border_col = is_sel ? UK_YELLOW : UK_SURFACE1;
 
@@ -49,9 +49,9 @@ void draw_power_tab(void)
 
     uk_draw_section_header(&g_win, px, 236, (int)w - 40, "ACPI Hardware & Subsystem Telemetry", UK_GREEN);
     uk_draw_panel(&g_win, px, 264, (int)w - 40, 56, UK_SURFACE0);
-    uk_draw_text(&g_win, px + 12, 270, "ACPI Controller: Intel PIIX4 Power Management Interface (I/O 0xB000)", UK_TEXT);
-    uk_draw_text(&g_win, px + 12, 286, "PM Timer Clock : 3.579545 MHz High-Precision 24-bit Counter (Fixed Rate)", UK_SUBTEXT0);
-    uk_draw_text(&g_win, px + 12, 302, "System Power   : AC Mains Online (ACPI S0 working, S5 soft-off)", UK_GREEN);
+    uk_draw_text(&g_win, px + 12, 270, "Display blanking wakes on keyboard or mouse input.", UK_TEXT);
+    uk_draw_text(&g_win, px + 12, 286, "CPU frequency scaling and suspend are unavailable.", UK_SUBTEXT0);
+    uk_draw_text(&g_win, px + 12, 302, "Restart and power-off use the kernel reboot interface.", UK_SUBTEXT0);
 
     uk_draw_section_header(&g_win, px, 330, (int)w - 40, "System Power Actions", UK_PEACH);
 
@@ -66,21 +66,8 @@ void draw_power_tab(void)
 
 void handle_power_mouse(int mx, int my)
 {
-    unsigned int w = g_win.width, h = g_win.height;
+    unsigned int w = (unsigned int)settings_content_width(), h = g_win.height;
     (void)w; (void)h;
-    /* Profile cards (y: 114..162) */
-                    int card_w = ((int)w - 40 - 24) / 3;
-                    if (my >= 114 && my <= 162) {
-                        for (int i = 0; i < 3; i++) {
-                            int cx = 20 + i * (card_w + 12);
-                            if (mx >= cx && mx <= cx + card_w) {
-                                apply_power_profile(i);
-                                draw_settings();
-                                break;
-                            }
-                        }
-                        return;
-                    }
                     /* Timeout pills (y: 200..226) */
                     int timeouts[4] = { 5, 15, 30, 0 };
                     int pill_w = ((int)w - 40 - 36) / 4;
@@ -119,13 +106,19 @@ void handle_power_mouse(int mx, int my)
                         if (mx >= 172 && mx <= 312) {
                             snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Initiating system reboot...");
                             draw_settings();
-                            reboot(RB_AUTOBOOT);
+                            if (reboot(RB_AUTOBOOT) < 0) {
+                                snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Error: Restart failed or access denied.");
+                                draw_settings();
+                            }
                             return;
                         }
                         if (mx >= 324 && mx <= 464) {
                             snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Initiating ACPI poweroff...");
                             draw_settings();
-                            reboot(RB_POWER_OFF);
+                            if (reboot(RB_POWER_OFF) < 0) {
+                                snprintf(g_power_status_msg, sizeof(g_power_status_msg), "Error: Power-off failed or access denied.");
+                                draw_settings();
+                            }
                             return;
                         }
                     }

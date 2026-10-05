@@ -12,32 +12,34 @@ void draw_system_tab(void)
 
     uk_draw_section_header(&g_win, px, SYS_SEC_Y, (int)w - 40, "Kernel & System Architecture", UK_TEAL);
 
-    struct sysinfo si;
-    sysinfo(&si);
+    struct sysinfo si = {0};
+    int memory_available = sysinfo(&si) == 0;
     unsigned long total_mb = (si.totalram * si.mem_unit) / (1024 * 1024);
     unsigned long free_mb  = (si.freeram * si.mem_unit) / (1024 * 1024);
 
     char mem_buf[64];
-    snprintf(mem_buf, sizeof(mem_buf), "%lu MB Total (%lu MB Free)", total_mb, free_mb);
+    if (memory_available) snprintf(mem_buf, sizeof(mem_buf), "%lu MB Total (%lu MB Free)", total_mb, free_mb);
+    else snprintf(mem_buf, sizeof(mem_buf), "Memory statistics unavailable");
 
     /* Real core count from sysconf(), not a guess: it was a hardcoded "4"
      * until sysconf() itself was fixed to read /proc/cpuinfo's real
      * enumeration (fs/procfs.c, smp_cpu_count()). */
     long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
     char cpu_buf[64];
-    snprintf(cpu_buf, sizeof(cpu_buf), "%ld Core%s (Preemptive CFS Scheduling)",
-             ncpus, ncpus == 1 ? "" : "s");
+    if (ncpus > 0) snprintf(cpu_buf, sizeof(cpu_buf), "%ld Core%s (Preemptive CFS Scheduling)",
+                           ncpus, ncpus == 1 ? "" : "s");
+    else snprintf(cpu_buf, sizeof(cpu_buf), "CPU count unavailable");
 
     static const char *sys_info[][2] = {
         { "Operating System", "AzamiOS v7.0.0 (x86_64 Microkernel)" },
         { "SMP CPU Cores",    "" },
         { "Memory Model",     "Buddy PMM + 4-Level VMM (PML4)" },
         { "System Memory",    "" },
-        { "Storage System",   "Persistent SATA AHCI (/hdd) + Ext2" },
+        { "Storage System",   "See Disks for filesystem usage" },
         { "Window Server",    "azwm Compositor (Zero-Copy SHMEM)" },
-        { "Audio Controller", "Intel AC97 PCI (/dev/dsp)" },
-        { "Power Management", "Intel PIIX4 ACPI PM (I/O 0xB000)" },
-        { "Security Engine",  "LSM + YAMA + Auto-Accept Policy" },
+        { "Audio Interface",  "OSS-compatible PCM (/dev/dsp)" },
+        { "Power Management", "Display blanking and kernel reboot" },
+        { "Security Engine",  "Kernel hardening and YAMA sysctls" },
     };
 
     int py = SYS_GRID_Y;

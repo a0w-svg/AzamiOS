@@ -123,7 +123,8 @@ typedef struct ahci_drive {
 } ahci_drive_t;
 
 static ahci_drive_t g_drives[AHCI_MAX_DRIVES];
-static u32          g_drive_count;     /* total live entries in g_drives[]  */
+static u32          g_drive_count;     /* claimed entries in g_drives[]     */
+static spinlock_t   g_drives_lock = SPINLOCK_INIT;
 static u32          g_sata_count;      /* naming counter: sata0, sata1, …   */
 static u32          g_optical_count;   /* naming counter: sr0, sr1, …       */
 
@@ -198,7 +199,7 @@ static int port_run_slot0(ahci_drive_t *d)
 
     mw(&p->ci, 1u);
 
-    int timed_out = !wait_event_timeout(d->wq,
+    wait_event_timeout(d->wq,
         !(mr(&p->ci) & 1u) || (mr(&p->is) & AHCI_PxIS_ERR_MASK),
         2000 /* 2000 ms timeout */);
 
@@ -454,7 +455,7 @@ static int ncq_issue_and_wait(ahci_drive_t *d, u32 slot)
     mw(&p->ci,   (1u << slot));
     spinlock_unlock(&d->lock);
 
-    int timed_out = !wait_event_timeout(d->wq,
+    wait_event_timeout(d->wq,
         (__atomic_load_n(&d->epoch, __ATOMIC_RELAXED) != my_epoch) ||
         (mr(&p->is) & AHCI_PxIS_ERR_MASK) ||
         !(mr(&p->sact) & (1u << slot)),
@@ -784,8 +785,6 @@ static int ahci_identify(ahci_drive_t *d, bool *out_ncq_supported)
 
 static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 hba_ncs, bool hba_s64a)
 {
-    if (g_drive_count >= AHCI_MAX_DRIVES) return;
-
     /* Wait for SATA PHY link (DET reaches 3). After an HBA reset a populated
      * port takes a few ms of COMRESET/COMWAKE negotiation; an *empty* port
      * reports DET==0 immediately, so bail fast once we've seen a stable 0 and
@@ -809,15 +808,25 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 
     }
     if ((ssts & 0x0F) != 3 || ((ssts >> 8) & 0x0F) != 1) return;   /* no device */
 
+    /* Claim a slot before issuing any command. The IRQ handler must be able
+     * to find this drive during IDENTIFY and the reads in block registration. */
+    irqflags_t flags = spinlock_lock_irqsave(&g_drives_lock);
+    if (g_drive_count >= AHCI_MAX_DRIVES) {
+        spinlock_unlock_irqrestore(&g_drives_lock, flags);
+        return;
+    }
     ahci_drive_t *d = &g_drives[g_drive_count];
     memset(d, 0, sizeof(*d));
-    d->port    = port;
     d->port_no = port_no;
     d->lock    = (spinlock_t)SPINLOCK_INIT;
+    init_waitqueue_head(&d->wq);
+    d->port = port;
+    g_drive_count++;
+    spinlock_unlock_irqrestore(&g_drives_lock, flags);
 
     if (port_stop(port) != 0) {
         pr_debug("[AHCI]  port %u: engine would not stop, skipped\n", port_no);
-        return;
+        goto fail_no_dma;
     }
 
     /* CAP.S64A (bit 31) says whether this HBA can even DMA to a 64-bit
@@ -833,10 +842,10 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 
     d->bounce_phys = hba_s64a ? pmm_alloc_pages(AHCI_BOUNCE_PAGES)
                               : pmm_alloc_pages_32(AHCI_BOUNCE_PAGES);
     if (!d->page_phys || !d->bounce_phys) {
-        if (d->page_phys) pmm_free_page(d->page_phys);
-        if (d->bounce_phys) pmm_free_pages(d->bounce_phys, AHCI_BOUNCE_PAGES);
+        if (d->page_phys) { pmm_free_page(d->page_phys); d->page_phys = 0; }
+        if (d->bounce_phys) { pmm_free_pages(d->bounce_phys, AHCI_BOUNCE_PAGES); d->bounce_phys = 0; }
         pr_debug("[AHCI]  port %u: out of memory\n", port_no);
-        return;
+        goto fail_no_dma;
     }
     d->page_virt   = PHYS_TO_VIRT(d->page_phys);
     d->bounce_virt = PHYS_TO_VIRT(d->bounce_phys);
@@ -906,7 +915,6 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 
         }
 
         g_optical_count++;
-        g_drive_count++;
         return;
     }
     if (sig == SATA_SIG_PM) {
@@ -1091,10 +1099,14 @@ static void ahci_port_bringup(ahci_port_t *port, u32 port_no, bool hba_ncq, u32 
     }
 
     g_sata_count++;
-    g_drive_count++;
     return;
 
 fail:
+    if (d->ncq_bounce_phys) {
+        size_t ncq_pages = d->ncq_nslots * AHCI_NCQ_SLOT_BOUNCE_BYTES / PAGE_SIZE;
+        pmm_free_pages(d->ncq_bounce_phys, ncq_pages);
+        d->ncq_bounce_phys = 0;
+    }
     /* The DMA page we are about to free backs the command list and the received
      * FIS area. If the engine did not actually stop (misbehaving device —
      * port_stop returns non-zero), the HBA would keep DMAing FISes into a page
@@ -1105,8 +1117,24 @@ fail:
     }
     mw(&port->clb,  0);  mw(&port->clbu, 0);
     mw(&port->fb,   0);  mw(&port->fbu,  0);
-    pmm_free_page(d->page_phys);
-    pmm_free_pages(d->bounce_phys, AHCI_BOUNCE_PAGES);
+    if (d->page_phys) {
+        pmm_free_page(d->page_phys);
+        d->page_phys = 0;
+    }
+    if (d->bounce_phys) {
+        pmm_free_pages(d->bounce_phys, AHCI_BOUNCE_PAGES);
+        d->bounce_phys = 0;
+    }
+
+fail_no_dma:
+    flags = spinlock_lock_irqsave(&g_drives_lock);
+    if (g_drive_count > 0 && d == &g_drives[g_drive_count - 1]) {
+        memset(d, 0, sizeof(*d));
+        g_drive_count--;
+    } else {
+        d->port = NULL;
+    }
+    spinlock_unlock_irqrestore(&g_drives_lock, flags);
 }
 
 /* ── Controller bring-up ───────────────────────────────────────────────── */
@@ -1124,12 +1152,14 @@ static irqreturn_t ahci_interrupt(int irq, void *dev_id)
             u32 pis = mr(&p->is);
             mw(&p->is, pis);
 
+            irqflags_t flags = spinlock_lock_irqsave(&g_drives_lock);
             for (u32 j = 0; j < g_drive_count; j++) {
                 if (g_drives[j].port == p) {
                     wake_up_all(&g_drives[j].wq);
                     break;
                 }
             }
+            spinlock_unlock_irqrestore(&g_drives_lock, flags);
         }
     }
     mw(&hba->is, is);
@@ -1236,6 +1266,4 @@ void block_ahci_init(void)
     g_sata_count    = 0;
     g_optical_count = 0;
     pci_driver_register(&ahci_pci_driver);
-    if (g_drive_count == 0)
-        pr_debug("[AHCI] no SATA drives found\n");
 }

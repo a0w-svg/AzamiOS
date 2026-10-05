@@ -720,6 +720,11 @@ void pmm_init(void *memmap_raw)
 
         phys_addr_t base = PAGE_ALIGN_UP(e->base);
         phys_addr_t end  = PAGE_ALIGN_DOWN(e->base + e->length);
+        /* Physical zero is the failure sentinel throughout the PMM/VMM API.
+         * UEFI may report the first page as usable; keep its bitmap bit set
+         * and exclude it from every free list so blk_pop() cannot consume a
+         * real block and mistake the returned address for an empty list. */
+        if (base < PAGE_SIZE) base = PAGE_SIZE;
         if (base >= end) continue;
 
         if (base >= pmm_max_addr || end > pmm_max_addr) {

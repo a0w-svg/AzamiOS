@@ -198,11 +198,23 @@ typedef struct {
     u64 rlim_max;   /* hard limit — ceiling a soft limit may be raised to */
 } krlimit_t;
 
+typedef struct uts_namespace {
+    u32  refcnt;
+    char nodename[65];
+    char domainname[65];
+} uts_namespace_t;
+
+uts_namespace_t *uts_ns_get(uts_namespace_t *ns);
+void uts_ns_put(uts_namespace_t *ns);
+uts_namespace_t *uts_ns_create(const char *nodename, const char *domainname);
+
 /**
  * struct process — Microkernel address space and resource container.
  */
 typedef struct process {
     u32             pid;             /* Process ID */
+    uts_namespace_t *uts_ns;         /* UTS namespace (nodename / domainname) */
+    bool            new_pid_ns;      /* Create children in new PID namespace */
     phys_addr_t     pml4_phys;       /* Physical address of level-4 page table (CR3) */
     u16             pcid;            /* PCID tag for this address space (0 = kernel) */
     u64             pcid_primed;     /* bit per CPU: set once this core has done a

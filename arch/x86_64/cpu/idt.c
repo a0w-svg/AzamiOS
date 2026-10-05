@@ -231,9 +231,6 @@ static bool handle_user_page_fault(pt_regs_t *r, uintptr_t fault_addr)
             } else if (proc->stack_low > 0 && fault_addr >= proc->stack_low &&
                        fault_addr < proc->stack_high) {
                 is_writable = true;
-            } else if (!vma_ok && proc->mmap_current > 0x0000600000000000ULL &&
-                       fault_addr >= 0x0000600000000000ULL && fault_addr < proc->mmap_current) {
-                is_writable = true;
             }
 
             /* Only resolve COW if the region actually has PROT_WRITE permission */
@@ -293,11 +290,6 @@ static bool handle_user_page_fault(pt_regs_t *r, uintptr_t fault_addr)
             region_prot = VMA_PROT_READ | VMA_PROT_WRITE;
         }
         else if (proc->heap_start > 0 && fault_addr >= proc->heap_start && fault_addr < proc->heap_end) {
-            valid_fault = true;
-            region_prot = VMA_PROT_READ | VMA_PROT_WRITE;
-        }
-        else if (!have_probe && proc->mmap_current > 0x0000600000000000ULL &&
-                 fault_addr >= 0x0000600000000000ULL && fault_addr < proc->mmap_current) {
             valid_fault = true;
             region_prot = VMA_PROT_READ | VMA_PROT_WRITE;
         }

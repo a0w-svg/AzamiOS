@@ -4,6 +4,7 @@
 #include <kernel/lib/string.h>
 #include <azami/debug.h>
 #include <arch/x86_64/cpu/spinlock.h>
+#include <arch/x86_64/mm/vmm.h>
 
 
 #define MAX_DMA_MASKS 256
@@ -140,7 +141,14 @@ static spinlock_t bounce_lock = SPINLOCK_INIT;
 static struct bounce_buffer *bounce_list = NULL;
 
 dma_addr_t dma_map_single(device_t *dev, void *cpu_addr, size_t size, enum dma_data_direction dir) {
-    phys_addr_t paddr = VIRT_TO_PHYS((virt_addr_t)cpu_addr);
+    if (!cpu_addr || size == 0) return 0;
+    phys_addr_t paddr;
+    if ((virt_addr_t)cpu_addr >= HHDM_BASE) {
+        paddr = VIRT_TO_PHYS((virt_addr_t)cpu_addr);
+    } else {
+        paddr = vmm_translate(vmm_kernel_space(), (virt_addr_t)cpu_addr);
+        if (!paddr) return 0;
+    }
     u64 mask = get_dma_mask(dev);
 
     if (paddr + size - 1 > mask) {

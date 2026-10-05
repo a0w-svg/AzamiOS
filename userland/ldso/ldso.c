@@ -72,6 +72,7 @@
  * ============================================================================ */
 
 #include <stdint.h>
+#include "../libc/include/internal/elf_hash.h"
 #include "../libc/include/sys/syscall.h"
 
 typedef uint8_t  u8;
@@ -166,6 +167,7 @@ typedef struct {
 #define DT_NEEDED        1
 #define DT_PLTRELSZ      2
 #define DT_HASH          4
+#define DT_GNU_HASH      0x6ffffef5
 #define DT_STRTAB        5
 #define DT_SYMTAB        6
 #define DT_RELA          7
@@ -354,6 +356,7 @@ static void parse_dynamic(obj_t *o, elf64_dyn_t *dyn)
 {
     u64 bias = o->load_bias;
     const char *strtab = 0;
+    const u32 *gnu_hash = 0;
 
     /* DT_STRTAB first: DT_NEEDED entries are string-table *offsets*. */
     for (elf64_dyn_t *d = dyn; d->d_tag != DT_NULL; d++)
@@ -379,11 +382,27 @@ static void parse_dynamic(obj_t *o, elf64_dyn_t *dyn)
             o->nsyms = hash[1];
             break;
         }
+        case DT_GNU_HASH:
+            gnu_hash = (const u32 *)(uintptr_t)(bias + d->d_un.d_ptr);
+            break;
         case DT_NEEDED:
             if (o->nneeded < MAX_NEEDED && strtab)
                 o->needed_names[o->nneeded++] = strtab + d->d_un.d_val;
             break;
         default: break;
+        }
+    }
+    if (!o->nsyms && gnu_hash) {
+        u64 address = (u64)(uintptr_t)gnu_hash;
+        for (u32 i = 0; i < o->phnum; i++) {
+            elf64_phdr_t *ph = &o->phdr_storage[i];
+            u64 start = bias + ph->p_vaddr;
+            if (ph->p_type == PT_LOAD && address >= start &&
+                address - start < ph->p_memsz) {
+                o->nsyms = __elf_gnu_hash_count(gnu_hash,
+                    ph->p_memsz - (address - start));
+                break;
+            }
         }
     }
 }
