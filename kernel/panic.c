@@ -97,8 +97,17 @@ __noreturn void kernel_panic(const char *fmt, ...)
             kprintf("%s", s ? s : "(null)");
             break;
         }
-        case 'u':
         case 'd': {
+            long long v = is_ll ? va_arg(ap, long long)
+                        : is_l ? (long long)va_arg(ap, long)
+                               : (long long)va_arg(ap, int);
+            if (v < 0) kputc('-');
+            /* Unsigned subtraction handles LLONG_MIN without signed overflow. */
+            panic_print_uint(v < 0 ? 0ULL - (unsigned long long)v
+                                  : (unsigned long long)v);
+            break;
+        }
+        case 'u': {
             unsigned long long v = is_ll ? va_arg(ap, unsigned long long)
                                  : is_l  ? (unsigned long long)va_arg(ap, unsigned long)
                                          : (unsigned long long)va_arg(ap, unsigned int);
