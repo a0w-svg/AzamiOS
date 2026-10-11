@@ -1,0 +1,429 @@
+{
+  "date": "2026-10-11",
+  "kernel_sha256": "b4af2a90e008b64b5094e021c2280f6b25cb62f503238bc4624599fc26435cb6",
+  "pmm_sha256": "7eefe2c9e6841be0d9c75b410e416b7f2a43f4ffc80618a572042c1b7541c554",
+  "configurations": [
+    {
+      "accel": "kvm",
+      "cpus": 1,
+      "memory_mb": 512,
+      "network": "none",
+      "records": [
+        {
+          "phase": "mixed",
+          "allocations": 30,
+          "orders_mask": 1023,
+          "pages": 3069,
+          "zero_bytes": 4190208,
+          "passed": true
+        },
+        {
+          "phase": "exhaust",
+          "allocations": 21,
+          "orders_mask": 65277,
+          "pages": 111886,
+          "order_failures": 19,
+          "buddy_pages": 0,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "remote",
+          "cpu": 0,
+          "supported": false,
+          "seed": 0,
+          "cached_pages": 0,
+          "drained": 0,
+          "recovered": 0,
+          "global_oom": true,
+          "passed": true
+        },
+        {
+          "phase": "restore",
+          "initial_pages": 111886,
+          "restored_pages": 111886,
+          "local_drained": 2,
+          "orders_restored": true,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "PASS",
+          "cpus": 1,
+          "passed": true
+        }
+      ]
+    },
+    {
+      "accel": "kvm",
+      "cpus": 1,
+      "memory_mb": 1536,
+      "network": "none",
+      "records": [
+        {
+          "phase": "mixed",
+          "allocations": 30,
+          "orders_mask": 1023,
+          "pages": 3069,
+          "zero_bytes": 4190208,
+          "passed": true
+        },
+        {
+          "phase": "exhaust",
+          "allocations": 23,
+          "orders_mask": 261885,
+          "pages": 374029,
+          "order_failures": 19,
+          "buddy_pages": 0,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "remote",
+          "cpu": 0,
+          "supported": false,
+          "seed": 0,
+          "cached_pages": 0,
+          "drained": 0,
+          "recovered": 0,
+          "global_oom": true,
+          "passed": true
+        },
+        {
+          "phase": "restore",
+          "initial_pages": 374029,
+          "restored_pages": 374029,
+          "local_drained": 1,
+          "orders_restored": true,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "PASS",
+          "cpus": 1,
+          "passed": true
+        }
+      ]
+    },
+    {
+      "accel": "kvm",
+      "cpus": 4,
+      "memory_mb": 512,
+      "network": "none",
+      "records": [
+        {
+          "phase": "mixed",
+          "allocations": 30,
+          "orders_mask": 1023,
+          "pages": 3069,
+          "zero_bytes": 4190208,
+          "passed": true
+        },
+        {
+          "phase": "exhaust",
+          "allocations": 25,
+          "orders_mask": 65183,
+          "pages": 111822,
+          "order_failures": 19,
+          "buddy_pages": 0,
+          "cached_pages": 1,
+          "passed": true
+        },
+        {
+          "phase": "remote",
+          "cpu": 1,
+          "supported": true,
+          "seed": 1376256,
+          "cached_pages": 1,
+          "drained": 1,
+          "recovered": 1376256,
+          "global_oom": true,
+          "passed": true
+        },
+        {
+          "phase": "restore",
+          "initial_pages": 111823,
+          "restored_pages": 111823,
+          "local_drained": 3,
+          "orders_restored": true,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "PASS",
+          "cpus": 4,
+          "passed": true
+        }
+      ]
+    },
+    {
+      "accel": "kvm",
+      "cpus": 4,
+      "memory_mb": 1536,
+      "network": "none",
+      "records": [
+        {
+          "phase": "mixed",
+          "allocations": 30,
+          "orders_mask": 1023,
+          "pages": 3069,
+          "zero_bytes": 4190208,
+          "passed": true
+        },
+        {
+          "phase": "exhaust",
+          "allocations": 27,
+          "orders_mask": 261791,
+          "pages": 373965,
+          "order_failures": 19,
+          "buddy_pages": 0,
+          "cached_pages": 1,
+          "passed": true
+        },
+        {
+          "phase": "remote",
+          "cpu": 1,
+          "supported": true,
+          "seed": 1380352,
+          "cached_pages": 1,
+          "drained": 1,
+          "recovered": 1380352,
+          "global_oom": true,
+          "passed": true
+        },
+        {
+          "phase": "restore",
+          "initial_pages": 373966,
+          "restored_pages": 373966,
+          "local_drained": 4,
+          "orders_restored": true,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "PASS",
+          "cpus": 4,
+          "passed": true
+        }
+      ]
+    },
+    {
+      "accel": "tcg",
+      "cpus": 1,
+      "memory_mb": 512,
+      "network": "none",
+      "records": [
+        {
+          "phase": "mixed",
+          "allocations": 30,
+          "orders_mask": 1023,
+          "pages": 3069,
+          "zero_bytes": 4190208,
+          "passed": true
+        },
+        {
+          "phase": "exhaust",
+          "allocations": 21,
+          "orders_mask": 65278,
+          "pages": 111888,
+          "order_failures": 19,
+          "buddy_pages": 0,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "remote",
+          "cpu": 0,
+          "supported": false,
+          "seed": 0,
+          "cached_pages": 0,
+          "drained": 0,
+          "recovered": 0,
+          "global_oom": true,
+          "passed": true
+        },
+        {
+          "phase": "restore",
+          "initial_pages": 111888,
+          "restored_pages": 111888,
+          "local_drained": 0,
+          "orders_restored": true,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "PASS",
+          "cpus": 1,
+          "passed": true
+        }
+      ]
+    },
+    {
+      "accel": "tcg",
+      "cpus": 1,
+      "memory_mb": 1536,
+      "network": "none",
+      "records": [
+        {
+          "phase": "mixed",
+          "allocations": 30,
+          "orders_mask": 1023,
+          "pages": 3069,
+          "zero_bytes": 4190208,
+          "passed": true
+        },
+        {
+          "phase": "exhaust",
+          "allocations": 25,
+          "orders_mask": 261885,
+          "pages": 374031,
+          "order_failures": 19,
+          "buddy_pages": 0,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "remote",
+          "cpu": 0,
+          "supported": false,
+          "seed": 0,
+          "cached_pages": 0,
+          "drained": 0,
+          "recovered": 0,
+          "global_oom": true,
+          "passed": true
+        },
+        {
+          "phase": "restore",
+          "initial_pages": 374031,
+          "restored_pages": 374031,
+          "local_drained": 3,
+          "orders_restored": true,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "PASS",
+          "cpus": 1,
+          "passed": true
+        }
+      ]
+    },
+    {
+      "accel": "tcg",
+      "cpus": 4,
+      "memory_mb": 512,
+      "network": "none",
+      "records": [
+        {
+          "phase": "mixed",
+          "allocations": 30,
+          "orders_mask": 1023,
+          "pages": 3069,
+          "zero_bytes": 4190208,
+          "passed": true
+        },
+        {
+          "phase": "exhaust",
+          "allocations": 27,
+          "orders_mask": 65183,
+          "pages": 111824,
+          "order_failures": 19,
+          "buddy_pages": 0,
+          "cached_pages": 1,
+          "passed": true
+        },
+        {
+          "phase": "remote",
+          "cpu": 1,
+          "supported": true,
+          "seed": 1368064,
+          "cached_pages": 1,
+          "drained": 1,
+          "recovered": 1368064,
+          "global_oom": true,
+          "passed": true
+        },
+        {
+          "phase": "restore",
+          "initial_pages": 111825,
+          "restored_pages": 111825,
+          "local_drained": 5,
+          "orders_restored": true,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "PASS",
+          "cpus": 4,
+          "passed": true
+        }
+      ]
+    },
+    {
+      "accel": "tcg",
+      "cpus": 4,
+      "memory_mb": 1536,
+      "network": "none",
+      "records": [
+        {
+          "phase": "mixed",
+          "allocations": 30,
+          "orders_mask": 1023,
+          "pages": 3069,
+          "zero_bytes": 4190208,
+          "passed": true
+        },
+        {
+          "phase": "exhaust",
+          "allocations": 27,
+          "orders_mask": 261791,
+          "pages": 373967,
+          "order_failures": 19,
+          "buddy_pages": 0,
+          "cached_pages": 1,
+          "passed": true
+        },
+        {
+          "phase": "remote",
+          "cpu": 1,
+          "supported": true,
+          "seed": 1372160,
+          "cached_pages": 1,
+          "drained": 1,
+          "recovered": 1372160,
+          "global_oom": true,
+          "passed": true
+        },
+        {
+          "phase": "restore",
+          "initial_pages": 373968,
+          "restored_pages": 373968,
+          "local_drained": 2,
+          "orders_restored": true,
+          "cached_pages": 0,
+          "passed": true
+        },
+        {
+          "phase": "PASS",
+          "cpus": 4,
+          "passed": true
+        }
+      ]
+    }
+  ],
+  "checks": {
+    "abi_assertions_each": 121,
+    "normal_boot_configurations": 10,
+    "parser_corrupt_variants_per_profile": 13,
+    "panic_formatter_boundary_cases": 11,
+    "dropped_rpc": "panic before pressure with rc=-110",
+    "unsupported_eight_cpu": "explicit skip, ABI121 completes, validator rejects as selftest success"
+  },
+  "limits": [
+    "Pre-scheduler owner-cache test; not concurrent allocator throughput.",
+    "No production reclaim or allocation-policy change.",
+    "Raw logs and kernel copies remain local under build/pmm-checkpoint-*; no bulky generated source snapshots are versioned.",
+    "One earlier TCG run had a DHCP-interleaved ABI verdict and was rejected; final isolated runs disable networking."
+  ]
+}

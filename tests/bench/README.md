@@ -156,3 +156,22 @@ verdict. Missing Linux metadata is explicitly recorded. Negative retention
 estimates are allowed because the reads are separate. No allocator tuning or
 starvation/mixed-order proof follows from this workload; see
 [the measurement record](../../docs/W4.3_PMM_RESULTS.md).
+
+## Opt-in physical allocator exhaustion
+
+`pmm_selftest.py` runs the boot test on an immutable copy of the built kernel.
+It defaults to one/four CPUs and 512/1536 MiB, requires all five PMM records and
+the post-test 121-check ABI verdict, and writes a compact summary. Raw guests,
+logs and kernel copies belong in the ignored build directory:
+
+```sh
+make -j8 build/kernel.elf
+python3 -B tests/bench/pmm_selftest.py --accel kvm --output build/pmm-selftest-kvm
+python3 -B tests/bench/pmm_selftest.py --accel tcg --output build/pmm-selftest-tcg
+python3 -B tests/bench/test_pmm_selftest.py \
+    build/pmm-selftest-kvm/kvm-4cpu-1536m/serial.log --cpus 4
+```
+
+This checks allocation-failure and restoration invariants before scheduling;
+it does not measure concurrent allocator throughput. See
+[the checkpoint results](../../docs/W4.3_PMM_SELFTEST_RESULTS.md).

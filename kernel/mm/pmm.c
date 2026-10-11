@@ -83,6 +83,8 @@
 #include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../../arch/x86_64/cpu/smp.h"
 #include "../../drivers/char/console.h"
+#include "../cmdline.h"
+#include "../time/timekeeping.h"
 
 
 /* Limine memory map types (from limine.h — we use the numeric values directly
@@ -1023,4 +1025,246 @@ void pmm_dump_stats(void)
                     (unsigned long long)st[zi].blocks[o]);
         }
     }
+}
+
+/* Boot-only real allocator stress. No allocation policy or hot-path counters
+ * change. APs service IPIs but have not started timers or scheduling. Fixed
+ * ownership records bound exhaustion work; hitting the bound is a failure,
+ * never evidence of exhaustion. All diagnostics are deferred until cleanup.
+ * A remote seed is one individually allocated order-0 frame, so its eventual
+ * free always matches the public API's original allocation order. */
+#define PMM_TEST_BLOCKS 4096
+typedef struct { phys_addr_t phys; u32 order; } pmm_test_block_t;
+static pmm_test_block_t g_pmm_test_blocks[PMM_TEST_BLOCKS];
+enum { PT_PENDING, PT_RUNNING, PT_DONE, PT_CANCELLED };
+enum { PT_DRAIN, PT_SEED };
+typedef struct {
+    u32 op, moved, cached;
+    s32 error;
+    phys_addr_t seed;
+} pmm_test_rpc_t;
+static u32 g_pmm_test_rpc_state;
+static u32 g_pmm_test_seed_remote;
+
+static void pmm_test_callback(void *data)
+{
+    pmm_test_rpc_t *request=data;
+    u32 expected=PT_PENDING;
+    if (!__atomic_compare_exchange_n(&g_pmm_test_rpc_state,&expected,PT_RUNNING,
+                                    false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return;
+    request->error=-1;
+    /* Callback never waits on a lock. Public pmm_drain_local() would block on
+     * g_pmm_lock and therefore is deliberately not used from this IRQ path. */
+    if (spinlock_try_lock(&g_pmm_lock)) {
+        u32 cpu=smp_current_cpu_id();
+        if (request->op==PT_SEED) {
+            pcp_t *p=&g_pcp[cpu][zone_of(request->seed)];
+            if (!p->count) {
+                /* Empty cache proves this public order-0 free cannot spill or
+                 * acquire the already-held global lock. Bitmap stays owned. */
+                pmm_free(request->seed,0);
+                __atomic_store_n(&g_pmm_test_seed_remote,1,__ATOMIC_RELEASE);
+                request->error=0;
+            }
+        } else {
+            request->error=0;
+            for (u32 zone=0;zone<PMM_ZONE_COUNT;zone++) {
+                pcp_t *p=&g_pcp[cpu][zone];
+                while (p->count) {
+                    phys_addr_t phys=p->page[--p->count];
+                    if (!zone_free_locked(phys,0)) request->error=-2;
+                    request->moved++;
+                }
+            }
+        }
+        request->cached=g_pcp[cpu][0].count+g_pcp[cpu][1].count;
+        spinlock_unlock(&g_pmm_lock);
+    }
+    __atomic_store_n(&g_pmm_test_rpc_state,PT_DONE,__ATOMIC_RELEASE);
+}
+
+static u32 pmm_test_call(u32 cpu,u32 op,phys_addr_t seed)
+{
+    pmm_test_rpc_t request={.op=op,.seed=seed};
+    __atomic_store_n(&g_pmm_test_rpc_state,PT_PENDING,__ATOMIC_RELEASE);
+    u64 deadline=ktime_get_ns()+250000000ULL;
+    int result=smp_rpc_call(cpu,pmm_test_callback,&request,sizeof(request),deadline);
+    if (result) {
+        u32 expected=PT_PENDING;
+        /* A cancelled transaction cannot change seed/cache ownership even if
+         * its IRQ callback arrives late. A started callback owns permanent
+         * globals only. Never free its seed or enter pressure with an unknown
+         * result: bounded observation followed by panic stops this boot. */
+        if (!__atomic_compare_exchange_n(&g_pmm_test_rpc_state,&expected,PT_CANCELLED,
+                                        false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
+            for (u32 spins=0;spins<1000000;spins++) {
+                if (__atomic_load_n(&g_pmm_test_rpc_state,__ATOMIC_ACQUIRE)==PT_DONE) break;
+                cpu_pause();
+            }
+        }
+        PANIC("PMM selftest RPC failed cpu=%u op=%u state=%u rc=%d",cpu,op,
+              __atomic_load_n(&g_pmm_test_rpc_state,__ATOMIC_ACQUIRE),result);
+    }
+    if (__atomic_load_n(&g_pmm_test_rpc_state,__ATOMIC_ACQUIRE)!=PT_DONE ||
+        request.error || (op==PT_DRAIN && request.cached))
+        PANIC("PMM selftest callback invariant cpu=%u op=%u error=%d",cpu,op,request.error);
+    return request.moved;
+}
+
+static u64 pmm_test_pattern(phys_addr_t phys)
+{
+    return phys^0xd71b4a935fc286e0ULL;
+}
+
+static void pmm_test_content(pmm_test_block_t block,bool write,bool zero)
+{
+    for (u64 page=0;page<(1ULL<<block.order);page++) {
+        phys_addr_t phys=block.phys+page*PAGE_SIZE;
+        volatile u64 *words=(volatile u64 *)PHYS_TO_VIRT(phys);
+        if (zero)
+            for (u32 word=0;word<PAGE_SIZE/sizeof(u64);word++)
+                if (words[word]) PANIC("PMM selftest nonzero frame 0x%llx",(unsigned long long)phys);
+        u64 pattern=pmm_test_pattern(phys);
+        if (write) { words[0]=pattern; words[PAGE_SIZE/sizeof(u64)-1]=~pattern; }
+        else if (words[0]!=pattern || words[PAGE_SIZE/sizeof(u64)-1]!=~pattern)
+            PANIC("PMM selftest frame content mismatch 0x%llx",(unsigned long long)phys);
+    }
+}
+
+static void pmm_test_add(u32 *count,phys_addr_t phys,u32 order,bool zero)
+{
+    if (!phys || *count>=PMM_TEST_BLOCKS || !IS_ALIGNED(phys,PAGE_SIZE<<order))
+        PANIC("PMM selftest allocation/descriptor bound order=%u count=%u",order,*count);
+    u64 end=phys+(PAGE_SIZE<<order);
+    for (u32 i=0;i<*count;i++) {
+        pmm_test_block_t b=g_pmm_test_blocks[i];
+        if (phys<b.phys+(PAGE_SIZE<<b.order) && b.phys<end)
+            PANIC("PMM selftest overlapping live allocations");
+    }
+    g_pmm_test_blocks[*count]=(pmm_test_block_t){.phys=phys,.order=order};
+    pmm_test_content(g_pmm_test_blocks[(*count)++],true,zero);
+}
+
+static u64 pmm_test_snapshot(pmm_zone_stat_t *stats)
+{
+    pmm_zone_stats(stats,PMM_ZONE_COUNT);
+    u64 pages=0;
+    for (u32 zone=0;zone<PMM_ZONE_COUNT;zone++) {
+        u64 weighted=0;
+        for (u32 order=0;order<PMM_ORDER_COUNT;order++) weighted+=stats[zone].blocks[order]<<order;
+        if (weighted!=stats[zone].free_pages || stats[zone].cached_pages)
+            PANIC("PMM selftest buddy/cache accounting zone=%u",zone);
+        pages+=weighted;
+    }
+    return pages;
+}
+
+void pmm_boot_selftest(void)
+{
+    if (!cmdline_get_bool("azami.pmm_selftest",false)) return;
+    u32 cpus=smp_cpu_count(); u64 mask=smp_online_mask();
+    if (smp_current_cpu_id()!=0 || __atomic_load_n(&g_smp_sched_active,__ATOMIC_ACQUIRE) ||
+        !g_pmm_percpu_ready)
+        PANIC("PMM selftest requires parked pre-scheduler CPUs");
+    if (!cpus || cpus>4 || pmm_get_total_pages()<(128ULL*1024*1024/PAGE_SIZE) ||
+        pmm_get_total_pages()>(2ULL*1024*1024*1024/PAGE_SIZE) ||
+        mask!=((1ULL<<cpus)-1)) {
+        kprintf("PMMTEST {\"phase\":\"skip\",\"reason\":\"requires 1-4 online CPUs and 128MiB-2GiB managed RAM\"}\n");
+        return;
+    }
+    for (u32 cpu=0;cpu<cpus;cpu++) pmm_test_call(cpu,PT_DRAIN,0);
+    pmm_zone_stat_t initial[PMM_ZONE_COUNT], final[PMM_ZONE_COUNT];
+    u64 initial_pages=pmm_test_snapshot(initial);
+    u32 count=0, mixed_mask=0; u64 zero_bytes=0, mixed_pages=0;
+    static const u32 orders[]={0,9,1,8,2,7,3,6,4,5};
+    for (u32 batch=0;batch<3;batch++)
+        for (u32 i=0;i<ARRAY_SIZE(orders);i++) {
+            u32 order=orders[i];
+            phys_addr_t phys=batch==0 ? pmm_alloc_zeroed(order) :
+                batch==1 ? pmm_alloc(order) : pmm_alloc_32(order);
+            if (batch==2 && phys && phys+(PAGE_SIZE<<order)>PMM_DMA32_LIMIT)
+                PANIC("PMM selftest DMA32 allocation out of range");
+            pmm_test_add(&count,phys,order,batch==0);
+            mixed_mask|=1U<<order; mixed_pages+=1ULL<<order;
+            if (!batch) zero_bytes+=PAGE_SIZE<<order;
+        }
+    for (u32 i=0;i<count;i++) pmm_test_content(g_pmm_test_blocks[i],false,false);
+    /* 7 is coprime with 30: every mixed-order block is freed exactly once. */
+    for (u32 i=0;i<count;i++) {
+        pmm_test_block_t block=g_pmm_test_blocks[(i*7)%count];
+        pmm_free(block.phys,block.order);
+    }
+    count=0; pmm_test_call(0,PT_DRAIN,0);
+    if (pmm_test_snapshot(final)!=initial_pages)
+        PANIC("PMM selftest mixed allocation capacity loss");
+    for (u32 zone=0;zone<PMM_ZONE_COUNT;zone++)
+        for (u32 order=0;order<PMM_ORDER_COUNT;order++)
+            if (final[zone].blocks[order]!=initial[zone].blocks[order])
+                PANIC("PMM selftest mixed buddy distribution changed");
+
+    phys_addr_t seed=0;
+    if (cpus>1) {
+        seed=pmm_alloc(0);
+        if (!seed) PANIC("PMM selftest remote seed allocation failed");
+        pmm_test_call(0,PT_DRAIN,0);
+        pmm_test_call(1,PT_SEED,seed);
+        if (!__atomic_load_n(&g_pmm_test_seed_remote,__ATOMIC_ACQUIRE))
+            PANIC("PMM selftest remote seed ownership not acknowledged");
+    }
+    u64 held_pages=0; u32 failures=0, exhaust_mask=0;
+    for (s32 order=PMM_MAX_ORDER;order>=0;order--) {
+        for (;;) {
+            if (count>=PMM_TEST_BLOCKS) PANIC("PMM selftest exhaustion descriptor cap reached");
+            phys_addr_t phys=pmm_alloc((u32)order);
+            if (!phys) { failures++; break; }
+            pmm_test_add(&count,phys,(u32)order,false);
+            held_pages+=1ULL<<order; exhaust_mask|=1U<<order;
+        }
+    }
+    pmm_zone_stats(final,PMM_ZONE_COUNT);
+    u64 buddy_pages=0,cached_pages=0;
+    for (u32 zone=0;zone<PMM_ZONE_COUNT;zone++) {
+        buddy_pages+=final[zone].free_pages; cached_pages+=final[zone].cached_pages;
+    }
+    u32 remote_pages=cpus>1 ? 1 : 0;
+    if (buddy_pages || cached_pages!=remote_pages || held_pages+remote_pages!=initial_pages ||
+        g_pcp[0][0].count || g_pcp[0][1].count || pmm_alloc(0))
+        PANIC("PMM selftest did not establish allocation failure accounting");
+    u32 exhaust_allocations=count;
+    u64 exhaust_pages=held_pages;
+    u32 drained=0;
+    phys_addr_t recovered=0;
+    if (cpus>1) {
+        drained=pmm_test_call(1,PT_DRAIN,0);
+        if (drained!=1) PANIC("PMM selftest remote drain changed unexpected frames");
+        recovered=pmm_alloc(0);
+        if (recovered!=seed) PANIC("PMM selftest remote seed recovery mismatch");
+        pmm_test_add(&count,recovered,0,false); held_pages++;
+    }
+    if (pmm_alloc(0) || pmm_test_snapshot(final))
+        PANIC("PMM selftest global exhaustion not established");
+    for (u32 i=0;i<count;i++) pmm_test_content(g_pmm_test_blocks[i],false,false);
+    while (count) {
+        pmm_test_block_t block=g_pmm_test_blocks[--count];
+        pmm_free(block.phys,block.order);
+    }
+    u32 restored_cache=pmm_test_call(0,PT_DRAIN,0);
+    u64 restored_pages=pmm_test_snapshot(final);
+    if (restored_pages!=initial_pages || held_pages!=initial_pages)
+        PANIC("PMM selftest capacity restoration failed");
+    for (u32 zone=0;zone<PMM_ZONE_COUNT;zone++)
+        for (u32 order=0;order<PMM_ORDER_COUNT;order++)
+            if (final[zone].blocks[order]!=initial[zone].blocks[order])
+                PANIC("PMM selftest buddy order restoration failed");
+    kprintf("PMMTEST {\"phase\":\"mixed\",\"allocations\":30,\"orders_mask\":%u,\"pages\":%llu,\"zero_bytes\":%llu,\"passed\":true}\n",
+            mixed_mask,(unsigned long long)mixed_pages,(unsigned long long)zero_bytes);
+    kprintf("PMMTEST {\"phase\":\"exhaust\",\"allocations\":%u,\"orders_mask\":%u,\"pages\":%llu,\"order_failures\":%u,\"buddy_pages\":%llu,\"cached_pages\":%llu,\"passed\":true}\n",
+            exhaust_allocations,exhaust_mask,(unsigned long long)exhaust_pages,failures,
+            (unsigned long long)buddy_pages,(unsigned long long)cached_pages);
+    kprintf("PMMTEST {\"phase\":\"remote\",\"cpu\":%u,\"supported\":%s,\"seed\":%llu,\"cached_pages\":%u,\"drained\":%u,\"recovered\":%llu,\"global_oom\":true,\"passed\":true}\n",
+            cpus>1 ? 1 : 0,cpus>1 ? "true" : "false",(unsigned long long)seed,
+            remote_pages,drained,(unsigned long long)recovered);
+    kprintf("PMMTEST {\"phase\":\"restore\",\"initial_pages\":%llu,\"restored_pages\":%llu,\"local_drained\":%u,\"orders_restored\":true,\"cached_pages\":0,\"passed\":true}\n",
+            (unsigned long long)initial_pages,(unsigned long long)restored_pages,restored_cache);
+    kprintf("PMMTEST {\"phase\":\"PASS\",\"cpus\":%u,\"passed\":true}\n",cpus);
 }

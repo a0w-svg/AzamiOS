@@ -42,7 +42,9 @@ coverage remains additional work. W4.3 now has a
 [measured FD reference checkpoint](W4.3_FD_RESULTS.md); continue with PMM,
 user-copy and COW measurement. A [controlled allocator baseline](W4.3_PMM_RESULTS.md)
 now passes on KVM/TCG with 55 worker records and 66 parked snapshots; allocation
-failure and mixed-order evidence remain before cache tuning. Inheritance/exec
+failure and mixed-order evidence is now recorded in the
+[opt-in boot checkpoint](W4.3_PMM_SELFTEST_RESULTS.md). Deferred reclaim and
+refill/spill measurements remain before cache tuning. Inheritance/exec
 workflow, groups and sampling remain later counter milestones. Gemini review
 confirmed a sysfs pagination
 defect; its fix passes 32/64-CPU enumeration.
@@ -270,7 +272,12 @@ batches. Lookup remains FD-locked and final teardown remains namespace-locked.
 Explicit-close lock ownership and concurrent status-flag updates remain limited.
 The [controlled one/four-worker baseline](W4.3_PMM_RESULTS.md) now records
 page integrity and approximate retention on KVM/TCG, with no allocator changes.
-Starvation, mixed-order and refill/drain evidence remain before cache tuning.
+The [opt-in exhaustion checkpoint](W4.3_PMM_SELFTEST_RESULTS.md) now covers real
+failures, mixed orders and exact restoration on one/four-CPU KVM/TCG guests.
+It reproduces one stranded remote cached page and recovery through an owner
+drain. Allocation policy is unchanged; production callers holding heap/VMM
+locks require an audited deferred-reclaim design. Refill/spill performance
+measurement remains before cache tuning.
 
 **Skills:** kernel-concurrency, custom-allocators, virtual memory, hardware-counters.
 

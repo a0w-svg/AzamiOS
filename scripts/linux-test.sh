@@ -15,6 +15,9 @@
 #
 #   LINUX_TEST_SMP=32 overrides vCPU count (1-64).
 #   LINUX_TEST_KERNEL=path selects an immutable kernel image for comparisons.
+#   LINUX_TEST_MEM_MB=512 overrides memory (128-65536 MiB).
+#   LINUX_TEST_ACCEL=auto|kvm|tcg selects the accelerator explicitly.
+#   LINUX_TEST_NET=none disables the default NIC for isolated probes.
 #
 # Payloads must report "== probe complete: N passed, M failed ==". A missing
 # verdict, timeout or kernel panic is a test failure, even if QEMU exits zero.
@@ -33,6 +36,20 @@ TIMEOUT="${LINUX_TEST_TIMEOUT:-60}"
 WORK="${LINUX_TEST_WORK:-build/linux-test}"
 KERNEL="${LINUX_TEST_KERNEL:-build/kernel.elf}"
 VCPUS="${LINUX_TEST_SMP:-4}"
+MEM_MB="${LINUX_TEST_MEM_MB:-1536}"
+ACCEL_REQUEST="${LINUX_TEST_ACCEL:-auto}"
+NETWORK_ARGS=()
+case "${LINUX_TEST_NET:-auto}" in
+    auto) ;;
+    none) NETWORK_ARGS=(-nic none) ;;
+    *) echo "error: LINUX_TEST_NET must be auto or none" >&2; exit 1 ;;
+esac
+if [[ ! "$MEM_MB" =~ ^[0-9]+$ ]] || [ "$MEM_MB" -lt 128 ] || [ "$MEM_MB" -gt 65536 ]; then
+    echo "error: LINUX_TEST_MEM_MB must be between 128 and 65536" >&2; exit 1
+fi
+case "$ACCEL_REQUEST" in auto|kvm|tcg) ;; *)
+    echo "error: LINUX_TEST_ACCEL must be auto, kvm or tcg" >&2; exit 1 ;;
+esac
 if ! [[ "$VCPUS" =~ ^[0-9]+$ ]] || [ "$VCPUS" -lt 1 ] || [ "$VCPUS" -gt 64 ]; then
     echo "error: LINUX_TEST_SMP must be between 1 and 64" >&2; exit 1
 fi
@@ -129,7 +146,10 @@ fi
 # KVM when this user can open it (an order of magnitude faster, and the CPU
 # model is the real one), multi-threaded TCG otherwise — the same choice the
 # top-level Makefile makes for `make run`.
-if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+if [ "$ACCEL_REQUEST" = kvm ] && { [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    echo "error: requested KVM is unavailable" >&2; exit 1
+fi
+if [ "$ACCEL_REQUEST" != tcg ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     ACCEL="-enable-kvm -cpu host"
 else
     ACCEL="-accel tcg,thread=multi,tb-size=512 -cpu max,+rdrand,+rdseed"
@@ -139,8 +159,9 @@ echo "  ▸  Booting $(basename "$PAYLOAD") as PID 1 (timeout ${TIMEOUT}s)..."
 rm -f "$WORK/serial.log"
 # shellcheck disable=SC2086
 timeout "$TIMEOUT" qemu-system-x86_64 \
-    -M q35 -m 1536M -smp "$VCPUS" \
+    -M q35 -m "${MEM_MB}M" -smp "$VCPUS" \
     $ACCEL \
+    "${NETWORK_ARGS[@]}" \
     -serial "file:$WORK/serial.log" -vga std -display none -no-reboot \
     -cdrom "$WORK/test.iso" >"$WORK/qemu.log" 2>&1 &
 QEMU_PID=$!

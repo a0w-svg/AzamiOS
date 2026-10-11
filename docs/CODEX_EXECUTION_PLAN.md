@@ -147,8 +147,10 @@ TID affinity and credential/dumpability checks. The sysctl defaults to 2. The
 user/kernel filtering and attached stock Linux 6.12 `perf stat`. Native/vendor
 runtime coverage remains additional work. The [W4.3 FD checkpoint](W4.3_FD_RESULTS.md)
 now includes measured safe reference release and the sysfs pagination fix. A
-[controlled PMM baseline](W4.3_PMM_RESULTS.md) is recorded. Allocation-failure,
-mixed-order, user-copy and COW measurements remain next. Follow
+[controlled PMM baseline](W4.3_PMM_RESULTS.md) and
+[opt-in exhaustion checkpoint](W4.3_PMM_SELFTEST_RESULTS.md) are recorded.
+Real failure/mixed-order/restore checks pass on one/four-CPU KVM/TCG guests.
+Deferred reclaim, refill/spill, user-copy and COW measurements remain next. Follow
 [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) for execution order. The original
 proposals below are historical.
 
