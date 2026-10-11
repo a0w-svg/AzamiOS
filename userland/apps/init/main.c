@@ -1782,6 +1782,18 @@ int main(int argc, char **argv)
             printf("[dynlink-test] dlopen_demo.elf exit status=%d\n", (status >> 8) & 0xFF);
         }
 
+        /* Comprehensive native dynamic loader runtime test suite */
+        p = fork();
+        if (p == 0) {
+            char *const args[] = { "/bin/dltest_runtime.elf", NULL };
+            execve("/bin/dltest_runtime.elf", args, NULL);
+            _exit(1);
+        } else if (p > 0) {
+            int status = 0;
+            waitpid(p, &status, 0);
+            printf("[dynlink-test] dltest_runtime.elf exit status=%d\n", (status >> 8) & 0xFF);
+        }
+
         /* fetch.elf (static) vs fetch_dyn.elf (PIE + libc.so): side-by-side
          * output comparison, same source, two different link strategies. */
         puts("[dynlink-test] --- fetch.elf (static) ---");

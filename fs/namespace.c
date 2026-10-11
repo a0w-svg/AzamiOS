@@ -365,7 +365,7 @@ static s64 do_bind(const char *canon_source, const char *canon_target,
 
 /* ── mount(2) ─────────────────────────────────────────────────────────────── */
 
-s64 vfs_mount_flags(const char *source, const char *target, const char *fstype,
+static s64 vfs_mount_flags_locked(const char *source, const char *target, const char *fstype,
                     unsigned long flags, const void *data)
 {
     if (!target || !target[0]) return -(s64)EINVAL;
@@ -458,7 +458,7 @@ s64 vfs_mount(const char *source, const char *target, const char *fstype, void *
 
 /* ── umount(2) ────────────────────────────────────────────────────────────── */
 
-s64 vfs_umount(const char *target, int flags)
+static s64 vfs_umount_locked(const char *target, int flags)
 {
     if (!target || !target[0]) return -(s64)EINVAL;
 
@@ -599,4 +599,21 @@ size_t mnt_format_mountinfo(char *buf, size_t max)
     }
     spinlock_unlock(&g_mnt_lock);
     return off;
+}
+
+s64 vfs_mount_flags(const char *source, const char *target, const char *fstype,
+                    unsigned long flags, const void *data)
+{
+    vfs_namespace_lock();
+    s64 err = vfs_mount_flags_locked(source, target, fstype, flags, data);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 vfs_umount(const char *target, int flags)
+{
+    vfs_namespace_lock();
+    s64 err = vfs_umount_locked(target, flags);
+    vfs_namespace_unlock();
+    return err;
 }

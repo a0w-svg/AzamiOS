@@ -24,7 +24,6 @@
 #include "../drivers/char/console.h"
 #include "time/timekeeping.h"
 
-#define USER_ADDR_MAX  0x0000800000000000ULL
 #define RFL_TF         (1ULL << 8)
 
 /* ── Access control ──────────────────────────────────────────────────────── */
@@ -58,6 +57,7 @@ static bool may_trace(process_t *tracer, process_t *target)
     if (g_yama_ptrace_scope == 2 && !is_admin) return false;
 
     if (is_admin) return true;
+    if (!__atomic_load_n(&target->dumpable,__ATOMIC_ACQUIRE)) return false;
 
     /* Scope 1 (Restricted): Tracer must be ancestor of target */
     if (g_yama_ptrace_scope == 1 && !is_descendant(tracer, target))
@@ -294,7 +294,7 @@ void ptrace_syscall_stop(pt_regs_t *r, bool on_entry)
     int sig = (p->ptrace_opts & PTRACE_O_TRACESYSGOOD) ? (SIGTRAP | 0x80) : SIGTRAP;
     int inject = ptrace_stop(r, sig, 0);
     if (inject > 0 && inject < _NSIG)
-        __atomic_or_fetch(&p->sig_pending, (1ULL << inject), __ATOMIC_SEQ_CST);
+        __atomic_or_fetch(&p->sig_pending, (SIG_MASK(inject)), __ATOMIC_SEQ_CST);
 }
 
 bool ptrace_report_trap(pt_regs_t *r, int sig)
@@ -311,7 +311,7 @@ bool ptrace_report_trap(pt_regs_t *r, int sig)
 
     int inject = ptrace_stop(r, sig, 0);
     if (inject > 0 && inject < _NSIG)
-        __atomic_or_fetch(&p->sig_pending, (1ULL << inject), __ATOMIC_SEQ_CST);
+        __atomic_or_fetch(&p->sig_pending, (SIG_MASK(inject)), __ATOMIC_SEQ_CST);
     return true;
 }
 

@@ -164,6 +164,13 @@ typedef struct {
     } a_un;
 } __attribute__((packed)) elf64_auxv_t;
 
+/* Build a detached image; errors leave proc untouched. Commit only after
+ * stopping exec siblings and releasing mappings tied to the old image. */
+int elf_prepare_exec(process_t *proc, const char *path, const char *const argv[],
+                     const char *const envp[], uintptr_t *out_entry,
+                     phys_addr_t *out_space, u64 *out_rsp, process_t **out_image);
+void elf_commit_exec(process_t *proc, process_t *image);
+
 /**
  * elf_load_exec(proc, path, argv, envp, out_entry, out_space, out_rsp) —
  * Load an ELF binary or shebang script from VFS into process memory space with System V AMD64 stack.

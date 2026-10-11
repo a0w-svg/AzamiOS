@@ -65,6 +65,7 @@
 #define EMULTIHOP   72  /* Multihop attempted */
 #define EBADMSG     74  /* Not a data message */
 #define EOVERFLOW   75  /* Value too large for defined data type */
+#define ELIBBAD     80  /* Accessing a corrupted shared library */
 #define EILSEQ      84  /* Illegal byte sequence */
 #define EUSERS      87  /* Too many users */
 #define ENOTSOCK    88  /* Socket operation on non-socket */

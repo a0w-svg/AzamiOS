@@ -8,8 +8,8 @@
  * (RSP % 16 == 8, [RSP] = return address = the libc restorer trampoline).
  *
  * Signals are process-wide here (process_t::sig_pending); whichever thread
- * next returns to ring 3 runs the handler. That matches single-threaded
- * programs exactly and is a legal POSIX choice for multi-threaded ones.
+ * next returns to ring 3 runs the handler. Per-thread masks and
+ * directed delivery remain incomplete; process-wide masks are a known limit.
  * ============================================================================ */
 
 #include "signal.h"
@@ -212,7 +212,7 @@ typedef struct {
 static inline u32 lowest_signal(sigset_t s)
 {
     for (u32 i = 1; i < _NSIG; i++)
-        if (s & (1ULL << i)) return i;
+        if (s & (SIG_MASK(i))) return i;
     return 0;
 }
 
@@ -221,6 +221,7 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
     /* Only when we are actually about to return to ring 3. */
     if ((r->cs & 3) != 3) return 0;
 
+    thread_t *thread = sched_current_thread();
     process_t *proc = sched_current_process();
     if (!proc || proc->is_zombie) return 0;
 
@@ -233,14 +234,31 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
         if (proc->is_zombie) return 0;
     }
 
-    if (!proc->sig_pending) return 0;
+    sigset_t blocked = thread ? thread->sig_blocked : proc->sig_blocked;
+    sigset_t t_pend = thread ? thread->sig_pending : 0;
+    sigset_t p_pend = proc->sig_pending;
 
-    sigset_t deliverable = proc->sig_pending & ~proc->sig_blocked;
-    /* SIGKILL / SIGSTOP are never caught. */
-    deliverable &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
-    if (!deliverable) return 0;
+    if (!t_pend && !p_pend) return 0;
 
-    u32 sig = lowest_signal(deliverable);
+    /* Check thread-directed deliverable signals first */
+    sigset_t t_deliv = t_pend & ~blocked;
+    t_deliv &= ~((SIG_MASK(SIGKILL)) | (SIG_MASK(SIGSTOP)));
+
+    /* Then process-directed deliverable signals */
+    sigset_t p_deliv = p_pend & ~blocked;
+    p_deliv &= ~((SIG_MASK(SIGKILL)) | (SIG_MASK(SIGSTOP)));
+
+    u32 sig = 0;
+    bool is_thread_sig = false;
+
+    if (t_deliv) {
+        sig = lowest_signal(t_deliv);
+        is_thread_sig = true;
+    } else if (p_deliv) {
+        sig = lowest_signal(p_deliv);
+        is_thread_sig = false;
+    }
+
     if (!sig) return 0;
 
     /* Signal-delivery-stop. The tracer gets to see the signal before its
@@ -248,7 +266,11 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
      * same one, a substitute, or none at all. Consuming the pending bit first
      * is what makes suppression mean something. */
     if (unlikely(ptrace_traced(proc))) {
-        __atomic_and_fetch(&proc->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
+        if (is_thread_sig && thread) {
+            __atomic_and_fetch(&thread->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        } else {
+            __atomic_and_fetch(&proc->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        }
         int newsig = ptrace_pre_signal(r, (int)sig);
         if (newsig <= 0 || newsig >= _NSIG) return 0;
         sig = (u32)newsig;
@@ -261,7 +283,11 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
 
     sigaction_t act = proc->sigactions[sig];
     if (act.sa_handler == SIG_DFL || act.sa_handler == SIG_IGN) {
-        __atomic_and_fetch(&proc->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
+        if (is_thread_sig && thread) {
+            __atomic_and_fetch(&thread->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        } else {
+            __atomic_and_fetch(&proc->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        }
 
         /*
          * A signal that was blocked when it arrived reaches here once the
@@ -297,15 +323,20 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
     if (!act.sa_restorer) {
         /* Without a restorer we cannot get control back cleanly. Drop the
          * signal rather than corrupt the thread. */
-        __atomic_and_fetch(&proc->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
+        if (is_thread_sig && thread) {
+            __atomic_and_fetch(&thread->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        } else {
+            __atomic_and_fetch(&proc->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        }
         return 0;
     }
 
     /* Interrupted syscall: restart it if the handler asked for SA_RESTART,
      * otherwise leave the -EINTR the syscall already returned. The `syscall`
      * instruction is 2 bytes, and r->rip points just past it. */
-    if (syscall_nr >= 0 && (s64)r->rax == -(s64)EINTR &&
-        (act.sa_flags & SA_RESTART)) {
+    if (syscall_nr >= 0 && syscall_nr != SYS_epoll_wait &&
+        syscall_nr != SYS_epoll_pwait && syscall_nr != SYS_epoll_pwait2 &&
+        (s64)r->rax == -(s64)EINTR && (act.sa_flags & SA_RESTART)) {
         r->rip -= 2;
         r->rax  = (u64)syscall_nr;
     }
@@ -313,10 +344,14 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
     /* Determine target stack: if SA_ONSTACK is set and an alternate stack
      * is registered and not already active, deliver onto it. Otherwise use the
      * interrupted stack below the 128-byte red zone. */
+    void *ss_sp = thread ? thread->sas_ss_sp : proc->sas_ss_sp;
+    size_t ss_size = thread ? thread->sas_ss_size : proc->sas_ss_size;
+    int ss_flags = thread ? thread->sas_ss_flags : proc->sas_ss_flags;
+
     u64 sp = r->rsp;
-    bool on_altstack = (proc->sas_ss_sp && !(proc->sas_ss_flags & 2 /* SS_DISABLE */) &&
-                        r->rsp >= (u64)(uintptr_t)proc->sas_ss_sp &&
-                        r->rsp < (u64)(uintptr_t)proc->sas_ss_sp + proc->sas_ss_size);
+    bool on_altstack = (ss_sp && !(ss_flags & 2 /* SS_DISABLE */) &&
+                        r->rsp >= (u64)(uintptr_t)ss_sp &&
+                        r->rsp < (u64)(uintptr_t)ss_sp + ss_size);
 
     /* The frame plus its alignment padding has to fit inside whatever stack we
      * pick. On the alternate stack that is a hard bound: writing below ss_sp
@@ -326,23 +361,31 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
      * takes the same exit: a fatal SIGSEGV, never a corrupted process. */
     const u64 frame_need = sizeof(sigframe_t) + 24;   /* + alignment slack */
 
-    if ((act.sa_flags & SA_ONSTACK) && proc->sas_ss_sp &&
-        !(proc->sas_ss_flags & 2 /* SS_DISABLE */) && !on_altstack) {
-        if (proc->sas_ss_size < frame_need) {
+    if ((act.sa_flags & SA_ONSTACK) && ss_sp &&
+        !(ss_flags & 2 /* SS_DISABLE */) && !on_altstack) {
+        if (ss_size < frame_need) {
             sdbg("[SIG] altstack too small (%llu < %llu)\n",
-                 (unsigned long long)proc->sas_ss_size,
+                 (unsigned long long)ss_size,
                  (unsigned long long)frame_need);
-            __atomic_and_fetch(&proc->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
+            if (is_thread_sig && thread) {
+                __atomic_and_fetch(&thread->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+            } else {
+                __atomic_and_fetch(&proc->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+            }
             sched_kill_process(proc->pid, SIGSEGV);
             return 0;
         }
-        sp = (u64)(uintptr_t)proc->sas_ss_sp + proc->sas_ss_size;
+        sp = (u64)(uintptr_t)ss_sp + ss_size;
     } else {
         sp -= 128;
     }
 
     if (sp < frame_need) {
-        __atomic_and_fetch(&proc->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
+        if (is_thread_sig && thread) {
+            __atomic_and_fetch(&thread->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        } else {
+            __atomic_and_fetch(&proc->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        }
         sched_kill_process(proc->pid, SIGSEGV);
         return 0;
     }
@@ -355,7 +398,8 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
     memset(&f, 0, sizeof(f));
     f.restorer   = (u64)(uintptr_t)act.sa_restorer;
     f.magic      = SIGFRAME_MAGIC;
-    f.saved_mask = proc->sig_blocked;
+    f.saved_mask = thread && thread->restore_signal_mask
+                 ? thread->saved_signal_mask : (thread ? thread->sig_blocked : proc->sig_blocked);
     f.regs       = *r;
 
     /* Snapshot the interrupted FPU/SSE/AVX state so a handler that uses floating
@@ -366,7 +410,12 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
     ((s32 *)f.siginfo)[0] = (s32)sig;
     ((s32 *)f.siginfo)[2] = 0;                       /* SI_USER */
 
-    f.uc_sigmask       = proc->sig_blocked;
+    f.uc_flags         = 0;
+    f.uc_link          = 0;
+    f.uc_stack[0]      = (u64)(uintptr_t)ss_sp;
+    f.uc_stack[1]      = on_altstack ? 1 /* SS_ONSTACK */ : ((ss_flags & 2) ? 2 : 0);
+    f.uc_stack[2]      = ss_size;
+    f.uc_sigmask       = f.saved_mask;
     f.uc_gregs[MREG_R8]  = r->r8;   f.uc_gregs[MREG_R9]  = r->r9;
     f.uc_gregs[MREG_R10] = r->r10;  f.uc_gregs[MREG_R11] = r->r11;
     f.uc_gregs[MREG_R12] = r->r12;  f.uc_gregs[MREG_R13] = r->r13;
@@ -379,10 +428,18 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
 
     if (copy_to_user((void *)(uintptr_t)sp, &f, sizeof(f)) != 0) {
         /* Bad user stack — turn this into a fatal SIGSEGV. */
-        __atomic_and_fetch(&proc->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
+        if (is_thread_sig && thread) {
+            __atomic_and_fetch(&thread->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        } else {
+            __atomic_and_fetch(&proc->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        }
         sched_kill_process(proc->pid, SIGSEGV);
         return 0;
     }
+
+    /* The handler runs under the temporary mask, but sigreturn must restore
+     * the mask from before epoll_pwait/sigsuspend. Hand ownership to the saved frame. */
+    if (thread) thread->restore_signal_mask = false;
 
     /* Enter the handler. */
     u64 uctx = sp + __builtin_offsetof(sigframe_t, uc_flags);
@@ -397,15 +454,23 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
     r->rflags &= ~(RFL_TF | RFL_DF | RFL_RF);   /* handler starts DF=0, no single-step */
 
     /* Block this signal (unless SA_NODEFER) plus the handler's sa_mask for
-     * the duration of the handler; rt_sigreturn restores saved_mask.
-     * BUG-4: use atomic OR — a concurrent rt_sigprocmask on another thread of
-     * the same process does a non-atomic RMW on sig_blocked; plain |= would
-     * produce lost mask bits under SMP. */
-    __atomic_or_fetch(&proc->sig_blocked, act.sa_mask, __ATOMIC_RELAXED);
-    if (!(act.sa_flags & SA_NODEFER))
-        __atomic_or_fetch(&proc->sig_blocked, (1ULL << sig), __ATOMIC_RELAXED);
+     * the duration of the handler; rt_sigreturn restores saved_mask. */
+    if (thread) {
+        __atomic_or_fetch(&thread->sig_blocked, act.sa_mask, __ATOMIC_RELAXED);
+        if (!(act.sa_flags & SA_NODEFER))
+            __atomic_or_fetch(&thread->sig_blocked, (SIG_MASK(sig)), __ATOMIC_RELAXED);
+        __atomic_store_n(&proc->sig_blocked, thread->sig_blocked, __ATOMIC_RELAXED);
+    } else {
+        __atomic_or_fetch(&proc->sig_blocked, act.sa_mask, __ATOMIC_RELAXED);
+        if (!(act.sa_flags & SA_NODEFER))
+            __atomic_or_fetch(&proc->sig_blocked, (SIG_MASK(sig)), __ATOMIC_RELAXED);
+    }
 
-    __atomic_and_fetch(&proc->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
+    if (is_thread_sig && thread) {
+        __atomic_and_fetch(&thread->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+    } else {
+        __atomic_and_fetch(&proc->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+    }
 
     if (act.sa_flags & SA_RESETHAND)
         /* BUG-T fix: use atomic store so a concurrent rt_sigaction() on a
@@ -457,15 +522,11 @@ s64 sys_rt_sigreturn_impl(pt_regs_t *r)
     nr.rflags = (nr.rflags & SIG_RFLAGS_USER_MASK) | 0x202ULL;   /* + IF, bit1 */
 
     *r = nr;
-    /* Plain store of sig_blocked (process-wide, owner-thread only). Do NOT touch
-     * sig_pending here — a concurrent kill() on another CPU may be OR-ing into
-     * it; a read-modify-write store would clobber that. */
-    /* BUG-P fix: use an atomic RELEASE store so a concurrent rt_sigprocmask()
-     * on a sibling thread that does an atomic OR into sig_blocked cannot have
-     * its update silently overwritten by our plain store.  We do NOT use
-     * fetch_and/fetch_or here because sigreturn must set an exact mask, not
-     * merge one — but the store must be atomic to avoid a torn write. */
-    u64 new_mask = f.saved_mask & ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
+    u64 new_mask = f.saved_mask & ~((SIG_MASK(SIGKILL)) | (SIG_MASK(SIGSTOP)));
+    thread_t *thread = sched_current_thread();
+    if (thread) {
+        __atomic_store_n(&thread->sig_blocked, new_mask, __ATOMIC_RELEASE);
+    }
     __atomic_store_n(&proc->sig_blocked, new_mask, __ATOMIC_RELEASE);
 
     /* Restore the FPU/SSE/AVX state the handler ran on top of (sanitised). */
@@ -474,4 +535,17 @@ s64 sys_rt_sigreturn_impl(pt_regs_t *r)
     /* Return the value the interrupted context had in RAX so the dispatcher's
      * `regs->rax = <ret>` is a no-op on the restored frame. */
     return (s64)r->rax;
+}
+
+/* A masked wait interrupted without a delivered handler still restores its
+ * original mask before returning to user mode. Called after signal selection. */
+void signal_restore_wait_mask(void)
+{
+    thread_t *thread = sched_current_thread();
+    process_t *proc = sched_current_process();
+    if (thread && thread->restore_signal_mask) {
+        __atomic_store_n(&thread->sig_blocked, thread->saved_signal_mask, __ATOMIC_RELEASE);
+        if (proc) __atomic_store_n(&proc->sig_blocked, thread->saved_signal_mask, __ATOMIC_RELEASE);
+        thread->restore_signal_mask = false;
+    }
 }

@@ -30,10 +30,18 @@
 extern "C" {
 #endif
 
+typedef struct {
+    const char *dli_fname; /* Pathname of shared object that contains address */
+    void       *dli_fbase; /* Base address at which shared object is mapped */
+    const char *dli_sname; /* Name of symbol whose definition overlaps address */
+    void       *dli_saddr; /* Exact address of symbol named by dli_sname */
+} Dl_info;
+
 void *dlopen(const char *path, int flags);
 void *dlsym(void *handle, const char *name);
 int   dlclose(void *handle);
 char *dlerror(void);
+int   dladdr(const void *addr, Dl_info *info);
 
 #ifdef __cplusplus
 }

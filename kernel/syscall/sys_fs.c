@@ -1224,17 +1224,8 @@ s64 sys_dup3_impl(pt_regs_t *r)
     return do_dup2(oldfd, newfd, (flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
 }
 
-s64 sys_fcntl_impl(pt_regs_t *r)
+static s64 fcntl_file(process_t *proc, file_t *f, int cmd, u64 arg)
 {
-    int fd = (int)r->rdi;
-    int cmd = (int)r->rsi;
-    u64 arg = r->rdx;
-
-    process_t *proc = sched_current_process();
-    if (!proc || fd < 0 || fd >= PROC_MAX_FDS || !proc->handle_table[fd]) return -(s64)EBADF;
-
-    file_t *f = (file_t *)proc->handle_table[fd];
-
     switch (cmd) {
     case 0:      /* F_DUPFD */
     case 1030: { /* F_DUPFD_CLOEXEC */
@@ -1242,14 +1233,9 @@ s64 sys_fcntl_impl(pt_regs_t *r)
         if (minfd < 0 || minfd >= PROC_MAX_FDS) return -(s64)EINVAL;
         __atomic_add_fetch(&f->f_count, 1, __ATOMIC_SEQ_CST);
         s64 nfd = fd_install_from(proc, f, (cmd == 1030) ? FD_CLOEXEC : 0, minfd);
-        if (nfd < 0) __atomic_sub_fetch(&f->f_count, 1, __ATOMIC_SEQ_CST);
+        if (nfd < 0) fput(f);
         return nfd;
     }
-    case 1: /* F_GETFD */
-        return (s64)proc->fd_flags[fd];
-    case 2: /* F_SETFD */
-        proc->fd_flags[fd] = (u8)(arg & FD_CLOEXEC);
-        return 0;
     case 3: /* F_GETFL */
         return f->f_flags;
     case 4: /* F_SETFL */
@@ -1310,9 +1296,40 @@ s64 sys_fcntl_impl(pt_regs_t *r)
     }
 }
 
+s64 sys_fcntl_impl(pt_regs_t *r)
+{
+    int fd = (int)(s32)r->rdi;
+    int cmd = (int)r->rsi;
+    u64 arg = r->rdx;
+    process_t *proc = sched_current_process();
+    if (!proc || fd < 0 || fd >= PROC_MAX_FDS) return -(s64)EBADF;
+
+    /* Descriptor flags belong to the slot, rather than to a pinned file.
+     * Lookup and update must share the lock with close/dup2/reinstallation. */
+    if (cmd == 1 || cmd == 2) {
+        irqflags_t fl = spinlock_lock_irqsave(&proc->fd_lock);
+        file_t *f = (file_t *)proc->handle_table[fd];
+        s64 ret = -(s64)EBADF;
+        if (f && (uintptr_t)f >= 0xFFFF800000000000ULL) {
+            if (cmd == 1) ret = proc->fd_flags[fd];
+            else { proc->fd_flags[fd] = (u8)(arg & FD_CLOEXEC); ret = 0; }
+        }
+        spinlock_unlock_irqrestore(&proc->fd_lock, fl);
+        return ret;
+    }
+
+    /* Pin the description while fd_lock protects the pointer. All returns,
+     * including user-copy and allocation errors, drop this reference once. */
+    file_t *f = fget(proc, fd);
+    if (!f) return -(s64)EBADF;
+    s64 ret = fcntl_file(proc, f, cmd, arg);
+    fput(f);
+    return ret;
+}
+
 /* ── Directories, Timers & System Information ────────────────────────────── */
 
-s64 sys_getcwd_impl(pt_regs_t *r)
+static s64 sys_getcwd_locked(pt_regs_t *r)
 {
     char *user_buf = (char *)r->rdi;
     size_t size    = (size_t)r->rsi;
@@ -1328,7 +1345,7 @@ s64 sys_getcwd_impl(pt_regs_t *r)
     return (s64)(uintptr_t)user_buf;
 }
 
-s64 sys_chdir_impl(pt_regs_t *r)
+static s64 sys_chdir_locked(pt_regs_t *r)
 {
     const char *user_path = (const char *)r->rdi;
     process_t *proc = sched_current_process();
@@ -1358,7 +1375,7 @@ s64 sys_chdir_impl(pt_regs_t *r)
     return 0;
 }
 
-s64 sys_fchdir_impl(pt_regs_t *r)
+static s64 sys_fchdir_locked(pt_regs_t *r)
 {
     int fd = (int)(s32)r->rdi;
     process_t *proc = sched_current_process();
@@ -1948,114 +1965,79 @@ struct kernel_open_how {
     u64 resolve;
 };
 
-static bool path_contains_symlink(const char *path)
-{
-    if (!path || !path[0]) return false;
-    char comp_buf[512];
-    size_t plen = strlen(path);
-    if (plen >= sizeof(comp_buf)) return false;
-
-    for (size_t i = 1; i <= plen; i++) {
-        if (path[i] == '/' || path[i] == '\0') {
-            memcpy(comp_buf, path, i);
-            comp_buf[i] = '\0';
-            dentry_t *d = NULL;
-            if (vfs_path_lookup_nofollow(comp_buf, &d) == 0 && d && d->d_inode) {
-                if (S_ISLNK(d->d_inode->i_mode)) return true;
-            }
-        }
-    }
-    return false;
-}
-
 s64 sys_openat2_impl(pt_regs_t *r)
 {
     int dirfd = (int)(s32)r->rdi;
     const char *user_path = (const char *)r->rsi;
-    const struct kernel_open_how *user_how = (const struct kernel_open_how *)r->rdx;
+    const void *user_how = (const void *)r->rdx;
     size_t size = (size_t)r->r10;
-
-    if (!user_path || !user_how || size < sizeof(struct kernel_open_how)) return -(s64)EINVAL;
-    if (size > sizeof(struct kernel_open_how)) return -(s64)E2BIG;
-
+    if (size < sizeof(struct kernel_open_how)) return -(s64)EINVAL;
+    if (size > 4096) return -(s64)E2BIG;
     struct kernel_open_how how;
-    if (copy_from_user(&how, user_how, sizeof(how)) != 0) return -(s64)EFAULT;
-
-    if ((how.flags >> 32) != 0) return -(s64)EINVAL;
-    if (how.resolve & ~(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)) return -(s64)EINVAL;
-
+    if (copy_from_user(&how, user_how, sizeof(how))) return -(s64)EFAULT;
+    /* Unknown extensions are accepted only when all extension bytes are zero. */
+    for (size_t offset = sizeof(how); offset < size;) {
+        u8 extra[64];
+        size_t bytes = size - offset;
+        if (bytes > sizeof(extra)) bytes = sizeof(extra);
+        uintptr_t address = (uintptr_t)user_how;
+        if (address >= TASK_SIZE_MAX || offset > TASK_SIZE_MAX - address)
+            return -(s64)EFAULT;
+        if (copy_from_user(extra, (const void *)(address + offset), bytes))
+            return -(s64)EFAULT;
+        for (size_t i = 0; i < bytes; i++) if (extra[i]) return -(s64)E2BIG;
+        offset += bytes;
+    }
+    const u64 known_resolve = RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS |
+        RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_CACHED;
+    /* Linux's known flags; unsupported file-description modes are explicit. */
+    const u64 known_flags = 3 | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_APPEND |
+        O_NONBLOCK | 0x1000ULL | 0x2000ULL | 0x4000ULL | 0x8000ULL |
+        O_DIRECTORY | O_NOFOLLOW | 0x40000ULL | O_CLOEXEC | 0x100000ULL |
+        0x200000ULL | 0x400000ULL;
+    const u64 supported_flags = 3 | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC |
+        O_APPEND | O_NONBLOCK | 0x8000ULL | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+    if ((how.flags & ~known_flags) || (how.resolve & ~known_resolve) ||
+        ((how.resolve & RESOLVE_BENEATH) && (how.resolve & RESOLVE_IN_ROOT)) ||
+        (how.mode & ~07777ULL) ||
+        (how.mode && !(how.flags & (O_CREAT | 0x400000ULL)))) return -(s64)EINVAL;
+    if ((how.flags & O_CREAT) && (how.flags & O_DIRECTORY)) return -(s64)EINVAL;
+    if ((how.flags & 0x200000ULL) && (how.flags & ~(0x200000ULL | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW)))
+        return -(s64)EINVAL;
+    if (how.flags & 0x400000ULL) {
+        if (!(how.flags & O_DIRECTORY) || !(how.flags & 3)) return -(s64)EINVAL;
+    }
+    if ((how.flags & ~supported_flags) || (how.flags & 3) == 3 ||
+        (how.resolve & (RESOLVE_NO_XDEV | RESOLVE_CACHED)))
+        return -(s64)EOPNOTSUPP;
+    if (!user_path) return -(s64)EFAULT;
+    char raw[512];
+    s64 length = copy_str_from_user(raw, user_path, sizeof(raw));
+    if (length < 0) return length;
+    if ((u64)length >= sizeof(raw) - 1) return -(s64)ENAMETOOLONG;
+    if (!length) return -(s64)ENOENT;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-
-    char raw[512];
-    if (copy_str_from_user(raw, user_path, sizeof(raw)) < 0) return -(s64)EFAULT;
-
-    if (how.resolve & RESOLVE_BENEATH) {
-        if (raw[0] == '/') return -(s64)EXDEV;
-
-        int rel_depth = 0;
-        const char *p = raw;
-        while (*p) {
-            while (*p == '/') p++;
-            if (!*p) break;
-            const char *start = p;
-            while (*p && *p != '/') p++;
-            size_t len = (size_t)(p - start);
-            if (len == 1 && start[0] == '.') continue;
-            if (len == 2 && start[0] == '.' && start[1] == '.') {
-                if (rel_depth <= 0) return -(s64)EXDEV;
-                rel_depth--;
-            } else {
-                rel_depth++;
-            }
-        }
+    file_t *dir = NULL;
+    if (dirfd != AT_FDCWD && (raw[0] != '/' || (how.resolve & RESOLVE_IN_ROOT))) {
+        dir = fget(proc, dirfd);
+        if (!dir) return -(s64)EBADF;
     }
-
-    char kpath[512];
-    s64 perr = copy_user_path_resolve_at(dirfd, kpath, sizeof(kpath), user_path);
-    if (perr < 0) return perr;
-
-    if (how.resolve & RESOLVE_BENEATH) {
-        char base_path[512];
-        if (dirfd == AT_FDCWD) {
-            const char *cwd = (proc->cwd[0]) ? proc->cwd : "/";
-            if (proc_is_confined(proc)) {
-                vpath_to_real(proc, cwd, base_path, sizeof(base_path));
-            } else {
-                strncpy(base_path, cwd, sizeof(base_path) - 1);
-                base_path[sizeof(base_path) - 1] = '\0';
-            }
-        } else {
-            if (dirfd < 0 || dirfd >= PROC_MAX_FDS || !proc->handle_table[dirfd])
-                return -(s64)EBADF;
-            file_t *df = (file_t *)proc->handle_table[dirfd];
-            if (!df || !df->f_dentry || !df->f_inode) return -(s64)EBADF;
-            if (!S_ISDIR(df->f_inode->i_mode)) return -(s64)ENOTDIR;
-            dentry_build_path(df->f_dentry, base_path, sizeof(base_path));
-        }
-        size_t blen = strlen(base_path);
-        while (blen > 1 && base_path[blen - 1] == '/') blen--;
-        if (strncmp(kpath, base_path, blen) != 0 ||
-            (kpath[blen] != '/' && kpath[blen] != '\0')) {
-            return -(s64)EXDEV;
-        }
+    char cwd[512];
+    vfs_namespace_lock(); /* Snapshot cwd/root together with the traversal. */
+    s64 err = vpath_to_real(proc, proc->cwd[0] ? proc->cwd : "/", cwd, sizeof(cwd));
+    if (err) {
+        vfs_namespace_unlock();
+        if (dir) fput(dir);
+        return err;
     }
-
-    if (how.resolve & RESOLVE_NO_SYMLINKS) {
-        if (path_contains_symlink(kpath)) {
-            return -(s64)ELOOP;
-        }
-    }
-
     u32 mode = (u32)how.mode;
-    if (how.flags & O_CREAT) {
-        mode &= ~proc->umask;
-    }
-
-    s64 open_err = 0;
-    file_t *file = vfs_open_err(kpath, (u32)how.flags, mode, &open_err);
-    if (!file) return open_err ? open_err : -(s64)ENOENT;
-
+    if (how.flags & O_CREAT) mode &= ~proc->umask;
+    file_t *file = vfs_openat_resolved(dir, cwd, proc->root[0] ? proc->root : "/",
+                                     raw, (u32)how.flags, mode, how.resolve, &err);
+    vfs_namespace_unlock();
+    if (dir) fput(dir);
+    if (!file) return err ? err : -(s64)ENOENT;
     s64 fd = fd_install(proc, file, (how.flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
     if (fd < 0) vfs_close(file);
     return fd;
@@ -2065,51 +2047,6 @@ s64 sys_faccessat2_impl(pt_regs_t *r)
 {
     return sys_faccessat_impl(r);
 }
-
-s64 sys_epoll_pwait2_impl(pt_regs_t *r)
-{
-    int epfd = (int)(s32)r->rdi;
-    void *events = (void *)r->rsi;
-    int maxevents = (int)(s32)r->rdx;
-    const struct linux_timespec *ts = (const struct linux_timespec *)r->r10;
-    const sigset_t *sigmask = (const sigset_t *)r->r8;
-    size_t sigsetsize = (size_t)r->r9;
-
-    process_t *proc = sched_current_process();
-    if (!proc) return -(s64)EPERM;
-
-    int timeout = -1;
-    if (ts) {
-        if ((uintptr_t)ts >= TASK_SIZE_MAX) return -(s64)EFAULT;
-        struct linux_timespec kts;
-        if (copy_from_user(&kts, ts, sizeof(kts)) != 0) return -(s64)EFAULT;
-        if (kts.tv_sec < 0 || kts.tv_nsec < 0 || kts.tv_nsec >= 1000000000L)
-            return -(s64)EINVAL;
-        timeout = (int)(kts.tv_sec * 1000 + kts.tv_nsec / 1000000);
-    }
-
-    sigset_t old_mask = proc->sig_blocked;
-    if (sigmask) {
-        if (sigsetsize != sizeof(sigset_t)) return -(s64)EINVAL;
-        if ((uintptr_t)sigmask >= TASK_SIZE_MAX) return -(s64)EFAULT;
-        sigset_t kmask;
-        if (copy_from_user(&kmask, sigmask, sizeof(sigset_t)) != 0) return -(s64)EFAULT;
-        proc->sig_blocked = kmask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-    }
-
-    pt_regs_t fake_r;
-    fake_r.rdi = (u64)epfd;
-    fake_r.rsi = (u64)events;
-    fake_r.rdx = (u64)maxevents;
-    fake_r.r10 = (u64)timeout;
-    s64 ret = sys_epoll_wait_impl(&fake_r);
-
-    if (sigmask) {
-        proc->sig_blocked = old_mask;
-    }
-    return ret;
-}
-
 
 /* ── Linux sendfile, copy_file_range, fallocate, statx, splice ──────────── */
 
@@ -2637,6 +2574,20 @@ s64 sys_fchownat_impl(pt_regs_t *r)
     return vfs_chown(kpath, uid, gid);
 }
 
+static bool path_is_dot_or_dotdot(const char *raw)
+{
+    if (!raw) return false;
+    size_t len = strlen(raw);
+    while (len > 0 && raw[len - 1] == '/') len--;
+    if (len == 0) return false;
+    const char *comp = raw + len;
+    while (comp > raw && *(comp - 1) != '/') comp--;
+    size_t comp_len = (raw + len) - comp;
+    if (comp_len == 1 && comp[0] == '.') return true;
+    if (comp_len == 2 && comp[0] == '.' && comp[1] == '.') return true;
+    return false;
+}
+
 s64 sys_renameat2_impl(pt_regs_t *r)
 {
     int olddfd = (int)(s32)r->rdi;
@@ -2645,11 +2596,49 @@ s64 sys_renameat2_impl(pt_regs_t *r)
     const char *newpath = (const char *)r->r10;
     unsigned int flags = (unsigned int)r->r8;
 
-    char kold[512], knew[512];
+    if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
+        return -(s64)EINVAL;
+    if ((flags & RENAME_NOREPLACE) && (flags & RENAME_EXCHANGE))
+        return -(s64)EINVAL;
+    if ((flags & RENAME_WHITEOUT) && (flags & RENAME_EXCHANGE))
+        return -(s64)EINVAL;
+    if (flags & RENAME_WHITEOUT)
+        return -(s64)EINVAL;
+
+    if (!oldpath || (uintptr_t)oldpath >= TASK_SIZE_MAX) return -(s64)EFAULT;
+    char raw_old[512];
+    s64 slen_old = copy_str_from_user(raw_old, oldpath, sizeof(raw_old));
+    if (slen_old < 0) return slen_old;
+    if (slen_old == 0) return -(s64)ENOENT;
+
+    char kold[512];
     s64 err = copy_user_path_resolve_at(olddfd, kold, sizeof(kold), oldpath);
     if (err < 0) return err;
+
+    if (!newpath || (uintptr_t)newpath >= TASK_SIZE_MAX) return -(s64)EFAULT;
+    char raw_new[512];
+    s64 slen_new = copy_str_from_user(raw_new, newpath, sizeof(raw_new));
+    if (slen_new < 0) return slen_new;
+    if (slen_new == 0) return -(s64)ENOENT;
+
+    char knew[512];
     err = copy_user_path_resolve_at(newdfd, knew, sizeof(knew), newpath);
     if (err < 0) return err;
+
+    if (path_is_dot_or_dotdot(raw_old)) {
+        dentry_t *d = NULL;
+        s64 d_err = vfs_path_lookup_nofollow(kold, &d);
+        if (d_err < 0 || !d || !d->d_inode) return -(s64)ENOENT;
+        return -(s64)EBUSY;
+    }
+
+    if (path_is_dot_or_dotdot(raw_new)) {
+        dentry_t *d = NULL;
+        s64 d_err = vfs_path_lookup_nofollow(knew, &d);
+        if (d_err < 0 || !d || !d->d_inode) return -(s64)ENOENT;
+        return -(s64)EBUSY;
+    }
+
     return vfs_rename_flags(kold, knew, flags);
 }
 
@@ -2873,32 +2862,141 @@ s64 sys_eventfd_impl(pt_regs_t *r)
 #define EPOLL_CTL_MOD 3
 #define EPOLL_CLOEXEC 02000000
 
+#define EPOLLEXCLUSIVE (1U << 28)
+#define EPOLLWAKEUP    (1U << 29)
+#define EPOLLONESHOT   (1U << 30)
+#define EPOLLET        (1U << 31)
+
 typedef struct {
+    u32 events;
+    u64 data;
+} __attribute__((packed)) linux_epoll_event_t;
+
+typedef struct {
+    file_t *file;
     int fd;
     u32 events;
     u64 data;
+    u64 last_event_seq;
+    bool et_active;
+    bool oneshot_fired;
 } epoll_item_t;
 
 #define EPOLL_MAX_ITEMS 64
-typedef struct {
+typedef struct epoll_ctx {
     int count;
     epoll_item_t items[EPOLL_MAX_ITEMS];
     spinlock_t lock;
+    struct epoll_ctx *next;
+    struct epoll_ctx *prev;
 } epoll_ctx_t;
+
+static epoll_ctx_t *g_epoll_head = NULL;
+static spinlock_t g_epoll_list_lock = SPINLOCK_INIT;
+
+void epoll_file_closed(file_t *file)
+{
+    if (!file) return;
+    irqflags_t lflags = spinlock_lock_irqsave(&g_epoll_list_lock);
+    epoll_ctx_t *curr = g_epoll_head;
+    while (curr) {
+        irqflags_t iflags = spinlock_lock_irqsave(&curr->lock);
+        for (int i = 0; i < curr->count; i++) {
+            if (curr->items[i].file == file) {
+                curr->items[i] = curr->items[curr->count - 1];
+                curr->count--;
+                i--;
+            }
+        }
+        spinlock_unlock_irqrestore(&curr->lock, iflags);
+        curr = curr->next;
+    }
+    spinlock_unlock_irqrestore(&g_epoll_list_lock, lflags);
+}
+
+static int epoll_poll_op(file_t *filp);
 
 static s64 epoll_release_op(inode_t *inode, file_t *filp)
 {
     (void)inode;
     if (filp && filp->private_data) {
-        kfree(filp->private_data);
+        epoll_ctx_t *ctx = (epoll_ctx_t *)filp->private_data;
+        irqflags_t lflags = spinlock_lock_irqsave(&g_epoll_list_lock);
+        if (ctx->prev) ctx->prev->next = ctx->next;
+        else if (g_epoll_head == ctx) g_epoll_head = ctx->next;
+        if (ctx->next) ctx->next->prev = ctx->prev;
+        spinlock_unlock_irqrestore(&g_epoll_list_lock, lflags);
+
+        kfree(ctx);
         filp->private_data = NULL;
     }
     return 0;
 }
 
 static file_operations_t g_epoll_fops = {
+    .poll = epoll_poll_op,
     .release = epoll_release_op,
 };
+
+static int epoll_poll_op(file_t *filp)
+{
+    if (!filp || !filp->private_data) return POLLNVAL;
+    epoll_ctx_t *ctx = (epoll_ctx_t *)filp->private_data;
+    irqflags_t flags = spinlock_lock_irqsave(&ctx->lock);
+    int count = ctx->count;
+    for (int i = 0; i < count; i++) {
+        file_t *tf = ctx->items[i].file;
+        if (!tf) continue;
+        u32 interest = ctx->items[i].events | POLLERR | POLLHUP;
+        u32 rev = (u16)check_file_readiness(tf, (short)interest);
+        if (rev & interest) {
+            spinlock_unlock_irqrestore(&ctx->lock, flags);
+            return POLLIN | POLLRDNORM;
+        }
+    }
+    spinlock_unlock_irqrestore(&ctx->lock, flags);
+    return 0;
+}
+
+static bool file_can_epoll(file_t *f)
+{
+    if (!f) return false;
+    if (f->f_inode && (S_ISREG(f->f_inode->i_mode) || S_ISDIR(f->f_inode->i_mode)))
+        return false;
+    if (f->f_op && f->f_op->poll)
+        return true;
+    if (f->f_inode && S_ISFIFO(f->f_inode->i_mode))
+        return true;
+    return false;
+}
+
+static bool epoll_has_cycle(epoll_ctx_t *from, epoll_ctx_t *target, int depth)
+{
+    if (depth > 5) return true;
+    if (from == target) return true;
+    for (int i = 0; i < from->count; i++) {
+        file_t *f = from->items[i].file;
+        if (f && f->f_op == &g_epoll_fops && f->private_data) {
+            epoll_ctx_t *child = (epoll_ctx_t *)f->private_data;
+            if (epoll_has_cycle(child, target, depth + 1)) return true;
+        }
+    }
+    return false;
+}
+
+static u64 file_get_event_seq(file_t *f)
+{
+    if (!f) return 0;
+    if (f->f_inode && S_ISFIFO(f->f_inode->i_mode) && f->private_data) {
+        pipe_t *p = (pipe_t *)f->private_data;
+        return (u64)p->write_pos + ((u64)p->count << 32);
+    }
+    if (f->f_op == &g_eventfd_fops && f->private_data) {
+        eventfd_ctx_t *ctx = (eventfd_ctx_t *)f->private_data;
+        return ctx->counter;
+    }
+    return f->f_pos;
+}
 
 s64 sys_epoll_create1_impl(pt_regs_t *r)
 {
@@ -2923,10 +3021,23 @@ s64 sys_epoll_create1_impl(pt_regs_t *r)
     f->f_fd_flags = (flags & EPOLL_CLOEXEC) ? FD_CLOEXEC : 0;
     f->f_count = 1;
 
+    irqflags_t lflags = spinlock_lock_irqsave(&g_epoll_list_lock);
+    ctx->next = g_epoll_head;
+    ctx->prev = NULL;
+    if (g_epoll_head) g_epoll_head->prev = ctx;
+    g_epoll_head = ctx;
+    spinlock_unlock_irqrestore(&g_epoll_list_lock, lflags);
+
     {
         s64 nfd = fd_install_from(proc, f, f->f_fd_flags, 3);
         if (nfd >= 0) return nfd;
     }
+
+    lflags = spinlock_lock_irqsave(&g_epoll_list_lock);
+    if (g_epoll_head == ctx) g_epoll_head = ctx->next;
+    if (ctx->next) ctx->next->prev = NULL;
+    spinlock_unlock_irqrestore(&g_epoll_list_lock, lflags);
+
     kfree(ctx);
     kfree(f);
     return -(s64)EMFILE;
@@ -2940,11 +3051,6 @@ s64 sys_epoll_create_impl(pt_regs_t *r)
     sub.rdi = 0;
     return sys_epoll_create1_impl(&sub);
 }
-
-typedef struct {
-    u32 events;
-    u64 data;
-} __attribute__((packed)) linux_epoll_event_t;
 
 s64 sys_epoll_ctl_impl(pt_regs_t *r)
 {
@@ -2970,175 +3076,313 @@ s64 sys_epoll_ctl_impl(pt_regs_t *r)
         fput(epfile);
         return -(s64)EBADF;
     }
-    fput(target_file);
+
+    if (!file_can_epoll(target_file)) {
+        fput(target_file);
+        fput(epfile);
+        return -(s64)EPERM;
+    }
 
     linux_epoll_event_t kevent;
+    memset(&kevent, 0, sizeof(kevent));
     if (op != EPOLL_CTL_DEL) {
         if (!event || (uintptr_t)event >= TASK_SIZE_MAX) {
+            fput(target_file);
             fput(epfile);
             return -(s64)EFAULT;
         }
         if (copy_from_user(&kevent, event, sizeof(linux_epoll_event_t)) != 0) {
+            fput(target_file);
             fput(epfile);
             return -(s64)EFAULT;
+        }
+        if (op == EPOLL_CTL_MOD && (kevent.events & EPOLLEXCLUSIVE)) {
+            fput(target_file);
+            fput(epfile);
+            return -(s64)EINVAL;
+        }
+    }
+
+    if (op == EPOLL_CTL_ADD && target_file->f_op == &g_epoll_fops && target_file->private_data) {
+        epoll_ctx_t *target_ctx = (epoll_ctx_t *)target_file->private_data;
+        if (target_ctx == ctx || epoll_has_cycle(target_ctx, ctx, 0)) {
+            fput(target_file);
+            fput(epfile);
+            return -(s64)ELOOP;
         }
     }
 
     spinlock_lock(&ctx->lock);
     if (op == EPOLL_CTL_ADD) {
         for (int i = 0; i < ctx->count; i++) {
-            if (ctx->items[i].fd == fd) {
+            if (ctx->items[i].file == target_file && ctx->items[i].fd == fd) {
                 spinlock_unlock(&ctx->lock);
+                fput(target_file);
                 fput(epfile);
                 return -(s64)EEXIST;
             }
         }
         if (ctx->count >= EPOLL_MAX_ITEMS) {
             spinlock_unlock(&ctx->lock);
+            fput(target_file);
             fput(epfile);
             return -(s64)ENOSPC;
         }
+        ctx->items[ctx->count].file = target_file;
         ctx->items[ctx->count].fd = fd;
         ctx->items[ctx->count].events = kevent.events;
         ctx->items[ctx->count].data = kevent.data;
+        ctx->items[ctx->count].last_event_seq = 0;
+        ctx->items[ctx->count].et_active = false;
+        ctx->items[ctx->count].oneshot_fired = false;
         ctx->count++;
         spinlock_unlock(&ctx->lock);
+        fput(target_file);
         fput(epfile);
         return 0;
     } else if (op == EPOLL_CTL_MOD) {
         for (int i = 0; i < ctx->count; i++) {
-            if (ctx->items[i].fd == fd) {
+            if (ctx->items[i].file == target_file && ctx->items[i].fd == fd) {
                 ctx->items[i].events = kevent.events;
                 ctx->items[i].data = kevent.data;
+                ctx->items[i].oneshot_fired = false;
+                ctx->items[i].et_active = false;
+                ctx->items[i].last_event_seq = 0;
                 spinlock_unlock(&ctx->lock);
+                fput(target_file);
                 fput(epfile);
                 return 0;
             }
         }
         spinlock_unlock(&ctx->lock);
+        fput(target_file);
         fput(epfile);
         return -(s64)ENOENT;
     } else if (op == EPOLL_CTL_DEL) {
         for (int i = 0; i < ctx->count; i++) {
-            if (ctx->items[i].fd == fd) {
+            if (ctx->items[i].file == target_file && ctx->items[i].fd == fd) {
                 ctx->items[i] = ctx->items[ctx->count - 1];
                 ctx->count--;
                 spinlock_unlock(&ctx->lock);
+                fput(target_file);
                 fput(epfile);
                 return 0;
             }
         }
         spinlock_unlock(&ctx->lock);
+        fput(target_file);
         fput(epfile);
         return -(s64)ENOENT;
     }
     spinlock_unlock(&ctx->lock);
+    fput(target_file);
     fput(epfile);
     return -(s64)EINVAL;
 }
 
-s64 sys_epoll_wait_impl(pt_regs_t *r)
+/* Nanosecond monotonic deadlines avoid both millisecond truncation and signed
+ * int overflow. Valid enormous relative intervals saturate, never wrap. */
+#define EPOLL_DEADLINE_MAX 0x7fffffffffffffffULL
+#define EPOLL_SCAN_NS 1000000ULL
+
+static u64 epoll_deadline(u64 seconds, u64 nanoseconds)
 {
-    int epfd = (int)r->rdi;
-    linux_epoll_event_t *events = (linux_epoll_event_t *)r->rsi;
-    int maxevents = (int)r->rdx;
-    int timeout_ms = (int)r->r10;
+    u64 now = ktime_get_ns();
+    if (seconds > EPOLL_DEADLINE_MAX / NSEC_PER_SEC) return EPOLL_DEADLINE_MAX;
+    u64 duration = seconds * NSEC_PER_SEC + nanoseconds;
+    if (duration > EPOLL_DEADLINE_MAX - now) return EPOLL_DEADLINE_MAX;
+    return now + duration;
+}
 
-    if (maxevents <= 0 || maxevents > 1024) return -(s64)EINVAL;
-    if (!events || (uintptr_t)events >= TASK_SIZE_MAX) return -(s64)EFAULT;
+typedef struct {
+    epoll_item_t items[EPOLL_MAX_ITEMS];
+    file_t *files[EPOLL_MAX_ITEMS];
+    linux_epoll_event_t events[EPOLL_MAX_ITEMS];
+} epoll_scan_t;
 
+static s64 epoll_wait_core(int epfd, linux_epoll_event_t *events, int maxevents,
+                           bool timed, bool nonblocking, u64 deadline)
+{
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-
     file_t *epfile = fget(proc, epfd);
     if (!epfile) return -(s64)EBADF;
-    if (epfile->f_op != &g_epoll_fops || !epfile->private_data) {
-        fput(epfile);
-        return -(s64)EINVAL;
-    }
-    epoll_ctx_t *ctx = (epoll_ctx_t *)epfile->private_data;
-
-    linux_epoll_event_t *kevents = (linux_epoll_event_t *)kmalloc(sizeof(linux_epoll_event_t) * (size_t)maxevents);
-    if (!kevents) {
-        fput(epfile);
-        return -(s64)ENOMEM;
-    }
-
-    u64 start_ticks = sched_get_ticks();
-    u64 end_ticks = (timeout_ms > 0) ? (start_ticks + ((u64)timeout_ms + 9) / 10) : 0;
+    s64 ret = -(s64)EINVAL;
+    if (maxevents <= 0 || maxevents > 0x7fffffff / (int)sizeof(*events)) goto out;
+    ret = -(s64)EFAULT;
+    size_t span = (size_t)maxevents * sizeof(*events);
+    if ((uintptr_t)events >= TASK_SIZE_MAX || span > TASK_SIZE_MAX - (uintptr_t)events) goto out;
+    ret = -(s64)EINVAL;
+    if (epfile->f_op != &g_epoll_fops || !epfile->private_data) goto out;
+    epoll_ctx_t *ctx = epfile->private_data;
+    epoll_scan_t *scan = kmalloc(sizeof(*scan));
+    ret = -(s64)ENOMEM;
+    if (!scan) goto out;
 
     for (;;) {
-        int ready_count = 0;
-        spinlock_lock(&ctx->lock);
-        for (int i = 0; i < ctx->count && ready_count < maxevents; i++) {
-            int tfd = ctx->items[i].fd;
-            file_t *tf = fget(proc, tfd);
-            if (!tf) continue;
-            short rev = check_file_readiness(tf, (short)ctx->items[i].events);
-            fput(tf);
-            if (rev & ctx->items[i].events) {
-                kevents[ready_count].events = (u32)(rev & ctx->items[i].events);
-                kevents[ready_count].data = ctx->items[i].data;
-                ready_count++;
+        /* Pin a snapshot before calling target poll/release methods. Neither
+         * callback nor user copying runs under the epoll spinlock. The epoll
+         * description itself stays pinned even if a sibling closes its fd. */
+        irqflags_t flags = spinlock_lock_irqsave(&ctx->lock);
+        int count = ctx->count;
+        memcpy(scan->items, ctx->items, (size_t)count * sizeof(epoll_item_t));
+        for (int i = 0; i < count; i++) {
+            file_t *tf = ctx->items[i].file;
+            if (tf && (uintptr_t)tf >= 0xFFFF800000000000ULL) {
+                __atomic_add_fetch(&tf->f_count, 1, __ATOMIC_SEQ_CST);
+                scan->files[i] = tf;
+            } else {
+                scan->files[i] = NULL;
             }
         }
-        spinlock_unlock(&ctx->lock);
+        spinlock_unlock_irqrestore(&ctx->lock, flags);
+        int ready = 0;
+        for (int i = 0; i < count; i++) {
+            file_t *tf = scan->files[i];
+            if (!tf) continue;
+            u32 interest = scan->items[i].events | POLLERR | POLLHUP;
+            u32 rev = (u16)check_file_readiness(tf, (short)interest);
+            u64 seq = file_get_event_seq(tf);
 
-        if (ready_count > 0) {
-            size_t not_copied = copy_to_user(events, kevents, sizeof(linux_epoll_event_t) * (size_t)ready_count);
-            kfree(kevents);
-            fput(epfile);
-            if (not_copied != 0) return -(s64)EFAULT;
-            return ready_count;
-        }
+            bool is_ready = (rev & interest) != 0;
+            if (!is_ready) {
+                flags = spinlock_lock_irqsave(&ctx->lock);
+                for (int k = 0; k < ctx->count; k++) {
+                    if (ctx->items[k].file == tf && ctx->items[k].fd == scan->items[i].fd) {
+                        ctx->items[k].et_active = false;
+                        break;
+                    }
+                }
+                spinlock_unlock_irqrestore(&ctx->lock, flags);
+            } else {
+                bool suppressed = false;
+                if (scan->items[i].events & EPOLLONESHOT) {
+                    if (scan->items[i].oneshot_fired) suppressed = true;
+                }
+                if (!suppressed && (scan->items[i].events & EPOLLET)) {
+                    if (scan->items[i].et_active && seq == scan->items[i].last_event_seq) {
+                        suppressed = true;
+                    }
+                }
+                if (!suppressed && ready < maxevents) {
+                    scan->events[ready].events = rev & interest;
+                    scan->events[ready++].data = scan->items[i].data;
 
-        if (timeout_ms == 0) {
-            kfree(kevents);
-            fput(epfile);
-            return 0;
+                    flags = spinlock_lock_irqsave(&ctx->lock);
+                    for (int k = 0; k < ctx->count; k++) {
+                        if (ctx->items[k].file == tf && ctx->items[k].fd == scan->items[i].fd) {
+                            if (scan->items[i].events & EPOLLONESHOT) {
+                                ctx->items[k].oneshot_fired = true;
+                            }
+                            if (scan->items[i].events & EPOLLET) {
+                                ctx->items[k].et_active = true;
+                                ctx->items[k].last_event_seq = seq;
+                            }
+                            break;
+                        }
+                    }
+                    spinlock_unlock_irqrestore(&ctx->lock, flags);
+                }
+            }
+            fput(tf);
         }
-        if (timeout_ms > 0 && sched_get_ticks() >= end_ticks) {
-            kfree(kevents);
-            fput(epfile);
-            return 0;
+        if (ready) {
+            ret = 0;
+            for (int i = 0; i < ready; i++) {
+                if (copy_to_user(&events[i], &scan->events[i], sizeof(*events))) {
+                    if (!ret) ret = -(s64)EFAULT;
+                    break;
+                }
+                ret++;
+            }
+            break;
         }
-
-        /* Interrupt on deliverable signals per POSIX/Linux */
-        if (proc->sig_pending & ~proc->sig_blocked) {
-            kfree(kevents);
-            fput(epfile);
-            return -(s64)EINTR;
-        }
-
-        sched_sleep(1);
+        u64 now = ktime_get_ns();
+        if (nonblocking || (timed && now >= deadline)) { ret = 0; break; }
+        if (sleep_signal_pending(proc)) { ret = -(s64)EINTR; break; }
+        /* This implementation rescans; readiness callbacks do not yet register
+         * epoll wait queues. Bound latency without busy-spinning, and never
+         * round a positive sub-millisecond timeout down to an immediate poll. */
+        u64 wake = now + EPOLL_SCAN_NS;
+        if (timed && deadline < wake) wake = deadline;
+        sched_sleep_until_ns(wake);
     }
+    kfree(scan);
+out:
+    fput(epfile);
+    return ret;
+}
+
+static s64 epoll_masked_wait(int epfd, linux_epoll_event_t *events, int maxevents,
+                             bool timed, bool nonblocking, u64 deadline,
+                             const sigset_t *mask, size_t mask_size)
+{
+    process_t *proc = sched_current_process();
+    thread_t *thread = sched_current_thread();
+    if (!proc || !thread) return -(s64)EPERM;
+    sigset_t saved = 0;
+    if (mask) {
+        if (mask_size != sizeof(sigset_t)) return -(s64)EINVAL;
+        sigset_t temporary;
+        if ((uintptr_t)mask >= TASK_SIZE_MAX || copy_from_user(&temporary, mask, sizeof(temporary)))
+            return -(s64)EFAULT;
+        saved = thread ? thread->sig_blocked : proc->sig_blocked;
+        temporary &= ~(SIG_MASK(SIGKILL) | SIG_MASK(SIGSTOP));
+        if (thread) __atomic_store_n(&thread->sig_blocked, temporary, __ATOMIC_RELEASE);
+        __atomic_store_n(&proc->sig_blocked, temporary, __ATOMIC_RELEASE);
+    }
+    s64 ret = epoll_wait_core(epfd, events, maxevents, timed, nonblocking, deadline);
+    if (mask) {
+        if (ret == -(s64)EINTR) {
+            /* Keep the temporary mask through handler selection. Otherwise a
+             * signal unblocked only for this wait becomes blocked again and
+             * the handler never runs. The signal frame restores saved. */
+            thread->saved_signal_mask = saved;
+            thread->restore_signal_mask = true;
+        } else {
+            if (thread) __atomic_store_n(&thread->sig_blocked, saved, __ATOMIC_RELEASE);
+            __atomic_store_n(&proc->sig_blocked, saved, __ATOMIC_RELEASE);
+        }
+    }
+    return ret;
+}
+
+s64 sys_epoll_wait_impl(pt_regs_t *r)
+{
+    int timeout = (int)(s32)r->r10;
+    u64 deadline = timeout > 0 ? epoll_deadline((u64)timeout / 1000,
+                                               ((u64)timeout % 1000) * 1000000) : 0;
+    return epoll_wait_core((int)(s32)r->rdi, (linux_epoll_event_t *)r->rsi,
+                           (int)(s32)r->rdx, timeout >= 0, timeout == 0, deadline);
 }
 
 s64 sys_epoll_pwait_impl(pt_regs_t *r)
 {
-    const sigset_t *user_sigmask = (const sigset_t *)r->r10;
-    size_t sigsetsize = (size_t)r->r8;
-    
-    process_t *proc = sched_current_process();
-    if (!proc) return -(s64)EPERM;
-    
-    sigset_t old_mask = proc->sig_blocked;
-    
-    if (user_sigmask) {
-        if (sigsetsize != sizeof(sigset_t)) return -(s64)EINVAL;
-        if ((uintptr_t)user_sigmask >= TASK_SIZE_MAX) return -(s64)EFAULT;
-        sigset_t kmask;
-        if (copy_from_user(&kmask, user_sigmask, sizeof(sigset_t)) != 0) return -(s64)EFAULT;
-        
-        proc->sig_blocked = kmask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    int timeout = (int)(s32)r->r10;
+    u64 deadline = timeout > 0 ? epoll_deadline((u64)timeout / 1000,
+                                               ((u64)timeout % 1000) * 1000000) : 0;
+    return epoll_masked_wait((int)(s32)r->rdi, (linux_epoll_event_t *)r->rsi,
+                             (int)(s32)r->rdx, timeout >= 0, timeout == 0, deadline,
+                             (const sigset_t *)r->r8, (size_t)r->r9);
+}
+
+s64 sys_epoll_pwait2_impl(pt_regs_t *r)
+{
+    const struct linux_timespec *timeout = (const struct linux_timespec *)r->r10;
+    bool nonblocking = false;
+    u64 deadline = 0;
+    if (timeout) {
+        struct linux_timespec ts;
+        if ((uintptr_t)timeout >= TASK_SIZE_MAX || copy_from_user(&ts, timeout, sizeof(ts)))
+            return -(s64)EFAULT;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= (long)NSEC_PER_SEC)
+            return -(s64)EINVAL;
+        nonblocking = !ts.tv_sec && !ts.tv_nsec;
+        deadline = epoll_deadline((u64)ts.tv_sec, (u64)ts.tv_nsec);
     }
-    
-    s64 ret = sys_epoll_wait_impl(r);
-    
-    if (user_sigmask) {
-        proc->sig_blocked = old_mask;
-    }
-    return ret;
+    return epoll_masked_wait((int)(s32)r->rdi, (linux_epoll_event_t *)r->rsi,
+                             (int)(s32)r->rdx, timeout != NULL, nonblocking, deadline,
+                             (const sigset_t *)r->r8, (size_t)r->r9);
 }
 
 /* ── Linux timerfd subsystem ──────────────────────────────────────────────── */
@@ -3396,19 +3640,25 @@ static s64 signalfd_read_op(file_t *filp, void *buf, size_t count, u64 *offset)
     signalfd_ctx_t *ctx = (signalfd_ctx_t *)filp->private_data;
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
+    thread_t *curr_th = sched_current_thread();
 
     for (;;) {
-        sigset_t match = proc->sig_pending & ctx->mask;
+        sigset_t th_p = curr_th ? curr_th->sig_pending : 0;
+        sigset_t match = (proc->sig_pending | th_p) & ctx->mask;
         if (match) {
             int sig = 0;
             for (int s = 1; s < _NSIG; s++) {
-                if (match & (1ULL << s)) {
+                if (match & (SIG_MASK(s))) {
                     sig = s;
                     break;
                 }
             }
             if (sig > 0) {
-                proc->sig_pending &= ~(1ULL << sig);
+                if (curr_th && (curr_th->sig_pending & (SIG_MASK(sig)))) {
+                    __atomic_and_fetch(&curr_th->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+                } else {
+                    __atomic_and_fetch(&proc->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+                }
 
                 struct signalfd_siginfo ssi;
                 memset(&ssi, 0, sizeof(ssi));
@@ -3437,8 +3687,10 @@ static int signalfd_poll_op(file_t *filp)
     signalfd_ctx_t *ctx = (signalfd_ctx_t *)filp->private_data;
     process_t *proc = sched_current_process();
     if (!proc) return POLLERR;
+    thread_t *curr_th = sched_current_thread();
+    sigset_t th_p = curr_th ? curr_th->sig_pending : 0;
 
-    if (proc->sig_pending & ctx->mask) {
+    if ((proc->sig_pending | th_p) & ctx->mask) {
         return POLLIN | POLLRDNORM;
     }
     return 0;
@@ -3521,7 +3773,7 @@ s64 sys_signalfd_impl(pt_regs_t *r)
     return sys_signalfd4_impl(&sub);
 }
 
-s64 sys_chroot_impl(pt_regs_t *r)
+static s64 sys_chroot_locked(pt_regs_t *r)
 {
     const char *user_path = (const char *)r->rdi;
     process_t *proc = sched_current_process();
@@ -4761,7 +5013,7 @@ s64 sys_vhangup_impl(pt_regs_t *r)
  * pivot_root(2) — swap the root filesystem for another mounted one.
  * ========================================================================= */
 
-s64 sys_pivot_root_impl(pt_regs_t *r)
+static s64 sys_pivot_root_locked(pt_regs_t *r)
 {
     const char *unew = (const char *)r->rdi;
     const char *uput = (const char *)r->rsi;
@@ -4888,4 +5140,45 @@ s64 sys_listmount_impl(pt_regs_t *r)
     (void)r;
     /* listmount: Currently unsupported, returning ENOSYS. Programs will fall back or handle it. */
     return -(s64)ENOSYS;
+}
+
+/* Process filesystem-view mutations share the openat2 snapshot guard. */
+s64 sys_getcwd_impl(pt_regs_t *r)
+{
+    vfs_namespace_lock();
+    s64 err = sys_getcwd_locked(r);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 sys_chdir_impl(pt_regs_t *r)
+{
+    vfs_namespace_lock();
+    s64 err = sys_chdir_locked(r);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 sys_fchdir_impl(pt_regs_t *r)
+{
+    vfs_namespace_lock();
+    s64 err = sys_fchdir_locked(r);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 sys_chroot_impl(pt_regs_t *r)
+{
+    vfs_namespace_lock();
+    s64 err = sys_chroot_locked(r);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 sys_pivot_root_impl(pt_regs_t *r)
+{
+    vfs_namespace_lock();
+    s64 err = sys_pivot_root_locked(r);
+    vfs_namespace_unlock();
+    return err;
 }

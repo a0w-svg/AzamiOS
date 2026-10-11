@@ -90,6 +90,13 @@ the package repository rather than baked into the image; see
 [PACKAGES.md](PACKAGES.md), and [TOOLCHAIN.md](TOOLCHAIN.md) for the
 compiler.
 
+The optional `make -C tools/linux perf-static` target builds unmodified,
+checksum-pinned Linux 6.12 `perf` with a static musl counting configuration.
+`perf-install` stages it into `DESTDIR/usr/bin/perf`. Attached `perf stat
+--no-inherit -e task-clock:u -t TID --timeout 300` and supported generic/raw
+hardware events are validated; default inheritance/exec, groups and recording
+remain unsupported. See [counter/tool results](W4.2_HARDWARE_RESULTS.md).
+
 `musl-gcc` is a wrapper around the host's `gcc` that substitutes musl's headers
 and startup files. It is an ordinary Linux compiler — nothing in it knows about
 AzamiOS.

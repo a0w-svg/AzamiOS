@@ -83,7 +83,7 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
     /* Guard: bail out (unwinding to the caller, which tears down the address
      * space) rather than letting an unsigned `top_offset` wrap and scribble
      * over adjacent HHDM memory. */
-    #define STK_NEED(n) do { if (top_offset < (size_t)(n)) goto out; } while (0)
+    #define STK_NEED(n) do { if (top_offset < (size_t)(n)) { rc = -E2BIG; goto out; } } while (0)
     #define PUSHQ(v)    do { STK_NEED(8); top_offset -= 8; \
                              *(u64 *)(kstack + top_offset) = (u64)(v); } while (0)
 
@@ -228,7 +228,10 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
     if (out_interp_filesz) *out_interp_filesz = 0;
     if (out_exec_stack) *out_exec_stack = false;
 
-    if (ehdr->e_phnum == 0 || ehdr->e_phnum > 256) {
+    if (ehdr->e_phentsize != sizeof(elf64_phdr_t) ||
+        ehdr->e_phnum == 0 || ehdr->e_phnum > 256 ||
+        ehdr->e_phoff > (u64)file->f_inode->i_size ||
+        (u64)ehdr->e_phnum * sizeof(elf64_phdr_t) > (u64)file->f_inode->i_size - ehdr->e_phoff) {
         return -ENOEXEC;
     }
 
@@ -246,14 +249,33 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
     s64 nread_hdrs = vfs_read(file, phdrs, phdr_table_size);
     if (nread_hdrs < (s64)phdr_table_size) {
         if (heap_alloc) kfree(phdrs);
-        return -ENOEXEC;
+        return nread_hdrs < 0 ? (int)nread_hdrs : -ENOEXEC;
     }
 
     int ret = 0;
+    /* The detached registry already contains the main executable when loading
+     * an interpreter. Reject collisions before either image can overwrite the
+     * other's pages. Overlapping PT_LOAD pages within one image remain valid. */
+    for (u16 i = 0; i < ehdr->e_phnum; i++) {
+        const elf64_phdr_t *ph = &phdrs[i];
+        if (ph->p_type != PT_LOAD || !ph->p_memsz) continue;
+        u64 start = load_bias + ph->p_vaddr;
+        if (start < load_bias || start >= TASK_SIZE_MAX ||
+            ph->p_memsz > TASK_SIZE_MAX - start) { ret = -EINVAL; goto cleanup; }
+        u64 end = ALIGN_UP(start + ph->p_memsz, PAGE_SIZE);
+        start = ALIGN_DOWN(start, PAGE_SIZE);
+        for (vm_area_t *v = proc->vma_list; v; v = v->next) {
+            if (start < v->end && end > v->start) { ret = -EINVAL; goto cleanup; }
+        }
+    }
     for (u16 i = 0; i < ehdr->e_phnum; i++) {
         const elf64_phdr_t *phdr = &phdrs[i];
 
-        if (phdr->p_type == PT_INTERP) {
+        if (phdr->p_type == PT_INTERP && out_interp_filesz && !*out_interp_filesz) {
+            if (phdr->p_filesz < 2 || phdr->p_filesz > 4096) {
+                ret = -ENOEXEC;
+                goto cleanup;
+            }
             if (out_interp_offset) *out_interp_offset = phdr->p_offset;
             if (out_interp_filesz) *out_interp_filesz = phdr->p_filesz;
         }
@@ -291,8 +313,11 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
 
         u64 seg_vaddr = load_bias + phdr->p_vaddr;
 
-        /* Prevent Integer Overflow */
-        if (seg_vaddr + phdr->p_memsz < seg_vaddr) {
+        /* Check additions before alignment and signed VFS offsets. */
+        if (seg_vaddr < load_bias || seg_vaddr >= TASK_SIZE_MAX ||
+            phdr->p_memsz > TASK_SIZE_MAX - seg_vaddr ||
+            phdr->p_offset > 0x7fffffffffffffffULL ||
+            phdr->p_filesz > 0x7fffffffffffffffULL - phdr->p_offset) {
             ret = -EINVAL;
             goto cleanup;
         }
@@ -319,7 +344,10 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
             if (phdr->p_flags & PF_R) vma_prot |= VMA_PROT_READ;
             if (phdr->p_flags & PF_W) vma_prot |= VMA_PROT_WRITE;
             if (phdr->p_flags & PF_X) vma_prot |= VMA_PROT_EXEC;
-            vma_add(proc, start_vaddr, end_vaddr, vma_prot, VMA_F_FILE);
+            if (vma_add(proc, start_vaddr, end_vaddr, vma_prot, VMA_F_FILE) < 0) {
+                ret = -ENOMEM;
+                goto cleanup;
+            }
         }
 
         /* Single pass: allocate, stream file data directly into page, zero padding/bss, and map */
@@ -336,7 +364,10 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
                     merged |= VMM_F_WRITE;
                 if ((old_flags & VMM_F_NX) && (vmm_flags & VMM_F_NX))
                     merged |= VMM_F_NX;
-                vmm_map(user_space, vaddr, phys, merged);
+                if (vmm_map(user_space, vaddr, phys, merged) != 0) {
+                    ret = -ENOMEM;
+                    goto cleanup;
+                }
                 page_buf = (void *)PHYS_TO_VIRT(phys);
             } else {
                 phys = pmm_alloc_page();
@@ -345,7 +376,11 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
                     goto cleanup;
                 }
                 page_buf = (void *)PHYS_TO_VIRT(phys);
-                vmm_map(user_space, vaddr, phys, vmm_flags);
+                if (vmm_map(user_space, vaddr, phys, vmm_flags) != 0) {
+                    pmm_free_page(phys);
+                    ret = -ENOMEM;
+                    goto cleanup;
+                }
             }
 
             /* Overlap calculation between this page [vaddr, page_end) and file data [seg_vaddr, file_data_end) */
@@ -367,7 +402,7 @@ static int load_elf_segments(process_t *proc, vmm_space_t user_space, file_t *fi
                 if (nread < (s64)read_bytes) {
                     pr_debug("[ELF] ERROR: Short read on segment %u at vaddr 0x%llx\n",
                              (unsigned int)i, (unsigned long long)vaddr);
-                    ret = -EIO;
+                    ret = nread < 0 ? (int)nread : -EIO;
                     goto cleanup;
                 }
 
@@ -395,6 +430,29 @@ cleanup:
 }
 
 
+static bool elf_header_valid(const elf64_ehdr_t *eh)
+{
+    return eh->e_ident_magic == ELF_MAGIC && eh->e_ident_class == ELFCLASS64 &&
+           eh->e_ident_data == ELFDATA2LSB && eh->e_machine == EM_X86_64 &&
+           (eh->e_type == ET_EXEC || eh->e_type == ET_DYN);
+}
+
+/* Interpreter names belong to the caller's root/cwd. The VFS walks raw
+ * components, including symlinks and .., relative to that root. */
+static file_t *elf_open_interpreter(process_t *proc, const char *path, s64 *err)
+{
+    char cwd[512];
+    int n = snprintf(cwd, sizeof(cwd), "%s%s", proc->root[0] ? proc->root : "/",
+                     proc->cwd[0] == '/' ? proc->cwd + 1 : proc->cwd);
+    /* root need not have a trailing slash. */
+    if (proc->root[0] && strcmp(proc->root, "/"))
+        n = snprintf(cwd, sizeof(cwd), "%s/%s", proc->root,
+                     proc->cwd[0] == '/' ? proc->cwd + 1 : proc->cwd);
+    if (n < 0 || (size_t)n >= sizeof(cwd)) { *err = -ENAMETOOLONG; return NULL; }
+    return vfs_openat_resolved(NULL, cwd, proc->root[0] ? proc->root : "/",
+                               path, 0, 0, 0, err);
+}
+
 /* Recursive ELF / Script loader */
 static int elf_load_exec_internal(process_t *proc, const char *path, const char *const argv[], const char *const envp[],
                                  uintptr_t *out_entry, phys_addr_t *out_space, u64 *out_rsp, int recursion_depth)
@@ -403,40 +461,13 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     if (!proc || !path || !out_entry || !out_space || !out_rsp) return -EINVAL;
 
     pr_debug("[ELF] Loading binary or script '%s' (depth %d)\n", path, recursion_depth);
-    file_t *file = vfs_open(path, 0, 0);
-    if (!file) {
-        char fallback_path[256];
-        if (path[0] == '/') {
-            snprintf(fallback_path, sizeof(fallback_path), "%s.elf", path);
-            file = vfs_open(fallback_path, 0, 0);
-            if (!file) {
-                snprintf(fallback_path, sizeof(fallback_path), "/bin%s", path);
-                file = vfs_open(fallback_path, 0, 0);
-            }
-            if (!file) {
-                snprintf(fallback_path, sizeof(fallback_path), "/sbin%s", path);
-                file = vfs_open(fallback_path, 0, 0);
-            }
-        } else {
-            snprintf(fallback_path, sizeof(fallback_path), "/bin/%s", path);
-            file = vfs_open(fallback_path, 0, 0);
-            if (!file) {
-                snprintf(fallback_path, sizeof(fallback_path), "/bin/%s.elf", path);
-                file = vfs_open(fallback_path, 0, 0);
-            }
-            if (!file) {
-                snprintf(fallback_path, sizeof(fallback_path), "/sbin/%s", path);
-                file = vfs_open(fallback_path, 0, 0);
-            }
-            if (!file) {
-                snprintf(fallback_path, sizeof(fallback_path), "/sbin/%s.elf", path);
-                file = vfs_open(fallback_path, 0, 0);
-            }
-        }
-    }
-    if (!file) {
-        pr_debug("[ELF] Failed to open binary: %s\n", path);
-        return -ENOENT;
+    s64 open_err = -ENOENT;
+    file_t *file = recursion_depth ? elf_open_interpreter(proc, path, &open_err)
+                                  : vfs_open_err(path, 0, 0, &open_err);
+    if (!file) return (int)open_err;
+    if (!S_ISREG(file->f_inode->i_mode) || !(file->f_inode->i_mode & 0111)) {
+        vfs_close(file);
+        return -EACCES;
     }
 
     /* Read header bytes to check for Shebang (#!) or ELF magic */
@@ -445,7 +476,7 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     s64 nread = vfs_read(file, hdr_buf, sizeof(hdr_buf));
     if (nread < 4) {
         vfs_close(file);
-        return -ENOEXEC;
+        return nread < 0 ? (int)nread : -ENOEXEC;
     }
 
     /* ── 1. Linux Shebang / Script Execution (binfmt_script) ──────────────── */
@@ -463,13 +494,22 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
             interp_line[out_i++] = hdr_buf[idx++];
         }
         interp_line[out_i] = '\0';
+        /* Do not execute a prefix of an interpreter name cut off by the
+         * fixed shebang buffer. A complete name needs a delimiter. */
+        if (idx == hlen && hlen == sizeof(hdr_buf) &&
+            !memchr(interp_line, ' ', out_i) && !memchr(interp_line, '\t', out_i))
+            return -ENOEXEC;
+        while (out_i && (interp_line[out_i - 1] == ' ' || interp_line[out_i - 1] == '\t'))
+            interp_line[--out_i] = '\0';
+        if (!out_i) return -ENOEXEC;
 
         /* Split interpreter and optional argument */
         char *interp = interp_line;
         while (*interp == ' ' || *interp == '\t') interp++;
         char *arg = NULL;
-        char *space = strchr(interp, ' ');
-        if (!space) space = strchr(interp, '\t');
+        char *space = interp;
+        while (*space && *space != ' ' && *space != '\t') space++;
+        if (!*space) space = NULL;
         if (space) {
             *space = '\0';
             arg = space + 1;
@@ -490,6 +530,7 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
             while (argv[src_i] && new_argc < 62) {
                 new_argv[new_argc++] = argv[src_i++];
             }
+            if (argv[src_i]) return -E2BIG;
         }
         new_argv[new_argc] = NULL;
 
@@ -509,15 +550,8 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     memcpy(&ehdr, hdr_buf, sizeof(ehdr));
 
 
-    if (ehdr.e_ident_magic != ELF_MAGIC || ehdr.e_ident_class != ELFCLASS64 ||
-        ehdr.e_ident_data != ELFDATA2LSB || ehdr.e_machine != EM_X86_64) {
+    if (!elf_header_valid(&ehdr)) {
         pr_debug("[ELF] Invalid ELF header magic/class/machine in %s\n", path);
-        vfs_close(file);
-        return -ENOEXEC;
-    }
-
-    if (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) {
-        pr_debug("[ELF] Unsupported ELF type %u in %s (only ET_EXEC and ET_DYN supported)\n", ehdr.e_type, path);
         vfs_close(file);
         return -ENOEXEC;
     }
@@ -541,9 +575,6 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
         vfs_close(file);
         return -ENOMEM;
     }
-    if (recursion_depth == 0) {
-        vma_reset(proc);
-    }
 
     /* Load main executable segments */
     u64 phdr_user_vaddr = 0;
@@ -564,70 +595,49 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
     u64 final_entry = main_entry;
     u64 interp_base = 0;
 
-    if (interp_filesz > 0 && interp_filesz < 256) {
-        char interp_path[256];
+    /* A PT_INTERP is a requirement, never a hint to search for another libc.
+     * Linux permits up to PATH_MAX bytes including the terminating NUL. */
+    if (interp_filesz) {
+        if (interp_offset > 0x7fffffffffffffffULL ||
+            interp_filesz > 0x7fffffffffffffffULL - interp_offset) {
+            err = -EINVAL;
+            goto image_fail;
+        }
+        char *interp_path = kmalloc((size_t)interp_filesz);
+        if (!interp_path) { err = -ENOMEM; goto image_fail; }
         file->f_pos = interp_offset;
-        s64 ilen = vfs_read(file, interp_path, interp_filesz);
-        if (ilen > 0) {
-            if (ilen >= (s64)sizeof(interp_path)) ilen = sizeof(interp_path) - 1;
-            interp_path[ilen] = '\0';
-
-            /* Try the path the binary embeds first, then a prioritised list
-             * of well-known locations that covers glibc, musl, and custom
-             * AzamiOS installations.  The loop tries each in order and stops
-             * at the first successful open(). */
-            static const char * const interp_search[] = {
-                /* exact embedded path (first) */
-                NULL,
-                /* standard glibc paths */
-                "/lib64/ld-linux-x86-64.so.2",
-                "/lib/ld-linux-x86-64.so.2",
-                "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-                "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-                "/usr/lib64/ld-linux-x86-64.so.2",
-                "/usr/lib/ld-linux-x86-64.so.2",
-                /* musl libc */
-                "/lib/ld-musl-x86_64.so.1",
-                "/lib/x86_64-linux-musl/ld-musl-x86_64.so.1",
-                /* AzamiOS-specific fallbacks */
-                "/lib/ld.so",
-                "/lib64/ld.so",
-                "/bin/ld.so",
-                NULL,
-            };
-
-            file_t *ifile = NULL;
-            for (int si = 0; interp_search[si] != NULL || si == 0; si++) {
-                const char *try_path = (si == 0) ? interp_path : interp_search[si];
-                if (!try_path) continue;
-                ifile = vfs_open(try_path, 0, 0);
-                if (ifile) break;
-            }
-
-            if (ifile) {
-                elf64_ehdr_t iehdr;
-                if (vfs_read(ifile, &iehdr, sizeof(iehdr)) == sizeof(iehdr)) {
-                    if (iehdr.e_ident_magic == ELF_MAGIC && iehdr.e_machine == EM_X86_64) {
-                        interp_base = (iehdr.e_type == ET_DYN)
-                                          ? INTERP_LOAD_BASE + aslr_offset(proc, ASLR_INTERP_RND_PAGES)
-                                          : 0;
-                        u64 iphdr_vaddr = 0;
-                        u64 imax_vaddr = 0;
-                        if (load_elf_segments(proc, user_space, ifile, &iehdr, interp_base,
-                                              &iphdr_vaddr, &imax_vaddr, NULL, NULL, NULL) == 0) {
-                            final_entry = interp_base + iehdr.e_entry;
-                            pr_debug("[ELF] Loaded dynamic linker %s (Base: 0x%016llx, Entry: 0x%016llx)\n",
-                                     interp_path, (unsigned long long)interp_base, (unsigned long long)final_entry);
-                        }
-                    }
-                }
-                vfs_close(ifile);
-            } else {
-                pr_debug("[ELF] WARNING: PT_INTERP '%s' not found in VFS; "
-                         "binary will likely crash without a dynamic linker.\n",
-                         interp_path);
+        s64 ilen = vfs_read(file, interp_path, (size_t)interp_filesz);
+        if (ilen != (s64)interp_filesz) {
+            err = ilen < 0 ? (int)ilen : -EIO;
+            kfree(interp_path);
+            goto image_fail;
+        }
+        if (interp_path[interp_filesz - 1] != '\0') {
+            kfree(interp_path);
+            err = -ENOEXEC;
+            goto image_fail;
+        }
+        file_t *ifile = elf_open_interpreter(proc, interp_path, &open_err);
+        kfree(interp_path);
+        if (!ifile) { err = (int)open_err; goto image_fail; }
+        if (!S_ISREG(ifile->f_inode->i_mode) || !(ifile->f_inode->i_mode & 0111)) {
+            err = -EACCES;
+        } else {
+            elf64_ehdr_t iehdr;
+            s64 nr = vfs_read(ifile, &iehdr, sizeof(iehdr));
+            if (nr != sizeof(iehdr)) err = nr < 0 ? (int)nr : -EIO;
+            else if (!elf_header_valid(&iehdr)) err = -ELIBBAD;
+            else {
+                interp_base = iehdr.e_type == ET_DYN
+                            ? INTERP_LOAD_BASE + aslr_offset(proc, ASLR_INTERP_RND_PAGES) : 0;
+                err = load_elf_segments(proc, user_space, ifile, &iehdr, interp_base,
+                                        NULL, NULL, NULL, NULL, NULL);
+                if (err == -ENOEXEC) err = -ELIBBAD;
+                final_entry = interp_base + iehdr.e_entry;
             }
         }
+        vfs_close(ifile);
+        if (err < 0) goto image_fail;
     }
 
     vfs_close(file);
@@ -646,7 +656,13 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
      * (present + write + user) in the dynamic linker's relocation loop — which
      * is exactly the fault that triggered this correction. */
 
-    /* ── 4. Allocate 16 KB Ring-3 User Stack ──────────────────────────────── */
+    /* ── 4. Allocate the initial Ring-3 stack ─────────────────────────────── */
+    for (vm_area_t *v = proc->vma_list; v; v = v->next) {
+        if (stack_top - USER_STACK_MAX_BYTES < v->end && stack_top > v->start) {
+            vmm_destroy_space(user_space);
+            return -EINVAL;
+        }
+    }
     u64 stack_flags = VMM_USER_RW;
     u32 stack_prot  = VMA_PROT_READ | VMA_PROT_WRITE;
     if (exec_stack) {
@@ -662,22 +678,30 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
             return -ENOMEM;
         }
         hw_clear_page((void *)PHYS_TO_VIRT(phys));
-        vmm_map(user_space, vaddr, phys, stack_flags);
+        if (vmm_translate(user_space, vaddr) ||
+            vmm_map(user_space, vaddr, phys, stack_flags) != 0) {
+            pmm_free_page(phys);
+            vmm_destroy_space(user_space);
+            return -ENOMEM;
+        }
         if (vaddr == stack_top - PAGE_SIZE) {
             top_page_phys = phys;
         }
     }
 
     /* ── 4b. vDSO: [vvar] + [vdso] (linux-vdso.so.1), AT_SYSINFO_EHDR ─────── */
-    u64 vdso_base = vdso_map(proc, user_space);
+    u64 vdso_base = 0;
+    err = vdso_map(proc, user_space, &vdso_base);
+    if (err < 0) { vmm_destroy_space(user_space); return err; }
 
     /* ── 5. Initialize Linux System V AMD64 Stack Frame ───────────────────── */
-    if (setup_user_stack(proc, user_space, top_page_phys, path, argv, envp,
+    err = setup_user_stack(proc, user_space, top_page_phys, path, argv, envp,
                          main_entry, phdr_user_vaddr, (u64)ehdr.e_phnum,
                          (u64)sizeof(elf64_phdr_t), interp_base, stack_top,
-                         vdso_base, out_rsp) < 0) {
+                         vdso_base, out_rsp);
+    if (err < 0) {
         vmm_destroy_space(user_space);
-        return -ENOMEM;
+        return err;
     }
 
     proc->heap_start   = ALIGN_UP(max_exec_vaddr, PAGE_SIZE);
@@ -691,8 +715,11 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
      * stack to grow on demand. */
     proc->stack_high = stack_top;
     proc->stack_low  = stack_top - USER_STACK_MAX_BYTES;
-    vma_add(proc, proc->stack_low, proc->stack_high,
-            stack_prot, VMA_F_ANON | VMA_F_STACK);
+    if (vma_add(proc, proc->stack_low, proc->stack_high,
+                stack_prot, VMA_F_ANON | VMA_F_STACK) < 0) {
+        vmm_destroy_space(user_space);
+        return -ENOMEM;
+    }
 
     *out_entry = (uintptr_t)final_entry;
     *out_space = user_space;
@@ -700,13 +727,65 @@ static int elf_load_exec_internal(process_t *proc, const char *path, const char 
              path, (unsigned long long)*out_entry, (unsigned long long)*out_rsp, (unsigned long long)user_space,
              (unsigned long long)proc->heap_start);
     return 0;
+
+image_fail:
+    vfs_close(file);
+    vmm_destroy_space(user_space);
+    return err;
 }
 
+
+int elf_prepare_exec(process_t *proc, const char *path, const char *const argv[],
+                     const char *const envp[], uintptr_t *out_entry,
+                     phys_addr_t *out_space, u64 *out_rsp, process_t **out_image)
+{
+    if (!proc || !path || !out_entry || !out_space || !out_rsp || !out_image)
+        return -EINVAL;
+    *out_image = NULL;
+    process_t *image = kzalloc(sizeof(*image));
+    if (!image) return -ENOMEM;
+    image->vma_lock = (spinlock_t)SPINLOCK_INIT;
+    image->personality = proc->personality;
+    image->uid = proc->uid; image->euid = proc->euid;
+    image->gid = proc->gid; image->egid = proc->egid;
+    vfs_namespace_lock();
+    memcpy(image->root, proc->root, sizeof(image->root));
+    memcpy(image->cwd, proc->cwd, sizeof(image->cwd));
+    vfs_namespace_unlock();
+    int err = elf_load_exec_internal(image, path, argv, envp, out_entry, out_space, out_rsp, 0);
+    if (err < 0) { vma_reset(image); kfree(image); return err; }
+    *out_image = image;
+    return 0;
+}
+
+/* Caller has stopped siblings before publishing an exec image. Spawned
+ * processes have no runnable thread yet. There are no fallible operations here. */
+void elf_commit_exec(process_t *proc, process_t *image)
+{
+    vma_reset(proc);
+    irqflags_t flags = spinlock_lock_irqsave(&proc->vma_lock);
+    proc->vma_list = image->vma_list;
+    proc->vma_tree = image->vma_tree;
+    proc->vmacache_seqnum++;
+    /* No set-ID or file-capability exec exists yet: a committed ordinary
+     * image resets dumpability just as Linux does. Failed exec preserves it. */
+    __atomic_store_n(&proc->dumpable,true,__ATOMIC_RELEASE);
+    proc->heap_start = image->heap_start;
+    proc->heap_end = image->heap_end;
+    proc->mmap_current = image->mmap_current;
+    proc->stack_low = image->stack_low;
+    proc->stack_high = image->stack_high;
+    spinlock_unlock_irqrestore(&proc->vma_lock, flags);
+    kfree(image);
+}
 
 int elf_load_exec(process_t *proc, const char *path, const char *const argv[], const char *const envp[],
                   uintptr_t *out_entry, phys_addr_t *out_space, u64 *out_rsp)
 {
-    return elf_load_exec_internal(proc, path, argv, envp, out_entry, out_space, out_rsp, 0);
+    process_t *image = NULL;
+    int err = elf_prepare_exec(proc, path, argv, envp, out_entry, out_space, out_rsp, &image);
+    if (!err) elf_commit_exec(proc, image);
+    return err;
 }
 
 process_t *sched_spawn_user_args(const char *path, const char *const argv[], const char *const envp[])

@@ -562,6 +562,7 @@ void kernel_main(void)
     extern void perf_init(void);
     extern void ktrace_init(void);
     pmu_init();
+    smp_rpc_init();
     perf_init();
     ktrace_init();
 

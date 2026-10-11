@@ -1,49 +1,14 @@
-/* ============================================================================
- * AzamiOS — perf_event_open(2)
- * File: kernel/perf/perf.h
- *
- * Counting, not profiling. An event is a file descriptor; read(2) on it returns
- * how many times the thing happened, and ioctl(2) starts, stops and resets it.
- * That is enough for `perf stat`, for a benchmark harness that wants cycles and
- * instructions around a region, and for anything that wants to know how often
- * a process faulted or was rescheduled.
- *
- * Sampling is deliberately absent
- * -------------------------------
- * There is no ring buffer, no PERF_RECORD_* stream and no overflow interrupt,
- * so an attr with a sample_period or sample_freq is rejected outright rather
- * than accepted and quietly ignored — a profiler that thinks it is sampling and
- * receives nothing is a worse failure than one that is told no. mmap(2) on a
- * perf fd fails for the same reason.
- *
- * What a counter is attached to
- * -----------------------------
- *   pid > 0 / pid == 0   count only while that process runs. Hardware counts
- *                        are accumulated across context switches by
- *                        perf_sched_switch(); software counts are the
- *                        difference between two reads of a process_t counter.
- *   pid == -1            system-wide. Hardware and raw events sum every core's
- *                        free-running counter as each core switches; software
- *                        events other than cpu-clock have no system-wide
- *                        source here and are refused.
- *
- * The `cpu` argument is accepted and remembered but does not restrict counting:
- * a per-CPU event would need to read a counter MSR on a core this thread is not
- * running on, and there is no cross-CPU call facility to do that with.
- *
- * Accuracy, honestly
- * ------------------
- * Hardware attribution is exact to the context switch: the delta is taken
- * between a read at switch-in and a read at switch-out on the same core, so no
- * other task's work lands in it. What does land in it is the handful of kernel
- * instructions between the switch itself and the hook — sub-microsecond, and
- * constant, but not zero. exclude_user/exclude_kernel are honoured by the
- * PERFEVTSEL bits, so those are exact.
- *
- * Time is measured in scheduler ticks (10 ms) and reported in nanoseconds, so
- * time_enabled, time_running, cpu-clock and task-clock are 10 ms granular. They
- * are not derived from the TSC because nothing in this kernel calibrates it.
- * ============================================================================ */
+/* Counting-only Linux perf ABI: task events accept pid 0 or a live TID and
+ * CPU -1 or a CPU filter; pid -1 requires an online CPU for system-wide events.
+ * Software clocks count monotonic context time. Task enabled time excludes
+ * descheduling; running time additionally excludes CPUs outside the filter.
+ * CPU-wide clocks include idle time. RESET preserves both time accumulators.
+ * Occurrences use scheduler/fault hooks and enabled/privilege/CPU filters.
+ * Hardware deltas use width-masked reads on the CPU owning each interval.
+ * Remote read/control uses bounded by-value requests; timeout is ETIMEDOUT.
+ * Events keep IDs, never borrowed task pointers; retirement freezes counts.
+ * Inheritance, enable-on-exec, groups, multiplexing and sampling are unsupported.
+ */
 #pragma once
 
 #include "../sched/sched.h"
@@ -99,6 +64,10 @@
 #define PERF_ATTR_EXCLUDE_HV     (1ULL << 6)
 #define PERF_ATTR_EXCLUDE_IDLE   (1ULL << 7)
 #define PERF_ATTR_ENABLE_ON_EXEC (1ULL << 12)
+#define PERF_ATTR_EXCLUDE_GUEST  (1ULL << 20)
+
+/* Counting accepts this record-layout metadata without producing samples. */
+#define PERF_SAMPLE_IDENTIFIER  (1ULL << 16)
 
 /* ── perf_event_open(2) flags ────────────────────────────────────────────── */
 #define PERF_FLAG_FD_NO_GROUP  (1UL << 0)
@@ -151,18 +120,21 @@ s64 sys_perf_event_open_impl(pt_regs_t *r);
 /**
  * perf_sched_switch(prev, next) — the context-switch hook.
  *
- * Maintains the per-process counters every software event reads, and closes
+ * Maintains process statistics and thread event intervals, and closes
  * out @prev's hardware deltas before opening @next's. Runs on every context
- * switch, so the no-events case is one relaxed load and a branch.
+ * switch; the no-events path also synchronizes pending PMU slot changes.
  *
  * Called from sched_post_switch(), i.e. already in @next's context on the core
  * both threads ran on — which is exactly what makes the hardware delta
  * attributable to @prev and nobody else.
  */
-void perf_sched_switch(process_t *prev, process_t *next);
+void perf_sched_switch(thread_t *prev, thread_t *next);
+void perf_thread_exit(thread_t *t);
+void perf_page_fault(bool user);
+extern s32 g_perf_event_paranoid;
 
 /**
- * perf_process_exit(p) — detach every event still pointing at @p.
+ * perf_process_exit(p) — freeze every remaining event owned by @p.
  *
  * The event stays open — its fd may be held by a parent that has not read it
  * yet — and its final count remains readable; it simply stops matching the

@@ -20,6 +20,7 @@
 #include "../kernel/mm/pmm.h"
 #include "../kernel/mm/vma.h"
 #include "../kernel/sched/sched.h"
+#include "../kernel/perf/perf.h"
 #include "../kernel/lib/string.h"
 #include "../drivers/char/console.h"
 #include "../include/azami/defs.h"
@@ -121,6 +122,7 @@ typedef enum {
     PROCFS_TYPE_IRQ_EFFECTIVE_AFFINITY,
 
     /* Security sysctl endpoints */
+    PROCFS_TYPE_SYS_KERNEL_PERF_EVENT_PARANOID,
     PROCFS_TYPE_SYS_KERNEL_DMESG_RESTRICT,
     PROCFS_TYPE_SYS_KERNEL_KPTR_RESTRICT,
     PROCFS_TYPE_SYS_KERNEL_MMAP_MIN_ADDR,
@@ -183,6 +185,9 @@ static inode_t *procfs_alloc_inode(super_block_t *sb, u64 ino, u32 mode, procfs_
 
     inode->i_ino = ino;
     inode->i_mode = mode;
+    inode->i_magiclink = type == PROCFS_TYPE_PID_EXE_SYMLINK ||
+                         type == PROCFS_TYPE_PID_CWD_SYMLINK ||
+                         type == PROCFS_TYPE_PID_FD_ENTRY;
     inode->i_sb = sb;
     inode->i_op = &g_procfs_inode_ops;
     inode->i_fop = &g_procfs_file_ops;
@@ -288,14 +293,25 @@ static s64 procfs_readlink(struct dentry *dentry, char *buf, size_t bufsiz)
         tmp[sizeof(tmp) - 1] = '\0';
     } else if (priv->type == PROCFS_TYPE_PID_NS_ENTRY) {
         const char *ns = (dentry && dentry->d_name[0]) ? dentry->d_name : "uts";
-        u32 inum = 4026531838U;
+        process_t *target = proc_get_by_pid(priv->pid);
+        if (!target) return -(s64)ENOENT;
+        u64 inum = 4026531838ULL;
+        if (strcmp(ns, "uts") == 0) {
+            uts_namespace_t *uts = proc_uts_ns_get(target);
+            if (!uts) { proc_put(target); return -(s64)ENOENT; }
+            inum = uts->inum;
+            uts_ns_put(uts);
+        }
         if (strcmp(ns, "ipc") == 0) inum = 4026531839U;
         else if (strcmp(ns, "mnt") == 0) inum = 4026531840U;
         else if (strcmp(ns, "net") == 0) inum = 4026531841U;
         else if (strcmp(ns, "pid") == 0 || strcmp(ns, "pid_for_children") == 0) inum = 4026531842U;
         else if (strcmp(ns, "user") == 0) inum = 4026531843U;
         else if (strcmp(ns, "cgroup") == 0) inum = 4026531844U;
-        scnprintf(tmp, sizeof(tmp), "%s:[%u]", ns, inum);
+        proc_put(target);
+        scnprintf(tmp, sizeof(tmp), "%s:[%llu]",
+                  strcmp(ns, "pid_for_children") == 0 ? "pid" : ns,
+                  (unsigned long long)inum);
     }
 
     size_t len = strlen(tmp);
@@ -1106,6 +1122,8 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 314, S_IFREG | 0644, PROCFS_TYPE_SYS_PID_MAX, 0);
         } else if (strcmp(name, "random") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 315, S_IFDIR | 0555, PROCFS_TYPE_SYS_KERNEL_RANDOM_DIR, 0);
+        } else if (strcmp(name, "perf_event_paranoid") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 349, S_IFREG | 0644, PROCFS_TYPE_SYS_KERNEL_PERF_EVENT_PARANOID, 0);
         } else if (strcmp(name, "dmesg_restrict") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 340, S_IFREG | 0644, PROCFS_TYPE_SYS_KERNEL_DMESG_RESTRICT, 0);
         } else if (strcmp(name, "kptr_restrict") == 0) {
@@ -1452,6 +1470,9 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
     case PROCFS_TYPE_SYS_NET_TCP_FIN_TIMEOUT:
         total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "60\n");
         break;
+    case PROCFS_TYPE_SYS_KERNEL_PERF_EVENT_PARANOID:
+        total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "%d\n", (int)__atomic_load_n(&g_perf_event_paranoid, __ATOMIC_RELAXED));
+        break;
     case PROCFS_TYPE_SYS_KERNEL_DMESG_RESTRICT:
         total_len = (size_t)scnprintf(tmp, PROCFS_TMP_SIZE, "%u\n", (unsigned int)g_dmesg_restrict);
         break;
@@ -1550,6 +1571,30 @@ static s64 procfs_file_write(struct file *filp, const void *buf, size_t len, u64
 
     procfs_priv_t *priv = (procfs_priv_t *)filp->f_inode->i_private;
     process_t *proc = sched_current_process();
+    if (priv->type == PROCFS_TYPE_SYS_KERNEL_PERF_EVENT_PARANOID) {
+        if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
+        if (!len) return 0;
+        if (len >= 32) return -(s64)EINVAL;
+        char value[32];
+        memcpy(value, buf, len);
+        value[len] = 0;
+        size_t at = 0;
+        while (value[at] == ' ' || value[at] == '\t') at++;
+        bool negative = value[at] == '-';
+        if (negative || value[at] == '+') at++;
+        bool digits = false;
+        u64 number = 0;
+        while (value[at] >= '0' && value[at] <= '9') {
+            digits = true;
+            number = number * 10 + (u64)(value[at++] - '0');
+            if (number > 2147483647ULL + (negative ? 1 : 0)) return -(s64)EINVAL;
+        }
+        while (value[at] == ' ' || value[at] == '\t' || value[at] == '\n' || value[at] == '\r') at++;
+        if (!digits || at != len) return -(s64)EINVAL;
+        s32 setting = negative ? (s32)(-(s64)number) : (s32)number;
+        __atomic_store_n(&g_perf_event_paranoid, setting, __ATOMIC_RELAXED);
+        return (s64)len;
+    }
     if (!proc || (proc->euid != 0 && !security_check_permission(proc, CAP_SYS_ADMIN))) {
         return -(s64)EPERM;
     }
@@ -1833,7 +1878,7 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
             idx++;
         }
     } else if (priv->type == PROCFS_TYPE_SYS_KERNEL_DIR) {
-        const char *kentries[] = { ".", "..", "osrelease", "ostype", "hostname", "version", "pid_max", "random", "dmesg_restrict", "kptr_restrict", "mmap_min_addr", "yama", "vm" };
+        const char *kentries[] = { ".", "..", "osrelease", "ostype", "hostname", "version", "pid_max", "random", "dmesg_restrict", "perf_event_paranoid", "kptr_restrict", "mmap_min_addr", "yama", "vm" };
         u64 total_entries = 13;
         while (idx < total_entries) {
             const char *name = kentries[idx];
@@ -2129,11 +2174,13 @@ void procfs_pid_exited(u32 pid)
 {
     if (!g_procfs_root || pid == 0) return;
 
+    vfs_namespace_lock();
     char name[16];
     scnprintf(name, sizeof(name), "%u", pid);
 
     dentry_t *d = dcache_lookup(g_procfs_root, name);
     if (d) procfs_drop_subtree(d);
+    vfs_namespace_unlock();
 }
 
 static s64 procfs_mount(file_system_type_t *fs_type, const char *dev_name, const char *dir_name, void *data)

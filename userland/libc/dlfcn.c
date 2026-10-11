@@ -25,11 +25,22 @@
 /* userland/libc/ldso_bridge.c */
 extern void *__libc_ldso_lookup(const char *name);
 
-static const char *g_dlerror_msg;
+static __thread char g_dlerror_buf[256];
+static __thread int  g_dlerror_pending;
 
 static void set_local_dlerror(const char *msg)
 {
-    g_dlerror_msg = msg;
+    if (!msg) {
+        g_dlerror_pending = 0;
+        return;
+    }
+    size_t i = 0;
+    while (msg[i] && i < sizeof(g_dlerror_buf) - 1) {
+        g_dlerror_buf[i] = msg[i];
+        i++;
+    }
+    g_dlerror_buf[i] = '\0';
+    g_dlerror_pending = 1;
 }
 
 void *dlopen(const char *path, int flags)
@@ -91,11 +102,26 @@ int dlclose(void *handle)
 
 char *dlerror(void)
 {
-    /* POSIX: returns NULL if called twice in a row with no intervening
-     * failure — the same one-shot contract ld.so's own __ldso_dlerror()
-     * already implements; we mirror it locally for the "no ld.so present"
-     * messages set directly in this file. */
-    const char *msg = g_dlerror_msg;
-    g_dlerror_msg = NULL;
-    return (char *)msg;
+    if (!g_dlerror_pending) return NULL;
+    g_dlerror_pending = 0;
+    return g_dlerror_buf;
+}
+
+int dladdr(const void *addr, Dl_info *info)
+{
+    if (!info) return 0;
+    int (*fn)(const void *, Dl_info *) =
+        (int (*)(const void *, Dl_info *))__libc_ldso_lookup("__ldso_dladdr");
+    if (!fn) {
+        set_local_dlerror("dladdr: no dynamic linker present (statically linked)");
+        return 0;
+    }
+    int ret = fn(addr, info);
+    if (ret == 0) {
+        const char *(*ldso_dlerror)(void) =
+            (const char *(*)(void))__libc_ldso_lookup("__ldso_dlerror");
+        const char *msg = ldso_dlerror ? ldso_dlerror() : NULL;
+        set_local_dlerror(msg ? msg : "dladdr: address not mapped");
+    }
+    return ret;
 }

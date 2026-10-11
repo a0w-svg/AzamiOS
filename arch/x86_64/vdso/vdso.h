@@ -14,6 +14,6 @@ struct process;
 void vdso_init(void);
 
 /** vdso_map(proc, space) — map [vvar] + [vdso] into a fresh address space.
- *  Returns the image base for AT_SYSINFO_EHDR, or 0 if there is no vDSO
- *  (libc then simply falls back to the syscalls). */
-u64 vdso_map(struct process *proc, vmm_space_t space);
+ *  Sets out_base for AT_SYSINFO_EHDR, or 0 if there is no vDSO
+ *  (libc then simply falls back to the syscalls). Returns negative errno on failure. */
+int vdso_map(struct process *proc, vmm_space_t space, u64 *out_base);

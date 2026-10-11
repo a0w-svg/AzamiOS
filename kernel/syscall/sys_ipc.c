@@ -230,6 +230,7 @@ typedef struct futex_q {
     process_t       *proc;
     uintptr_t        uaddr;
     u32              bitset;
+    bool            *woken; /* Stable wake predicate, shared by waitv entries. */
     struct futex_q  *next;
 } futex_q_t;
 
@@ -285,13 +286,15 @@ static inline u32 futex_hash(uintptr_t uaddr) {
  * new one), which is exactly the part that belongs to the caller. Returns 0 if
  * woken by a FUTEX_WAKE, -EINTR on a pending signal, -ETIMEDOUT on expiry. */
 static s64 futex_wait_queued(process_t *proc, thread_t *curr, uintptr_t uaddr,
-                             u32 bitset, u64 timeout_ticks)
+                             u32 expected, u32 bitset, u64 timeout_ticks)
 {
+    bool woken = false;
     futex_q_t q;
     q.thread = curr;
     q.proc = proc;
     q.uaddr = uaddr;
     q.bitset = bitset;
+    q.woken = &woken;
     q.next = NULL;
 
     u32 b = futex_hash(uaddr);
@@ -300,14 +303,21 @@ static s64 futex_wait_queued(process_t *proc, thread_t *curr, uintptr_t uaddr,
     g_futex_table[b] = &q;
     spinlock_unlock(&g_futex_bucket_locks[b]);
 
+    /* Publish before checking: a store+wake before publication is observed
+     * by this read, and any later wake sets the stable predicate. */
+    u32 value = 0;
+    s64 error = 0;
+    if (copy_from_user(&value, (const void *)uaddr, sizeof(value)) != 0)
+        error = -(s64)EFAULT;
+    else if (value != expected)
+        error = -(s64)EAGAIN;
     u64 start_ticks = sched_get_ticks();
-    if (timeout_ticks > 0) {
-        sched_sleep(timeout_ticks);
-    } else {
-        sched_block(THREAD_BLOCKED_PENDING);
-    }
+    if (!error) sched_wait_flag(&woken, timeout_ticks);
 
-    spinlock_lock(&g_futex_bucket_locks[b]);
+    /* REQUEUE can move the stack entry to another bucket while we wait.
+     * Freeze bucket migration before reading q.uaddr or removing the entry. */
+    futex_lock_all_buckets();
+    b = futex_hash(q.uaddr);
     bool was_woken = true;
     futex_q_t **curr_q = &g_futex_table[b];
     while (*curr_q) {
@@ -318,7 +328,9 @@ static s64 futex_wait_queued(process_t *proc, thread_t *curr, uintptr_t uaddr,
         }
         curr_q = &(*curr_q)->next;
     }
-    spinlock_unlock(&g_futex_bucket_locks[b]);
+    futex_unlock_all_buckets();
+
+    if (error) return error;
 
     /* BUG-AJ fix: return -ETIMEDOUT or -EINTR when not awakened by FUTEX_WAKE */
     if (!was_woken) {
@@ -346,6 +358,7 @@ static int futex_wake_addr(process_t *proc, uintptr_t uaddr, u32 nr, u32 bitset)
         if (q->proc == proc && q->uaddr == uaddr && (q->bitset & bitset)) {
             *curr_q = q->next;
             q->next = NULL;
+            __atomic_store_n(q->woken, true, __ATOMIC_RELEASE);
             sched_unblock(q->thread);
             woken++;
         } else {
@@ -410,7 +423,7 @@ s64 sys_futex_impl(pt_regs_t *r)
             }
         }
 
-        return futex_wait_queued(proc, curr, uaddr, bitset, timeout_ticks);
+        return futex_wait_queued(proc, curr, uaddr, val, bitset, timeout_ticks);
     }
     case FUTEX_WAKE:
     case FUTEX_WAKE_BITSET: {
@@ -501,6 +514,7 @@ s64 sys_futex_impl(pt_regs_t *r)
                 if ((u32)woken < val) {
                     *curr_q = entry->next;
                     entry->next = NULL;
+                    __atomic_store_n(entry->woken, true, __ATOMIC_RELEASE);
                     sched_unblock(entry->thread);
                     woken++;
                     continue;
@@ -698,6 +712,7 @@ s64 sys_futex_waitv_impl(pt_regs_t *r)
      * before enqueueing would lose a wake that lands in between. */
     futex_q_t q[FUTEX_WAITV_MAX];
     u32 bucket[FUTEX_WAITV_MAX];
+    bool wake_flag = false;
 
     futex_lock_all_buckets();
     for (unsigned int i = 0; i < nr; i++) {
@@ -705,6 +720,7 @@ s64 sys_futex_waitv_impl(pt_regs_t *r)
         q[i].proc   = proc;
         q[i].uaddr  = (uintptr_t)w[i].uaddr;
         q[i].bitset = FUTEX_BITSET_MATCH_ANY;
+        q[i].woken  = &wake_flag;
         bucket[i]   = futex_hash(q[i].uaddr);
         q[i].next   = g_futex_table[bucket[i]];
         g_futex_table[bucket[i]] = &q[i];
@@ -716,7 +732,7 @@ s64 sys_futex_waitv_impl(pt_regs_t *r)
     #define FUTEX_WAITV_DEQUEUE(found_out) do {                          \
         futex_lock_all_buckets();                                        \
         for (unsigned int _i = 0; _i < nr; _i++) {                       \
-            futex_q_t **pp = &g_futex_table[bucket[_i]];                 \
+            futex_q_t **pp = &g_futex_table[futex_hash(q[_i].uaddr)];   \
             bool _still = false;                                         \
             while (*pp) {                                                \
                 if (*pp == &q[_i]) { *pp = q[_i].next; _still = true; break; } \
@@ -744,8 +760,7 @@ s64 sys_futex_waitv_impl(pt_regs_t *r)
     }
 
     u64 start_ticks = sched_get_ticks();
-    if (timeout_ticks > 0) sched_sleep(timeout_ticks);
-    else                   sched_block(THREAD_BLOCKED_PENDING);
+    sched_wait_flag(&wake_flag, timeout_ticks);
 
     bool woken = false;
     FUTEX_WAITV_DEQUEUE(woken);
@@ -903,7 +918,7 @@ s64 sys_futex_wait_impl(pt_regs_t *r)
         if (timeout_ticks == 0) timeout_ticks = 1;
     }
 
-    return futex_wait_queued(proc, curr, uaddr, mask, timeout_ticks);
+    return futex_wait_queued(proc, curr, uaddr, val, mask, timeout_ticks);
 }
 
 s64 sys_futex_requeue_impl(pt_regs_t *r)

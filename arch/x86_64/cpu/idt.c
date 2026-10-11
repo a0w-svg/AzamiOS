@@ -17,6 +17,7 @@
 #include "../../../kernel/mm/vma.h"
 #include "../../../kernel/signal.h"
 #include "../../../kernel/ptrace.h"
+#include "../../../kernel/perf/perf.h"
 #include "../mm/vmm.h"
 #include "hwaccel.h"
 #include "cpu.h"
@@ -236,7 +237,8 @@ static bool handle_user_page_fault(pt_regs_t *r, uintptr_t fault_addr)
             /* Only resolve COW if the region actually has PROT_WRITE permission */
             if (is_writable) {
                 if (vmm_cow_fault(proc->pml4_phys, fault_addr) == 0) {
-                    proc->nr_minor_faults++;
+                    __atomic_add_fetch(&proc->nr_minor_faults, 1, __ATOMIC_RELAXED);
+                    perf_page_fault((r->cs & 3) == 3);
                     return true; /* COW resolved; resume instruction */
                 }
             }
@@ -309,7 +311,8 @@ static bool handle_user_page_fault(pt_regs_t *r, uintptr_t fault_addr)
                 if (region_prot & VMA_PROT_WRITE) mf |= VMM_F_WRITE;
                 if (!(region_prot & VMA_PROT_EXEC)) mf |= VMM_F_NX;
                 vmm_map(proc->pml4_phys, ALIGN_DOWN(fault_addr, PAGE_SIZE), new_page, mf);
-                proc->nr_minor_faults++;
+                __atomic_add_fetch(&proc->nr_minor_faults, 1, __ATOMIC_RELAXED);
+                perf_page_fault((r->cs & 3) == 3);
                 return true; /* Demand page resolved; resume instruction */
             }
         }

@@ -1,19 +1,12 @@
-/* ============================================================================
- * AzamiOS — perf_event_open(2)
- * File: kernel/perf/perf.c
- *
- * See perf.h for the model and for what is deliberately not implemented.
- * ========================================================================= */
-
+/* Counting-only perf ABI. See perf.h for the supported scope. */
 #define DEBUG 0
 #include <azami/debug.h>
-
 #include "perf.h"
 #include "../uaccess.h"
-#include "../sched/sched.h"
 #include "../security/security.h"
 #include "../mm/kmalloc.h"
 #include "../lib/string.h"
+#include "../time/timekeeping.h"
 #include "../../arch/x86_64/cpu/pmu.h"
 #include "../../arch/x86_64/cpu/smp.h"
 #include "../../arch/x86_64/cpu/spinlock.h"
@@ -22,577 +15,466 @@
 #include "../../drivers/char/console.h"
 #include "../syscall/syscall.h"
 
-/* The LAPIC preemption timer runs at 100 Hz (see lapic_timer_start in
- * ap_c_entry / kernel_main), so one scheduler tick is 10 ms. Every duration
- * perf reports is a multiple of this. */
-#define PERF_TICK_NS  10000000ULL
-
-#define PERF_MAX_EVENTS  64
-
-/* poll(2) revents this fd can report. */
-#define POLLIN      0x0001
-#define POLLRDNORM  0x0040
+#define PERF_MAX_EVENTS 64
+#define PERF_NO_CPU ((u32)-1)
+#define PERF_POLLHUP 0x0010
 
 typedef struct perf_event {
     struct perf_event *next;
-
-    u32  type;
-    u64  config;
-    u64  read_format;
-    u64  attr_flags;
-
-    u32  target_pid;        /* 0 == system-wide                             */
-    s32  cpu;               /* remembered, not enforced — see perf.h        */
-    u32  owner_pid;
-
-    int  slot;              /* PMU counter slot, or -1 for a software event */
-    u64  evtsel;
-
-    bool enabled;
-    bool running;           /* hardware: the target is on a CPU right now   */
-
-    u64  count;             /* accumulated hardware events                  */
-    u64  sw_base;           /* software: counter value when last reset      */
-    u64  prev[SMP_MAX_CPUS];/* last raw counter read, per core              */
-
-    u64  id;
-    u64  enabled_tick;      /* tick at which counting last started          */
-    u64  time_enabled;      /* ticks, excluding the currently-open interval */
-    u64  time_running;
+    u64 config, read_format, attr_flags, id;
+    u32 target_tid, target_pid, running_cpu, last_cpu;
+    s32 cpu;
+    int slot;
+    bool enabled, dead;
+    u64 count, prev, running_ns;
+    u64 time_enabled, time_running;
 } perf_event_t;
 
-static spinlock_t    g_perf_lock = SPINLOCK_INIT;
+static spinlock_t g_perf_lock = SPINLOCK_INIT;
 static perf_event_t *g_perf_list;
-static u32           g_perf_count;
-static u64           g_perf_next_id = 1;
-
-/* Fast-path gate for the context-switch hook: the number of events that need
- * per-switch hardware bookkeeping. Zero on any system that is not being
- * measured, which is nearly always. */
-static volatile u32  g_perf_hw_events;
+static u32 g_perf_count;
+static u64 g_perf_next_id = 1;
+/* Atomic sysctl access: readers do not need the event-table lock. */
+s32 g_perf_event_paranoid = 2;
 
 void perf_init(void)
 {
-    g_perf_list       = NULL;
-    g_perf_count      = 0;
-    g_perf_hw_events  = 0;
     char buf[64];
     pmu_format(buf, sizeof(buf));
-    kprintf("[PERF] perf_event_open ready (pmu: %s)\n", buf);
+    kprintf("[PERF] scoped counting ready (pmu: %s)\n", buf);
 }
 
-/* ── The context-switch hook ─────────────────────────────────────────────── */
+static bool targets_thread(const perf_event_t *e, const thread_t *t)
+{
+    return t && t->proc && t->tid == e->target_tid && t->proc->pid == e->target_pid;
+}
 
-void perf_sched_switch(process_t *prev, process_t *next)
+static bool eligible(const perf_event_t *e)
+{
+    return e->running_cpu != PERF_NO_CPU &&
+           (e->cpu < 0 || e->running_cpu == (u32)e->cpu);
+}
+static bool system_event(const perf_event_t *e) { return e->target_tid == 0; }
+
+static bool clock_event(const perf_event_t *e)
+{
+    return e->slot < 0 && (e->config == PERF_COUNT_SW_CPU_CLOCK ||
+                           e->config == PERF_COUNT_SW_TASK_CLOCK);
+}
+
+/* Fold only on the CPU that owns the open interval. Callers hold g_perf_lock.
+ * Software timestamps can be folded remotely; a raw PMU read never can. */
+static void fold_running(perf_event_t *e, u64 now)
+{
+    if (!e->enabled || e->running_cpu == PERF_NO_CPU) return;
+    u64 duration = now >= e->running_ns ? now - e->running_ns : 0;
+    e->time_enabled += duration;
+    if (eligible(e)) e->time_running += duration;
+    if (clock_event(e) && eligible(e)) e->count += duration;
+    if (e->slot >= 0 && eligible(e)) {
+        u64 raw = pmu_slot_read(e->slot);
+        e->count += pmu_counter_delta(raw, e->prev, g_pmu.mask);
+        e->prev = raw;
+    }
+    e->running_ns = now;
+}
+
+void perf_sched_switch(thread_t *prev, thread_t *next)
 {
     u32 cpu = smp_current_cpu_id();
-
-    /* Maintained unconditionally: these are the source for the software
-     * events, and the numbers /proc/<pid>/stat reports. */
-    if (next) {
-        next->nr_ctx_switches++;
-        if (next->last_cpu != (u32)-1 && next->last_cpu != cpu)
-            next->nr_migrations++;
-        next->last_cpu = cpu;
+    if (next && next->proc) {
+        __atomic_add_fetch(&next->proc->nr_ctx_switches, 1, __ATOMIC_RELAXED);
+        if (next->proc->last_cpu != (u32)-1 && next->proc->last_cpu != cpu)
+            __atomic_add_fetch(&next->proc->nr_migrations, 1, __ATOMIC_RELAXED);
+        next->proc->last_cpu = cpu;
     }
-
-    if (!__atomic_load_n(&g_perf_hw_events, __ATOMIC_RELAXED)) return;
-    if (!g_pmu.present) return;
-
-    /* A slot may have been claimed or released since this core last looked. */
+    /* Also disarm released slots when the last event has disappeared. */
     pmu_sync_local();
-
+    u32 last = next ? __atomic_exchange_n(&next->perf_last_cpu,cpu,__ATOMIC_RELAXED) : PERF_NO_CPU;
+    if (!__atomic_load_n(&g_perf_count, __ATOMIC_RELAXED)) return;
     irqflags_t fl = spinlock_lock_irqsave(&g_perf_lock);
+    u64 now = ktime_get_ns();
     for (perf_event_t *e = g_perf_list; e; e = e->next) {
-        if (e->slot < 0 || !e->enabled) continue;
-
-        u64 now = pmu_slot_read(e->slot);
-
-        if (e->target_pid == 0) {
-            /* System-wide: every core folds in the events it saw since its own
-             * previous switch, so the total is a genuine sum across cores. */
-            e->count += (now - e->prev[cpu]) & g_pmu.mask;
-            e->prev[cpu] = now;
+        if (e->dead) continue;
+        if (system_event(e)) {
+            if (e->cpu != (s32)cpu) continue;
+            fold_running(e, now);
+            if (e->enabled && e->slot < 0 && !(e->attr_flags & PERF_ATTR_EXCLUDE_KERNEL)) {
+                if (e->config == PERF_COUNT_SW_CONTEXT_SWITCHES && prev != next) e->count++;
+                if (e->config == PERF_COUNT_SW_CPU_MIGRATIONS && next &&
+                    last != PERF_NO_CPU && last != cpu) e->count++;
+            }
             continue;
         }
+        if (targets_thread(e, prev) && e->running_cpu == cpu) {
+            fold_running(e, now);
+            if (e->enabled && e->slot < 0 &&
+                e->config == PERF_COUNT_SW_CONTEXT_SWITCHES && prev != next && eligible(e) &&
+                !(e->attr_flags & PERF_ATTR_EXCLUDE_KERNEL))
+                e->count++;
+            e->running_cpu = PERF_NO_CPU;
+        }
+        if (targets_thread(e, next)) {
+            if (e->enabled && e->slot < 0 &&
+                e->config == PERF_COUNT_SW_CPU_MIGRATIONS && e->last_cpu != PERF_NO_CPU &&
+                e->last_cpu != cpu && (e->cpu < 0 || e->cpu == (s32)cpu) &&
+                !(e->attr_flags & PERF_ATTR_EXCLUDE_KERNEL))
+                e->count++;
+            e->last_cpu = e->running_cpu = cpu;
+            e->running_ns = now;
+            if (e->slot >= 0 && eligible(e)) e->prev = pmu_slot_read(e->slot);
+        }
+    }
+    spinlock_unlock_irqrestore(&g_perf_lock, fl);
+}
 
-        if (prev && prev->pid == e->target_pid && e->running) {
-            e->count += (now - e->prev[cpu]) & g_pmu.mask;
-            e->running = false;
-        }
-        if (next && next->pid == e->target_pid) {
-            e->prev[cpu] = now;
-            e->running = true;
-        }
+void perf_page_fault(bool user)
+{
+    if (!__atomic_load_n(&g_perf_count, __ATOMIC_RELAXED)) return;
+    thread_t *t = sched_current_thread();
+    if (!t) return;
+    irqflags_t fl = spinlock_lock_irqsave(&g_perf_lock);
+    for (perf_event_t *e = g_perf_list; e; e = e->next) {
+        if (e->dead || !e->enabled || e->slot >= 0 ||
+            (!system_event(e) && !targets_thread(e, t)) ||
+            (e->cpu >= 0 && e->cpu != (s32)smp_current_cpu_id())) continue;
+        if ((user && (e->attr_flags & PERF_ATTR_EXCLUDE_USER)) ||
+            (!user && (e->attr_flags & PERF_ATTR_EXCLUDE_KERNEL))) continue;
+        if (e->config == PERF_COUNT_SW_PAGE_FAULTS ||
+            e->config == PERF_COUNT_SW_PAGE_FAULTS_MIN) e->count++;
+    }
+    spinlock_unlock_irqrestore(&g_perf_lock, fl);
+}
+
+static void stop_event(perf_event_t *e, u64 now)
+{
+    if (e->enabled) {
+        fold_running(e, now);
+        e->enabled = false;
+    }
+}
+
+/* Called only after a retiring thread is off its CPU (or on its own CPU).
+ * No process/thread pointer survives in an event or crosses a lock boundary. */
+void perf_thread_exit(thread_t *t)
+{
+    if (!t || !__atomic_load_n(&g_perf_count, __ATOMIC_RELAXED)) return;
+    irqflags_t fl = spinlock_lock_irqsave(&g_perf_lock);
+    u64 now = ktime_get_ns();
+    for (perf_event_t *e = g_perf_list; e; e = e->next) {
+        if (e->dead || !targets_thread(e, t)) continue;
+        stop_event(e, now);
+        e->running_cpu = PERF_NO_CPU;
+        e->dead = true;
     }
     spinlock_unlock_irqrestore(&g_perf_lock, fl);
 }
 
 void perf_process_exit(process_t *p)
 {
-    if (!p) return;
-    if (!__atomic_load_n(&g_perf_count, __ATOMIC_RELAXED)) return;
-
+    if (!p || !__atomic_load_n(&g_perf_count, __ATOMIC_RELAXED)) return;
     irqflags_t fl = spinlock_lock_irqsave(&g_perf_lock);
+    u64 now = ktime_get_ns();
     for (perf_event_t *e = g_perf_list; e; e = e->next) {
-        if (e->target_pid != p->pid) continue;
-        /* The count is already final: the context switch that took the dying
-         * process off its CPU folded in the last delta, on that CPU, where the
-         * subtraction was still meaningful. Doing it again here — from the
-         * reaper, on whatever CPU it happens to be running — would subtract
-         * this core's counter from a value read on another and add garbage.
-         * So only stop following the pid, which must happen before the number
-         * can be reused by a new process. */
-        e->running    = false;
-        e->enabled    = false;
-        e->target_pid = (u32)-1;    /* matches no live process */
+        if (e->dead || e->target_pid != p->pid) continue;
+        stop_event(e, now);
+        e->running_cpu = PERF_NO_CPU;
+        e->dead = true;
     }
     spinlock_unlock_irqrestore(&g_perf_lock, fl);
 }
 
-/* ── Reading a count ─────────────────────────────────────────────────────── */
+enum { PERF_OP_READ=0, PERF_OP_ENABLE=1, PERF_OP_DISABLE=2, PERF_OP_RESET=3 };
+#define PERF_RPC_TIMEOUT_NS 250000000ULL
+/* No pointers travel through a remote request. Event IDs never get reused. */
+typedef struct { u64 id, deadline, out[4]; s32 op, rc, cpu; u32 words; } perf_request_t;
 
-/* Value of the process_t counter a software event is a difference of. */
-static u64 sw_source(const perf_event_t *e, const process_t *t)
+/* Caller holds the event lock and has disabled interrupts. No blocking locks
+ * may be acquired here: this also runs from the bounded CPU-call interrupt. */
+static void execute_request(perf_request_t *r)
 {
-    switch (e->config) {
-    case PERF_COUNT_SW_CPU_CLOCK:
-        return sched_get_ticks();
-    case PERF_COUNT_SW_TASK_CLOCK:
-        return t ? (t->utime_ticks + t->stime_ticks) : 0;
-    case PERF_COUNT_SW_PAGE_FAULTS:
-        return t ? (t->nr_minor_faults + t->nr_major_faults) : 0;
-    case PERF_COUNT_SW_PAGE_FAULTS_MIN:
-        return t ? t->nr_minor_faults : 0;
-    case PERF_COUNT_SW_PAGE_FAULTS_MAJ:
-        return t ? t->nr_major_faults : 0;
-    case PERF_COUNT_SW_CONTEXT_SWITCHES:
-        return t ? t->nr_ctx_switches : 0;
-    case PERF_COUNT_SW_CPU_MIGRATIONS:
-        return t ? t->nr_migrations : 0;
-    default:
-        /* alignment-faults and emulation-faults cannot happen on this kernel:
-         * #AC from ring 3 is fatal and nothing is emulated. Reporting a
-         * constant zero is the truth, not a stub. */
-        return 0;
+    perf_event_t *e=g_perf_list;
+    while(e && e->id!=r->id) e=e->next;
+    if(!e) { r->rc=-EBADF; return; }
+    u64 now;
+    if(!ktime_try_get_ns(&now)) { r->rc=-EAGAIN; return; }
+    if(now>=r->deadline) { r->rc=-ETIMEDOUT; return; }
+    /* CPU-wide software events also execute on their CPU, giving the software
+     * suite real cross-CPU delivery/timeout coverage without a usable PMU. */
+    bool raw_needed=e->slot>=0 && eligible(e) &&
+                    (e->enabled || (r->op==PERF_OP_ENABLE && !e->dead));
+    u32 cpu=system_event(e) ? (u32)e->cpu : e->running_cpu;
+    if((system_event(e) || raw_needed) && cpu!=smp_current_cpu_id()) {
+        r->cpu=(s32)cpu; r->rc=-EAGAIN; return;
     }
-}
-
-/* The value sw_source() would return for a (type, config) pair against @t,
- * without an event struct. perf_event_open() uses it to take the software
- * baseline while it still holds a reference to the target, rather than keeping
- * a bare process pointer alive across the rest of the call. */
-static u64 sw_seed_for(u32 type, u64 config, const process_t *t)
-{
-    if (type != PERF_TYPE_SOFTWARE) return 0;
-    perf_event_t tmp;
-    __builtin_memset(&tmp, 0, sizeof(tmp));
-    tmp.config = config;
-    return sw_source(&tmp, t);
-}
-
-/* Caller holds g_perf_lock. */
-static u64 event_value_locked(perf_event_t *e)
-{
-    if (e->slot >= 0) {
-        u64 v = e->count;
-        /* Fold in the interval that is open right now, so a read from inside
-         * the measured process sees its own cycles rather than only those up
-         * to the last context switch. */
-        if (e->running && e->enabled) {
-            process_t *cur = sched_current_process();
-            if (cur && cur->pid == e->target_pid) {
-                u32 cpu = smp_current_cpu_id();
-                v += (pmu_slot_read(e->slot) - e->prev[cpu]) & g_pmu.mask;
-            }
+    if(raw_needed && !pmu_try_sync_local()) { r->rc=-EAGAIN; return; }
+    if(r->op==PERF_OP_ENABLE) {
+        if(!e->enabled && !e->dead) {
+            e->enabled=true;
+            e->running_ns=now;
+            if(e->slot>=0 && eligible(e)) e->prev=pmu_slot_read(e->slot);
         }
-        return v;
+    } else if(r->op==PERF_OP_DISABLE) stop_event(e,now);
+    else {
+        fold_running(e,now);
+        if(r->op==PERF_OP_RESET) e->count=0;
     }
-
-    process_t *t = e->target_pid && e->target_pid != (u32)-1
-                   ? proc_get_by_pid(e->target_pid) : NULL;
-    u64 raw = sw_source(e, t);
-    if (t) proc_put(t);
-    u64 delta = raw >= e->sw_base ? raw - e->sw_base : 0;
-
-    /* The two clock events are tick counts; every other software event is
-     * already a plain occurrence count. */
-    if (e->config == PERF_COUNT_SW_CPU_CLOCK || e->config == PERF_COUNT_SW_TASK_CLOCK)
-        delta *= PERF_TICK_NS;
-    return e->count + delta;
+    if(r->op==PERF_OP_READ) {
+        u32 n=0;
+        r->out[n++]=e->count;
+        if(e->read_format & PERF_FORMAT_TOTAL_TIME_ENABLED) r->out[n++]=e->time_enabled;
+        if(e->read_format & PERF_FORMAT_TOTAL_TIME_RUNNING) r->out[n++]=e->time_running;
+        if(e->read_format & PERF_FORMAT_ID) r->out[n++]=e->id;
+        r->words=n;
+    }
+    r->rc=0;
+}
+static void remote_request(void *value)
+{
+    perf_request_t *r=value;
+    if(!spinlock_try_lock(&g_perf_lock)) { r->rc=-EAGAIN; return; }
+    execute_request(r);
+    spinlock_unlock(&g_perf_lock);
+}
+static s64 perform_request(u64 id, s32 op, perf_request_t *result)
+{
+    perf_request_t r={.id=id,.op=op};
+    for(u32 attempts=0; attempts<100000; attempts++) {
+        u64 now;
+        if(!ktime_try_get_ns(&now)) { cpu_pause(); continue; }
+        if(!r.deadline) r.deadline=now+PERF_RPC_TIMEOUT_NS;
+        if(now>=r.deadline) return -(s64)ETIMEDOUT;
+        r.cpu=-1; r.rc=-EAGAIN;
+        irqflags_t fl=spinlock_irq_save();
+        remote_request(&r);
+        spinlock_irq_restore(fl);
+        if(r.rc==-EAGAIN && r.cpu>=0) {
+            int rc=smp_rpc_call((u32)r.cpu,remote_request,&r,sizeof(r),r.deadline);
+            if(rc && rc!=-EBUSY && rc!=-EAGAIN) return rc;
+            if(rc) r.rc=-EAGAIN;
+        }
+        if(r.rc!=-EAGAIN) { if(result) *result=r; return r.rc; }
+        cpu_pause(); /* migration or bounded lock/slot contention: retry */
+    }
+    return -(s64)ETIMEDOUT;
 }
 
-static s64 perf_read_op(file_t *filp, void *buf, size_t len, u64 *offset)
+static s64 perf_read_op(file_t *f, void *buf, size_t len, u64 *offset)
 {
     (void)offset;
-    perf_event_t *e = (perf_event_t *)filp->private_data;
-    if (!e) return -(s64)EBADF;
-    if (!buf) return -(s64)EFAULT;
-
-    u64 out[4];
-    u32 n = 0;
-
-    irqflags_t fl = spinlock_lock_irqsave(&g_perf_lock);
-    out[n++] = event_value_locked(e);
-
-    u64 ticks = sched_get_ticks();
-    u64 open_interval = (e->enabled && ticks > e->enabled_tick)
-                        ? (ticks - e->enabled_tick) : 0;
-    if (e->read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
-        out[n++] = (e->time_enabled + open_interval) * PERF_TICK_NS;
-    if (e->read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
-        out[n++] = (e->time_running + open_interval) * PERF_TICK_NS;
-    if (e->read_format & PERF_FORMAT_ID)
-        out[n++] = e->id;
-    spinlock_unlock_irqrestore(&g_perf_lock, fl);
-
-    size_t need = (size_t)n * sizeof(u64);
-    /* Linux returns -ENOSPC for a buffer too small to hold the whole record;
-     * a short read would silently truncate a multi-word format. */
-    if (len < need) return -(s64)ENOSPC;
-
-    memcpy(buf, out, need);
+    perf_event_t *e=f->private_data;
+    if(!e) return -(s64)EBADF;
+    perf_request_t r;
+    s64 rc=perform_request(e->id,PERF_OP_READ,&r);
+    if(rc) return rc;
+    size_t need=r.words*sizeof(u64);
+    if(len<need) return -(s64)ENOSPC;
+    memcpy(buf,r.out,need);
     return (s64)need;
 }
-
-static s64 perf_ioctl_op(file_t *filp, u32 cmd, u64 arg)
+static s64 perf_ioctl_op(file_t *f, u32 cmd, u64 arg)
 {
-    (void)arg;
-    perf_event_t *e = (perf_event_t *)filp->private_data;
-    if (!e) return -(s64)EBADF;
-
-    /* Accept both the bare request number and the full _IO('$', n) encoding
-     * glibc's <linux/perf_event.h> produces. */
-    u32 nr = cmd & 0xFF;
-    u32 magic = (cmd >> 8) & 0xFF;
-    if (cmd > 0xFF && magic != (u32)PERF_IOC_MAGIC) return -(s64)ENOTTY;
-
-    irqflags_t fl = spinlock_lock_irqsave(&g_perf_lock);
-    u64 ticks = sched_get_ticks();
-    s64 rc = 0;
-
-    switch (nr) {
-    case PERF_IOC_ENABLE:
-        if (!e->enabled) {
-            e->enabled = true;
-            e->enabled_tick = ticks;
-            /* Re-open the hardware interval from wherever the counter is now,
-             * so the time the event spent disabled is not credited to it. */
-            if (e->slot >= 0) {
-                u32 cpu = smp_current_cpu_id();
-                e->prev[cpu] = pmu_slot_read(e->slot);
-                process_t *cur = sched_current_process();
-                e->running = (e->target_pid == 0) ||
-                             (cur && cur->pid == e->target_pid);
-            }
-        }
-        break;
-
-    case PERF_IOC_DISABLE:
-        if (e->enabled) {
-            if (e->slot >= 0 && e->running) {
-                process_t *cur = sched_current_process();
-                if (e->target_pid == 0 || (cur && cur->pid == e->target_pid)) {
-                    u32 cpu = smp_current_cpu_id();
-                    e->count += (pmu_slot_read(e->slot) - e->prev[cpu]) & g_pmu.mask;
-                }
-                e->running = false;
-            }
-            if (ticks > e->enabled_tick) {
-                e->time_enabled += ticks - e->enabled_tick;
-                e->time_running += ticks - e->enabled_tick;
-            }
-            e->enabled = false;
-        }
-        break;
-
-    case PERF_IOC_RESET:
-        e->count = 0;
-        if (e->slot >= 0) {
-            u32 cpu = smp_current_cpu_id();
-            e->prev[cpu] = pmu_slot_read(e->slot);
-        } else {
-            process_t *t = e->target_pid && e->target_pid != (u32)-1
-                           ? proc_get_by_pid(e->target_pid) : NULL;
-            e->sw_base = sw_source(e, t);
-            if (t) proc_put(t);
-        }
-        e->time_enabled = 0;
-        e->time_running = 0;
-        e->enabled_tick = ticks;
-        break;
-
-    case PERF_IOC_ID:
-        spinlock_unlock_irqrestore(&g_perf_lock, fl);
-        if (!arg || arg >= 0x0000800000000000ULL) return -(s64)EFAULT;
-        if (copy_to_user((void *)(uintptr_t)arg, &e->id, sizeof(u64)) != 0)
-            return -(s64)EFAULT;
-        return 0;
-
-    case PERF_IOC_REFRESH:
-    case PERF_IOC_PERIOD:
-        /* Both only mean anything for a sampling event, and there are none. */
-        rc = -(s64)EINVAL;
-        break;
-
-    default:
-        rc = -(s64)ENOTTY;
-        break;
+    perf_event_t *e=f->private_data;
+    if(!e) return -(s64)EBADF;
+    if(cmd==0x80082407U) {
+        u64 id=e->id;
+        return copy_to_user((void *)(uintptr_t)arg,&id,sizeof(id)) ? -(s64)EFAULT : 0;
     }
-    spinlock_unlock_irqrestore(&g_perf_lock, fl);
-    return rc;
+    if(cmd!=0x2400U && cmd!=0x2401U && cmd!=0x2403U)
+        return (cmd==0x2402U || cmd==0x40082404U) ? -(s64)EINVAL : -(s64)ENOTTY;
+    if(arg&~1ULL) return -(s64)EINVAL;
+    s32 op=cmd==0x2400U ? PERF_OP_ENABLE : cmd==0x2401U ? PERF_OP_DISABLE : PERF_OP_RESET;
+    return perform_request(e->id,op,NULL);
 }
 
-static int perf_poll_op(file_t *filp)
+static int perf_poll_op(file_t *f)
 {
-    (void)filp;
-    /* A perf fd only becomes readable through sampling, which this kernel does
-     * not do; read(2) always succeeds immediately, so report readable and never
-     * leave a poller waiting for an event that cannot arrive. */
-    return POLLIN | POLLRDNORM;
+    (void)f;
+    /* Linux reports HUP when an event has no sampling ring buffer, including
+     * a live counting-only event. read(2) still returns the current count. */
+    return PERF_POLLHUP;
 }
 
-static s64 perf_release_op(inode_t *inode, file_t *filp)
+static s64 perf_release_op(inode_t *inode, file_t *f)
 {
     (void)inode;
-    perf_event_t *e = filp ? (perf_event_t *)filp->private_data : NULL;
+    perf_event_t *e = f ? f->private_data : NULL;
     if (!e) return 0;
-    filp->private_data = NULL;
-
     irqflags_t fl = spinlock_lock_irqsave(&g_perf_lock);
     perf_event_t **pp = &g_perf_list;
-    while (*pp) {
-        if (*pp == e) { *pp = e->next; break; }
-        pp = &(*pp)->next;
+    while (*pp && *pp != e) pp = &(*pp)->next;
+    if (*pp) {
+        *pp = e->next;
+        __atomic_sub_fetch(&g_perf_count, 1, __ATOMIC_RELAXED);
     }
-    if (g_perf_count) g_perf_count--;
-    if (e->slot >= 0 && g_perf_hw_events) g_perf_hw_events--;
+    f->private_data = NULL;
     spinlock_unlock_irqrestore(&g_perf_lock, fl);
-
     if (e->slot >= 0) pmu_slot_release(e->slot);
     kfree(e);
     return 0;
 }
 
 static file_operations_t g_perf_fops = {
-    .read    = perf_read_op,
-    .ioctl   = perf_ioctl_op,
-    .poll    = perf_poll_op,
-    .release = perf_release_op,
+    .read = perf_read_op, .ioctl = perf_ioctl_op,
+    .poll = perf_poll_op, .release = perf_release_op,
 };
 
-/* ── perf_event_open(2) ──────────────────────────────────────────────────── */
-
-/* Copy the caller's attr, honouring its self-declared size. Every version of
- * the struct is a prefix of the next, so a short one zero-extends; a longer one
- * from a newer libc is only accepted if the part we do not understand is zero,
- * which is what stops a flag we would silently ignore from being set. */
-static s64 copy_attr(struct perf_event_attr *out, const void *uattr)
+static s64 attr_too_big(void *uattr)
 {
-    u8 raw[PERF_ATTR_SIZE_MAX];
-    memset(raw, 0, sizeof(raw));
-
-    u32 size = 0;
-    if (copy_from_user(&size, (const u8 *)uattr + 4, sizeof(size)) != 0)
+    u32 supported = PERF_ATTR_SIZE_MAX;
+    if (copy_to_user((u8 *)uattr + 4, &supported, sizeof(supported)))
         return -(s64)EFAULT;
-    if (size == 0) size = PERF_ATTR_SIZE_VER0;
-    if (size < PERF_ATTR_SIZE_VER0) return -(s64)EINVAL;
+    return -(s64)E2BIG;
+}
 
-    u32 take = size > PERF_ATTR_SIZE_MAX ? PERF_ATTR_SIZE_MAX : size;
-    if (copy_from_user(raw, uattr, take) != 0) return -(s64)EFAULT;
-
-    if (size > PERF_ATTR_SIZE_MAX) {
-        /* Verify the tail we cannot interpret is all zero, a byte at a time —
-         * E2BIG is exactly what Linux returns here, and libc retries smaller. */
-        for (u32 off = PERF_ATTR_SIZE_MAX; off < size; off++) {
-            u8 b;
-            if (copy_from_user(&b, (const u8 *)uattr + off, 1) != 0)
-                return -(s64)EFAULT;
-            if (b) return -(s64)E2BIG;
-        }
-    }
-
+static s64 copy_attr(struct perf_event_attr *out, void *uattr)
+{
+    u8 raw[4096];
+    u32 size;
+    if (copy_from_user(&size, (u8 *)uattr + 4, sizeof(size))) return -(s64)EFAULT;
+    if (!size) size = PERF_ATTR_SIZE_VER0;
+    if (size < PERF_ATTR_SIZE_VER0 || size > sizeof(raw)) return attr_too_big(uattr);
+    memset(raw, 0, sizeof(raw));
+    if (copy_from_user(raw, uattr, size)) return -(s64)EFAULT;
+    for (u32 i = PERF_ATTR_SIZE_MAX; i < size; i++)
+        if (raw[i]) return attr_too_big(uattr);
+    /* Fields after flags belong to sampling, breakpoints, or newer features.
+     * Do not silently ignore a nonzero field even within a known attr size. */
+    for (u32 i = 48; i < size && i < PERF_ATTR_SIZE_MAX; i++)
+        if (raw[i]) return -(s64)EOPNOTSUPP;
     memcpy(out, raw, sizeof(*out));
     out->size = size;
     return 0;
 }
 
+/* Linux READ_REALCREDS fallback, without Yama's ATTACH-only restriction.
+ * CAP_SYS_PTRACE permits observing another credential set, but does not bypass
+ * perf paranoid policy. CAP_PERFMON/CAP_SYS_ADMIN bypass both scope checks. */
+static bool can_observe(process_t *me, process_t *target, bool privileged)
+{
+    if(privileged || me==target) return true;
+    if(security_check_permission(me,CAP_SYS_PTRACE)) return true;
+    return me->uid==target->uid && me->uid==target->euid && me->uid==target->suid &&
+           me->gid==target->gid && me->gid==target->egid && me->gid==target->sgid &&
+           __atomic_load_n(&target->dumpable,__ATOMIC_ACQUIRE) &&
+           !(target->cap_permitted & ~me->cap_permitted);
+}
+
 s64 sys_perf_event_open_impl(pt_regs_t *r)
 {
-    const void *uattr = (const void *)r->rdi;
-    s32   pid       = (s32)r->rsi;
-    s32   cpu       = (s32)r->rdx;
-    s32   group_fd  = (s32)r->r10;
-    u64   flags     = r->r8;
-
     process_t *me = sched_current_process();
-    if (!me) return -(s64)EPERM;
-    if (!uattr || (uintptr_t)uattr >= 0x0000800000000000ULL) return -(s64)EFAULT;
+    thread_t *self = sched_current_thread();
+    void *uattr = (void *)r->rdi;
+    s32 pid = (s32)r->rsi, cpu = (s32)r->rdx, group = (s32)r->r10;
+    u64 flags = r->r8;
+    if (!me || !self) return -(s64)EPERM;
     if (flags & ~(u64)(PERF_FLAG_FD_NO_GROUP | PERF_FLAG_FD_OUTPUT |
-                       PERF_FLAG_FD_CLOEXEC))
-        return -(s64)EINVAL;
-    if (flags & PERF_FLAG_PID_CGROUP) return -(s64)EINVAL;
-
-    struct perf_event_attr attr;
-    s64 rc = copy_attr(&attr, uattr);
+                         PERF_FLAG_PID_CGROUP | PERF_FLAG_FD_CLOEXEC)) return -(s64)EINVAL;
+    struct perf_event_attr a;
+    s64 rc = copy_attr(&a, uattr);
     if (rc < 0) return rc;
-
-    /* No ring buffer, so no sampling. Say so rather than accept an event that
-     * would never deliver a record. */
-    if (attr.sample_period != 0) return -(s64)EOPNOTSUPP;
-    if (attr.sample_type != 0)   return -(s64)EOPNOTSUPP;
-    if (attr.read_format & PERF_FORMAT_GROUP) return -(s64)EOPNOTSUPP;
-    if (attr.read_format & ~(u64)(PERF_FORMAT_TOTAL_TIME_ENABLED |
-                                  PERF_FORMAT_TOTAL_TIME_RUNNING |
-                                  PERF_FORMAT_ID))
-        return -(s64)EINVAL;
-
-    /* Groups are not scheduled as a unit here; every event is independent, so
-     * a leader fd is accepted only in its "no group" form. */
-    if (group_fd >= 0 && !(flags & PERF_FLAG_FD_NO_GROUP))
-        return -(s64)EOPNOTSUPP;
-
-    /* ── Target and permission ──────────────────────────────────────────── */
-    /* The target process is only needed here (credential check) and for a
-     * one-time software-counter baseline. Both are taken now, while a counted
-     * reference keeps it alive; nothing downstream keeps the pointer, so it can
-     * never be dereferenced after the process is reaped on another CPU. */
-    u32  target_pid;
-    bool target_is_self = false;
-    u64  sw_seed        = 0;
-    if (pid == -1) {
-        /* System-wide measurement sees every process on the machine, so it is
-         * gated the way Linux gates perf_event_paranoid > 0. */
-        if (!security_check_permission(me, CAP_PERFMON) &&
-            !security_check_permission(me, CAP_SYS_ADMIN) && me->euid != 0)
-            return -(s64)EACCES;
-        if (cpu < 0) return -(s64)EINVAL;   /* Linux requires a CPU here */
-        target_pid = 0;
-        sw_seed    = sw_seed_for(attr.type, attr.config, NULL);
-    } else if (pid == 0) {
-        target_pid     = me->pid;
-        target_is_self = true;
-        sw_seed        = sw_seed_for(attr.type, attr.config, me);
-    } else if (pid > 0) {
-        process_t *t = proc_get_by_pid((u32)pid);
-        if (!t) return -(s64)ESRCH;
-        /* Same credential rule as ptrace(2) and process_vm_readv(2): counting
-         * another process's instructions is an observation channel into it. */
-        bool allowed = security_check_permission(me, CAP_PERFMON) ||
-                       me->euid == 0 ||
-                       (me->uid == t->uid && me->uid == t->euid &&
-                        me->uid == t->suid);
-        target_pid     = t->pid;
-        target_is_self = (t == me);
-        sw_seed        = sw_seed_for(attr.type, attr.config, t);
-        proc_put(t);
-        if (!allowed) return -(s64)EACCES;
-    } else {
-        return -(s64)EINVAL;
+    if (a.flags >> 38) return -(s64)EINVAL;
+    /* AzamiOS has no guest execution domain. exclude_guest is therefore
+     * satisfied for every event; exclude_host still remains unsupported.
+     * IDENTIFIER only describes sample records and is inert at period zero. */
+    u64 supported = PERF_ATTR_DISABLED | PERF_ATTR_EXCLUDE_USER |
+                    PERF_ATTR_EXCLUDE_KERNEL | PERF_ATTR_EXCLUDE_HV |
+                    PERF_ATTR_EXCLUDE_GUEST;
+    if (a.flags & ~supported || a.sample_period || (a.sample_type & ~PERF_SAMPLE_IDENTIFIER) ||
+        (flags & (PERF_FLAG_FD_OUTPUT | PERF_FLAG_PID_CGROUP))) return -(s64)EOPNOTSUPP;
+    if (a.read_format & ~31ULL) return -(s64)EINVAL;
+    if (a.read_format & (PERF_FORMAT_GROUP | 16)) return -(s64)EOPNOTSUPP;
+    if (group < -1 || pid < -1 || cpu < -1) return -(s64)EINVAL;
+    if (group >= 0) {
+        file_t *leader = syscall_fget(me, group);
+        if (!leader) return -(s64)EBADF;
+        bool valid = leader->f_op == &g_perf_fops;
+        syscall_fput(leader);
+        if (!valid) return -(s64)EBADF;
+        if (!(flags & PERF_FLAG_FD_NO_GROUP)) return -(s64)EOPNOTSUPP;
     }
-
-    /* ── Resolve the event ──────────────────────────────────────────────── */
-    int slot = -1;
-    u64 evtsel = 0;
-
-    switch (attr.type) {
-    case PERF_TYPE_HARDWARE:
-        if (attr.config >= PERF_COUNT_HW_MAX) return -(s64)EINVAL;
+    if (pid == -1 && cpu == -1) return -(s64)EINVAL;
+    if (cpu >= 0 && ((u32)cpu >= SMP_MAX_CPUS || !(smp_online_mask() & (1ULL << cpu))))
+        return -(s64)ENODEV;
+    bool privileged = security_check_permission(me, CAP_PERFMON) ||
+                      security_check_permission(me, CAP_SYS_ADMIN);
+    s32 paranoid = __atomic_load_n(&g_perf_event_paranoid, __ATOMIC_RELAXED);
+    if (!privileged && ((paranoid >= 2 && !(a.flags & PERF_ATTR_EXCLUDE_KERNEL)) ||
+                        (paranoid >= 1 && pid == -1))) return -(s64)EACCES;
+    u64 selector = 0;
+    if (a.type == PERF_TYPE_SOFTWARE) {
+        if (a.config >= PERF_COUNT_SW_MAX) return -(s64)EINVAL;
+        /* No #AC/emulation event hooks exist; do not fabricate zero totals. */
+        if (a.config == PERF_COUNT_SW_ALIGNMENT_FAULTS ||
+            a.config == PERF_COUNT_SW_EMULATION_FAULTS) return -(s64)ENOENT;
+    } else if (a.type == PERF_TYPE_HARDWARE || a.type == PERF_TYPE_RAW) {
+        if (a.type == PERF_TYPE_HARDWARE && a.config >= PERF_COUNT_HW_MAX) return -(s64)EINVAL;
+        if (a.type == PERF_TYPE_RAW && (!a.config || a.config & ~PMU_EVTSEL_RAW_MASK))
+            return -(s64)EINVAL;
         if (!g_pmu.present) return -(s64)ENOENT;
-        evtsel = pmu_hw_event(attr.config);
-        if (!evtsel) return -(s64)ENOENT;   /* this CPU cannot count it */
-        break;
+        selector = a.type == PERF_TYPE_RAW ? a.config : pmu_hw_event(a.config);
+        if (!selector) return -(s64)ENOENT;
+        if (!(a.flags & PERF_ATTR_EXCLUDE_USER)) selector |= PMU_EVTSEL_USR;
+        if (!(a.flags & PERF_ATTR_EXCLUDE_KERNEL)) selector |= PMU_EVTSEL_OS;
+        if (!(selector & (PMU_EVTSEL_USR | PMU_EVTSEL_OS))) return -(s64)EINVAL;
+        selector |= PMU_EVTSEL_EN;
+    } else return -(s64)EOPNOTSUPP;
 
-    case PERF_TYPE_RAW:
-        if (!g_pmu.present) return -(s64)ENOENT;
-        if (attr.config & ~PMU_EVTSEL_RAW_MASK) return -(s64)EINVAL;
-        if (!attr.config) return -(s64)EINVAL;
-        evtsel = attr.config;
-        break;
-
-    case PERF_TYPE_SOFTWARE:
-        if (attr.config >= PERF_COUNT_SW_MAX) return -(s64)EINVAL;
-        /* Everything but the wall clock is a per-process counter, and there is
-         * no machine-wide total to subtract from for a system-wide event. */
-        if (target_pid == 0 && attr.config != PERF_COUNT_SW_CPU_CLOCK &&
-            attr.config != PERF_COUNT_SW_DUMMY)
-            return -(s64)EOPNOTSUPP;
-        break;
-
-    default:
-        /* Tracepoints need a trace event registry, hw-cache needs a per-model
-         * table, and breakpoints need the debug registers this kernel does not
-         * context-switch. None of them are half-implemented. */
-        return -(s64)EOPNOTSUPP;
+    perf_event_t *e = kzalloc(sizeof(*e));
+    file_t *f = kzalloc(sizeof(*f));
+    if (!e || !f) { kfree(e); kfree(f); return -(s64)ENOMEM; }
+    f->f_op=&g_perf_fops;
+    f->private_data=e;
+    f->f_mode=0600;
+    f->f_count=1;
+    f->f_fd_flags=flags & PERF_FLAG_FD_CLOEXEC ? FD_CLOEXEC : 0;
+    e->cpu=cpu;
+    e->slot=-1;
+    e->config=a.config;
+    e->read_format=a.read_format;
+    e->attr_flags=a.flags;
+    e->running_cpu=e->last_cpu=PERF_NO_CPU;
+    /* Lock order: scheduler -> perf -> PMU. Validate and publish
+     * atomically against retirement; no thread pointer leaves this section. */
+    sched_lock();
+    thread_t *target=NULL;
+    if(pid!=-1) {
+        u32 tid=pid==0 ? self->tid : (u32)pid;
+        for(process_t *p=sched_get_process_list(); p && !target; p=p->next)
+            for(thread_t *t=p->threads; t; t=t->proc_next)
+                if(t->tid==tid && t->state!=THREAD_ZOMBIE && t->state!=THREAD_DYING) { target=t; break; }
+        if(!target) rc=-(s64)ESRCH;
+        else {
+            process_t *p=target->proc;
+            if(!can_observe(me,p,privileged)) rc=-(s64)EACCES;
+            else {
+                e->target_tid=target->tid; e->target_pid=p->pid;
+                e->last_cpu=__atomic_load_n(&target->perf_last_cpu,__ATOMIC_RELAXED);
+                for(u32 c=0; c<SMP_MAX_CPUS; c++) {
+                    cpu_info_t *info=smp_cpu_info(c);
+                    if(info && info->current_thread==target) { e->running_cpu=c; break; }
+                }
+            }
+        }
+    } else e->running_cpu=(u32)cpu;
+    if(rc<0) { sched_unlock(); kfree(e); kfree(f); return rc; }
+    irqflags_t fl=spinlock_lock_irqsave(&g_perf_lock);
+    e->slot=selector ? pmu_slot_acquire(selector) : -1;
+    if((selector && e->slot<0) || g_perf_count>=PERF_MAX_EVENTS) {
+        if(e->slot>=0) pmu_slot_release(e->slot);
+        spinlock_unlock_irqrestore(&g_perf_lock,fl);
+        sched_unlock(); kfree(e); kfree(f); return -(s64)ENOSPC;
     }
-
-    if (evtsel) {
-        /* exclude_user/exclude_kernel are the counter's own ring filter, so
-         * they cost nothing and are exact. Default (neither set) counts both. */
-        if (!(attr.flags & PERF_ATTR_EXCLUDE_USER))   evtsel |= PMU_EVTSEL_USR;
-        if (!(attr.flags & PERF_ATTR_EXCLUDE_KERNEL)) evtsel |= PMU_EVTSEL_OS;
-        if (!(evtsel & (PMU_EVTSEL_USR | PMU_EVTSEL_OS))) return -(s64)EINVAL;
-        evtsel |= PMU_EVTSEL_EN;
-
-        slot = pmu_slot_acquire(evtsel);
-        if (slot < 0) return -(s64)ENOSPC;   /* every counter is taken */
-    }
-
-    /* ── Build the event ────────────────────────────────────────────────── */
-    perf_event_t *e = (perf_event_t *)kzalloc(sizeof(perf_event_t));
-    if (!e) { if (slot >= 0) pmu_slot_release(slot); return -(s64)ENOMEM; }
-
-    e->type        = attr.type;
-    e->config      = attr.config;
-    e->read_format = attr.read_format;
-    e->attr_flags  = attr.flags;
-    e->target_pid  = target_pid;
-    e->cpu         = cpu;
-    e->owner_pid   = me->pid;
-    e->slot        = slot;
-    e->evtsel      = evtsel;
-    e->enabled     = !(attr.flags & PERF_ATTR_DISABLED);
-
-    file_t *f = (file_t *)kzalloc(sizeof(file_t));
-    if (!f) {
-        kfree(e);
-        if (slot >= 0) pmu_slot_release(slot);
-        return -(s64)ENOMEM;
-    }
-    f->f_op         = &g_perf_fops;
-    f->private_data = e;
-    f->f_mode       = 0600;
-    f->f_count      = 1;
-    f->f_fd_flags   = (flags & PERF_FLAG_FD_CLOEXEC) ? FD_CLOEXEC : 0;
-
-    irqflags_t fl = spinlock_lock_irqsave(&g_perf_lock);
-    if (g_perf_count >= PERF_MAX_EVENTS) {
-        spinlock_unlock_irqrestore(&g_perf_lock, fl);
-        kfree(f);
-        kfree(e);
-        if (slot >= 0) pmu_slot_release(slot);
-        return -(s64)ENOSPC;
-    }
-    e->id = g_perf_next_id++;
-    e->enabled_tick = sched_get_ticks();
-    if (slot >= 0) {
-        u64 now = pmu_slot_read(slot);
-        for (u32 i = 0; i < SMP_MAX_CPUS; i++) e->prev[i] = now;
-        e->running = e->enabled && (target_pid == 0 || target_is_self);
-        g_perf_hw_events++;
-    } else {
-        e->sw_base = sw_seed;
-    }
-    e->next = g_perf_list;
-    g_perf_list = e;
-    g_perf_count++;
-    spinlock_unlock_irqrestore(&g_perf_lock, fl);
-
-    s64 fd = syscall_install_fd(me, f, f->f_fd_flags);
-    if (fd < 0) {
-        perf_release_op(NULL, f);
-        kfree(f);
-        return fd;
-    }
+    e->running_ns=ktime_get_ns();
+    e->id=g_perf_next_id++;
+    e->next=g_perf_list; g_perf_list=e;
+    __atomic_add_fetch(&g_perf_count,1,__ATOMIC_RELAXED);
+    spinlock_unlock_irqrestore(&g_perf_lock,fl);
+    sched_unlock();
+    /* Initialize under our sole file reference before publishing a descriptor.
+     * Callbacks resolve the internal ID; retirement may safely freeze it here. */
+    if (!(a.flags & PERF_ATTR_DISABLED)) rc=perform_request(e->id,PERF_OP_ENABLE,NULL);
+    s64 fd=rc<0 ? rc : syscall_install_fd(me,f,f->f_fd_flags);
+    if(fd<0) syscall_fput(f);
     return fd;
 }

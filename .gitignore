@@ -23,6 +23,10 @@ serial.log
 qemu.log
 bochsout.txt
 
+# Keep raw runs and bulky generated source snapshots local.
+tests/semantics/evidence/
+tests/bench/baselines/
+
 # output folders
 build/
 bin/

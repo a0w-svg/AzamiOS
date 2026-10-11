@@ -16,6 +16,7 @@
 #include "spinlock.h"
 #include "../../../drivers/char/console.h"
 #include "../../../kernel/lib/string.h"
+#include "../../../kernel/cmdline.h"
 #include "../../../include/azami/defs.h"
 
 pmu_info_t g_pmu;
@@ -31,6 +32,7 @@ static u32 g_slot_refs[PMU_MAX_COUNTERS];
  * own copy falls behind; nothing else has to be broadcast. */
 static volatile u64 g_pmu_gen;
 static u64 g_pmu_local_gen[SMP_MAX_CPUS];
+static u64 g_local_evtsel[SMP_MAX_CPUS][PMU_MAX_COUNTERS];
 
 /* ── MSR addressing ──────────────────────────────────────────────────────── */
 
@@ -65,6 +67,8 @@ static inline u64 rdpmc_raw(u32 idx)
 extern int hwaccel_probe_asm(void *scratch, u32 which);
 #define PROBE_RDPMC  4
 
+static void pmu_boot_selftest(void);
+
 /* ── Detection ───────────────────────────────────────────────────────────── */
 
 void pmu_init(void)
@@ -90,8 +94,10 @@ void pmu_init(void)
             /* EBX's bit vector marks architectural events that are *not*
              * available; only the bits CPUID says it enumerated are valid. */
             u32 ebx_len = (eax >> 24) & 0xFF;
-            g_pmu.unavail_mask = (ebx_len >= 32) ? ebx
-                               : (ebx_len ? (ebx & ((1u << ebx_len) - 1)) : 0);
+            /* Bits beyond the enumerated vector have no architectural event
+             * guarantee. Treat them as unavailable, not implicitly present. */
+            g_pmu.unavail_mask = ebx_len >= 32 ? ebx
+                               : ebx | ~((1u << ebx_len) - 1);
         }
     } else if (cpu_is_amd()) {
         /* Every 64-bit AMD part has the four K7-style counters; the extended
@@ -109,6 +115,8 @@ void pmu_init(void)
 
     if (!g_pmu.present) {
         kprintf("[PMU] no performance counters (perf: software events only)\n");
+        if (cmdline_get_bool("azami.pmu_selftest", false))
+            kprintf("PMUSKIP {\"reason\":\"PMU unavailable\"}\n");
         return;
     }
 
@@ -139,6 +147,8 @@ void pmu_init(void)
             __builtin_memset(&g_pmu, 0, sizeof(g_pmu));
             kprintf("[PMU] CPUID enumerates counters but RDPMC faults — "
                     "PMU disabled (perf: software events only)\n");
+            if (cmdline_get_bool("azami.pmu_selftest", false))
+                kprintf("PMUSKIP {\"reason\":\"RDPMC faults\"}\n");
             return;
         }
     }
@@ -149,6 +159,7 @@ void pmu_init(void)
                                  g_pmu.version == 2 ? " v2" :
                                  g_pmu.version == 3 ? " v3" : " v4+"),
             g_pmu.nr_counters, g_pmu.width);
+    if (cmdline_get_bool("azami.pmu_selftest", false)) pmu_boot_selftest();
 }
 
 void pmu_init_ap(void)
@@ -231,20 +242,29 @@ u64 pmu_slot_read(int slot)
     return rdpmc_raw((u32)slot) & g_pmu.mask;
 }
 
-void pmu_sync_local(void)
+static bool pmu_sync(bool bounded)
 {
-    if (!g_pmu.present) return;
+    if (!g_pmu.present) return true;
 
     u32 cpu = smp_current_cpu_id();
-    if (cpu >= SMP_MAX_CPUS) return;
+    if (cpu >= SMP_MAX_CPUS) return false;
 
     u64 gen = __atomic_load_n(&g_pmu_gen, __ATOMIC_ACQUIRE);
-    if (g_pmu_local_gen[cpu] == gen) return;      /* the whole hot path */
+    if (g_pmu_local_gen[cpu] == gen) return true;      /* the whole hot path */
 
-    irqflags_t fl = spinlock_lock_irqsave(&g_pmu_lock);
+    irqflags_t fl = spinlock_irq_save();
+    if (bounded) {
+        if (!spinlock_try_lock(&g_pmu_lock)) { spinlock_irq_restore(fl); return false; }
+    } else spinlock_lock(&g_pmu_lock);
     u64 armed = 0;
     for (u32 i = 0; i < g_pmu.nr_counters; i++) {
         u64 sel = g_slot_refs[i] ? g_slot_evtsel[i] : 0;
+        /* Preserve unchanged counters across unrelated slot changes. */
+        if (g_local_evtsel[cpu][i] == sel) {
+            if (sel) armed |= (1ULL << i);
+            continue;
+        }
+        g_local_evtsel[cpu][i] = sel;
         /* Disarm before rewriting the selector: changing what a counter counts
          * while it is enabled leaves a few events of the old kind in it. */
         wrmsr(evtsel_msr(i), 0);
@@ -257,7 +277,11 @@ void pmu_sync_local(void)
     if (g_pmu.has_global_ctrl) wrmsr(MSR_IA32_PERF_GLOBAL_CTRL, armed);
     g_pmu_local_gen[cpu] = gen;
     spinlock_unlock_irqrestore(&g_pmu_lock, fl);
+    return true;
 }
+void pmu_sync_local(void) { (void)pmu_sync(false); }
+bool pmu_try_sync_local(void) { return pmu_sync(true); }
+
 
 /* ── Event encoding ──────────────────────────────────────────────────────── */
 
@@ -282,7 +306,7 @@ static int intel_unavail_bit(u64 hw)
     case HW_CPU_CYCLES:          return 0;
     case HW_INSTRUCTIONS:        return 1;
     case HW_REF_CPU_CYCLES:      return 2;
-    case HW_BUS_CYCLES:          return 2;   /* same UnHalted Reference Cycles */
+    case HW_BUS_CYCLES:          return -1;
     case HW_CACHE_REFERENCES:    return 3;
     case HW_CACHE_MISSES:        return 4;
     case HW_BRANCH_INSTRUCTIONS: return 5;
@@ -318,7 +342,6 @@ u64 pmu_hw_event(u64 hw_config)
         case HW_CACHE_MISSES:        event = 0x2E; umask = 0x41; break;
         case HW_BRANCH_INSTRUCTIONS: event = 0xC4; umask = 0x00; break;
         case HW_BRANCH_MISSES:       event = 0xC5; umask = 0x00; break;
-        case HW_BUS_CYCLES:
         case HW_REF_CPU_CYCLES:      event = 0x3C; umask = 0x01; break;
         /* Frontend/backend stalls have no architectural encoding — they are
          * per-microarchitecture, and this kernel does not carry a model table. */
@@ -329,4 +352,46 @@ u64 pmu_hw_event(u64 hw_config)
     }
 
     return PMU_EVTSEL_EVENT(event) | PMU_EVTSEL_UMASK(umask);
+}
+
+/* Opt-in boot validation before scheduler/perf users exist. No userspace API
+ * can write a PMC. INT remains clear, so crossing the counter width generates
+ * no PMI. Restore the slot and raw counter before normal initialization. */
+static void pmu_boot_selftest(void)
+{
+    u64 event = pmu_hw_event(1);
+    if (!event) {
+        kprintf("PMUSKIP {\"reason\":\"instructions unavailable\"}\n");
+        return;
+    }
+    irqflags_t fl = spinlock_irq_save();
+    u64 selector = event | PMU_EVTSEL_USR | PMU_EVTSEL_OS | PMU_EVTSEL_EN;
+    int slot = pmu_slot_acquire(selector);
+    u64 before = 0, after = 0, delta = 0;
+    bool passed = false;
+    if (slot >= 0) {
+        wrmsr(evtsel_msr((u32)slot), 0);
+        wrmsr(counter_msr((u32)slot), g_pmu.mask - 4095);
+        wrmsr(evtsel_msr((u32)slot), selector);
+        __asm__ volatile("lfence" ::: "memory");
+        before = pmu_slot_read(slot);
+        u32 loops = 65536;
+        u64 value = 1;
+        __asm__ volatile("1: addq $1, %0; rolq $1, %0; decl %1; jnz 1b"
+                         : "+r"(value), "+r"(loops) :: "cc", "memory");
+        __asm__ volatile("lfence" ::: "memory");
+        after = pmu_slot_read(slot);
+        delta = pmu_counter_delta(after, before, g_pmu.mask);
+        passed = before > g_pmu.mask - 4096 && after < before &&
+                 delta >= 65536 && delta < 1048576;
+        pmu_slot_release(slot);
+        pmu_sync_local();
+        wrmsr(counter_msr((u32)slot), 0);
+        if (g_pmu.has_global_ctrl)
+            wrmsr(MSR_IA32_PERF_GLOBAL_OVF_CTRL, 1ULL << slot);
+    }
+    spinlock_irq_restore(fl);
+    kprintf("PMUTEST {\"name\":\"wrap\",\"width\":%u,\"before\":%llu,"
+            "\"after\":%llu,\"delta\":%llu,\"passed\":%s}\n",
+            g_pmu.width, before, after, delta, passed ? "true" : "false");
 }

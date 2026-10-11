@@ -33,3 +33,5 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr);
  * signal_deliver_pending() built. Registered as SYS_rt_sigreturn.
  */
 s64 sys_rt_sigreturn_impl(pt_regs_t *r);
+
+void signal_restore_wait_mask(void);
