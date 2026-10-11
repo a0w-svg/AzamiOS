@@ -5,6 +5,25 @@
  * ============================================================================ */
 #include "syscall_internal.h"
 
+#define CLONE_NEWNS        0x00020000ULL
+#define CLONE_NEWCGROUP    0x02000000ULL
+#define CLONE_NEWUTS       0x04000000ULL
+#define CLONE_NEWIPC       0x08000000ULL
+#define CLONE_NEWUSER      0x10000000ULL
+#define CLONE_NEWPID       0x20000000ULL
+#define CLONE_NEWNET       0x40000000ULL
+#define CLONE_NEWTIME      0x00000080ULL /* unshare/clone3, not legacy clone's signal byte */
+#define CLONE_NAMESPACE_MASK (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | \
+                              CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET)
+
+static s64 namespace_flags_check(process_t *proc, u64 flags)
+{
+    if ((flags & ~CLONE_NEWUSER) && !security_check_permission(proc, CAP_SYS_ADMIN))
+        return -(s64)EPERM;
+    if (flags & ~CLONE_NEWUTS) return -(s64)EOPNOTSUPP;
+    return 0;
+}
+
 /* proc_clone_attrs() — copy the POSIX process attributes a fork()/clone() child
  * inherits from its parent: cwd, umask, credentials, supplementary groups,
  * process group / session, resource layout, TLS bases, and signal state.
@@ -20,9 +39,7 @@ static void proc_clone_attrs(process_t *child, const process_t *parent)
     strncpy(child->root, parent->root, sizeof(child->root) - 1);
     child->root[sizeof(child->root) - 1] = '\0';
 
-    if (child->uts_ns) uts_ns_put(child->uts_ns);
-    child->uts_ns = uts_ns_get(parent->uts_ns);
-    child->new_pid_ns = false;
+    proc_uts_ns_replace(child, proc_uts_ns_get(parent));
 
     child->umask = parent->umask;
     child->uid  = parent->uid;   child->euid = parent->euid;   child->suid = parent->suid;
@@ -50,6 +67,7 @@ static void proc_clone_attrs(process_t *child, const process_t *parent)
     child->cap_effective   = parent->cap_effective;
     child->cap_inheritable = parent->cap_inheritable;
     child->cap_bounding    = parent->cap_bounding;
+    child->dumpable = __atomic_load_n(&parent->dumpable,__ATOMIC_ACQUIRE);
     child->no_new_privs    = parent->no_new_privs;
     child->seccomp_mode    = parent->seccomp_mode;
     /* SECCOMP_MODE_FILTER: the child starts out sharing the parent's filter
@@ -65,13 +83,20 @@ static void proc_clone_attrs(process_t *child, const process_t *parent)
 
     for (int i = 0; i < _NSIG; i++)
         child->sigactions[i] = parent->sigactions[i];
-    child->sig_blocked = parent->sig_blocked;
+    thread_t *curr_th = sched_current_thread();
+    child->sig_blocked = curr_th ? curr_th->sig_blocked : parent->sig_blocked;
     child->sig_pending = 0;
 
     /* Alternate signal stack is preserved across fork */
-    child->sas_ss_sp    = parent->sas_ss_sp;
-    child->sas_ss_size  = parent->sas_ss_size;
-    child->sas_ss_flags = parent->sas_ss_flags;
+    if (curr_th) {
+        child->sas_ss_sp    = curr_th->sas_ss_sp;
+        child->sas_ss_size  = curr_th->sas_ss_size;
+        child->sas_ss_flags = curr_th->sas_ss_flags & ~1;
+    } else {
+        child->sas_ss_sp    = parent->sas_ss_sp;
+        child->sas_ss_size  = parent->sas_ss_size;
+        child->sas_ss_flags = parent->sas_ss_flags & ~1;
+    }
 
     /* The robust-futex list address is a userspace pointer into an address
      * space fork() duplicated verbatim, so it stays valid in the child. */
@@ -224,6 +249,11 @@ static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int 
     process_t *parent = sched_current_process();
     if (!parent) return -(s64)EPERM;
 
+    s64 ns_error = namespace_flags_check(parent, flags & CLONE_NAMESPACE_MASK);
+    if (ns_error) return ns_error;
+    if ((flags & CLONE_NEWUTS) && (flags & 0x00010000ULL /* CLONE_THREAD */))
+        return -(s64)EOPNOTSUPP; /* No per-thread namespace storage yet. */
+
     /* CLONE_VM|CLONE_THREAD: a real thread that SHARES the caller's address
      * space — glibc pthread_create. It must NOT get a private
      * vmm_clone_space()/proc_create() copy (that breaks every shared futex /
@@ -278,10 +308,15 @@ static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int 
 
     child->parent       = parent;
     proc_clone_attrs(child, parent);
-    if (flags & 0x04000000ULL /* CLONE_NEWUTS */) {
-        uts_ns_put(child->uts_ns);
-        child->uts_ns = uts_ns_create(parent->uts_ns ? parent->uts_ns->nodename : "azamios",
-                                      parent->uts_ns ? parent->uts_ns->domainname : "local");
+    if (flags & CLONE_NEWUTS) {
+        uts_namespace_t *source = proc_uts_ns_get(child);
+        uts_namespace_t *ns = uts_ns_clone(source);
+        uts_ns_put(source);
+        if (!ns) {
+            proc_destroy(child);
+            return -(s64)ENOMEM;
+        }
+        proc_uts_ns_replace(child, ns);
     }
     if (vma_clone(child, parent) != 0) {
         proc_destroy(child);
@@ -377,68 +412,57 @@ s64 sys_vfork_impl(pt_regs_t *r)
 /* Shared execve core: `kpath` is an already-resolved absolute path; argv/envp
  * are user-space pointer vectors. On success this replaces the current address
  * space and rewrites `r`, so it does not return to the caller's program. */
+/* Copy each vector completely or reject it. A bad pointer must never turn
+ * into a silently shortened argv/envp and a successful image replacement. */
+static int exec_copy_vector(const char *const *user, char ***out)
+{
+    char **vector = kzalloc(128 * sizeof(*vector));
+    if (!vector) return -ENOMEM;
+    *out = vector;
+    if (!user) return 0;
+    for (int i = 0; i < 128; i++) {
+        const char *value = NULL;
+        if ((uintptr_t)user >= TASK_SIZE_MAX ||
+            copy_from_user(&value, &user[i], sizeof(value))) return -EFAULT;
+        if (!value) return 0;
+        if (i == 127) return -E2BIG;
+        if ((uintptr_t)value >= TASK_SIZE_MAX) return -EFAULT;
+        vector[i] = kmalloc(1024);
+        if (!vector[i]) return -ENOMEM;
+        s64 err = copy_str_from_user(vector[i], value, 1024);
+        if (err < 0) return err == -ENAMETOOLONG ? -E2BIG : (int)err;
+        if (err == 1023) return -E2BIG;
+    }
+    return -E2BIG;
+}
+
+static void exec_free_vector(char **vector)
+{
+    if (!vector) return;
+    for (int i = 0; i < 128; i++) kfree(vector[i]);
+    kfree(vector);
+}
+
 static s64 execve_core(pt_regs_t *r, const char *kpath,
                        const char *const *user_argv, const char *const *user_envp)
 {
-    /* Allocate argv and envp pointer arrays on heap to prevent kernel stack overflow */
-    char **kargv = (char **)kzalloc(128 * sizeof(char *));
-    if (!kargv) return -(s64)ENOMEM;
-
-    int argc = 0;
-    if (user_argv && (uintptr_t)user_argv < TASK_SIZE_MAX) {
-        for (int i = 0; i < 127; i++) {
-            const char *arg_ptr = NULL;
-            if (copy_from_user(&arg_ptr, &user_argv[i], sizeof(char *)) != 0) break;
-            if (!arg_ptr) break;
-            if ((uintptr_t)arg_ptr >= TASK_SIZE_MAX) break;
-
-            char *buf = (char *)kmalloc(1024);
-            if (!buf) break;
-            if (copy_str_from_user(buf, arg_ptr, 1024) < 0) {
-                kfree(buf);
-                break;
-            }
-            kargv[argc++] = buf;
-        }
-    }
-    if (argc == 0) {
+    char **kargv = NULL, **kenvp = NULL;
+    int copy_err = exec_copy_vector(user_argv, &kargv);
+    if (!copy_err) copy_err = exec_copy_vector(user_envp, &kenvp);
+    if (!copy_err && !kargv[0]) {
         kargv[0] = strdup(kpath);
-        argc = 1;
+        if (!kargv[0]) copy_err = -ENOMEM;
     }
-    kargv[argc] = NULL;
-
-    char **kenvp = (char **)kzalloc(128 * sizeof(char *));
-    if (!kenvp) {
-        for (int i = 0; i < argc; i++) kfree(kargv[i]);
-        kfree(kargv);
-        return -(s64)ENOMEM;
+    if (copy_err) {
+        exec_free_vector(kargv);
+        exec_free_vector(kenvp);
+        return copy_err;
     }
-
-    int envc = 0;
-    if (user_envp && (uintptr_t)user_envp < TASK_SIZE_MAX) {
-        for (int i = 0; i < 127; i++) {
-            const char *env_ptr = NULL;
-            if (copy_from_user(&env_ptr, &user_envp[i], sizeof(char *)) != 0) break;
-            if (!env_ptr) break;
-            if ((uintptr_t)env_ptr >= TASK_SIZE_MAX) break;
-
-            char *buf = (char *)kmalloc(1024);
-            if (!buf) break;
-            if (copy_str_from_user(buf, env_ptr, 1024) < 0) {
-                kfree(buf);
-                break;
-            }
-            kenvp[envc++] = buf;
-        }
-    }
-    kenvp[envc] = NULL;
 
     process_t *proc = sched_current_process();
     if (!proc) {
-        for (int i = 0; i < argc; i++) kfree(kargv[i]);
-        for (int i = 0; i < envc; i++) kfree(kenvp[i]);
-        kfree(kargv);
-        kfree(kenvp);
+        exec_free_vector(kargv);
+        exec_free_vector(kenvp);
         return -(s64)EPERM;
     }
 
@@ -447,38 +471,14 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
     u64 new_rsp = 0;
     phys_addr_t old_space = proc->pml4_phys;
 
-    int err = elf_load_exec(proc, kpath, (const char *const *)kargv, (const char *const *)kenvp,
-                            &new_entry, &new_space, &new_rsp);
-    if (err < 0 && kpath[0] == '/') {
-        char alt_path[256];
-        size_t klen = strlen(kpath);
-        if (klen < sizeof(alt_path) - 5) {
-            strncpy(alt_path, kpath, sizeof(alt_path) - 5);
-            alt_path[klen] = '.';
-            alt_path[klen + 1] = 'e';
-            alt_path[klen + 2] = 'l';
-            alt_path[klen + 3] = 'f';
-            alt_path[klen + 4] = '\0';
-            err = elf_load_exec(proc, alt_path, (const char *const *)kargv, (const char *const *)kenvp,
-                                &new_entry, &new_space, &new_rsp);
-        }
-    }
+    process_t *image = NULL;
+    int err = elf_prepare_exec(proc, kpath, (const char *const *)kargv, (const char *const *)kenvp,
+                              &new_entry, &new_space, &new_rsp, &image);
 
-    for (int i = 0; i < argc; i++) kfree(kargv[i]);
-    for (int i = 0; i < envc; i++) kfree(kenvp[i]);
-    kfree(kargv);
-    kfree(kenvp);
+    exec_free_vector(kargv);
+    exec_free_vector(kenvp);
 
     if (err < 0) return (s64)err;
-
-    /* BUG-AF fix: Close FD_CLOEXEC file descriptors ONLY AFTER elf_load_exec()
-     * succeeds. If execve fails before this point, all file descriptors remain intact. */
-    for (int i = 0; i < PROC_MAX_FDS; i++) {
-        if (proc->handle_table[i] && (proc->fd_flags[i] & FD_CLOEXEC)) {
-            file_t *f = fd_detach(proc, i);
-            if (f) vfs_close(f);
-        }
-    }
 
     /* POSIX: execve terminates every other thread of the process. Do it before
      * we free the old address space — a sibling still running user code on the
@@ -491,9 +491,19 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
      * so they are not leaked for the entire lifetime of the new process. */
     sched_dethread_reap();
 
+    /* Only a successful image build closes CLOEXEC descriptors. Stop siblings
+     * first so they cannot replace a descriptor during this commit. */
+    for (int i = 0; i < PROC_MAX_FDS; i++) {
+        if (proc->handle_table[i] && (proc->fd_flags[i] & FD_CLOEXEC)) {
+            file_t *f = fd_detach(proc, i);
+            if (f) vfs_close(f);
+        }
+    }
+
     ipc_shmem_unmap_all(proc);
     sysvipc_process_exec(proc);   /* POSIX: SysV segments do not survive exec */
 
+    elf_commit_exec(proc, image);
     proc->pml4_phys = new_space;
     /* Same PCID tag, brand-new address space behind it: clear the primed mask
      * so the next switch to it flushes that tag on each core, evicting the
@@ -530,6 +540,13 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
         }
     }
     /* Reset alternate signal stack on execve */
+    thread_t *curr_thread = sched_current_thread();
+    if (curr_thread) {
+        curr_thread->sas_ss_sp = NULL;
+        curr_thread->sas_ss_size = 0;
+        curr_thread->sas_ss_flags = 2; /* SS_DISABLE */
+        curr_thread->sig_pending = 0;
+    }
     proc->sas_ss_sp = NULL;
     proc->sas_ss_size = 0;
     proc->sas_ss_flags = 2; /* SS_DISABLE */
@@ -574,7 +591,7 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
 s64 sys_execve_impl(pt_regs_t *r)
 {
     const char *user_path = (const char *)r->rdi;
-    if (!user_path) return -(s64)EINVAL;
+    if (!user_path) return -(s64)EFAULT;
     if ((uintptr_t)user_path >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     char kpath[512];
@@ -628,7 +645,9 @@ s64 sys_execveat_impl(pt_regs_t *r)
 s64 sys_exit_impl(pt_regs_t *r)
 {
     process_t *proc = sched_current_process();
-    if (proc) {
+    /* exit(2) terminates the calling thread. Shared descriptors, tracing
+     * relationships, and the process exit status belong to the last thread. */
+    if (proc && !sched_has_live_siblings()) {
         /* Don't clobber a termination signal already recorded by the fault
          * handler (segfault etc.) with the trap frame's rdi. */
         if (r && proc->term_signal == 0) proc->exit_code = (int)r->rdi & 0xFF;
@@ -717,6 +736,7 @@ s64 sys_setuid_impl(pt_regs_t *r)  {
         if (new_uid != p->uid && new_uid != p->euid && new_uid != p->suid)
             return -(s64)EPERM;
     }
+    if(p->euid!=new_uid) __atomic_store_n(&p->dumpable,false,__ATOMIC_RELEASE);
     p->uid = new_uid;
     p->euid = new_uid;
     p->suid = new_uid;
@@ -731,6 +751,7 @@ s64 sys_setgid_impl(pt_regs_t *r)  {
         if (new_gid != p->gid && new_gid != p->egid && new_gid != p->sgid)
             return -(s64)EPERM;
     }
+    if(p->egid!=new_gid) __atomic_store_n(&p->dumpable,false,__ATOMIC_RELEASE);
     p->gid = new_gid;
     p->egid = new_gid;
     p->sgid = new_gid;
@@ -1191,6 +1212,14 @@ s64 sys_clone3_impl(pt_regs_t *r)
     size_t to_copy = size < sizeof(kargs) ? size : sizeof(kargs);
     if (copy_from_user(&kargs, uargs, to_copy) != 0) return -(s64)EFAULT;
 
+    /* clone3 has a separate exit_signal field; bit 7 in flags really is a
+     * time namespace request here. Do not fold it into the legacy signal byte. */
+    if (kargs.flags & CLONE_NEWTIME) {
+        process_t *proc = sched_current_process();
+        s64 ns_error = namespace_flags_check(proc, (kargs.flags & CLONE_NAMESPACE_MASK) | CLONE_NEWTIME);
+        return ns_error;
+    }
+
     u64 flags = kargs.flags | (kargs.exit_signal & 0xFFULL);
     virt_addr_t child_stack = kargs.stack ? (virt_addr_t)(kargs.stack + kargs.stack_size) : 0;
     int *parent_tidptr = (int *)(uintptr_t)kargs.parent_tid;
@@ -1562,8 +1591,13 @@ s64 sys_prctl_impl(pt_regs_t *r)
         if (copy_to_user((void *)arg2, p->name, strlen(p->name) + 1) != 0) return -(s64)EFAULT;
         return 0;
     }
-    if (option == 3 /* PR_GET_DUMPABLE */) return 1;
-    if (option == 4 /* PR_SET_DUMPABLE */) return 0;
+    if (option == 3 /* PR_GET_DUMPABLE */)
+        return __atomic_load_n(&p->dumpable,__ATOMIC_ACQUIRE) ? 1 : 0;
+    if (option == 4 /* PR_SET_DUMPABLE */) {
+        if(arg2>1) return -(s64)EINVAL;
+        __atomic_store_n(&p->dumpable,arg2!=0,__ATOMIC_RELEASE);
+        return 0;
+    }
     if (option == 7 /* PR_GET_KEEPCAPS */) return 0;
     if (option == 8 /* PR_SET_KEEPCAPS */) return 0;
     if (option == 38 /* PR_SET_NO_NEW_PRIVS */) {
@@ -1620,65 +1654,22 @@ s64 sys_prctl_impl(pt_regs_t *r)
 
 s64 sys_sched_getaffinity_impl(pt_regs_t *r)
 {
-    s32 pid = (s32)r->rdi;
-    size_t cpusetsize = (size_t)r->rsi;
-    void *mask = (void *)r->rdx;
-    if (pid < 0) return -(s64)EINVAL;
-    if (!mask || (uintptr_t)mask >= TASK_SIZE_MAX) return -(s64)EFAULT;
-    if (cpusetsize < sizeof(u64)) return -(s64)EINVAL;
-
-    process_t *target = (pid == 0) ? sched_current_process() : proc_get_by_pid((u32)pid);
-    if (!target) return -(s64)ESRCH;
-    u64 affinity = target->affinity_mask;
-    if (pid > 0) proc_put(target);
-
-    u32 ncpus = smp_cpu_count();
-    if (ncpus == 0) ncpus = 1;
-    u64 avail_mask = (ncpus >= 64) ? ~0ULL : ((1ULL << ncpus) - 1);
-    affinity &= avail_mask;
-    if (copy_to_user(mask, &affinity, sizeof(u64)) != 0) return -(s64)EFAULT;
-    return (s64)sizeof(u64);
+    s32 tid=(s32)r->rdi;
+    if(tid<0 || r->rsi<sizeof(u64)) return -(s64)EINVAL;
+    u64 mask=0;
+    int rc=sched_tid_affinity((u32)tid,&mask,false);
+    if(rc) return rc;
+    if(copy_to_user((void *)r->rdx,&mask,sizeof(mask))) return -(s64)EFAULT;
+    return sizeof(mask);
 }
 
 s64 sys_sched_setaffinity_impl(pt_regs_t *r)
 {
-    s32 pid = (s32)r->rdi;
-    size_t cpusetsize = (size_t)r->rsi;
-    const void *mask = (const void *)r->rdx;
-
-    if (pid < 0) return -(s64)EINVAL;
-    if (!mask || (uintptr_t)mask >= TASK_SIZE_MAX) return -(s64)EFAULT;
-    if (cpusetsize < sizeof(u64)) return -(s64)EINVAL;
-
-    process_t *caller = sched_current_process();
-    if (!caller) return -(s64)EPERM;
-
-    process_t *target = (pid == 0) ? caller : proc_get_by_pid((u32)pid);
-    if (!target) return -(s64)ESRCH;
-
-    if (caller->euid != 0 && caller->uid != target->uid && caller->euid != target->uid) {
-        if (pid != 0) proc_put(target);
-        return -(s64)EPERM;
-    }
-
-    u64 user_mask = 0;
-    if (copy_from_user(&user_mask, mask, sizeof(u64)) != 0) {
-        if (pid != 0) proc_put(target);
-        return -(s64)EFAULT;
-    }
-
-    u32 ncpus = smp_cpu_count();
-    if (ncpus == 0) ncpus = 1;
-    u64 avail_mask = (ncpus >= 64) ? ~0ULL : ((1ULL << ncpus) - 1);
-
-    if ((user_mask & avail_mask) == 0) {
-        if (pid != 0) proc_put(target);
-        return -(s64)EINVAL;
-    }
-
-    int err = sched_set_proc_affinity(target, user_mask & avail_mask);
-    if (pid != 0) proc_put(target);
-    return err < 0 ? (s64)err : 0;
+    s32 tid=(s32)r->rdi;
+    if(tid<0 || r->rsi<sizeof(u64)) return -(s64)EINVAL;
+    u64 mask;
+    if(copy_from_user(&mask,(void *)r->rdx,sizeof(mask))) return -(s64)EFAULT;
+    return sched_tid_affinity((u32)tid,&mask,true);
 }
 
 s64 sys_getpgid_impl(pt_regs_t *r)
@@ -1714,6 +1705,7 @@ s64 sys_setreuid_impl(pt_regs_t *r)
         if (euid != (u32)-1 && euid != proc->uid && euid != proc->euid && euid != proc->suid) return -(s64)EPERM;
     }
     if (ruid != (u32)-1) proc->uid = ruid;
+    if(euid!=(u32)-1 && euid!=proc->euid) __atomic_store_n(&proc->dumpable,false,__ATOMIC_RELEASE);
     if (euid != (u32)-1) proc->euid = euid;
     security_caps_on_setuid(proc);
     return 0;
@@ -1734,6 +1726,7 @@ s64 sys_setresuid_impl(pt_regs_t *r)
         if (suid != (u32)-1 && suid != proc->uid && suid != proc->euid && suid != proc->suid) return -(s64)EPERM;
     }
     if (ruid != (u32)-1) proc->uid = ruid;
+    if(euid!=(u32)-1 && euid!=proc->euid) __atomic_store_n(&proc->dumpable,false,__ATOMIC_RELEASE);
     if (euid != (u32)-1) proc->euid = euid;
     if (suid != (u32)-1) proc->suid = suid;
     security_caps_on_setuid(proc);
@@ -1764,6 +1757,7 @@ s64 sys_setregid_impl(pt_regs_t *r)
         if (egid != (u32)-1 && egid != proc->gid && egid != proc->egid && egid != proc->sgid) return -(s64)EPERM;
     }
     if (rgid != (u32)-1) proc->gid = rgid;
+    if(egid!=(u32)-1 && egid!=proc->egid) __atomic_store_n(&proc->dumpable,false,__ATOMIC_RELEASE);
     if (egid != (u32)-1) proc->egid = egid;
     return 0;
 }
@@ -1781,6 +1775,7 @@ s64 sys_setresgid_impl(pt_regs_t *r)
         if (sgid != (u32)-1 && sgid != proc->gid && sgid != proc->egid && sgid != proc->sgid) return -(s64)EPERM;
     }
     if (rgid != (u32)-1) proc->gid = rgid;
+    if(egid!=(u32)-1 && egid!=proc->egid) __atomic_store_n(&proc->dumpable,false,__ATOMIC_RELEASE);
     if (egid != (u32)-1) proc->egid = egid;
     if (sgid != (u32)-1) proc->sgid = sgid;
     return 0;
@@ -2208,6 +2203,7 @@ s64 sys_setfsuid_impl(pt_regs_t *r)
     if (!p) return 0;
     u32 old = p->fsuid;
     if (p->euid == 0 || fsuid == p->uid || fsuid == p->euid || fsuid == p->suid || fsuid == p->fsuid) {
+        if(p->fsuid!=fsuid) __atomic_store_n(&p->dumpable,false,__ATOMIC_RELEASE);
         p->fsuid = fsuid;
     }
     return (s64)old;
@@ -2219,6 +2215,7 @@ s64 sys_setfsgid_impl(pt_regs_t *r)
     if (!p) return 0;
     u32 old = p->fsgid;
     if (p->euid == 0 || fsgid == p->gid || fsgid == p->egid || fsgid == p->sgid || fsgid == p->fsgid) {
+        if(p->fsgid!=fsgid) __atomic_store_n(&p->dumpable,false,__ATOMIC_RELEASE);
         p->fsgid = fsgid;
     }
     return (s64)old;
@@ -2233,38 +2230,16 @@ s64 sys_unshare_impl(pt_regs_t *r)
 
     #define CLONE_FS           0x00000200ULL
     #define CLONE_FILES        0x00000400ULL
-    #define CLONE_NEWNS        0x00020000ULL
-    #define CLONE_NEWCGROUP    0x02000000ULL
-    #define CLONE_NEWUTS       0x04000000ULL
-    #define CLONE_NEWIPC       0x08000000ULL
-    #define CLONE_NEWUSER      0x10000000ULL
-    #define CLONE_NEWPID       0x20000000ULL
-    #define CLONE_NEWNET       0x40000000ULL
-
-    u64 valid = CLONE_FS | CLONE_FILES | CLONE_NEWNS | CLONE_NEWCGROUP |
-                CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+    u64 valid = CLONE_FS | CLONE_FILES | CLONE_NAMESPACE_MASK | CLONE_NEWTIME;
 
     if (flags & ~valid) return -(s64)EINVAL;
 
-    /* Linux requires CAP_SYS_ADMIN for unsharing namespaces (except CLONE_NEWUSER) */
-    if ((flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWNET)) &&
-        !security_check_permission(proc, CAP_SYS_ADMIN)) {
-        return -(s64)EPERM;
-    }
-
-    if (flags & CLONE_NEWUTS) {
-        uts_namespace_t *new_ns = uts_ns_create(proc->uts_ns ? proc->uts_ns->nodename : "azamios",
-                                                proc->uts_ns ? proc->uts_ns->domainname : "local");
-        if (!new_ns) return -(s64)ENOMEM;
-        uts_ns_put(proc->uts_ns);
-        proc->uts_ns = new_ns;
-    }
-
-    if (flags & CLONE_NEWPID) {
-        proc->new_pid_ns = true;
-    }
-
-    return 0;
+    s64 err = namespace_flags_check(proc, flags & (CLONE_NAMESPACE_MASK | CLONE_NEWTIME));
+    if (err) return err;
+    /* A thread-local fs/fd context is not represented by process_t. Reject
+     * these requests before any namespace change, including mixed requests. */
+    if (flags & (CLONE_FS | CLONE_FILES)) return -(s64)EOPNOTSUPP;
+    return (flags & CLONE_NEWUTS) ? proc_uts_ns_unshare(proc) : 0;
 }
 
 /* ============================================================================
@@ -2342,15 +2317,14 @@ s64 sys_setns_impl(pt_regs_t *r)
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
-    if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
 
     file_t *f = fget(proc, fd);
     if (!f) return -(s64)EBADF;
     fput(f);
 
-    /* There is a single namespace of each kind, so no descriptor can name a
-     * different one to join. EINVAL is what Linux returns for an fd that is
-     * not a namespace file, and is what callers probe for. */
+    /* Counted namespace descriptors and namespace joining are not implemented.
+     * Ordinary files are invalid for setns regardless of the caller's
+     * capabilities. A bad descriptor is EBADF, not a permission failure. */
     return -(s64)EINVAL;
 }
 

@@ -531,6 +531,29 @@ static u64 ktime_get_clock_ns(u32 clk)
     return (u64)s * NSEC_PER_SEC + (u64)n;
 }
 
+/* Unlike the ordinary seqlock reader, never wait for a remote publisher.
+ * An IRQ callback and its sender must stay bounded even if that CPU stalls. */
+bool ktime_try_get_ns(u64 *result)
+{
+    if(!result || !__atomic_load_n(&g_tk_ready,__ATOMIC_ACQUIRE)) return false;
+    const struct vdso_data *vd=g_vd;
+    for(u32 tries=0; tries<8; tries++) {
+        u32 seq=__atomic_load_n(&vd->seq,__ATOMIC_ACQUIRE);
+        if(seq&1) continue;
+        clocksource_t *cs=tk.cs;
+        u64 now=cs->read(), last=vd->cycle_last;
+        u64 delta=(now-last)&vd->mask;
+        if(cs==&g_cs_tsc && (s64)(now-last)<0) delta=0;
+        u64 sec=vd->basetime[VDSO_CLOCK_MONOTONIC].sec;
+        u64 ns=(vd->basetime[VDSO_CLOCK_MONOTONIC].nsec + delta*vd->mult)>>vd->shift;
+        __asm__ volatile("" ::: "memory");
+        if(__atomic_load_n(&vd->seq,__ATOMIC_ACQUIRE)!=seq) continue;
+        *result=sec*NSEC_PER_SEC + ns;
+        return true;
+    }
+    return false;
+}
+
 u64 ktime_get_ns(void)      { return ktime_get_clock_ns(VDSO_CLOCK_MONOTONIC); }
 u64 ktime_get_raw_ns(void)  { return ktime_get_clock_ns(VDSO_CLOCK_MONOTONIC_RAW); }
 u64 ktime_get_real_ns(void) { return ktime_get_clock_ns(VDSO_CLOCK_REALTIME); }

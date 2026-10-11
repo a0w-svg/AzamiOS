@@ -57,7 +57,7 @@
  * invert and cmask. USR/OS come from the event's exclude_* attributes and INT
  * is refused outright — arming an overflow interrupt for a handler that does
  * not exist would wedge the core. */
-#define PMU_EVTSEL_RAW_MASK  0x00FFFFFFULL
+#define PMU_EVTSEL_RAW_MASK  0xFF84FFFFULL
 
 typedef struct {
     bool present;        /* a usable PMU was found                          */
@@ -120,3 +120,12 @@ void pmu_sync_local(void);
  * a valid selector.
  */
 u64 pmu_hw_event(u64 hw_config);
+
+/* IRQ callbacks must not wait on the global slot lock. */
+bool pmu_try_sync_local(void);
+
+/* Subtraction uses the enumerated physical/virtual counter width. */
+static inline u64 pmu_counter_delta(u64 raw, u64 previous, u64 mask)
+{
+    return (raw - previous) & mask;
+}

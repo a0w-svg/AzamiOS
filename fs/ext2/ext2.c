@@ -27,6 +27,7 @@ static u64 ext2_decode_rdev(u32 old_word, u32 new_word);
 static s64 ext2_unlink(struct inode *dir, struct dentry *dentry);
 static s64 ext2_rmdir(struct inode *dir, struct dentry *dentry);
 static s64 ext2_rename(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry);
+static s64 ext2_rename2(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry, unsigned int flags);
 static s64 ext2_symlink(struct inode *dir, struct dentry *dentry, const char *symname);
 static s64 ext2_link(struct inode *dir, struct dentry *old_dentry, struct dentry *dentry);
 static s64 ext2_readlink(struct dentry *dentry, char *buf, size_t bufsiz);
@@ -45,6 +46,7 @@ static inode_operations_t ext2_inode_ops = {
     .readlink = ext2_readlink,
     .link = ext2_link,
     .mknod = ext2_mknod,
+    .rename2 = ext2_rename2,
 };
 
 static file_operations_t ext2_file_ops = {
@@ -2214,6 +2216,11 @@ static s64 ext2_unlink(struct inode *dir, struct dentry *dentry) {
     }
 
     inode->i_nlink = 0;
+    if (inode->i_open_count) {
+        ext2_sync_inode(fs, inode);
+        dentry->d_inode = NULL;
+        return 0;
+    }
     ext2_truncate(inode);
     ext2_free_inode(fs, inode->i_ino);
 
@@ -2305,6 +2312,12 @@ static s64 ext2_rmdir(struct inode *dir, struct dentry *dentry) {
     if (dir->i_nlink > 2) dir->i_nlink--;
     ext2_sync_inode((ext2_fs_info_t *)dir->i_sb->s_fs_info, dir);
 
+    dentry->d_inode->i_nlink = 0;
+    if (dentry->d_inode->i_open_count) {
+        ext2_sync_inode((ext2_fs_info_t *)dir->i_sb->s_fs_info, dentry->d_inode);
+        dentry->d_inode = NULL;
+        return 0;
+    }
     ext2_truncate(dentry->d_inode);
     ext2_free_inode((ext2_fs_info_t *)dir->i_sb->s_fs_info, dentry->d_inode->i_ino);
     
@@ -2356,8 +2369,10 @@ static s64 ext2_rename(struct inode *old_dir, struct dentry *old_dentry, struct 
     if (new_dentry->d_inode) {
         s64 rerr;
         if (S_ISDIR(new_dentry->d_inode->i_mode)) {
+            if (!S_ISDIR(old_dentry->d_inode->i_mode)) return -(s64)EISDIR;
             rerr = ext2_rmdir(new_dir, new_dentry);
         } else {
+            if (S_ISDIR(old_dentry->d_inode->i_mode)) return -(s64)ENOTDIR;
             rerr = ext2_unlink(new_dir, new_dentry);
         }
         if (rerr < 0) return rerr;
@@ -2394,6 +2409,81 @@ static s64 ext2_rename(struct inode *old_dir, struct dentry *old_dentry, struct 
     new_dentry->d_inode = old_dentry->d_inode;
     old_dentry->d_inode = NULL;
     return 0;
+}
+
+static s64 ext2_rename2(struct inode *old_dir, struct dentry *old_dentry,
+                        struct inode *new_dir, struct dentry *new_dentry,
+                        unsigned int flags)
+{
+    if (flags & RENAME_EXCHANGE) {
+        if (!old_dentry->d_inode || !new_dentry->d_inode) return -(s64)ENOENT;
+        if (old_dentry->d_inode == new_dentry->d_inode) return 0;
+
+        ext2_fs_info_t *fs = (ext2_fs_info_t *)old_dir->i_sb->s_fs_info;
+        bool old_is_dir = S_ISDIR(old_dentry->d_inode->i_mode);
+        bool new_is_dir = S_ISDIR(new_dentry->d_inode->i_mode);
+        bool cross_dir = (old_dir->i_ino != new_dir->i_ino);
+
+        u32 old_ino = old_dentry->d_inode->i_ino;
+        u32 new_ino = new_dentry->d_inode->i_ino;
+        u32 old_mode = old_dentry->d_inode->i_mode;
+        u32 new_mode = new_dentry->d_inode->i_mode;
+
+        u8 old_ftype = EXT2_FT_REG_FILE;
+        if (S_ISDIR(old_mode))       old_ftype = EXT2_FT_DIR;
+        else if (S_ISLNK(old_mode))  old_ftype = EXT2_FT_SYMLINK;
+        else if (S_ISCHR(old_mode))  old_ftype = EXT2_FT_CHRDEV;
+        else if (S_ISBLK(old_mode))  old_ftype = EXT2_FT_BLKDEV;
+        else if (S_ISFIFO(old_mode)) old_ftype = EXT2_FT_FIFO;
+        else if (S_ISSOCK(old_mode)) old_ftype = EXT2_FT_SOCK;
+
+        u8 new_ftype = EXT2_FT_REG_FILE;
+        if (S_ISDIR(new_mode))       new_ftype = EXT2_FT_DIR;
+        else if (S_ISLNK(new_mode))  new_ftype = EXT2_FT_SYMLINK;
+        else if (S_ISCHR(new_mode))  new_ftype = EXT2_FT_CHRDEV;
+        else if (S_ISBLK(new_mode))  new_ftype = EXT2_FT_BLKDEV;
+        else if (S_ISFIFO(new_mode)) new_ftype = EXT2_FT_FIFO;
+        else if (S_ISSOCK(new_mode)) new_ftype = EXT2_FT_SOCK;
+
+        s64 err = ext2_remove_dir_entry(old_dir, old_dentry->d_name);
+        if (err < 0) return err;
+        err = ext2_remove_dir_entry(new_dir, new_dentry->d_name);
+        if (err < 0) {
+            ext2_add_dir_entry(old_dir, old_ino, old_dentry->d_name, old_ftype);
+            return err;
+        }
+
+        err = ext2_add_dir_entry(new_dir, old_ino, new_dentry->d_name, old_ftype);
+        if (err < 0) {
+            ext2_add_dir_entry(old_dir, old_ino, old_dentry->d_name, old_ftype);
+            ext2_add_dir_entry(new_dir, new_ino, new_dentry->d_name, new_ftype);
+            return err;
+        }
+        err = ext2_add_dir_entry(old_dir, new_ino, old_dentry->d_name, new_ftype);
+        if (err < 0) {
+            ext2_remove_dir_entry(new_dir, new_dentry->d_name);
+            ext2_add_dir_entry(old_dir, old_ino, old_dentry->d_name, old_ftype);
+            ext2_add_dir_entry(new_dir, new_ino, new_dentry->d_name, new_ftype);
+            return err;
+        }
+
+        if (cross_dir) {
+            if (old_is_dir) {
+                ext2_update_dotdot(fs, old_dentry->d_inode, new_dir->i_ino);
+                if (old_dir->i_nlink > 2) old_dir->i_nlink--;
+                new_dir->i_nlink++;
+            }
+            if (new_is_dir) {
+                ext2_update_dotdot(fs, new_dentry->d_inode, old_dir->i_ino);
+                if (new_dir->i_nlink > 2) new_dir->i_nlink--;
+                old_dir->i_nlink++;
+            }
+            ext2_sync_inode(fs, old_dir);
+            ext2_sync_inode(fs, new_dir);
+        }
+        return 0;
+    }
+    return ext2_rename(old_dir, old_dentry, new_dir, new_dentry);
 }
 
 static s64 ext2_symlink(struct inode *dir, struct dentry *dentry, const char *symname) {
@@ -2758,4 +2848,15 @@ void ext2_free_inode(ext2_fs_info_t *fs, u32 ino) {
     }
     spinlock_unlock(&g_ext2_alloc_lock);
     if (freed) ext2_sync_bg(fs, bg);
+}
+
+/* Final open-description release after unlink/rmdir. Caller holds the VFS
+ * namespace guard; open files retain their inode and blocks until here. */
+void ext2_evict_unlinked(inode_t *inode)
+{
+    ext2_fs_info_t *fs = (ext2_fs_info_t *)inode->i_sb->s_fs_info;
+    ext2_truncate(inode);
+    ext2_free_inode(fs, inode->i_ino);
+    kfree(inode->i_private);
+    kfree(inode);
 }

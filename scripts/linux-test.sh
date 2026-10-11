@@ -13,6 +13,12 @@
 #   LINUX_TEST_CMDLINE="clocksource=hpet" scripts/linux-test.sh   # extra kernel args
 #   LINUX_TEST_ROOT=path/to/root scripts/linux-test.sh payload  # extra initrd files
 #
+#   LINUX_TEST_SMP=32 overrides vCPU count (1-64).
+#   LINUX_TEST_KERNEL=path selects an immutable kernel image for comparisons.
+#   LINUX_TEST_MEM_MB=512 overrides memory (128-65536 MiB).
+#   LINUX_TEST_ACCEL=auto|kvm|tcg selects the accelerator explicitly.
+#   LINUX_TEST_NET=none disables the default NIC for isolated probes.
+#
 # Payloads must report "== probe complete: N passed, M failed ==". A missing
 # verdict, timeout or kernel panic is a test failure, even if QEMU exits zero.
 #
@@ -28,6 +34,25 @@ cd "$REPO" || exit 1
 PAYLOAD="${1:-tools/linux/out/bin/azami-abi-probe}"
 TIMEOUT="${LINUX_TEST_TIMEOUT:-60}"
 WORK="${LINUX_TEST_WORK:-build/linux-test}"
+KERNEL="${LINUX_TEST_KERNEL:-build/kernel.elf}"
+VCPUS="${LINUX_TEST_SMP:-4}"
+MEM_MB="${LINUX_TEST_MEM_MB:-1536}"
+ACCEL_REQUEST="${LINUX_TEST_ACCEL:-auto}"
+NETWORK_ARGS=()
+case "${LINUX_TEST_NET:-auto}" in
+    auto) ;;
+    none) NETWORK_ARGS=(-nic none) ;;
+    *) echo "error: LINUX_TEST_NET must be auto or none" >&2; exit 1 ;;
+esac
+if [[ ! "$MEM_MB" =~ ^[0-9]+$ ]] || [ "$MEM_MB" -lt 128 ] || [ "$MEM_MB" -gt 65536 ]; then
+    echo "error: LINUX_TEST_MEM_MB must be between 128 and 65536" >&2; exit 1
+fi
+case "$ACCEL_REQUEST" in auto|kvm|tcg) ;; *)
+    echo "error: LINUX_TEST_ACCEL must be auto, kvm or tcg" >&2; exit 1 ;;
+esac
+if ! [[ "$VCPUS" =~ ^[0-9]+$ ]] || [ "$VCPUS" -lt 1 ] || [ "$VCPUS" -gt 64 ]; then
+    echo "error: LINUX_TEST_SMP must be between 1 and 64" >&2; exit 1
+fi
 EXTRA_ROOT="${LINUX_TEST_ROOT:-}"
 
 if [ ! -x "$PAYLOAD" ]; then
@@ -35,8 +60,8 @@ if [ ! -x "$PAYLOAD" ]; then
     echo "       run 'make linux' first, or pass a static Linux binary." >&2
     exit 1
 fi
-if [ ! -f build/kernel.elf ]; then
-    echo "error: build/kernel.elf missing — run 'make' first." >&2
+if [ ! -f "$KERNEL" ]; then
+    echo "error: kernel image $KERNEL missing — run 'make' first." >&2
     exit 1
 fi
 
@@ -97,7 +122,7 @@ fi
 
 mke2fs -q -F -t ext2 -b 4096 -d "$STAGING/root" "$WORK/initrd.ext2" 24M || exit 1
 
-cp build/kernel.elf         "$STAGING/iso/boot/kernel.elf"
+cp "$KERNEL"               "$STAGING/iso/boot/kernel.elf"
 cp "$WORK/initrd.ext2"      "$STAGING/iso/boot/initrd.ext2"
 # LINUX_TEST_CMDLINE appends kernel parameters to every boot entry.
 sed -e "s|^\(\s*kernel_cmdline:.*\)$|\1 ${LINUX_TEST_CMDLINE:-}|" \
@@ -121,7 +146,10 @@ fi
 # KVM when this user can open it (an order of magnitude faster, and the CPU
 # model is the real one), multi-threaded TCG otherwise — the same choice the
 # top-level Makefile makes for `make run`.
-if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+if [ "$ACCEL_REQUEST" = kvm ] && { [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    echo "error: requested KVM is unavailable" >&2; exit 1
+fi
+if [ "$ACCEL_REQUEST" != tcg ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     ACCEL="-enable-kvm -cpu host"
 else
     ACCEL="-accel tcg,thread=multi,tb-size=512 -cpu max,+rdrand,+rdseed"
@@ -131,8 +159,9 @@ echo "  ▸  Booting $(basename "$PAYLOAD") as PID 1 (timeout ${TIMEOUT}s)..."
 rm -f "$WORK/serial.log"
 # shellcheck disable=SC2086
 timeout "$TIMEOUT" qemu-system-x86_64 \
-    -M q35 -m 1536M -smp 4 \
+    -M q35 -m "${MEM_MB}M" -smp "$VCPUS" \
     $ACCEL \
+    "${NETWORK_ARGS[@]}" \
     -serial "file:$WORK/serial.log" -vga std -display none -no-reboot \
     -cdrom "$WORK/test.iso" >"$WORK/qemu.log" 2>&1 &
 QEMU_PID=$!
@@ -158,7 +187,13 @@ QEMU_PID=""
 echo "  ── guest output ────────────────────────────────────────────────────"
 # Everything from the first line the payload printed; the kernel's own boot
 # chatter ends at the scheduler hand-off.
-sed -n '/Starting preemptive CFS scheduling/,$p' "$WORK/serial.log" 2>/dev/null | tail -n +2
+if grep -aq 'Starting preemptive CFS scheduling' "$WORK/serial.log"; then
+    sed -n '/Starting preemptive CFS scheduling/,$p' "$WORK/serial.log" 2>/dev/null | tail -n +2
+else
+    # quiet/loglevel can suppress the hand-off marker. Preserve the complete
+    # serial stream so successful payload observations are still reviewable.
+    cat "$WORK/serial.log"
+fi
 
 # Report unimplemented syscalls separately: they are the usual reason a newly
 # ported binary misbehaves, and the kernel logs each number once.

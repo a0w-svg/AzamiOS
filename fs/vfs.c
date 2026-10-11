@@ -22,6 +22,34 @@ static spinlock_t g_vfs_lock = SPINLOCK_INIT;
 static dentry_t *g_vfs_root = NULL;
 static file_system_type_t *g_fs_types = NULL;
 
+static uintptr_t g_namespace_owner;
+static unsigned int g_namespace_depth;
+
+void vfs_namespace_lock(void)
+{
+    thread_t *thread = sched_current_thread();
+    /* Before scheduling starts, filesystem bring-up has a single caller. */
+    uintptr_t owner = thread ? (uintptr_t)thread : (uintptr_t)&g_namespace_owner;
+    if (__atomic_load_n(&g_namespace_owner, __ATOMIC_ACQUIRE) == owner) {
+        g_namespace_depth++;
+        return;
+    }
+    for (;;) {
+        uintptr_t empty = 0;
+        if (__atomic_compare_exchange_n(&g_namespace_owner, &empty, owner, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
+        if (thread) sched_yield();
+        else __asm__ volatile("pause");
+    }
+    g_namespace_depth = 1;
+}
+
+void vfs_namespace_unlock(void)
+{
+    if (--g_namespace_depth == 0)
+        __atomic_store_n(&g_namespace_owner, 0, __ATOMIC_RELEASE);
+}
+
 /* --------------------------------------------------------------------------
  * Dentry Cache
  * -------------------------------------------------------------------------- */
@@ -515,6 +543,10 @@ s64 vfs_resolve_path(const char *cwd, const char *path, char *out_buf, size_t ou
             out_buf[out_pos++] = comps[i][j];
         }
     }
+    size_t plen = strlen(path);
+    if (plen > 0 && path[plen - 1] == '/' && out_pos > 1 && out_pos + 1 < out_len) {
+        out_buf[out_pos++] = '/';
+    }
     out_buf[out_pos] = '\0';
     return 0;
 }
@@ -657,6 +689,7 @@ restart:
             }
         }
         
+        bool had_slash = (*p == '/');
         while (*p == '/') p++; /* Skip trailing slashes to check if this is the last component */
         
         if (!next->d_inode) {
@@ -675,6 +708,9 @@ restart:
          * O_NOFOLLOW), in which case the link dentry itself is the result. */
         if (S_ISLNK(next->d_inode->i_mode)) {
             if (*p == '\0' && !follow_final) {
+                if (had_slash) {
+                    return -(s64)ENOTDIR;
+                }
                 *out_dentry = next;
                 return 0;
             }
@@ -729,7 +765,7 @@ restart:
             }
         }
         
-        if (*p && !S_ISDIR(next->d_inode->i_mode)) {
+        if ((*p || had_slash) && !S_ISDIR(next->d_inode->i_mode)) {
             /* next has a valid inode — if we allocated it and added it to the
              * dcache, it is now owned by the cache and must not be freed here. */
             return -(s64)ENOTDIR;
@@ -759,24 +795,20 @@ s64 vfs_path_lookup_nofollow(const char *path, dentry_t **out_dentry)
 
 /* vfs_open_err: like vfs_open but sets *out_errno on failure so callers
  * can distinguish ENOENT from EEXIST (BUG-10). */
-file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno)
+static file_t *vfs_finish_open(dentry_t *dentry, s64 err, u32 flags, u32 mode,
+                               s64 *out_errno)
 {
     if (out_errno) *out_errno = -(s64)ENOENT; /* default */
 
-    dentry_t *dentry = NULL;
-    s64 err = (flags & O_NOFOLLOW) ? vfs_path_lookup_nofollow(path, &dentry)
-                                  : vfs_path_lookup(path, &dentry);
+    if (err == 0 && dentry && dentry->d_inode && (flags & O_CREAT) && (flags & O_EXCL)) {
+        if (out_errno) *out_errno = -(s64)EEXIST;
+        return NULL;
+    }
 
     /* O_NOFOLLOW: a trailing symlink is an error (POSIX → ELOOP). */
     if (err == 0 && (flags & O_NOFOLLOW) && dentry && dentry->d_inode &&
         S_ISLNK(dentry->d_inode->i_mode)) {
         if (out_errno) *out_errno = -(s64)ELOOP;
-        return NULL;
-    }
-
-    if (err == 0 && dentry && dentry->d_inode && (flags & O_CREAT) && (flags & O_EXCL)) {
-        /* BUG-10 fix: file exists and O_EXCL was requested → EEXIST */
-        if (out_errno) *out_errno = -(s64)EEXIST;
         return NULL;
     }
 
@@ -871,20 +903,179 @@ file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno)
         }
     }
 
-    if ((flags & O_TRUNC) && ((flags & 3) == O_WRONLY || (flags & 3) == O_RDWR) && S_ISREG(dentry->d_inode->i_mode)) {
-        vfs_truncate(f, 0);
+    if ((flags & O_TRUNC) && S_ISREG(dentry->d_inode->i_mode)) {
+        s64 trunc_error = vfs_truncate(f, 0);
+        if (trunc_error < 0) {
+            kfree(f);
+            if (out_errno) *out_errno = trunc_error;
+            return NULL;
+        }
         f->f_pos = 0;
     }
     
     if (f->f_op && f->f_op->open) {
-        if (f->f_op->open(f->f_inode, f) < 0) {
+        s64 open_error = f->f_op->open(f->f_inode, f);
+        if (open_error < 0) {
             kfree(f);
-            if (out_errno) *out_errno = -(s64)EIO;
+            if (out_errno) *out_errno = open_error;
             return NULL;
         }
     }
     if (out_errno) *out_errno = 0;
+    f->f_inode->i_open_count++;
+    f->f_inode_ref = true;
     return f;
+}
+
+file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno)
+{
+    vfs_namespace_lock();
+    dentry_t *dentry = NULL;
+    s64 err = ((flags & O_NOFOLLOW) || ((flags & O_CREAT) && (flags & O_EXCL)))
+                                  ? vfs_path_lookup_nofollow(path, &dentry)
+                                  : vfs_path_lookup(path, &dentry);
+    file_t *file = vfs_finish_open(dentry, err, flags, mode, out_errno);
+    vfs_namespace_unlock();
+    return file;
+}
+
+/* This walk never normalizes away components before resolving their inode.
+ * Its root and start are directory objects, not path prefixes. The topology
+ * guard excludes rename, unlink, replacement, and mount grafts through open. */
+static bool vfs_descends_from(dentry_t *entry, dentry_t *root)
+{
+    for (unsigned int depth = 0; entry && depth < 4096; depth++) {
+        if (entry == root) return true;
+        if (entry == entry->d_parent) break;
+        entry = entry->d_parent;
+    }
+    return false;
+}
+
+static s64 vfs_walk_at(dentry_t *start, dentry_t *root, const char *path,
+                       u32 flags, u64 resolve, dentry_t **out)
+{
+    char pending[512], rewrite[512], target[512];
+    size_t length = strnlen(path, sizeof(pending));
+    if (length == sizeof(pending)) return -(s64)ENAMETOOLONG;
+    if (!length) return -(s64)ENOENT;
+    memcpy(pending, path, length + 1);
+    dentry_t *anchor = start;
+    bool beneath = resolve & VFS_RESOLVE_BENEATH;
+    if (pending[0] == '/' && beneath) return -(s64)EXDEV;
+    dentry_t *curr = pending[0] == '/' ? root : start;
+    char *p = pending;
+    unsigned int links = 0;
+    for (;;) {
+        while (*p == '/') p++;
+        if (!*p) { *out = curr; return 0; }
+        if (!curr || !curr->d_inode) return -(s64)ENOENT;
+        if (!S_ISDIR(curr->d_inode->i_mode)) return -(s64)ENOTDIR;
+        char component[VFS_NAME_MAX];
+        size_t n = 0;
+        while (*p && *p != '/') {
+            if (n == sizeof(component) - 1) return -(s64)ENAMETOOLONG;
+            component[n++] = *p++;
+        }
+        component[n] = 0;
+        bool slash = *p == '/';
+        while (*p == '/') p++;
+        if (!strcmp(component, ".")) continue;
+        if (!strcmp(component, "..")) {
+            if (curr == anchor && beneath) return -(s64)EXDEV;
+            if (curr != root && curr->d_parent) curr = curr->d_parent;
+            if ((resolve & (VFS_RESOLVE_BENEATH | VFS_RESOLVE_IN_ROOT)) &&
+                !vfs_descends_from(curr, beneath ? anchor : root)) return -(s64)EXDEV;
+            continue;
+        }
+        dentry_t *next = dcache_lookup(curr, component);
+        if (!next) {
+            if (!curr->d_inode->i_op || !curr->d_inode->i_op->lookup)
+                return -(s64)ENOENT;
+            dentry_t *fresh = dcache_alloc(curr, component);
+            if (!fresh) return -(s64)ENOMEM;
+            next = curr->d_inode->i_op->lookup(curr->d_inode, fresh);
+            if (!next) next = fresh;
+            if (next != fresh) kfree(fresh);
+            if (next->d_inode) dcache_add(next);
+        }
+        if (!next->d_inode) {
+            if (*p || slash) { kfree(next); return -(s64)ENOENT; }
+            *out = next;
+            return -(s64)ENOENT;
+        }
+        if ((resolve & (VFS_RESOLVE_BENEATH | VFS_RESOLVE_IN_ROOT)) &&
+            !vfs_descends_from(next, beneath ? anchor : root)) return -(s64)EXDEV;
+        if (S_ISLNK(next->d_inode->i_mode)) {
+            bool follow = *p || slash || (!(flags & O_NOFOLLOW) &&
+                          !((flags & O_CREAT) && (flags & O_EXCL)));
+            if (!follow) { *out = next; return 0; }
+            if ((resolve & VFS_RESOLVE_NO_SYMLINKS) ||
+                (next->d_inode->i_magiclink &&
+                 (resolve & (VFS_RESOLVE_NO_MAGICLINKS | VFS_RESOLVE_BENEATH | VFS_RESOLVE_IN_ROOT))))
+                return -(s64)ELOOP;
+            if (++links > VFS_MAXSYMLINKS) return -(s64)ELOOP;
+            if (g_protected_symlinks &&
+                ((curr->d_inode->i_mode & (S_ISVTX | S_IWOTH)) == (S_ISVTX | S_IWOTH))) {
+                process_t *proc = sched_current_process();
+                if (proc && proc->euid != 0 &&
+                    !security_check_permission(proc, CAP_DAC_OVERRIDE) &&
+                    !security_check_permission(proc, CAP_FOWNER) &&
+                    proc->euid != next->d_inode->i_uid &&
+                    curr->d_inode->i_uid != next->d_inode->i_uid)
+                    return -(s64)EACCES;
+            }
+            if (!next->d_inode->i_op || !next->d_inode->i_op->readlink)
+                return -(s64)EINVAL;
+            s64 got = next->d_inode->i_op->readlink(next, target, sizeof(target) - 1);
+            if (got < 0) return got;
+            if (!got) return -(s64)ENOENT;
+            if ((u64)got >= sizeof(target) - 1) return -(s64)ENAMETOOLONG;
+            target[got] = 0;
+            if (target[0] == '/') {
+                if (beneath) return -(s64)EXDEV;
+                curr = root;
+            }
+            int total = snprintf(rewrite, sizeof(rewrite), "%s%s%s", target,
+                                 (*p || slash) ? "/" : "", p);
+            if (total < 0 || (size_t)total >= sizeof(rewrite)) return -(s64)ENAMETOOLONG;
+            memcpy(pending, rewrite, (size_t)total + 1);
+            p = pending;
+            continue;
+        }
+        if ((*p || slash) && !S_ISDIR(next->d_inode->i_mode)) return -(s64)ENOTDIR;
+        curr = next;
+    }
+}
+
+file_t *vfs_openat_resolved(file_t *dir, const char *cwd, const char *rootpath,
+                          const char *path, u32 flags, u32 mode, u64 resolve,
+                          s64 *out_errno)
+{
+    vfs_namespace_lock();
+    dentry_t *root = NULL, *start = NULL, *found = NULL;
+    s64 err = vfs_path_lookup(rootpath, &root);
+    if (!err && (!root || !root->d_inode || !S_ISDIR(root->d_inode->i_mode)))
+        err = -(s64)ENOTDIR;
+    if (!err && dir) {
+        start = dir->f_dentry;
+        if (!start || !start->d_inode) err = -(s64)ENOENT;
+        else if (!S_ISDIR(start->d_inode->i_mode)) err = -(s64)ENOTDIR;
+    } else if (!err && path[0] == '/' && !(resolve & VFS_RESOLVE_IN_ROOT)) {
+        start = root;
+    } else if (!err) {
+        err = vfs_path_lookup(cwd, &start);
+    }
+    if (!err && (resolve & VFS_RESOLVE_IN_ROOT)) root = start;
+    if (!err) err = vfs_walk_at(start, root, path, flags, resolve, &found);
+    file_t *file = NULL;
+    if (!err || (err == -(s64)ENOENT && found))
+        file = vfs_finish_open(found, err, flags, mode, out_errno);
+    else if (out_errno) *out_errno = err;
+    if (start && start != root && start != found && !dir && !start->d_inode) kfree(start);
+    if (root && root != found && !root->d_inode) kfree(root);
+    vfs_namespace_unlock();
+    return file;
 }
 
 file_t *vfs_open(const char *path, u32 flags, u32 mode)
@@ -907,7 +1098,7 @@ static inline bool is_valid_vfs_fop(const file_operations_t *fop)
 }
 
 
-s64 vfs_close(file_t *file)
+static s64 vfs_close_locked(file_t *file)
 {
     if (!is_valid_vfs_file(file)) return -(s64)EBADF;
 
@@ -920,9 +1111,22 @@ s64 vfs_close(file_t *file)
     if (__atomic_sub_fetch(&file->f_count, 1, __ATOMIC_SEQ_CST) != 0) {
         return 0; /* Still referenced by another handle, or already zero */
     }
+
+    epoll_file_closed(file);
+
+    bool evict_ext2 = false;
+    if (file->f_inode_ref && file->f_inode) {
+        file->f_inode->i_open_count--;
+        evict_ext2 = file->f_inode->i_sb && file->f_inode->i_sb->s_magic == 0xEF53 &&
+                     file->f_inode->i_open_count == 0 && file->f_inode->i_nlink == 0;
+    }
     
     if (is_valid_vfs_fop(file->f_op) && file->f_op->release) {
         file->f_op->release(file->f_inode, file);
+    }
+    if (evict_ext2) {
+        extern void ext2_evict_unlinked(inode_t *inode);
+        ext2_evict_unlinked(file->f_inode);
     }
     kfree(file);
     return 0;
@@ -1014,7 +1218,10 @@ static void vfs_fill_stat(inode_t *i, struct stat *statbuf)
     statbuf->st_mtime = i->i_mtime;
     statbuf->st_ctime = i->i_ctime;
 
-    statbuf->st_nlink = i->i_nlink ? i->i_nlink : (S_ISDIR(i->i_mode) ? 2 : 1);
+    bool known_links = i->i_sb &&
+        (i->i_sb->s_magic == 0xEF53 || i->i_sb->s_magic == 0x01021994);
+    statbuf->st_nlink = (known_links || i->i_nlink) ? i->i_nlink :
+                       (S_ISDIR(i->i_mode) ? 2 : 1);
     statbuf->st_blksize = (i->i_sb && i->i_sb->s_blocksize) ? (s64)i->i_sb->s_blocksize : 4096;
 }
 
@@ -1061,7 +1268,7 @@ s64 vfs_ioctl(file_t *file, u32 cmd, u64 arg)
     return -(s64)EINVAL;
 }
 
-s64 vfs_mkdir(const char *path, u32 mode)
+static s64 vfs_mkdir_locked(const char *path, u32 mode)
 {
     dentry_t *dentry = NULL;
     s64 err = vfs_path_lookup_nofollow(path, &dentry);
@@ -1098,7 +1305,7 @@ s64 vfs_mkdir(const char *path, u32 mode)
  * that still has no ->mknod falls back to ->create for the two types that
  * are indistinguishable from a regular file on disk.
  */
-s64 vfs_mknod(const char *path, u32 mode, u64 rdev)
+static s64 vfs_mknod_locked(const char *path, u32 mode, u64 rdev)
 {
     u32 fmt = mode & S_IFMT;
     if (fmt == 0) fmt = S_IFREG;
@@ -1160,7 +1367,7 @@ static bool vfs_check_sticky(inode_t *dir, inode_t *victim)
     return false;
 }
 
-s64 vfs_unlink(const char *path)
+static s64 vfs_unlink_locked(const char *path)
 {
     dentry_t *dentry = NULL;
     /* nofollow: unlink(2) removes the name it was given. Following the final
@@ -1193,7 +1400,7 @@ s64 vfs_unlink(const char *path)
     return err;
 }
 
-s64 vfs_rmdir(const char *path)
+static s64 vfs_rmdir_locked(const char *path)
 {
     dentry_t *dentry = NULL;
     /* nofollow, for the same reason as vfs_unlink(); a trailing symlink is
@@ -1233,7 +1440,7 @@ s64 vfs_rmdir(const char *path)
     return err;
 }
 
-s64 vfs_rename_flags(const char *oldpath, const char *newpath, unsigned int flags)
+static s64 vfs_rename_flags_locked(const char *oldpath, const char *newpath, unsigned int flags)
 {
     if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
         return -(s64)EINVAL;
@@ -1241,38 +1448,105 @@ s64 vfs_rename_flags(const char *oldpath, const char *newpath, unsigned int flag
         return -(s64)EINVAL;
     if ((flags & RENAME_WHITEOUT) && (flags & RENAME_EXCHANGE))
         return -(s64)EINVAL;
-    if (flags & (RENAME_EXCHANGE | RENAME_WHITEOUT))
+    if (flags & RENAME_WHITEOUT)
         return -(s64)EINVAL;
 
+    size_t old_len = strlen(oldpath);
+    size_t new_len = strlen(newpath);
+    if (!old_len || !new_len) return -(s64)ENOENT;
+    bool old_has_slash = (oldpath[old_len - 1] == '/');
+    bool new_has_slash = (newpath[new_len - 1] == '/');
+
     dentry_t *old_dentry = NULL, *new_dentry = NULL;
-    /* POSIX: rename() does not follow symbolic links on either oldpath or
-     * newpath. If oldpath is a symlink, the link itself is moved; if newpath
-     * is a symlink, it is replaced rather than followed. */
     s64 err = vfs_path_lookup_nofollow(oldpath, &old_dentry);
-    if (err < 0 || !old_dentry || !old_dentry->d_inode) {
+    if (err < 0) {
+        if (old_dentry && !old_dentry->d_inode) kfree(old_dentry);
+        return err;
+    }
+    if (!old_dentry || !old_dentry->d_inode) {
         if (old_dentry && !old_dentry->d_inode) kfree(old_dentry);
         return -(s64)ENOENT;
     }
-    err = vfs_path_lookup_nofollow(newpath, &new_dentry);
-    if (err < 0 && err != -(s64)ENOENT) {
-        if (new_dentry && !new_dentry->d_inode) kfree(new_dentry);
-        return err;
+    if (old_has_slash && !S_ISDIR(old_dentry->d_inode->i_mode)) {
+        return -(s64)ENOTDIR;
     }
-    if (!new_dentry) return -(s64)ENOENT;
 
-    /* Linux renameat2: RENAME_NOREPLACE returns -EEXIST if target exists */
+    err = vfs_path_lookup_nofollow(newpath, &new_dentry);
+    if (flags & RENAME_EXCHANGE) {
+        if (err < 0) {
+            if (new_dentry && !new_dentry->d_inode) kfree(new_dentry);
+            return err;
+        }
+        if (!new_dentry || !new_dentry->d_inode) {
+            if (new_dentry && !new_dentry->d_inode) kfree(new_dentry);
+            return -(s64)ENOENT;
+        }
+        if (new_has_slash && !S_ISDIR(new_dentry->d_inode->i_mode)) {
+            return -(s64)ENOTDIR;
+        }
+    } else {
+        if (err < 0 && err != -(s64)ENOENT) {
+            if (new_dentry && !new_dentry->d_inode) kfree(new_dentry);
+            return err;
+        }
+        if (!new_dentry) return -(s64)ENOENT;
+        if (new_has_slash) {
+            if (!S_ISDIR(old_dentry->d_inode->i_mode)) {
+                if (!new_dentry->d_inode) kfree(new_dentry);
+                return -(s64)ENOTDIR;
+            }
+            if (new_dentry->d_inode && !S_ISDIR(new_dentry->d_inode->i_mode)) {
+                return -(s64)ENOTDIR;
+            }
+        }
+    }
+
+    /* POSIX / Linux: . and .. cannot be renamed or replaced */
+    if (strcmp(old_dentry->d_name, ".") == 0 || strcmp(old_dentry->d_name, "..") == 0 ||
+        strcmp(new_dentry->d_name, ".") == 0 || strcmp(new_dentry->d_name, "..") == 0) {
+        if (new_dentry && !new_dentry->d_inode) kfree(new_dentry);
+        return -(s64)EBUSY;
+    }
+
+    /* Same file check */
+    if (old_dentry == new_dentry || (old_dentry->d_inode && new_dentry->d_inode &&
+        old_dentry->d_inode == new_dentry->d_inode)) {
+        if (flags & RENAME_NOREPLACE) return -(s64)EEXIST;
+        return 0;
+    }
+
+    if (new_dentry->d_parent && new_dentry->d_parent->d_inode &&
+        new_dentry->d_parent->d_inode->i_sb != old_dentry->d_inode->i_sb) {
+        if (!new_dentry->d_inode) kfree(new_dentry);
+        return -(s64)EXDEV;
+    }
+
+    if (S_ISDIR(old_dentry->d_inode->i_mode) &&
+        vfs_descends_from(new_dentry->d_parent, old_dentry)) {
+        if (!new_dentry->d_inode) kfree(new_dentry);
+        return -(s64)EINVAL;
+    }
+
+    if ((flags & RENAME_EXCHANGE) && new_dentry->d_inode &&
+        S_ISDIR(new_dentry->d_inode->i_mode) &&
+        vfs_descends_from(old_dentry->d_parent, new_dentry)) {
+        return -(s64)EINVAL;
+    }
+
     if ((flags & RENAME_NOREPLACE) && new_dentry->d_inode) {
         return -(s64)EEXIST;
     }
 
     if (inode_is_rdonly(old_dentry->d_inode) ||
-        (new_dentry->d_parent && inode_is_rdonly(new_dentry->d_parent->d_inode))) {
+        (new_dentry->d_parent && inode_is_rdonly(new_dentry->d_parent->d_inode)) ||
+        (old_dentry->d_parent && inode_is_rdonly(old_dentry->d_parent->d_inode))) {
         if (!new_dentry->d_inode) kfree(new_dentry);
         return -(s64)EROFS;
     }
 
     if (!old_dentry->d_parent || !old_dentry->d_parent->d_inode ||
-        !old_dentry->d_parent->d_inode->i_op || !old_dentry->d_parent->d_inode->i_op->rename ||
+        !old_dentry->d_parent->d_inode->i_op ||
+        (!old_dentry->d_parent->d_inode->i_op->rename && !old_dentry->d_parent->d_inode->i_op->rename2) ||
         !new_dentry->d_parent || !new_dentry->d_parent->d_inode) {
         if (!new_dentry->d_inode) kfree(new_dentry);
         return -(s64)EPERM;
@@ -1286,16 +1560,75 @@ s64 vfs_rename_flags(const char *oldpath, const char *newpath, unsigned int flag
     if (new_dentry->d_inode && !vfs_check_sticky(new_dentry->d_parent->d_inode, new_dentry->d_inode)) {
         return -(s64)EPERM;
     }
-    
-    err = old_dentry->d_parent->d_inode->i_op->rename(
-        old_dentry->d_parent->d_inode, old_dentry,
-        new_dentry->d_parent->d_inode, new_dentry
-    );
-    if (err == 0) {
-        dcache_remove(old_dentry);
-        if (new_dentry->d_inode) {
+
+    if (!(flags & RENAME_EXCHANGE)) {
+        if (S_ISDIR(old_dentry->d_inode->i_mode)) {
+            if (new_dentry->d_inode && !S_ISDIR(new_dentry->d_inode->i_mode)) {
+                return -(s64)ENOTDIR;
+            }
+        } else {
+            if (new_dentry->d_inode && S_ISDIR(new_dentry->d_inode->i_mode)) {
+                return -(s64)EISDIR;
+            }
+        }
+    }
+
+    if (flags & RENAME_EXCHANGE) {
+        if (!old_dentry->d_parent->d_inode->i_op->rename2) return -(s64)EINVAL;
+        err = old_dentry->d_parent->d_inode->i_op->rename2(
+            old_dentry->d_parent->d_inode, old_dentry,
+            new_dentry->d_parent->d_inode, new_dentry, flags
+        );
+        if (err == 0) {
+            dcache_remove(old_dentry);
+            dcache_remove(new_dentry);
+
+            dentry_t *old_parent = old_dentry->d_parent;
+            dentry_t *new_parent = new_dentry->d_parent;
+            char old_name[VFS_NAME_MAX];
+            char new_name[VFS_NAME_MAX];
+            memcpy(old_name, old_dentry->d_name, sizeof(old_name));
+            memcpy(new_name, new_dentry->d_name, sizeof(new_name));
+
+            old_dentry->d_parent = new_parent;
+            memcpy(old_dentry->d_name, new_name, sizeof(old_dentry->d_name));
+
+            new_dentry->d_parent = old_parent;
+            memcpy(new_dentry->d_name, old_name, sizeof(new_dentry->d_name));
+
+            dcache_add(old_dentry);
             dcache_add(new_dentry);
         }
+        return err;
+    }
+
+    inode_t *moved_inode = old_dentry->d_inode;
+    bool destination_cached = new_dentry->d_inode != NULL;
+    dentry_t *new_parent = new_dentry->d_parent;
+    char new_name[VFS_NAME_MAX];
+    memcpy(new_name, new_dentry->d_name, sizeof(new_name));
+
+    if (old_dentry->d_parent->d_inode->i_op->rename2) {
+        err = old_dentry->d_parent->d_inode->i_op->rename2(
+            old_dentry->d_parent->d_inode, old_dentry,
+            new_dentry->d_parent->d_inode, new_dentry, flags
+        );
+    } else {
+        err = old_dentry->d_parent->d_inode->i_op->rename(
+            old_dentry->d_parent->d_inode, old_dentry,
+            new_dentry->d_parent->d_inode, new_dentry
+        );
+    }
+
+    if (err == 0) {
+        dcache_remove(old_dentry);
+        if (destination_cached) dcache_remove(new_dentry);
+        old_dentry->d_parent = new_parent;
+        memcpy(old_dentry->d_name, new_name, sizeof(old_dentry->d_name));
+        old_dentry->d_inode = moved_inode;
+        dcache_add(old_dentry);
+        new_dentry->d_inode = NULL;
+        if (!destination_cached) kfree(new_dentry);
     } else if (!new_dentry->d_inode) {
         kfree(new_dentry);
     }
@@ -1328,7 +1661,7 @@ s64 vfs_truncate(file_t *file, u64 length)
     return 0;
 }
 
-s64 vfs_symlink(const char *target, const char *linkpath)
+static s64 vfs_symlink_locked(const char *target, const char *linkpath)
 {
     dentry_t *dentry = NULL;
     s64 err = vfs_path_lookup_nofollow(linkpath, &dentry);
@@ -1358,7 +1691,7 @@ s64 vfs_symlink(const char *target, const char *linkpath)
 /* vfs_link() — hard-link @newpath to the inode @oldpath already names.
  * link(2) does not follow a trailing symlink on the *new* path (that name must
  * not exist at all) but does resolve the old one, matching Linux's default. */
-s64 vfs_link(const char *oldpath, const char *newpath)
+static s64 vfs_link_locked(const char *oldpath, const char *newpath)
 {
     dentry_t *old_dentry = NULL;
     s64 err = vfs_path_lookup(oldpath, &old_dentry);
@@ -1690,4 +2023,84 @@ s64 vfs_flock(file_t *file, int operation)
     return 0;
 }
 
+/* Namespace mutation entry points share the traversal guard. */
+s64 vfs_mkdir(const char *path, u32 mode)
+{
+    vfs_namespace_lock();
+    s64 err = vfs_mkdir_locked(path, mode);
+    vfs_namespace_unlock();
+    return err;
+}
 
+s64 vfs_mknod(const char *path, u32 mode, u64 rdev)
+{
+    vfs_namespace_lock();
+    s64 err = vfs_mknod_locked(path, mode, rdev);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 vfs_unlink(const char *path)
+{
+    vfs_namespace_lock();
+    s64 err = vfs_unlink_locked(path);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 vfs_rmdir(const char *path)
+{
+    vfs_namespace_lock();
+    s64 err = vfs_rmdir_locked(path);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 vfs_rename_flags(const char *oldpath, const char *newpath, unsigned int flags)
+{
+    vfs_namespace_lock();
+    s64 err = vfs_rename_flags_locked(oldpath, newpath, flags);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 vfs_symlink(const char *target, const char *linkpath)
+{
+    vfs_namespace_lock();
+    s64 err = vfs_symlink_locked(target, linkpath);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 vfs_link(const char *oldpath, const char *newpath)
+{
+    vfs_namespace_lock();
+    s64 err = vfs_link_locked(oldpath, newpath);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 vfs_close(file_t *file)
+{
+    vfs_namespace_lock();
+    s64 err = vfs_close_locked(file);
+    vfs_namespace_unlock();
+    return err;
+}
+
+s64 vfs_put(file_t *file)
+{
+    if (!is_valid_vfs_file(file)) return -(s64)EBADF;
+    /* The caller owns a reference, so reading f_count is safe. A successful
+     * decrement may let another owner perform the final close immediately:
+     * never access file again after it succeeds. At one reference, leave the
+     * decrement to the namespace-locked finalizer, including its inode and
+     * driver teardown. Lookup still acquires its reference under fd_lock. */
+    u32 refs = __atomic_load_n(&file->f_count, __ATOMIC_SEQ_CST);
+    while (refs > 1) {
+        if (__atomic_compare_exchange_n(&file->f_count, &refs, refs - 1, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return 0;
+    }
+    return vfs_close(file);
+}

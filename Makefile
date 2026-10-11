@@ -183,6 +183,7 @@ ARCH_C_SRCS := \
     arch/x86_64/cpu/pic.c \
     arch/x86_64/cpu/lapic.c \
     arch/x86_64/cpu/smp.c \
+    arch/x86_64/cpu/smp_rpc.c \
     arch/x86_64/cpu/topology.c \
     arch/x86_64/cpu/cpufreq.c \
     arch/x86_64/mm/vmm.c \

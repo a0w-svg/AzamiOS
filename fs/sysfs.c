@@ -20,6 +20,7 @@
 #include "../drivers/base/base.h"
 #include "../userland/libc/include/sys/dirent.h"
 #include "../kernel/perf/ktrace.h"
+#include "../arch/x86_64/cpu/pmu.h"
 
 #define SYSFS_SUPER_MAGIC 0x62656572
 
@@ -89,6 +90,15 @@ typedef enum {
     SYSFS_TYPE_DM_CLASS_DIR,
     SYSFS_TYPE_DM_DEVICE_DIR,
     SYSFS_TYPE_DM_DEVICE_ATTR,
+
+    /* Linux perf discovery: real software source and detected CPU PMU. */
+    SYSFS_TYPE_EVENT_SOURCE_BUS,
+    SYSFS_TYPE_EVENT_SOURCE_DEVICES,
+    SYSFS_TYPE_PMU_DIR,
+    SYSFS_TYPE_PMU_TYPE,
+    SYSFS_TYPE_PMU_CPUS,
+    SYSFS_TYPE_PMU_FORMAT_DIR,
+    SYSFS_TYPE_PMU_FORMAT_ATTR,
 
     /* Power & Kernel */
     SYSFS_TYPE_POWER_ATTR_STATE,
@@ -316,14 +326,60 @@ static const char *sysfs_dm_device_attr(dm_device_t *dev, u32 idx)
     return NULL;
 }
 
-/* Names the idx-th child of a driver-model directory (excluding . and ..). */
+/* Names the idx-th child of a live directory (excluding . and ..). Dynamic
+ * registries must be indexed directly: a fixed temporary array would impose
+ * a directory-size limit that pagination cannot overcome. */
 static const char *sysfs_dm_child(sysfs_priv_t *priv, u64 idx, u8 *dtype)
 {
     *dtype = DT_DIR;
 
+    /* Registry indices are u32. A large directory seek must reach EOF rather
+     * than wrap its index and repeat an earlier child. */
+    if (idx > (u64)~0U) return NULL;
+
     switch (priv->type) {
+    case SYSFS_TYPE_CLASS_DIR: {
+        static const char *const classes[] = { "net", "block", "sound" };
+        if (idx < ARRAY_SIZE(classes)) return classes[idx];
+        idx -= ARRAY_SIZE(classes);
+        for (u32 i = 0; ; i++) {
+            dm_class_t *cls = dm_class_nth(i);
+            if (!cls) return NULL;
+            /* Lookup gives these names to the stable legacy projections. */
+            if (!strcmp(cls->name, "net") || !strcmp(cls->name, "block") ||
+                !strcmp(cls->name, "sound")) continue;
+            if (idx-- == 0) return cls->name;
+        }
+    }
+    case SYSFS_TYPE_CLASS_BLOCK_DIR: {
+        block_dev_t *bd = block_dev_first();
+        while (bd && idx) { bd = block_dev_next(bd); idx--; }
+        return bd ? bd->name : NULL;
+    }
+    case SYSFS_TYPE_DEVICES_DIR:
+        if (idx == 0) return "system";
+        idx--;
+        for (u32 i = 0; ; i++) {
+            dm_bus_t *bus = dm_bus_nth(i);
+            if (!bus) return NULL;
+            if (!strcmp(bus->name, "system")) continue;
+            if (idx-- == 0) return bus->name;
+        }
+    case SYSFS_TYPE_CPU_DIR: {
+        static const char *const attrs[] = { "online", "present", "possible" };
+        if (idx < ARRAY_SIZE(attrs)) {
+            *dtype = DT_REG;
+            return attrs[idx];
+        }
+        idx -= ARRAY_SIZE(attrs);
+        u32 ncpu = smp_cpu_count();
+        if (!ncpu) ncpu = 1;
+        if (ncpu > SMP_MAX_CPUS) ncpu = SMP_MAX_CPUS;
+        return idx < ncpu ? sysfs_cpu_dir_name((u32)idx) : NULL;
+    }
     case SYSFS_TYPE_BUS_DIR: {
-        dm_bus_t *bus = dm_bus_nth((u32)idx);
+        if (idx == 0) return "event_source";
+        dm_bus_t *bus = dm_bus_nth((u32)(idx - 1));
         return bus ? bus->name : NULL;
     }
     case SYSFS_TYPE_DM_BUS_DIR:
@@ -362,6 +418,10 @@ static const char *sysfs_dm_child(sysfs_priv_t *priv, u64 idx, u8 *dtype)
 static bool sysfs_is_dm_dir(sysfs_node_type_t type)
 {
     switch (type) {
+    case SYSFS_TYPE_CLASS_DIR:
+    case SYSFS_TYPE_CLASS_BLOCK_DIR:
+    case SYSFS_TYPE_DEVICES_DIR:
+    case SYSFS_TYPE_CPU_DIR:
     case SYSFS_TYPE_BUS_DIR:
     case SYSFS_TYPE_DM_BUS_DIR:
     case SYSFS_TYPE_DM_BUS_DEVICES:
@@ -375,7 +435,7 @@ static bool sysfs_is_dm_dir(sysfs_node_type_t type)
     }
 }
 
-/* Emit dirents for a driver-model directory, walking it live each call. */
+/* Emit bounded pages of dirents, walking the live registry each call. */
 static s64 sysfs_dm_readdir(sysfs_priv_t *priv, void *dirent_buf, size_t len, u64 *offset)
 {
     size_t written = 0;
@@ -419,6 +479,12 @@ static s64 sysfs_dm_readdir(sysfs_priv_t *priv, void *dirent_buf, size_t len, u6
  * Sysfs File Reading
  * -------------------------------------------------------------------------- */
 
+/* Only bits the raw-event validator implements are advertised. */
+static const char *const pmu_formats[] = {"event", "umask", "edge", "inv", "cmask"};
+static const char *const pmu_format_values[] = {
+    "config:0-7\n", "config:8-15\n", "config:18\n", "config:23\n", "config:24-31\n"
+};
+
 static s64 sysfs_file_read(struct file *filp, void *buf, size_t len, u64 *offset)
 {
     if (!filp || !buf || !offset || !filp->f_inode || !filp->f_inode->i_private)
@@ -431,6 +497,16 @@ static s64 sysfs_file_read(struct file *filp, void *buf, size_t len, u64 *offset
     size_t total_len = 0;
 
     switch (priv->type) {
+    case SYSFS_TYPE_PMU_TYPE:
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%u\n", priv->index);
+        break;
+    case SYSFS_TYPE_PMU_CPUS:
+        total_len = sysfs_format_cpulist(tmp, sizeof(tmp), smp_online_mask());
+        break;
+    case SYSFS_TYPE_PMU_FORMAT_ATTR:
+        if (priv->index >= ARRAY_SIZE(pmu_format_values)) return -(s64)EINVAL;
+        total_len = (size_t)scnprintf(tmp, sizeof(tmp), "%s", pmu_format_values[priv->index]);
+        break;
     case SYSFS_TYPE_DM_DEVICE_ATTR: {
         dm_device_t *dev = sysfs_dm_device(priv);
         if (!dev) return 0;
@@ -846,9 +922,40 @@ static struct dentry *sysfs_lookup(struct inode *dir, struct dentry *dentry)
         if (strcmp(name, "state") == 0) {
             dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 600, S_IFREG | 0644, SYSFS_TYPE_POWER_ATTR_STATE, NULL, 0);
         }
+    } else if (priv->type == SYSFS_TYPE_EVENT_SOURCE_BUS) {
+        if (strcmp(name, "devices") == 0)
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 9001, S_IFDIR | 0555,
+                                              SYSFS_TYPE_EVENT_SOURCE_DEVICES, NULL, 0);
+    } else if (priv->type == SYSFS_TYPE_EVENT_SOURCE_DEVICES) {
+        if (strcmp(name, "software") == 0 || (g_pmu.present && strcmp(name, "cpu") == 0)) {
+            u32 type = strcmp(name, "software") == 0 ? 1 : 4;
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 9010 + type, S_IFDIR | 0555,
+                                              SYSFS_TYPE_PMU_DIR, name, type);
+        }
+    } else if (priv->type == SYSFS_TYPE_PMU_DIR) {
+        if (strcmp(name, "type") == 0)
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 9020 + priv->index, S_IFREG | 0444,
+                                              SYSFS_TYPE_PMU_TYPE, NULL, priv->index);
+        else if (priv->index == 4 && strcmp(name, "cpus") == 0)
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 9030, S_IFREG | 0444,
+                                              SYSFS_TYPE_PMU_CPUS, NULL, 0);
+        else if (strcmp(name, "format") == 0)
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 9040 + priv->index, S_IFDIR | 0555,
+                                              SYSFS_TYPE_PMU_FORMAT_DIR, NULL, priv->index);
+    } else if (priv->type == SYSFS_TYPE_PMU_FORMAT_DIR && priv->index == 4) {
+        for (u32 i = 0; i < ARRAY_SIZE(pmu_formats); i++) {
+            if (strcmp(name, pmu_formats[i]) == 0) {
+                dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 9050 + i, S_IFREG | 0444,
+                                                  SYSFS_TYPE_PMU_FORMAT_ATTR, NULL, i);
+                break;
+            }
+        }
     } else if (priv->type == SYSFS_TYPE_BUS_DIR) {
         dm_bus_t *bus = dm_bus_find(name);
-        if (bus) {
+        if (strcmp(name, "event_source") == 0) {
+            dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 9000, S_IFDIR | 0555,
+                                              SYSFS_TYPE_EVENT_SOURCE_BUS, NULL, 0);
+        } else if (bus) {
             dentry->d_inode = sysfs_alloc_inode(dir->i_sb, 800, S_IFDIR | 0555,
                                                 SYSFS_TYPE_DM_BUS_DIR, bus->name, 0);
         }
@@ -959,17 +1066,22 @@ static s64 sysfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u6
     entries[0] = "."; types[0] = DT_DIR;
     entries[1] = ".."; types[1] = DT_DIR;
 
-    if (priv->type == SYSFS_TYPE_ROOT_DIR) {
+    if (priv->type == SYSFS_TYPE_EVENT_SOURCE_BUS) {
+        entries[total_entries] = "devices"; types[total_entries++] = DT_DIR;
+    } else if (priv->type == SYSFS_TYPE_EVENT_SOURCE_DEVICES) {
+        entries[total_entries] = "software"; types[total_entries++] = DT_DIR;
+        if (g_pmu.present) { entries[total_entries] = "cpu"; types[total_entries++] = DT_DIR; }
+    } else if (priv->type == SYSFS_TYPE_PMU_DIR) {
+        entries[total_entries] = "type"; types[total_entries++] = DT_REG;
+        entries[total_entries] = "format"; types[total_entries++] = DT_DIR;
+        if (priv->index == 4) { entries[total_entries] = "cpus"; types[total_entries++] = DT_REG; }
+    } else if (priv->type == SYSFS_TYPE_PMU_FORMAT_DIR && priv->index == 4) {
+        for (u32 i = 0; i < ARRAY_SIZE(pmu_formats); i++) {
+            entries[total_entries] = pmu_formats[i]; types[total_entries++] = DT_REG;
+        }
+    } else if (priv->type == SYSFS_TYPE_ROOT_DIR) {
         const char *r[] = { "class", "devices", "kernel", "power", "bus", "fs", "block" };
         for (int i = 0; i < 7; i++) { entries[total_entries] = r[i]; types[total_entries++] = DT_DIR; }
-    } else if (priv->type == SYSFS_TYPE_CLASS_DIR) {
-        const char *c[] = { "net", "block", "sound" };
-        for (int i = 0; i < 3; i++) { entries[total_entries] = c[i]; types[total_entries++] = DT_DIR; }
-        for (u32 i = 0; total_entries < ARRAY_SIZE(entries); i++) {
-            dm_class_t *cls = dm_class_nth(i);
-            if (!cls) break;
-            entries[total_entries] = cls->name; types[total_entries++] = DT_DIR;
-        }
     } else if (priv->type == SYSFS_TYPE_CLASS_NET_DIR) {
         net_device_t *ndev = net_get_default_device();
         entries[total_entries] = ndev ? ndev->name : "eth0"; types[total_entries++] = DT_DIR;
@@ -981,11 +1093,6 @@ static s64 sysfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u6
     } else if (priv->type == SYSFS_TYPE_NET_STATS_DIR) {
         const char *ns[] = { "rx_bytes", "tx_bytes", "rx_packets", "tx_packets" };
         for (int i = 0; i < 4; i++) { entries[total_entries] = ns[i]; types[total_entries++] = DT_REG; }
-    } else if (priv->type == SYSFS_TYPE_CLASS_BLOCK_DIR) {
-        for (block_dev_t *bd = block_dev_first(); bd && total_entries < ARRAY_SIZE(entries);
-             bd = block_dev_next(bd)) {
-            entries[total_entries] = bd->name; types[total_entries++] = DT_DIR;
-        }
     } else if (priv->type == SYSFS_TYPE_BLOCK_DEV_DIR) {
         const char *ba[] = { "dev", "size", "removable", "stat", "ro" };
         for (int i = 0; i < 5; i++) { entries[total_entries] = ba[i]; types[total_entries++] = DT_REG; }
@@ -1007,32 +1114,8 @@ static s64 sysfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u6
         entries[total_entries] = "card0"; types[total_entries++] = DT_DIR;
     } else if (priv->type == SYSFS_TYPE_SOUND_CARD_DIR) {
         entries[total_entries] = "id"; types[total_entries++] = DT_REG;
-    } else if (priv->type == SYSFS_TYPE_DEVICES_DIR) {
-        /* The topological view: /sys/devices/<bus>/<device>. */
-        entries[total_entries] = "system"; types[total_entries++] = DT_DIR;
-        for (u32 i = 0; total_entries < ARRAY_SIZE(entries); i++) {
-            dm_bus_t *bus = dm_bus_nth(i);
-            if (!bus) break;
-            entries[total_entries] = bus->name; types[total_entries++] = DT_DIR;
-        }
     } else if (priv->type == SYSFS_TYPE_SYSTEM_DIR) {
         entries[total_entries] = "cpu"; types[total_entries++] = DT_DIR;
-    } else if (priv->type == SYSFS_TYPE_CPU_DIR) {
-        entries[total_entries] = "online"; types[total_entries++] = DT_REG;
-        entries[total_entries] = "present"; types[total_entries++] = DT_REG;
-        entries[total_entries] = "possible"; types[total_entries++] = DT_REG;
-        /* One entry per CPU that actually exists. This used to be a fixed
-         * cpu0..cpu3, which listed four CPUs on a single-core boot and hid
-         * every CPU past the fourth on anything larger — and the directories
-         * it named did resolve, because lookup parses any cpuN. Anything
-         * enumerating CPUs through sysfs (nproc, lscpu, hwloc, glibc's
-         * get_nprocs) reads this list. */
-        u32 ncpu = smp_cpu_count();
-        if (ncpu == 0) ncpu = 1;
-        for (u32 i = 0; i < ncpu && total_entries < ARRAY_SIZE(entries) - 1; i++) {
-            entries[total_entries] = sysfs_cpu_dir_name(i);
-            types[total_entries++] = DT_DIR;
-        }
     } else if (priv->type == SYSFS_TYPE_CPU_CORE_DIR) {
         entries[total_entries] = "online"; types[total_entries++] = DT_REG;
         entries[total_entries] = "topology"; types[total_entries++] = DT_DIR;

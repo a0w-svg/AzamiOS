@@ -39,7 +39,7 @@ s64 sys_kill_impl(pt_regs_t *r)
             if (h != SIG_DFL && h != SIG_IGN && sig != SIGKILL && sig != SIGSTOP) {
                 /* Custom handler installed: queue it. signal_deliver_pending()
                  * runs it on the way back out of this syscall. */
-                __atomic_or_fetch(&curr->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+                __atomic_or_fetch(&curr->sig_pending, (SIG_MASK(sig)), __ATOMIC_SEQ_CST);
                 return 0;
             }
             if (h == SIG_IGN) return 0;
@@ -51,8 +51,8 @@ s64 sys_kill_impl(pt_regs_t *r)
              * default action is taken when the mask is lifted, or the signal
              * is consumed by sigwait()/sigtimedwait(). SIGKILL and SIGSTOP
              * cannot be blocked and are excluded above. */
-            if (curr->sig_blocked & (1ULL << sig)) {
-                __atomic_or_fetch(&curr->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+            if (curr->sig_blocked & (SIG_MASK(sig))) {
+                __atomic_or_fetch(&curr->sig_pending, (SIG_MASK(sig)), __ATOMIC_SEQ_CST);
                 return 0;
             }
             curr->term_signal = sig;
@@ -94,12 +94,12 @@ s64 sys_kill_impl(pt_regs_t *r)
         ret = 0;
         sighandler_t h = curr->sigactions[sig].sa_handler;
         if (h != SIG_DFL && h != SIG_IGN && sig != SIGKILL && sig != SIGSTOP) {
-            __atomic_or_fetch(&curr->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+            __atomic_or_fetch(&curr->sig_pending, (SIG_MASK(sig)), __ATOMIC_SEQ_CST);
         } else if (h != SIG_IGN &&
                    !(sig == 17 || sig == 18 || sig == 23 || sig == 28)) {
-            if (curr->sig_blocked & (1ULL << sig)) {
+            if (curr->sig_blocked & (SIG_MASK(sig))) {
                 /* Blocked: queue it rather than acting on it (see above). */
-                __atomic_or_fetch(&curr->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+                __atomic_or_fetch(&curr->sig_pending, (SIG_MASK(sig)), __ATOMIC_SEQ_CST);
             } else {
                 curr->term_signal = sig;
                 curr->exit_code   = 128 + sig;
@@ -167,12 +167,15 @@ s64 sys_rt_sigprocmask_impl(pt_regs_t *r)
 
     if (sigsetsize != sizeof(sigset_t)) return -(s64)EINVAL;
 
+    thread_t *thread = sched_current_thread();
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
 
+    sigset_t cur_blocked = thread ? thread->sig_blocked : proc->sig_blocked;
+
     if (user_oldset) {
         if ((uintptr_t)user_oldset >= TASK_SIZE_MAX) return -(s64)EFAULT;
-        if (copy_to_user(user_oldset, &proc->sig_blocked, sizeof(sigset_t)) != 0)
+        if (copy_to_user(user_oldset, &cur_blocked, sizeof(sigset_t)) != 0)
             return -(s64)EFAULT;
     }
 
@@ -183,21 +186,27 @@ s64 sys_rt_sigprocmask_impl(pt_regs_t *r)
             return -(s64)EFAULT;
 
         /* SIGKILL and SIGSTOP cannot be blocked */
-        kset &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
+        kset &= ~((SIG_MASK(SIGKILL)) | (SIG_MASK(SIGSTOP)));
 
+        sigset_t new_blocked = cur_blocked;
         switch (how) {
         case SIG_BLOCK:
-            proc->sig_blocked |= kset;
+            new_blocked |= kset;
             break;
         case SIG_UNBLOCK:
-            proc->sig_blocked &= ~kset;
+            new_blocked &= ~kset;
             break;
         case SIG_SETMASK:
-            proc->sig_blocked = kset;
+            new_blocked = kset;
             break;
         default:
             return -(s64)EINVAL;
         }
+
+        if (thread) {
+            __atomic_store_n(&thread->sig_blocked, new_blocked, __ATOMIC_SEQ_CST);
+        }
+        __atomic_store_n(&proc->sig_blocked, new_blocked, __ATOMIC_SEQ_CST);
     }
 
     return 0;
@@ -208,8 +217,9 @@ s64 sys_tkill_impl(pt_regs_t *r)
     s32 tid = (s32)r->rdi;
     int sig = (int)r->rsi;
     if (tid <= 0) return -(s64)EINVAL;
+    if (sig < 0 || sig >= _NSIG) return -(s64)EINVAL;
     process_t *curr = sched_current_process();
-    return sched_kill_process_permitted(curr, (u32)tid, sig);
+    return sched_kill_thread_permitted(curr, 0, tid, sig);
 }
 
 s64 sys_tgkill_impl(pt_regs_t *r)
@@ -217,10 +227,10 @@ s64 sys_tgkill_impl(pt_regs_t *r)
     s32 tgid = (s32)r->rdi;
     s32 tid = (s32)r->rsi;
     int sig = (int)r->rdx;
-    if (tid <= 0) return -(s64)EINVAL;
+    if (tgid <= 0 || tid <= 0) return -(s64)EINVAL;
+    if (sig < 0 || sig >= _NSIG) return -(s64)EINVAL;
     process_t *curr = sched_current_process();
-    if (tgid > 0) return sched_kill_process_permitted(curr, (u32)tgid, sig);
-    return sched_kill_process_permitted(curr, (u32)tid, sig);
+    return sched_kill_thread_permitted(curr, tgid, tid, sig);
 }
 
 /* rt_sigpending(set, sigsetsize) — signals raised but still blocked. */
@@ -232,7 +242,10 @@ s64 sys_rt_sigpending_impl(pt_regs_t *r)
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
     if (!uset || (uintptr_t)uset >= TASK_SIZE_MAX) return -(s64)EFAULT;
-    sigset_t pend = proc->sig_pending & proc->sig_blocked;
+    thread_t *curr = sched_current_thread();
+    sigset_t thread_p = curr ? curr->sig_pending : 0;
+    sigset_t blocked = curr ? curr->sig_blocked : proc->sig_blocked;
+    sigset_t pend = (proc->sig_pending | thread_p) & blocked;
     if (copy_to_user(uset, &pend, sizeof pend) != 0) return -(s64)EFAULT;
     return 0;
 }
@@ -242,6 +255,7 @@ s64 sys_sigaltstack_impl(pt_regs_t *r)
 {
     process_t *p = sched_current_process();
     if (!p) return -(s64)EPERM;
+    thread_t *t = sched_current_thread();
 
     const void *unew = (const void *)r->rdi;
     void *uold       = (void *)r->rsi;
@@ -254,14 +268,18 @@ s64 sys_sigaltstack_impl(pt_regs_t *r)
 
     user_stack_t old_st;
     memset(&old_st, 0, sizeof(old_st));
-    old_st.ss_sp    = p->sas_ss_sp;
-    old_st.ss_size  = p->sas_ss_size;
-    old_st.ss_flags = (p->sas_ss_flags & 2 /* SS_DISABLE */) ? 2 : 0;
+    void *cur_sp = t ? t->sas_ss_sp : p->sas_ss_sp;
+    size_t cur_sz = t ? t->sas_ss_size : p->sas_ss_size;
+    int cur_flags = t ? t->sas_ss_flags : p->sas_ss_flags;
+
+    old_st.ss_sp    = cur_sp;
+    old_st.ss_size  = cur_sz;
+    old_st.ss_flags = (cur_flags & 2 /* SS_DISABLE */) ? 2 : 0;
 
     /* Check if currently executing on the registered alternate stack */
-    if (p->sas_ss_sp && !(p->sas_ss_flags & 2 /* SS_DISABLE */) &&
-        r->rsp >= (u64)(uintptr_t)p->sas_ss_sp &&
-        r->rsp < (u64)(uintptr_t)p->sas_ss_sp + p->sas_ss_size) {
+    if (cur_sp && !(cur_flags & 2 /* SS_DISABLE */) &&
+        r->rsp >= (u64)(uintptr_t)cur_sp &&
+        r->rsp < (u64)(uintptr_t)cur_sp + cur_sz) {
         old_st.ss_flags |= 1 /* SS_ONSTACK */;
     }
 
@@ -278,7 +296,15 @@ s64 sys_sigaltstack_impl(pt_regs_t *r)
         user_stack_t new_st;
         if (copy_from_user(&new_st, unew, sizeof(new_st)) != 0) return -(s64)EFAULT;
 
+        /* Validate flags: only SS_DISABLE (2), SS_ONSTACK (1), SS_AUTODISARM (1<<31) or 0 are allowed */
+        if (new_st.ss_flags & ~(1 | 2 | (int)0x80000000)) return -(s64)EINVAL;
+
         if (new_st.ss_flags & 2 /* SS_DISABLE */) {
+            if (t) {
+                t->sas_ss_flags = 2;
+                t->sas_ss_sp    = NULL;
+                t->sas_ss_size  = 0;
+            }
             p->sas_ss_flags = 2;
             p->sas_ss_sp    = NULL;
             p->sas_ss_size  = 0;
@@ -286,6 +312,11 @@ s64 sys_sigaltstack_impl(pt_regs_t *r)
             /* Minimum size validation: MINSIGSTKSZ is 2048 */
             if (new_st.ss_size < 2048) return -(s64)ENOMEM;
             if ((uintptr_t)new_st.ss_sp >= TASK_SIZE_MAX) return -(s64)EFAULT;
+            if (t) {
+                t->sas_ss_sp    = new_st.ss_sp;
+                t->sas_ss_size  = new_st.ss_size;
+                t->sas_ss_flags = new_st.ss_flags & ~1;
+            }
             p->sas_ss_sp    = new_st.ss_sp;
             p->sas_ss_size  = new_st.ss_size;
             p->sas_ss_flags = new_st.ss_flags & ~1;
@@ -319,13 +350,14 @@ s64 sys_rt_sigtimedwait_impl(pt_regs_t *r)
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
+    thread_t *curr = sched_current_thread();
     if (sigsetsize != sizeof(sigset_t)) return -(s64)EINVAL;
     if (!uset || (uintptr_t)uset >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     sigset_t set;
     if (copy_from_user(&set, uset, sizeof(set)) != 0) return -(s64)EFAULT;
     /* SIGKILL and SIGSTOP can never be waited for. */
-    set &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
+    set &= ~((SIG_MASK(SIGKILL)) | (SIG_MASK(SIGSTOP)));
 
     bool have_timeout = false;
     u64  deadline = 0;
@@ -339,15 +371,21 @@ s64 sys_rt_sigtimedwait_impl(pt_regs_t *r)
     }
 
     for (;;) {
-        sigset_t ready = proc->sig_pending & set;
+        sigset_t thread_p = curr ? curr->sig_pending : 0;
+        sigset_t proc_p = proc->sig_pending;
+        sigset_t ready = (thread_p | proc_p) & set;
         if (ready) {
             u32 sig = 0;
             for (u32 i = 1; i < 64; i++) {
-                if (ready & (1ULL << i)) { sig = i; break; }
+                if (ready & (SIG_MASK(i))) { sig = i; break; }
             }
             /* Accepting the signal consumes it: it must not also be delivered
              * to a handler on the way out. */
-            __atomic_and_fetch(&proc->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
+            if (curr && (curr->sig_pending & (SIG_MASK(sig)))) {
+                __atomic_and_fetch(&curr->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+            } else {
+                __atomic_and_fetch(&proc->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+            }
 
             if (uinfo && (uintptr_t)uinfo < TASK_SIZE_MAX) {
                 struct k_siginfo info;
@@ -366,7 +404,9 @@ s64 sys_rt_sigtimedwait_impl(pt_regs_t *r)
         sched_sleep(1);
 
         /* A signal outside @set that is deliverable ends the wait with EINTR. */
-        if (proc->sig_pending & ~proc->sig_blocked & ~set) return -(s64)EINTR;
+        sigset_t blk = curr ? curr->sig_blocked : proc->sig_blocked;
+        sigset_t all_pend = proc->sig_pending | (curr ? curr->sig_pending : 0);
+        if (all_pend & ~blk & ~set) return -(s64)EINTR;
     }
 }
 
@@ -377,25 +417,33 @@ s64 sys_rt_sigsuspend_impl(pt_regs_t *r)
 
     process_t *proc = sched_current_process();
     if (!proc) return -(s64)EPERM;
+    thread_t *thread = sched_current_thread();
     if (sigsetsize != sizeof(sigset_t)) return -(s64)EINVAL;
     if (!umask || (uintptr_t)umask >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     sigset_t mask;
     if (copy_from_user(&mask, umask, sizeof(mask)) != 0) return -(s64)EFAULT;
-    mask &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
+    mask &= ~((SIG_MASK(SIGKILL)) | (SIG_MASK(SIGSTOP)));
 
-    sigset_t saved = proc->sig_blocked;
+    sigset_t saved = thread ? thread->sig_blocked : proc->sig_blocked;
+    if (thread) thread->sig_blocked = mask;
     proc->sig_blocked = mask;
 
-    /* Wait until something outside the temporary mask becomes pending.  The
-     * handler runs after the old mask is restored rather than under the
-     * suspend mask, which is the one place this departs from POSIX. */
-    while (!(proc->sig_pending & ~proc->sig_blocked)) {
+    /* Wait until something outside the temporary mask becomes pending. */
+    while (1) {
+        sigset_t pend = proc->sig_pending | (thread ? thread->sig_pending : 0);
+        sigset_t blk = thread ? thread->sig_blocked : proc->sig_blocked;
+        if (pend & ~blk) break;
         sched_sleep(1);
         if (proc->is_zombie) break;
     }
 
-    proc->sig_blocked = saved;
+    if (thread) {
+        thread->saved_signal_mask = saved;
+        thread->restore_signal_mask = true;
+    } else {
+        proc->sig_blocked = saved;
+    }
     return -(s64)EINTR;
 }
 
@@ -421,15 +469,22 @@ s64 sys_rt_sigqueueinfo_impl(pt_regs_t *r)
 
 s64 sys_rt_tgsigqueueinfo_impl(pt_regs_t *r)
 {
-    u32 tgid = (u32)r->rdi;
+    s32 tgid = (s32)r->rdi;
+    s32 tid  = (s32)r->rsi;
     int sig  = (int)r->rdx;
     void *ui = (void *)r->r10;
 
-    if (sig < 0 || sig >= 64) return -(s64)EINVAL;
+    if (tgid <= 0 || tid <= 0) return -(s64)EINVAL;
+    if (sig < 0 || sig >= _NSIG) return -(s64)EINVAL;
     if (ui && (uintptr_t)ui >= TASK_SIZE_MAX) return -(s64)EFAULT;
+
+    if (ui) {
+        struct k_siginfo info;
+        if (copy_from_user(&info, ui, sizeof(info)) != 0) return -(s64)EFAULT;
+    }
     if (sig == 0) return 0;
     process_t *curr = sched_current_process();
-    return sched_kill_process_permitted(curr, tgid, sig);
+    return sched_kill_thread_permitted(curr, tgid, tid, sig);
 }
 
 /* ============================================================================

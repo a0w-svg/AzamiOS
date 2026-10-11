@@ -2017,6 +2017,8 @@ void quick_exit(int status)
     _Exit(status);
 }
 
+extern void *__libc_ldso_lookup(const char *name);
+
 void exit(int status)
 {
     /* 1. Run atexit & C++ destructors registered via __cxa_atexit */
@@ -2032,10 +2034,13 @@ void exit(int status)
         }
     }
 
-    /* 3. Flush open stdio streams */
+    /* 3. Run shared-library destructors via ld-azami.so */
+    void (*ldso_fini)(void) = (void (*)(void))__libc_ldso_lookup("__ldso_fini");
+    if (ldso_fini) ldso_fini();
+
+    /* 4. Flush open stdio streams */
     fflush(NULL);
 
-    /* 4. Terminate process */
+    /* 5. Terminate process */
     _exit(status);
 }
-

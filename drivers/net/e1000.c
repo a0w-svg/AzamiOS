@@ -531,7 +531,7 @@ void e1000_poll_rx(void)
     }
     g_e1000_rx_draining = true;
 
-    u8 local_buf[E1000_PKT_BUF_SIZE];
+    static u8 s_e1000_rx_buf[E1000_PKT_BUF_SIZE];
 
     while (g_e1000_dev.rx_descs[g_e1000_dev.rx_cur].status & E1000_RXD_STAT_DD) {
         u32 cur    = g_e1000_dev.rx_cur;
@@ -554,8 +554,8 @@ void e1000_poll_rx(void)
 
         size_t copy_len = 0;
         if (deliver) {
-            copy_len = (len < sizeof(local_buf)) ? len : sizeof(local_buf);
-            memcpy(local_buf, g_e1000_dev.rx_buffers[cur], copy_len);
+            copy_len = (len < sizeof(s_e1000_rx_buf)) ? len : sizeof(s_e1000_rx_buf);
+            memcpy(s_e1000_rx_buf, g_e1000_dev.rx_buffers[cur], copy_len);
         }
 
         g_e1000_dev.rx_descs[cur].status = 0;
@@ -565,7 +565,7 @@ void e1000_poll_rx(void)
         if (copy_len > 0) {
             spinlock_unlock_irqrestore(&g_e1000_rx_lock, flags);
             extern void net_process_incoming(const u8 *pkt, size_t len);
-            net_process_incoming(local_buf, copy_len);
+            net_process_incoming(s_e1000_rx_buf, copy_len);
             flags = spinlock_lock_irqsave(&g_e1000_rx_lock);
         }
     }

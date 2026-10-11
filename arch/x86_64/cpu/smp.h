@@ -163,3 +163,15 @@ bool smp_nmi_stop_self(void);
 /** Set to true by the BSP once early init is complete; APs spin on this before
  *  starting their LAPIC timer and entering the scheduler (see smp.c). */
 extern volatile bool g_smp_sched_active;
+
+/* Bounded by-value calls. func must be a bounded, non-blocking IRQ callback
+ * and may access only the owned payload or independently lifetime-safe data.
+ * Pending timeouts cancel execution. A RUNNING timeout leaves the fixed slot
+ * owned by the receiver until completion; caller storage is never retained.
+ * Returns EBUSY rather than accumulating requests on an unresponsive CPU.
+ * deadline_ns is an absolute ktime_get_ns deadline; no locks may be held. */
+#define SMP_RPC_BYTES 128
+/* Callback must reside in permanent kernel text and remain bounded/nonblocking. */
+int smp_rpc_call(u32 cpu, void (*func)(void *), void *value, size_t size, u64 deadline_ns);
+void smp_rpc_drain(void);
+void smp_rpc_init(void);

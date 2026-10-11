@@ -43,6 +43,11 @@ typedef struct {
     u8 buffer[FPU_STATE_MAX_SIZE];
 } fpu_state_t;
 
+#define _NSIG      64
+typedef u64 sigset_t;
+/* Linux sigset_t bit zero denotes signal 1, in kernel and user memory alike. */
+#define SIG_MASK(sig) (1ULL << ((unsigned)(sig) - 1))
+
 /**
  * struct thread — Microkernel execution unit.
  */
@@ -79,6 +84,13 @@ typedef struct thread {
                                           * distinguishes "TLS base explicitly set to
                                           * NULL" from "never set, inherit proc->fs_base".
                                           * Fixes TODO(T-01). */
+    u64             saved_signal_mask; /* Original mask for an interrupted masked wait. */
+    bool            restore_signal_mask; /* Restore after handler selection, or via sigreturn. */
+    sigset_t        sig_blocked;     /* Per-thread blocked signals bitmask */
+    sigset_t        sig_pending;     /* Per-thread pending signals bitmask */
+    void           *sas_ss_sp;       /* Per-thread alternate signal stack */
+    size_t          sas_ss_size;
+    int             sas_ss_flags;
     u64             clear_child_tid; /* CLONE_CHILD_CLEARTID / set_tid_address(2) futex */
     u64             affinity_mask;   /* CPU affinity bitmask (bit k = CPU k allowed) */
     fpu_state_t     fpu_state;       /* XSAVE/FXSAVE area */
@@ -106,6 +118,7 @@ typedef struct thread {
      * nanoseconds this thread has run, charged at every context switch by
      * sched_post_switch(), and the moment its current run began (0 while
      * it is not on a CPU). */
+    u32             perf_last_cpu;   /* Last scheduled CPU, or UINT32_MAX. */
     u64             sum_exec_ns;
     u64             exec_start_ns;
     u32             magic;           /* THREAD_MAGIC while live, 0 once retired.
@@ -139,9 +152,6 @@ typedef struct thread {
 #define SIGTSTP    20
 #define SIGWINCH   28
 #define SIGSYS     31   /* seccomp SECCOMP_RET_TRAP/RET_KILL_* report this signal */
-#define _NSIG      64
-
-typedef u64 sigset_t;
 
 typedef void (*sighandler_t)(int);
 #define SIG_DFL ((sighandler_t)0)
@@ -200,21 +210,23 @@ typedef struct {
 
 typedef struct uts_namespace {
     u32  refcnt;
+    spinlock_t lock;                 /* Protects both name fields. */
+    u64 inum;                       /* Stable, never-reused namespace identity. */
     char nodename[65];
     char domainname[65];
 } uts_namespace_t;
 
 uts_namespace_t *uts_ns_get(uts_namespace_t *ns);
 void uts_ns_put(uts_namespace_t *ns);
-uts_namespace_t *uts_ns_create(const char *nodename, const char *domainname);
+uts_namespace_t *uts_ns_clone(uts_namespace_t *source);
+void uts_ns_read(uts_namespace_t *ns, char nodename[65], char domainname[65]);
 
 /**
  * struct process — Microkernel address space and resource container.
  */
 typedef struct process {
     u32             pid;             /* Process ID */
-    uts_namespace_t *uts_ns;         /* UTS namespace (nodename / domainname) */
-    bool            new_pid_ns;      /* Create children in new PID namespace */
+    uts_namespace_t *uts_ns;         /* Pointer/ref acquisition protected by scheduler lock. */
     phys_addr_t     pml4_phys;       /* Physical address of level-4 page table (CR3) */
     u16             pcid;            /* PCID tag for this address space (0 = kernel) */
     u64             pcid_primed;     /* bit per CPU: set once this core has done a
@@ -325,8 +337,9 @@ typedef struct process {
     u64             cap_inheritable;       /* Caps preserved across execve()   */
     u64             cap_bounding;          /* Ceiling; only ever cleared       */
 
-    /* PR_SET_NO_NEW_PRIVS. Once set it is inherited and can never be cleared,
-     * so a sandboxed child cannot regain privilege through a setuid execve(). */
+    /* Dumpability controls cross-task observation. PR_SET_NO_NEW_PRIVS is
+     * inherited and one-way, preventing regained privileges through exec. */
+    bool            dumpable;             /* PR_SET_DUMPABLE; protects cross-task observation */
     bool            no_new_privs;
 
     /* seccomp(2) mode: 0 = disabled, 1 = SECCOMP_MODE_STRICT, 2 = _FILTER.
@@ -438,6 +451,14 @@ typedef struct process {
     u64             sum_exec_ns;
 } process_t;
 
+/* Get a counted snapshot, replace a process-owned reference, or create a
+ * private UTS namespace. Replace consumes the supplied reference (NULL at
+ * final teardown). Unshare rejects live sibling threads until per-thread
+ * namespace storage exists. Call without scheduler/namespace locks held. */
+uts_namespace_t *proc_uts_ns_get(const process_t *proc);
+void proc_uts_ns_replace(process_t *proc, uts_namespace_t *ns);
+s64 proc_uts_ns_unshare(process_t *proc);
+
 /* wait4(2) option bits this kernel honours. */
 #define WNOHANG      0x00000001
 #define WUNTRACED    0x00000002
@@ -465,6 +486,12 @@ void sched_check_reschedule(void);
 
 /** sched_block(new_state) — Block current thread until unblocked. */
 void sched_block(thread_state_t new_state);
+
+/** Sleep only if @woken is still false while holding the scheduler lock.
+ * Queue owners publish it with a release store before sched_unblock(), and
+ * keep it alive until this call returns. Zero ticks means no timeout. */
+void sched_wait_flag(const bool *woken, u64 ticks);
+bool sched_has_live_siblings(void);
 
 /** sched_sleep(ticks) — Put current thread to sleep for specified tick count. */
 void sched_sleep(u64 ticks);
@@ -495,6 +522,7 @@ void sched_wake_proc_waiters(process_t *p);
 
 /** sched_current_thread() — Return pointer to current thread on calling CPU. */
 thread_t *sched_current_thread(void);
+process_t *proc_get_by_tid(u32 tid); /* counted owner, release with proc_put */
 
 /** sched_current_process() — Return pointer to current process on calling CPU. */
 process_t *sched_current_process(void);
@@ -558,6 +586,8 @@ int sched_collect_pids(u32 *out, int max, int which, u32 who);
 
 /** sched_set_thread_affinity(t, mask) — Update allowed CPU mask for thread. Returns 0 or negative errno. */
 int sched_set_thread_affinity(thread_t *t, u64 mask);
+/* Linux TID-scoped affinity with lookup/retirement and credential checks. */
+int sched_tid_affinity(u32 tid, u64 *mask, bool set);
 
 /** sched_set_proc_affinity(p, mask) — Update allowed CPU mask for process and its threads. Returns 0 or negative errno. */
 int sched_set_proc_affinity(process_t *p, u64 mask);
@@ -630,6 +660,17 @@ s64 sched_kill_process(u32 pid, int sig);
 
 /** sched_kill_process_permitted(caller, pid, sig) — Check POSIX permissions and signal process. */
 s64 sched_kill_process_permitted(process_t *caller, u32 pid, int sig);
+
+/** sched_kill_thread_permitted(caller, tgid, tid, sig) — Check permissions and send signal to specific thread. */
+s64 sched_kill_thread_permitted(process_t *caller, s32 tgid, s32 tid, int sig);
+
+static inline bool thread_has_pending_signal(const thread_t *t, const process_t *p)
+{
+    if (!p) return false;
+    sigset_t b = t ? t->sig_blocked : p->sig_blocked;
+    sigset_t pend = p->sig_pending | (t ? t->sig_pending : 0);
+    return (pend & ~b) != 0;
+}
 
 /** sched_get_process_list() — Return head of global process list. */
 process_t *sched_get_process_list(void);
@@ -705,4 +746,3 @@ bool sched_resume_process(process_t *p, bool cont_report);
  * a stop, a resume and a ptrace-stop; the exit path has its own wakeup.
  */
 void sched_notify_parent(process_t *p, int sig);
-

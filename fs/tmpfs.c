@@ -106,6 +106,9 @@ static s64      tmpfs_unlink(inode_t *dir, dentry_t *dentry);
 static s64      tmpfs_rmdir(inode_t *dir, dentry_t *dentry);
 static s64      tmpfs_rename(inode_t *old_dir, dentry_t *old_dentry,
                              inode_t *new_dir, dentry_t *new_dentry);
+static s64      tmpfs_rename2(inode_t *old_dir, dentry_t *old_dentry,
+                              inode_t *new_dir, dentry_t *new_dentry,
+                              unsigned int flags);
 static s64      tmpfs_symlink(inode_t *dir, dentry_t *dentry, const char *sym);
 static s64      tmpfs_readlink(dentry_t *dentry, char *buf, size_t buflen);
 static s64      tmpfs_link(inode_t *dir, dentry_t *old_dentry, dentry_t *dentry);
@@ -146,6 +149,7 @@ static inode_operations_t s_tmpfs_dir_iops = {
     .readlink = NULL,
     .link     = tmpfs_link,
     .mknod    = tmpfs_mknod,
+    .rename2  = tmpfs_rename2,
 };
 
 static inode_operations_t s_tmpfs_file_iops = {
@@ -631,6 +635,7 @@ static s64 tmpfs_rmdir(inode_t *dir, dentry_t *dentry)
 
     tmpfs_dir_remove(parent, node);
     if (dir->i_nlink > 2) dir->i_nlink--;
+    if (node->inode) node->inode->i_nlink = 0;
     tmpfs_node_put(node);
     dentry->d_inode = NULL;
     return 0;
@@ -641,15 +646,24 @@ static s64 tmpfs_rename(inode_t *old_dir, dentry_t *old_dentry,
 {
     tmpfs_node_t *src_parent = (tmpfs_node_t *)old_dir->i_private;
     tmpfs_node_t *dst_parent = (tmpfs_node_t *)new_dir->i_private;
-    if (!src_parent || !dst_parent) return -22;
+    if (!src_parent || !dst_parent) return -(s64)EINVAL;
 
     tmpfs_node_t *node = tmpfs_dir_find(src_parent, old_dentry->d_name);
-    if (!node) return -2;
+    if (!node) return -(s64)ENOENT;
 
     /* Remove any existing destination entry */
     tmpfs_node_t *existing = tmpfs_dir_find(dst_parent, new_dentry->d_name);
     if (existing) {
+        if (S_ISDIR(node->mode)) {
+            if (!S_ISDIR(existing->mode)) return -(s64)ENOTDIR;
+            if (existing->children) return -(s64)ENOTEMPTY;
+        } else {
+            if (S_ISDIR(existing->mode)) return -(s64)EISDIR;
+        }
         tmpfs_dir_remove(dst_parent, existing);
+        if (S_ISDIR(existing->mode)) {
+            if (dst_parent->inode && dst_parent->inode->i_nlink > 2) dst_parent->inode->i_nlink--;
+        }
         tmpfs_node_put(existing);
     }
 
@@ -662,9 +676,61 @@ static s64 tmpfs_rename(inode_t *old_dir, dentry_t *old_dentry,
     node->name[nlen] = '\0';
 
     tmpfs_dir_add(dst_parent, node);
+    if (src_parent != dst_parent && S_ISDIR(node->mode)) {
+        if (src_parent->inode && src_parent->inode->i_nlink > 2) src_parent->inode->i_nlink--;
+        if (dst_parent->inode) dst_parent->inode->i_nlink++;
+    }
     new_dentry->d_inode = node->inode;
     old_dentry->d_inode = NULL;
     return 0;
+}
+
+static s64 tmpfs_rename2(inode_t *old_dir, dentry_t *old_dentry,
+                         inode_t *new_dir, dentry_t *new_dentry,
+                         unsigned int flags)
+{
+    if (flags & RENAME_EXCHANGE) {
+        tmpfs_node_t *src_parent = (tmpfs_node_t *)old_dir->i_private;
+        tmpfs_node_t *dst_parent = (tmpfs_node_t *)new_dir->i_private;
+        if (!src_parent || !dst_parent) return -(s64)EINVAL;
+
+        tmpfs_node_t *node1 = tmpfs_dir_find(src_parent, old_dentry->d_name);
+        tmpfs_node_t *node2 = tmpfs_dir_find(dst_parent, new_dentry->d_name);
+        if (!node1 || !node2) return -(s64)ENOENT;
+
+        if (node1 == node2) return 0;
+
+        tmpfs_dir_remove(src_parent, node1);
+        tmpfs_dir_remove(dst_parent, node2);
+
+        char name1[TMPFS_NAME_MAX + 1];
+        char name2[TMPFS_NAME_MAX + 1];
+        strncpy(name1, old_dentry->d_name, TMPFS_NAME_MAX);
+        name1[TMPFS_NAME_MAX] = '\0';
+        strncpy(name2, new_dentry->d_name, TMPFS_NAME_MAX);
+        name2[TMPFS_NAME_MAX] = '\0';
+
+        strncpy(node1->name, name2, TMPFS_NAME_MAX);
+        node1->name[TMPFS_NAME_MAX] = '\0';
+        strncpy(node2->name, name1, TMPFS_NAME_MAX);
+        node2->name[TMPFS_NAME_MAX] = '\0';
+
+        tmpfs_dir_add(dst_parent, node1);
+        tmpfs_dir_add(src_parent, node2);
+
+        if (src_parent != dst_parent) {
+            if (S_ISDIR(node1->mode)) {
+                if (src_parent->inode && src_parent->inode->i_nlink > 2) src_parent->inode->i_nlink--;
+                if (dst_parent->inode) dst_parent->inode->i_nlink++;
+            }
+            if (S_ISDIR(node2->mode)) {
+                if (dst_parent->inode && dst_parent->inode->i_nlink > 2) dst_parent->inode->i_nlink--;
+                if (src_parent->inode) src_parent->inode->i_nlink++;
+            }
+        }
+        return 0;
+    }
+    return tmpfs_rename(old_dir, old_dentry, new_dir, new_dentry);
 }
 
 static s64 tmpfs_symlink(inode_t *dir, dentry_t *dentry, const char *sym)

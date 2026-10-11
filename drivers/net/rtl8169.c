@@ -165,13 +165,13 @@ void rtl8169_poll_rx(void)
     g_r8169_rx_draining = true;
     spinlock_unlock_irqrestore(&g_r8169_rx_lock, flags);
 
-    u8 local_buf[RTL8169_PKT_BUF_SIZE];
+    static u8 s_r8169_rx_buf[RTL8169_PKT_BUF_SIZE];
     while (true) {
-        s64 r = rtl8169_recv_packet(local_buf, sizeof(local_buf));
+        s64 r = rtl8169_recv_packet(s_r8169_rx_buf, sizeof(s_r8169_rx_buf));
         if (r <= 0) break;
 
         extern void net_process_incoming(const u8 *pkt, size_t len);
-        net_process_incoming(local_buf, (size_t)r);
+        net_process_incoming(s_r8169_rx_buf, (size_t)r);
     }
 
     flags = spinlock_lock_irqsave(&g_r8169_rx_lock);

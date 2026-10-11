@@ -65,28 +65,22 @@ struct utsname {
     char domainname[65];
 };
 
-static char g_kernel_nodename[65] = "azamios";
-static char g_kernel_domainname[65] = "local";
-
 s64 sys_uname_impl(pt_regs_t *r)
 {
     struct utsname *u = (struct utsname *)r->rdi;
     if (!u || (uintptr_t)u >= TASK_SIZE_MAX) return -(s64)EFAULT;
 
     process_t *proc = sched_current_process();
-    const char *nodename = (proc && proc->uts_ns && proc->uts_ns->nodename[0])
-                           ? proc->uts_ns->nodename : g_kernel_nodename;
-    const char *domainname = (proc && proc->uts_ns && proc->uts_ns->domainname[0])
-                             ? proc->uts_ns->domainname : g_kernel_domainname;
-
     struct utsname info;
     memset(&info, 0, sizeof(info));
+    uts_namespace_t *ns = proc_uts_ns_get(proc);
+    if (!ns) return -(s64)ESRCH;
+    uts_ns_read(ns, info.nodename, info.domainname);
+    uts_ns_put(ns);
     strncpy(info.sysname, "AzamiOS", sizeof(info.sysname) - 1);
-    strncpy(info.nodename, nodename, sizeof(info.nodename) - 1);
     strncpy(info.release, "7.0.0-posix", sizeof(info.release) - 1);
     strncpy(info.version, "AzamiOS Modular Microkernel v7.0 x86_64 SMP", sizeof(info.version) - 1);
     strncpy(info.machine, "x86_64", sizeof(info.machine) - 1);
-    strncpy(info.domainname, domainname, sizeof(info.domainname) - 1);
 
     if (copy_to_user(u, &info, sizeof(info)) != 0) return -(s64)EFAULT;
     return 0;
@@ -437,46 +431,34 @@ s64 sys_membarrier_impl(pt_regs_t *r)
     }
 }
 
-s64 sys_sethostname_impl(pt_regs_t *r)
+static s64 uts_set_name(pt_regs_t *r, bool domain)
 {
     const char *name = (const char *)r->rdi;
     size_t len = (size_t)r->rsi;
     process_t *proc = sched_current_process();
     if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
-    if (!name || (uintptr_t)name >= TASK_SIZE_MAX || len >= sizeof(g_kernel_nodename)) return -(s64)EINVAL;
+    if (len > 64) return -(s64)EINVAL;
     char buf[65];
     memset(buf, 0, sizeof(buf));
-    if (copy_from_user(buf, name, len) != 0) return -(s64)EFAULT;
+    if (len && copy_from_user(buf, name, len) != 0) return -(s64)EFAULT;
     buf[len] = '\0';
-    if (proc && proc->uts_ns) {
-        strncpy(proc->uts_ns->nodename, buf, sizeof(proc->uts_ns->nodename) - 1);
-        proc->uts_ns->nodename[sizeof(proc->uts_ns->nodename) - 1] = '\0';
-    } else {
-        strncpy(g_kernel_nodename, buf, sizeof(g_kernel_nodename) - 1);
-        g_kernel_nodename[sizeof(g_kernel_nodename) - 1] = '\0';
-    }
+    uts_namespace_t *ns = proc_uts_ns_get(proc);
+    if (!ns) return -(s64)ESRCH;
+    irqflags_t irqf = spinlock_lock_irqsave(&ns->lock);
+    memcpy(domain ? ns->domainname : ns->nodename, buf, sizeof(buf));
+    spinlock_unlock_irqrestore(&ns->lock, irqf);
+    uts_ns_put(ns);
     return 0;
+}
+
+s64 sys_sethostname_impl(pt_regs_t *r)
+{
+    return uts_set_name(r, false);
 }
 
 s64 sys_setdomainname_impl(pt_regs_t *r)
 {
-    const char *name = (const char *)r->rdi;
-    size_t len = (size_t)r->rsi;
-    process_t *proc = sched_current_process();
-    if (!security_check_permission(proc, CAP_SYS_ADMIN)) return -(s64)EPERM;
-    if (!name || (uintptr_t)name >= TASK_SIZE_MAX || len >= sizeof(g_kernel_domainname)) return -(s64)EINVAL;
-    char buf[65];
-    memset(buf, 0, sizeof(buf));
-    if (copy_from_user(buf, name, len) != 0) return -(s64)EFAULT;
-    buf[len] = '\0';
-    if (proc && proc->uts_ns) {
-        strncpy(proc->uts_ns->domainname, buf, sizeof(proc->uts_ns->domainname) - 1);
-        proc->uts_ns->domainname[sizeof(proc->uts_ns->domainname) - 1] = '\0';
-    } else {
-        strncpy(g_kernel_domainname, buf, sizeof(g_kernel_domainname) - 1);
-        g_kernel_domainname[sizeof(g_kernel_domainname) - 1] = '\0';
-    }
-    return 0;
+    return uts_set_name(r, true);
 }
 
 /* ============================================================================

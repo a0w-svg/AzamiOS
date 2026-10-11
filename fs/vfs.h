@@ -217,6 +217,7 @@ typedef struct inode_operations {
      * device nodes a /dev populated by mdev, udev or MAKEDEV consists of —
      * it returned -EPERM for every S_IFCHR/S_IFBLK/S_IFSOCK request. */
     s64 (*mknod)(struct inode *dir, struct dentry *dentry, u32 mode, u64 rdev);
+    s64 (*rename2)(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry, unsigned int flags);
 } inode_operations_t;
 
 /* --------------------------------------------------------------------------
@@ -226,6 +227,8 @@ typedef struct inode {
     u64 i_ino;
     u32 i_mode;
     u32 i_nlink;   /* Hard links to this inode; 0 means "filesystem has none" */
+    u32 i_open_count; /* Dentry-backed open descriptions; namespace lock held. */
+    bool i_magiclink; /* procfs resource links, not ordinary text symlinks. */
     u32 i_uid;
     u32 i_gid;
     u64 i_size;
@@ -311,6 +314,7 @@ typedef struct file {
     u32 f_fd_flags; /* Per-FD flags: FD_CLOEXEC (1) — not shared across dup/fork */
     u32 f_mode;
     u32 f_count; /* Reference count */
+    bool f_inode_ref; /* This description owns an i_open_count reference. */
     void *private_data; /* Used by drivers/filesystems for state */
 } file_t;
 
@@ -402,7 +406,23 @@ s64 vfs_path_lookup_nofollow(const char *path, dentry_t **out_dentry);
 void dentry_build_path(dentry_t *d, char *buf, size_t max);
 file_t *vfs_open(const char *path, u32 flags, u32 mode);
 file_t *vfs_open_err(const char *path, u32 flags, u32 mode, s64 *out_errno);
+
+/* Process-context, sleepable, recursive topology guard. Never acquire it
+ * while holding a spinlock. Filesystem callbacks may reenter VFS on the
+ * same thread. Metadata traversal and namespace mutations share this guard. */
+void vfs_namespace_lock(void);
+void vfs_namespace_unlock(void);
+#define VFS_RESOLVE_NO_MAGICLINKS 0x02
+#define VFS_RESOLVE_NO_SYMLINKS   0x04
+#define VFS_RESOLVE_BENEATH       0x08
+#define VFS_RESOLVE_IN_ROOT       0x10
+file_t *vfs_openat_resolved(file_t *dir, const char *cwd, const char *root,
+                          const char *path, u32 flags, u32 mode, u64 resolve,
+                          s64 *out_errno);
 s64 vfs_close(file_t *file);
+/* Drop an owned temporary reference. Nonfinal puts do not enter the namespace
+ * lock or perform descriptor-close side effects; final puts use vfs_close. */
+s64 vfs_put(file_t *file);
 s64 vfs_read(file_t *file, void *buf, size_t size);
 s64 vfs_write(file_t *file, const void *buf, size_t size);
 s64 vfs_lseek(file_t *file, s64 offset, int whence);
@@ -464,3 +484,5 @@ int devfs_set_size(const char *name, u64 size);
  *  filesystem (not just /dev) reaches its driver. 0 on a hit, -1 if none. */
 int devfs_lookup_rdev(u64 rdev, file_operations_t **out_fops, void **out_priv);
 void devfs_init(void);
+
+void epoll_file_closed(file_t *file);

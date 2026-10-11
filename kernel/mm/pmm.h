@@ -65,6 +65,11 @@ void pmm_init(void *memmap);
  */
 void pmm_enable_percpu(void);
 
+/** Opt-in destructive-pressure boot test. Call after timekeeping/RPC init,
+ * before scheduler activation. Disabled boots return without allocations;
+ * invariant or unresolved ownership failures panic instead of continuing. */
+void pmm_boot_selftest(void);
+
 /**
  * pmm_drain_local() — Return the calling CPU's cached pages to the buddy.
  *

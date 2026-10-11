@@ -114,6 +114,7 @@ void smp_call_function_interrupt(void)
 {
     cpu_info_t *cpu = smp_get_cpu();
     if (cpu) cpu->ipis_call++;
+    smp_rpc_drain();
     smp_call_drain_local();
 }
 

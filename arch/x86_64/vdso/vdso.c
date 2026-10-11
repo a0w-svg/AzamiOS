@@ -106,8 +106,9 @@ void vdso_init(void)
             (unsigned long long)len, n);
 }
 
-u64 vdso_map(struct process *proc, vmm_space_t space)
+int vdso_map(struct process *proc, vmm_space_t space, u64 *out_base)
 {
+    *out_base = 0;
     if (!g_vdso_ok) return 0;
 
     u64 span = (u64)(VVAR_PAGES + g_vdso_npages) * PAGE_SIZE;
@@ -116,11 +117,14 @@ u64 vdso_map(struct process *proc, vmm_space_t space)
         rnd = (krandom_u64() % VDSO_RND_PAGES) * PAGE_SIZE;
     u64 vvar = VDSO_WINDOW_TOP - span - rnd;
     u64 base = vvar + (u64)VVAR_PAGES * PAGE_SIZE;
+    for (vm_area_t *v = proc->vma_list; v; v = v->next) {
+        if (vvar < v->end && vvar + span > v->start) return -EINVAL;
+    }
 
     /* Data page: read-only, never executable. */
     if (vmm_map(space, vvar, timekeeping_vvar_phys(),
                 VMM_F_PRESENT | VMM_F_USER | VMM_F_NX | VMM_F_SHARED) != 0)
-        return 0;
+        return -ENOMEM;
 
     /* HPET page, uncached, so the vDSO can read the main counter directly
      * whenever the timekeeper runs on (or switches to) the HPET. Mapped
@@ -131,17 +135,19 @@ u64 vdso_map(struct process *proc, vmm_space_t space)
         vmm_map(space, vvar + PAGE_SIZE, hpet,
                 VMM_F_PRESENT | VMM_F_USER | VMM_F_NX | VMM_F_SHARED |
                 VMM_F_PCD | VMM_F_PWT) != 0)
-        return 0;
+        return -ENOMEM;
 
     for (u32 i = 0; i < g_vdso_npages; i++) {
         if (vmm_map(space, base + (u64)i * PAGE_SIZE, g_vdso_pages[i],
                     VMM_F_PRESENT | VMM_F_USER | VMM_F_SHARED) != 0)
-            return 0;
+            return -ENOMEM;
     }
 
-    vma_add(proc, vvar, vvar + (hpet ? 2 : 1) * PAGE_SIZE,
-            VMA_PROT_READ, VMA_F_VVAR | VMA_F_SHARED);
-    vma_add(proc, base, base + (u64)g_vdso_npages * PAGE_SIZE,
-            VMA_PROT_READ | VMA_PROT_EXEC, VMA_F_VDSO | VMA_F_SHARED);
-    return base;
+    if (vma_add(proc, vvar, vvar + (hpet ? 2 : 1) * PAGE_SIZE,
+                VMA_PROT_READ, VMA_F_VVAR | VMA_F_SHARED) < 0 ||
+        vma_add(proc, base, base + (u64)g_vdso_npages * PAGE_SIZE,
+                VMA_PROT_READ | VMA_PROT_EXEC, VMA_F_VDSO | VMA_F_SHARED) < 0)
+        return -ENOMEM;
+    *out_base = base;
+    return 0;
 }

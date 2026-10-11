@@ -191,6 +191,27 @@ endif
 # ── ABI probe ────────────────────────────────────────────────────────────────
 probe: $(PROBE)
 
+.PHONY: namespace-probe
+namespace-probe: $(OUT_DIR)/bin/azami-namespace-probe
+
+.PHONY: futex-race-probe
+futex-race-probe: $(OUT_DIR)/bin/azami-futex-race-probe
+
+.PHONY: openat2-probe
+openat2-probe: $(OUT_DIR)/bin/azami-openat2-probe
+
+$(OUT_DIR)/bin/azami-openat2-probe: tests/openat2.c $(MUSL_GCC)
+	@mkdir -p $(@D)
+	$(MUSL_GCC) -static -std=c11 -O2 -g -Wall -Wextra -Werror $< -o $@ -pthread
+
+$(OUT_DIR)/bin/azami-futex-race-probe: tests/futex-races.c $(MUSL_GCC)
+	@mkdir -p $(@D)
+	$(MUSL_GCC) -static -std=c11 -O2 -g -Wall -Wextra -Werror $< -o $@ -pthread
+
+$(OUT_DIR)/bin/azami-namespace-probe: tests/namespaces.c $(MUSL_GCC)
+	@mkdir -p $(OUT_DIR)/bin
+	$(MUSL_GCC) -static -std=c11 -O2 -g -Wall -Wextra -Werror $< -o $@ -pthread
+
 $(PROBE): tests/abi-probe.c $(MUSL_GCC)
 	@mkdir -p $(OUT_DIR)/bin
 	@$(CCACHE_PREFIX) $(MUSL_GCC) -static -O2 -o $@ $< -lpthread
@@ -232,3 +253,70 @@ distclean: clean
 # Not a prerequisite of `all` — ports exist to be installed from the package
 # repository at runtime, not to be baked into the image.
 include ports.mk
+include perf.mk
+
+# ELF/exec semantics: the probe builds real fixtures in its private tmpdir.
+.PHONY: exec-probe
+exec-probe: $(OUT_DIR)/bin/azami-exec-probe
+
+$(OUT_DIR)/exec-interpreter.inc: tests/exec-interpreter.S
+	@mkdir -p $(OUT_DIR)
+	$(HOST_CC) -c -o $(OUT_DIR)/exec-interpreter.o $<
+	objcopy -O binary -j .text $(OUT_DIR)/exec-interpreter.o $(OUT_DIR)/exec-interpreter.bin
+	python3 -c 'from pathlib import Path; b=Path("$(OUT_DIR)/exec-interpreter.bin").read_bytes(); Path("$@").write_text("static const unsigned char exec_interpreter[] = {" + ",".join(str(x) for x in b) + "};\n")'
+
+$(OUT_DIR)/bin/azami-exec-probe: tests/exec.c $(OUT_DIR)/exec-interpreter.inc $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I$(OUT_DIR) -o $@ $<
+
+exec-probe: $(OUT_DIR)/bin/azami-exec-dynamic $(OUT_DIR)/bin/libc.so
+
+$(OUT_DIR)/bin/azami-exec-dynamic: tests/exec-dynamic.c $(MUSL_DIR)/lib/libc.so $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -std=c11 -O2 -g -Wall -Wextra -Werror -fPIE -pie -Wl,-dynamic-linker,./libc.so -o $@ $<
+
+$(OUT_DIR)/bin/libc.so: $(MUSL_DIR)/lib/libc.so
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+.PHONY: epoll-probe
+epoll-probe: $(OUT_DIR)/bin/azami-epoll-probe
+
+$(OUT_DIR)/bin/azami-epoll-probe: tests/epoll.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -o $@ $<
+
+.PHONY: rename-probe
+rename-probe: $(OUT_DIR)/bin/azami-rename-probe
+
+$(OUT_DIR)/bin/azami-rename-probe: tests/rename.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -o $@ $<
+
+.PHONY: signals-probe
+signals-probe: $(OUT_DIR)/bin/azami-signals-probe
+
+$(OUT_DIR)/bin/azami-signals-probe: tests/signals.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -o $@ $<
+
+
+
+.PHONY: perf-probe
+perf-probe: $(OUT_DIR)/bin/azami-perf-probe
+
+$(OUT_DIR)/bin/azami-perf-probe: tests/perf.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -o $@ $<
+
+.PHONY: fd-lifetime-probe sysfs-pagination-probe
+fd-lifetime-probe: $(OUT_DIR)/bin/azami-fd-lifetime-probe
+sysfs-pagination-probe: $(OUT_DIR)/bin/azami-sysfs-pagination-probe
+
+$(OUT_DIR)/bin/azami-fd-lifetime-probe: tests/fd-lifetime.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -o $@ $<
+
+$(OUT_DIR)/bin/azami-sysfs-pagination-probe: tests/sysfs-pagination.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -o $@ $<

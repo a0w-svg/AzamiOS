@@ -1,0 +1,140 @@
+{
+  "fork/fork_waitpid": {
+    "elapsed_ns": {
+      "iqr": 54144117.5,
+      "max": 639147650,
+      "median": 464077560.0,
+      "median_absolute_deviation": 34044500.0,
+      "min": 382108530,
+      "n": 10
+    },
+    "forks_per_second": {
+      "iqr": 257.1282761501884,
+      "max": 2617.0575150468376,
+      "median": 2154.8955096349555,
+      "median_absolute_deviation": 161.86394130065207,
+      "min": 1564.583707692581,
+      "n": 10
+    }
+  },
+  "mmap/sequential": {
+    "elapsed_ns": {
+      "iqr": 321265497.5,
+      "max": 972475170,
+      "median": 473158430.0,
+      "median_absolute_deviation": 46916245.0,
+      "min": 421754080,
+      "n": 10
+    },
+    "logical_mib_per_second": {
+      "iqr": 238.78175351644978,
+      "max": 606.9887930900396,
+      "median": 542.4982753333313,
+      "median_absolute_deviation": 58.165841966641665,
+      "min": 263.24579577697597,
+      "n": 10
+    },
+    "logical_pages_per_second": {
+      "iqr": 61128.128900211144,
+      "max": 155389.13103105014,
+      "median": 138879.55848533282,
+      "median_absolute_deviation": 14890.455543460266,
+      "min": 67390.92371890585,
+      "n": 10
+    },
+    "mmap_elapsed_ns": {
+      "iqr": 319447567.5,
+      "max": 961744050,
+      "median": 463448710.0,
+      "median_absolute_deviation": 45755785.0,
+      "min": 413297940,
+      "n": 10
+    },
+    "touch_elapsed_ns": {
+      "iqr": 1294410.0,
+      "max": 10765570,
+      "median": 9700235.0,
+      "median_absolute_deviation": 796750.0,
+      "min": 8456140,
+      "n": 10
+    }
+  },
+  "mmap/shuffled": {
+    "elapsed_ns": {
+      "iqr": 343519425.0,
+      "max": 1094535290,
+      "median": 595122655.0,
+      "median_absolute_deviation": 167349475.0,
+      "min": 409133230,
+      "n": 10
+    },
+    "logical_mib_per_second": {
+      "iqr": 258.67648018146605,
+      "max": 625.7130470678219,
+      "median": 444.93501387939034,
+      "median_absolute_deviation": 138.6817179437179,
+      "min": 233.8892152120559,
+      "n": 10
+    },
+    "logical_pages_per_second": {
+      "iqr": 66221.17892645531,
+      "max": 160182.5400493624,
+      "median": 113903.36355312393,
+      "median_absolute_deviation": 35502.51979359178,
+      "min": 59875.63909428631,
+      "n": 10
+    },
+    "mmap_elapsed_ns": {
+      "iqr": 339652832.5,
+      "max": 1061963290,
+      "median": 569913430.0,
+      "median_absolute_deviation": 159707985.0,
+      "min": 391016920,
+      "n": 10
+    },
+    "touch_elapsed_ns": {
+      "iqr": 8591975.0,
+      "max": 32572000,
+      "median": 21964525.0,
+      "median_absolute_deviation": 3942660.0,
+      "min": 17208050,
+      "n": 10
+    }
+  },
+  "pipe/round_trip": {
+    "elapsed_ns": {
+      "iqr": 70897212.5,
+      "max": 669854250,
+      "median": 567277985.0,
+      "median_absolute_deviation": 36802820.0,
+      "min": 517985570,
+      "n": 10
+    },
+    "ns_per_round_trip": {
+      "iqr": 7089.721250000002,
+      "max": 66985.425,
+      "median": 56727.798500000004,
+      "median_absolute_deviation": 3680.2820000000065,
+      "min": 51798.557,
+      "n": 10
+    }
+  },
+  "syscall/getpid": {
+    "elapsed_ns": {
+      "iqr": 268543000.0,
+      "max": 4275543720,
+      "median": 3858726730.0,
+      "median_absolute_deviation": 175347885.0,
+      "min": 3488585360,
+      "n": 10
+    },
+    "ns_per_call": {
+      "iqr": 26.854299999999967,
+      "max": 427.554372,
+      "median": 385.87267299999996,
+      "median_absolute_deviation": 17.534788499999962,
+      "min": 348.858536,
+      "n": 10
+    }
+  }
+}

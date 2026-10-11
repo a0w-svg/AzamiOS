@@ -39,6 +39,18 @@ otherwise (`vda2`, `hda2`).
 | `maxcpus=<n>` | Bring up at most `n` CPUs (`maxcpus=0` is the same as `nosmp`). |
 | `nr_cpus=<n>` | Same limit as `maxcpus=`. |
 
+### Allocator boot test
+
+`azami.pmm_selftest=1` runs real physical-memory exhaustion and mixed-order
+allocation tests before the scheduler starts. It requires one to four CPUs and
+128 MiB to 2 GiB of managed physical memory. Other configurations explicitly
+skip. Successful runs restore the initial page count and buddy-order
+distribution, then continue boot. Invariant failures or unresolved remote
+cache ownership halt boot with a panic. The default is disabled.
+
+Use disposable guests for this test. See
+[the allocator checkpoint](W4.3_PMM_SELFTEST_RESULTS.md) for reproduction.
+
 ### Console and logging
 
 | Parameter | Meaning |
@@ -62,3 +74,5 @@ Userspace output to `/dev/console` is never affected by `quiet`.
 | Parameter | Meaning |
 |---|---|
 | `azami.disk_selftest=1` | Run the block-driver self-tests at boot (AHCI TRIM and NCQ, NVMe and virtio-scsi write/read-back). **They write to the disks they test**, so they are off by default; only use this on disposable disk images. |
+
+| `smp_rpc_drop_cpu=<n>` | Test-only fault injection: discard bounded CPU requests on logical CPU `n`. Perf operations targeting it return `ETIMEDOUT`; legacy SMP calls and scheduling continue. Off by default. Use `n=1` with the perf timeout probe and at least two CPUs. |

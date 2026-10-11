@@ -40,7 +40,7 @@ static u32 g_process_count = 0;
 static process_t *g_kernel_proc = NULL;
 static u32 g_next_pid = 1;
 static u32 g_next_pcid = 0;   /* rolls 1..4095 for user address spaces */
-static u32 g_next_tid = 1;
+/* Process leaders and sibling threads share the Linux PID/TID ID space. */
 
 /* Per-CPU CFS Runqueues (SCHED-SMP-01)
  *
@@ -221,7 +221,7 @@ static thread_t *thread_alloc(void)
     if (likely(t)) __builtin_memset(t, 0, sizeof(*t));
     else   t = (thread_t *)kzalloc(sizeof(thread_t));
 
-    if (t) t->magic = THREAD_MAGIC;
+    if (t) { t->magic = THREAD_MAGIC; t->perf_last_cpu = (u32)-1; }
     return t;
 }
 
@@ -260,6 +260,7 @@ static void thread_free(thread_t *t)
  */
 static inline void thread_zombify_locked(thread_t *t)
 {
+    perf_thread_exit(t);
     t->state = THREAD_ZOMBIE;
     if (t->proc && t->proc->wait_thread == t)
         t->proc->wait_thread = NULL;
@@ -292,8 +293,7 @@ void sched_post_switch(void)
      * one's. This runs in the *new* thread on the core both of them ran on,
      * which is what makes the counter delta attributable to exactly one task.
      * Before the lock below, because cpu->prev_thread is cleared there. */
-    perf_sched_switch(cpu->prev_thread ? cpu->prev_thread->proc : NULL,
-                      cpu->current_thread ? cpu->current_thread->proc : NULL);
+    perf_sched_switch(cpu->prev_thread, cpu->current_thread);
 
     /*
      * FS base and KERNEL_GS_BASE only matter to code that will run in ring 3:
@@ -1041,13 +1041,17 @@ u32 sched_cpu_of(const thread_t *t)
 
 static uts_namespace_t init_uts_ns = {
     .refcnt = 1,
+    .lock = SPINLOCK_INIT,
+    .inum = 4026531838ULL,
     .nodename = "azamios",
     .domainname = "local",
 };
 
+static u64 next_uts_inum = 4026531845ULL;
+
 uts_namespace_t *uts_ns_get(uts_namespace_t *ns)
 {
-    if (ns) {
+    if (ns && ns != &init_uts_ns) {
         __atomic_add_fetch(&ns->refcnt, 1, __ATOMIC_SEQ_CST);
     }
     return ns;
@@ -1062,14 +1066,74 @@ void uts_ns_put(uts_namespace_t *ns)
     }
 }
 
-uts_namespace_t *uts_ns_create(const char *nodename, const char *domainname)
+void uts_ns_read(uts_namespace_t *ns, char nodename[65], char domainname[65])
 {
+    irqflags_t irqf = spinlock_lock_irqsave(&ns->lock);
+    memcpy(nodename, ns->nodename, sizeof(ns->nodename));
+    memcpy(domainname, ns->domainname, sizeof(ns->domainname));
+    spinlock_unlock_irqrestore(&ns->lock, irqf);
+}
+
+uts_namespace_t *uts_ns_clone(uts_namespace_t *source)
+{
+    if (!source) return NULL;
     uts_namespace_t *ns = (uts_namespace_t *)kzalloc(sizeof(uts_namespace_t));
     if (!ns) return NULL;
+    /* IDs survive destruction and cannot alias a later namespace. Refuse
+     * exhaustion rather than allowing the counter to wrap. */
+    u64 inum = __atomic_load_n(&next_uts_inum, __ATOMIC_RELAXED);
+    do {
+        if (inum == ~0ULL) { kfree(ns); return NULL; }
+    } while (!__atomic_compare_exchange_n(&next_uts_inum, &inum, inum + 1,
+                                          false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
     ns->refcnt = 1;
-    strncpy(ns->nodename, nodename ? nodename : "azamios", sizeof(ns->nodename) - 1);
-    strncpy(ns->domainname, domainname ? domainname : "local", sizeof(ns->domainname) - 1);
+    ns->lock = (spinlock_t)SPINLOCK_INIT;
+    ns->inum = inum;
+    uts_ns_read(source, ns->nodename, ns->domainname);
     return ns;
+}
+
+uts_namespace_t *proc_uts_ns_get(const process_t *proc)
+{
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    uts_namespace_t *ns = uts_ns_get(proc ? proc->uts_ns : &init_uts_ns);
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    return ns;
+}
+
+void proc_uts_ns_replace(process_t *proc, uts_namespace_t *ns)
+{
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    uts_namespace_t *old = proc->uts_ns;
+    proc->uts_ns = ns;
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    uts_ns_put(old);
+}
+
+s64 proc_uts_ns_unshare(process_t *proc)
+{
+    uts_namespace_t *source = proc_uts_ns_get(proc);
+    uts_namespace_t *ns = uts_ns_clone(source);
+    uts_ns_put(source);
+    if (!ns) return -(s64)ENOMEM;
+
+    /* Namespace state is process-wide in AzamiOS. Thread creation and this
+     * test use the same lock, so a live sibling cannot be missed. Allocation,
+     * string copies and reference destruction happen outside this lock. */
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    thread_t *self = sched_current_thread();
+    for (thread_t *t = proc->threads; t; t = t->proc_next) {
+        if (t != self && t->state != THREAD_ZOMBIE) {
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            uts_ns_put(ns);
+            return -(s64)EOPNOTSUPP;
+        }
+    }
+    uts_namespace_t *old = proc->uts_ns;
+    proc->uts_ns = ns;
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    uts_ns_put(old);
+    return 0;
 }
 
 process_t *proc_create(const char *name, phys_addr_t pml4_phys)
@@ -1078,7 +1142,6 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     if (!proc) return NULL;
 
     proc->uts_ns = uts_ns_get(&init_uts_ns);
-    proc->new_pid_ns = false;
 
     proc->pml4_phys = pml4_phys ? pml4_phys : vmm_kernel_space();
     proc->vma_lock = (spinlock_t)SPINLOCK_INIT;
@@ -1115,6 +1178,7 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     proc->fsuid = proc->euid;
     proc->fsgid = proc->egid;
     proc->pkey_alloc_map = 0x1; /* key 0 is the default key, always taken */
+    proc->dumpable = true;
     proc->affinity_mask = (u64)-1; /* All CPUs allowed by default */
 
     /* POSIX resource limits: infinite unless a resource has a real ceiling.
@@ -1333,10 +1397,7 @@ void proc_destroy(process_t *proc)
         kfree(proc->io_bitmap);
         proc->io_bitmap = NULL;
     }
-    if (proc->uts_ns) {
-        uts_ns_put(proc->uts_ns);
-        proc->uts_ns = NULL;
-    }
+    proc_uts_ns_replace(proc, NULL);
     kfree(proc);
 }
 
@@ -1625,7 +1686,7 @@ thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool
     if (!t) return NULL;
 
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
-    t->tid = (proc && proc->threads == NULL) ? proc->pid : g_next_tid++;
+    t->tid = (proc && proc->threads == NULL) ? proc->pid : g_next_pid++;
     spinlock_unlock_irqrestore(&g_sched_lock, irqf);
 
     t->proc = proc ? proc : g_kernel_proc;
@@ -1642,6 +1703,23 @@ thread_t *thread_create_ex(process_t *proc, uintptr_t entry, uintptr_t arg, bool
     t->rt_priority   = sched_rt_prio_for(t->proc);
     t->rr_ticks_left = t->rt_priority ? SCHED_RR_TICKS : 0;
     t->rt_next       = NULL;
+
+    thread_t *curr_th = sched_current_thread();
+    /* Linux fork/clone inherit the creating thread's mask. Kernel threads use
+     * their process default; a process-wide default cannot represent per-thread CPU selection. */
+    if (!is_kernel && curr_th) t->affinity_mask=curr_th->affinity_mask;
+    if (proc && proc->threads == NULL) {
+        t->sig_blocked = proc->sig_blocked;
+        t->sas_ss_sp = proc->sas_ss_sp;
+        t->sas_ss_size = proc->sas_ss_size;
+        t->sas_ss_flags = proc->sas_ss_flags ? proc->sas_ss_flags : 2;
+    } else {
+        t->sig_blocked = curr_th ? curr_th->sig_blocked : (proc ? proc->sig_blocked : 0);
+        t->sas_ss_sp = NULL;
+        t->sas_ss_size = 0;
+        t->sas_ss_flags = 2; /* SS_DISABLE */
+    }
+    t->sig_pending = 0;
     
     /* Allocate a guarded 16 KB kernel stack for this thread */
     u64 kstack_base = kstack_alloc();
@@ -2057,6 +2135,7 @@ void sched_yield(void)
      * thread on its way out (DYING) has to leave regardless, and the idle
      * thread yields to anything. */
     if (next && prev->state != THREAD_DYING &&
+        (prev->affinity_mask & (1ULL << cpu->cpu_id)) &&
         prev != g_idle_threads[cpu->cpu_id] &&
         !sched_should_switch(prev, next)) {
         rq_push_back_local(cpu->cpu_id, next);
@@ -2407,7 +2486,7 @@ void sched_check_reschedule(void)
     }
 }
 
-void sched_block(thread_state_t new_state)
+static void sched_block_common(thread_state_t new_state, const bool *woken)
 {
     cpu_info_t *cpu = smp_get_cpu();
     if (!cpu || !cpu->current_thread) return;
@@ -2425,6 +2504,13 @@ void sched_block(thread_state_t new_state)
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
 
     thread_t *prev = cpu->current_thread;
+
+    if (woken && __atomic_load_n(woken, __ATOMIC_ACQUIRE)) {
+        if (prev->state == THREAD_READY) prev->state = THREAD_RUNNING;
+        prev->unblock_pending = false;
+        spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+        return;
+    }
 
     if (prev->state == THREAD_READY) {
         /* BUG-I fix: a concurrent sched_unblock() raced us and set state to
@@ -2482,7 +2568,12 @@ void sched_block(thread_state_t new_state)
 
 /* Common body of sched_sleep() and sched_sleep_until_ns(): exactly one of
  * @ticks (tick-count sleep) and @deadline_ns (high-resolution) is non-zero. */
-static void sched_sleep_common(u64 ticks, u64 deadline_ns)
+void sched_block(thread_state_t new_state)
+{
+    sched_block_common(new_state, NULL);
+}
+
+static void sched_sleep_common(u64 ticks, u64 deadline_ns, const bool *woken)
 {
     cpu_info_t *cpu = smp_get_cpu();
     if (!cpu || !cpu->current_thread) return;
@@ -2490,6 +2581,12 @@ static void sched_sleep_common(u64 ticks, u64 deadline_ns)
     irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
     
     thread_t *prev = cpu->current_thread;
+    if (woken && __atomic_load_n(woken, __ATOMIC_ACQUIRE)) {
+        if (prev->state == THREAD_READY) prev->state = THREAD_RUNNING;
+        prev->unblock_pending = false;
+        spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+        return;
+    }
     /* Don't let a sleep request bury a pending kill — see sched_yield. */
     if (prev->state != THREAD_DYING) {
         u64 now_ticks = g_system_ticks;
@@ -2542,7 +2639,13 @@ void sched_sleep(u64 ticks)
         sched_yield();
         return;
     }
-    sched_sleep_common(ticks, 0);
+    sched_sleep_common(ticks, 0, NULL);
+}
+
+void sched_wait_flag(const bool *woken, u64 ticks)
+{
+    if (ticks) sched_sleep_common(ticks, 0, woken);
+    else sched_block_common(THREAD_BLOCKED_PENDING, woken);
 }
 
 bool sched_hrsleep_available(void)
@@ -2569,7 +2672,7 @@ void sched_sleep_until_ns(u64 deadline_ns)
         sched_sleep(rem / tick_ns + ((rem % tick_ns) ? 1 : 0));
         return;
     }
-    sched_sleep_common(0, deadline_ns);
+    sched_sleep_common(0, deadline_ns, NULL);
 }
 
 /* Insert into the high-resolution queue, ascending by sleep_deadline_ns.
@@ -2756,7 +2859,7 @@ static void notify_waiter_locked(process_t *parent, int sig)
     if (sig > 0 && sig < _NSIG) {
         sighandler_t h = parent->sigactions[sig].sa_handler;
         if (h != SIG_IGN && h != SIG_DFL)
-            __atomic_or_fetch(&parent->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+            __atomic_or_fetch(&parent->sig_pending, (SIG_MASK(sig)), __ATOMIC_SEQ_CST);
     }
 
     thread_t *w = parent->wait_thread;
@@ -2830,13 +2933,13 @@ static void request_stop_locked(process_t *p, int sig, u32 kind)
     __atomic_store_n(&p->stop_state, kind, __ATOMIC_RELEASE);
 
     /* POSIX: a stop discards a SIGCONT that has not been acted on yet. */
-    __atomic_and_fetch(&p->sig_pending, ~(1ULL << SIGCONT), __ATOMIC_SEQ_CST);
+    __atomic_and_fetch(&p->sig_pending, ~(SIG_MASK(SIGCONT)), __ATOMIC_SEQ_CST);
 
     /* See the note above: this is what breaks a thread out of a blocking
      * syscall. sched_stop_current() clears the bit again as it parks, so the
      * signal is never also *delivered*. */
     if (sig > 0 && sig < _NSIG)
-        __atomic_or_fetch(&p->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+        __atomic_or_fetch(&p->sig_pending, (SIG_MASK(sig)), __ATOMIC_SEQ_CST);
 
     poke_threads_locked(p);
 }
@@ -2860,8 +2963,8 @@ bool sched_resume_process(process_t *p, bool cont_report)
 
     /* POSIX: continuing discards every stop signal still pending. */
     __atomic_and_fetch(&p->sig_pending,
-                       ~((1ULL << SIGSTOP) | (1ULL << SIGTSTP) |
-                         (1ULL << 21 /*SIGTTIN*/) | (1ULL << 22 /*SIGTTOU*/)),
+                       ~((SIG_MASK(SIGSTOP)) | (SIG_MASK(SIGTSTP)) |
+                         (SIG_MASK(21) /*SIGTTIN*/) | (SIG_MASK(22) /*SIGTTOU*/)),
                        __ATOMIC_SEQ_CST);
 
     if (was_stopped && cont_report) p->cont_pending = true;
@@ -2889,7 +2992,7 @@ void sched_stop_current(void)
     /* The signal that asked for the stop was only ever a wake-up device; it
      * must not also run its own disposition once we resume. */
     if (p->stop_signal > 0 && p->stop_signal < _NSIG)
-        __atomic_and_fetch(&p->sig_pending, ~(1ULL << p->stop_signal),
+        __atomic_and_fetch(&p->sig_pending, ~(SIG_MASK(p->stop_signal)),
                            __ATOMIC_SEQ_CST);
 
     while (__atomic_load_n(&p->stop_state, __ATOMIC_ACQUIRE) != PROC_STOP_NONE) {
@@ -3025,6 +3128,22 @@ void sched_dethread_reap(void)
         thread_free(to_free);
         to_free = next;
     }
+}
+
+bool sched_has_live_siblings(void)
+{
+    thread_t *self = sched_current_thread();
+    if (!self || !self->proc) return false;
+    irqflags_t flags = spinlock_lock_irqsave(&g_sched_lock);
+    bool siblings = false;
+    for (thread_t *t = self->proc->threads; t; t = t->proc_next) {
+        if (t != self && t->state != THREAD_DYING && t->state != THREAD_ZOMBIE) {
+            siblings = true;
+            break;
+        }
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, flags);
+    return siblings;
 }
 
 void sched_exit_thread(void)
@@ -3407,8 +3526,8 @@ s64 sched_kill_process(u32 pid, int sig)
         target->stop_notified = false;
         /* POSIX: continuing discards every stop signal still pending. */
         __atomic_and_fetch(&target->sig_pending,
-                           ~((1ULL << SIGSTOP) | (1ULL << SIGTSTP) |
-                             (1ULL << 21 /*SIGTTIN*/) | (1ULL << 22 /*SIGTTOU*/)),
+                           ~((SIG_MASK(SIGSTOP)) | (SIG_MASK(SIGTSTP)) |
+                             (SIG_MASK(21) /*SIGTTIN*/) | (SIG_MASK(22) /*SIGTTOU*/)),
                            __ATOMIC_SEQ_CST);
         if (was_stopped) {
             target->cont_pending = true;
@@ -3419,6 +3538,12 @@ s64 sched_kill_process(u32 pid, int sig)
                 else if (t->state == THREAD_RUNNING)         t->state = THREAD_READY;
             }
             notify_waiter_locked(target->parent, SIGCHLD);
+        }
+        for (thread_t *t = target->threads; t; t = t->proc_next) {
+            __atomic_and_fetch(&t->sig_pending,
+                               ~((SIG_MASK(SIGSTOP)) | (SIG_MASK(SIGTSTP)) |
+                                 (SIG_MASK(21) /*SIGTTIN*/) | (SIG_MASK(22) /*SIGTTOU*/)),
+                               __ATOMIC_SEQ_CST);
         }
         /* The resume happens either way; the *disposition* still applies, so a
          * process with a SIGCONT handler falls through to have it queued. */
@@ -3474,21 +3599,27 @@ s64 sched_kill_process(u32 pid, int sig)
             }
             /*
              * POSIX: a blocked signal stays pending; its action is taken when
-             * it is unblocked, or consumed by sigwait()/sigtimedwait().  Only
-             * SIGKILL and SIGSTOP ignore the mask.  Without this a process
-             * that blocked, say, SIGUSR2 would be killed by it anyway.
+             * it is unblocked, or consumed by sigwait()/sigtimedwait().
+             * If all threads block this signal, it stays pending on the process.
              */
-            if (sig != 9 /* SIGKILL */ && sig != 19 /* SIGSTOP */ &&
-                (target->sig_blocked & (1ULL << sig))) {
-                __atomic_or_fetch(&target->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
+            bool all_blocked = true;
+            for (thread_t *t = target->threads; t; t = t->proc_next) {
+                if (!(t->sig_blocked & (SIG_MASK(sig)))) {
+                    all_blocked = false;
+                    break;
+                }
+            }
+            if (all_blocked) {
+                __atomic_or_fetch(&target->sig_pending, (SIG_MASK(sig)), __ATOMIC_SEQ_CST);
                 spinlock_unlock_irqrestore(&g_sched_lock, irqf);
                 return 0;
             }
         } else {
             /* Custom handler registered */
-            __atomic_or_fetch(&target->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
-            /* Wake up blocked/sleeping threads to handle signal */
+            __atomic_or_fetch(&target->sig_pending, (SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+            /* Wake up a thread that does not block this signal */
             for (thread_t *t = target->threads; t; t = t->proc_next) {
+                if (t->sig_blocked & (SIG_MASK(sig))) continue;
                 if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
                     if (t->state == THREAD_SLEEPING) sleep_queue_remove_locked(t);
                     enqueue_ready(t);
@@ -3502,6 +3633,7 @@ s64 sched_kill_process(u32 pid, int sig)
                 } else if (t->state == THREAD_RUNNING && t->cpu_id != smp_current_cpu_id()) {
                     smp_send_reschedule(t->cpu_id);
                 }
+                break;
             }
             spinlock_unlock_irqrestore(&g_sched_lock, irqf);
             return 0;
@@ -3635,6 +3767,135 @@ s64 sched_kill_process_permitted(process_t *caller, u32 pid, int sig)
     return sched_kill_process(pid, sig);
 }
 
+/* Counted owner lookup for observation APIs whose pid argument is a Linux TID.
+ * Never return a borrowed thread pointer beyond g_sched_lock. */
+process_t *proc_get_by_tid(u32 tid)
+{
+    irqflags_t fl = spinlock_lock_irqsave(&g_sched_lock);
+    process_t *found = NULL;
+    for (process_t *p = g_process_list; p && !found; p = p->next) {
+        for (thread_t *t = p->threads; t; t = t->proc_next) {
+            if (t->tid == tid && t->state != THREAD_ZOMBIE && t->state != THREAD_DYING) {
+                proc_get_locked(p);
+                found = p;
+                break;
+            }
+        }
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock, fl);
+    return found;
+}
+
+s64 sched_kill_thread_permitted(process_t *caller, s32 tgid, s32 tid, int sig)
+{
+    if (tid <= 0) return -(s64)EINVAL;
+    if (tgid < 0) return -(s64)EINVAL;
+    if (sig != 0 && (sig < 0 || sig >= _NSIG)) return -(s64)EINVAL;
+
+    irqflags_t irqf = spinlock_lock_irqsave(&g_sched_lock);
+    process_t *target_proc = NULL;
+    thread_t *target_thread = NULL;
+
+    for (process_t *p = g_process_list; p; p = p->next) {
+        if (tgid > 0 && p->pid != (u32)tgid) continue;
+        for (thread_t *th = p->threads; th; th = th->proc_next) {
+            if (th->tid == (u32)tid) {
+                target_proc = p;
+                target_thread = th;
+                break;
+            }
+        }
+        if (target_thread) break;
+    }
+
+    if (!target_thread || !target_proc) {
+        spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+        return -(s64)ESRCH;
+    }
+
+    if (target_proc == g_kernel_proc && sig != 0) {
+        spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+        return -(s64)EPERM;
+    }
+
+    if (caller && caller != target_proc && caller->pid != target_proc->pid) {
+        bool allowed = (caller->euid == 0 || security_check_permission(caller, CAP_KILL) ||
+                        caller->euid == target_proc->uid || caller->euid == target_proc->suid ||
+                        caller->uid  == target_proc->uid || caller->uid  == target_proc->suid);
+        if (!allowed) {
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            return -(s64)EPERM;
+        }
+
+        if (target_proc->pid == 1 && sig != 0) {
+            sighandler_t h = target_proc->sigactions[sig].sa_handler;
+            if (h == SIG_DFL || h == SIG_IGN || sig == SIGKILL || sig == SIGSTOP) {
+                spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+                return (sig == SIGKILL || sig == SIGSTOP) ? -(s64)EPERM : 0;
+            }
+        }
+    }
+
+    if (sig == 0) {
+        spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+        return 0;
+    }
+
+    /* Job control stop / continue signals affect the whole thread group */
+    if (sig == SIGCONT || sig == SIGSTOP || sig == SIGTSTP ||
+        sig == 21 /*SIGTTIN*/ || sig == 22 /*SIGTTOU*/) {
+        u32 tpid = target_proc->pid;
+        spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+        return sched_kill_process(tpid, sig);
+    }
+
+    sighandler_t handler = target_proc->sigactions[sig].sa_handler;
+    if (sig != SIGKILL && sig != SIGSTOP) {
+        if (handler == SIG_IGN) {
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            return 0;
+        }
+        if (handler == SIG_DFL) {
+            if (sig == 17 /* SIGCHLD */ || sig == 23 /* SIGURG */ ||
+                sig == 28 /* SIGWINCH */ || sig == 18 /* SIGCONT */) {
+                spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+                return 0;
+            }
+            if (target_thread->sig_blocked & (SIG_MASK(sig))) {
+                __atomic_or_fetch(&target_thread->sig_pending, (SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+                spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+                return 0;
+            }
+            u32 tpid = target_proc->pid;
+            spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+            return sched_kill_process(tpid, sig);
+        }
+
+        /* Custom handler installed: route specifically to target thread */
+        __atomic_or_fetch(&target_thread->sig_pending, (SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+
+        if (!(target_thread->sig_blocked & (SIG_MASK(sig)))) {
+            if (target_thread->state == THREAD_BLOCKED || target_thread->state == THREAD_SLEEPING) {
+                if (target_thread->state == THREAD_SLEEPING) sleep_queue_remove_locked(target_thread);
+                enqueue_ready(target_thread);
+            } else if (target_thread->state == THREAD_BLOCKED_PENDING ||
+                       target_thread->state == THREAD_SLEEPING_PENDING) {
+                target_thread->unblock_pending = true;
+            } else if (target_thread->state == THREAD_RUNNING &&
+                       target_thread->cpu_id != smp_current_cpu_id()) {
+                smp_send_reschedule(target_thread->cpu_id);
+            }
+        }
+        spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+        return 0;
+    }
+
+    /* SIGKILL or SIGSTOP */
+    u32 tpid = target_proc->pid;
+    spinlock_unlock_irqrestore(&g_sched_lock, irqf);
+    return sched_kill_process(tpid, sig);
+}
+
 process_t *sched_kernel_process(void)
 {
     return g_kernel_proc;
@@ -3765,6 +4026,41 @@ static void thread_apply_affinity_locked(thread_t *t, u64 mask, u32 ncpus)
             if (!(mask & (1ULL << i))) pulled = rq_try_remove_on(i, t);
     }
     if (pulled) enqueue_ready(t);
+}
+
+/* Resolve a Linux TID while retirement cannot free it. Only the current
+ * thread may survive the lock boundary, through its already-owned context. */
+int sched_tid_affinity(u32 tid, u64 *mask, bool set)
+{
+    thread_t *self=sched_current_thread();
+    process_t *caller=sched_current_process();
+    if(!self || !caller || !mask) return -ESRCH;
+    if(!tid) tid=self->tid;
+    u64 online=smp_online_mask();
+    irqflags_t fl=spinlock_lock_irqsave(&g_sched_lock);
+    thread_t *target=NULL;
+    for(process_t *p=g_process_list; p && !target; p=p->next)
+        for(thread_t *t=p->threads; t; t=t->proc_next)
+            if(t->tid==tid && t->state!=THREAD_ZOMBIE && t->state!=THREAD_DYING) { target=t; break; }
+    int rc=0;
+    bool migrate=false;
+    if(!target) rc=-ESRCH;
+    else if(!set) *mask=target->affinity_mask & online;
+    else if(caller!=target->proc && caller->euid!=target->proc->uid &&
+            caller->euid!=target->proc->euid && !security_check_permission(caller,CAP_SYS_NICE)) rc=-EPERM;
+    else if(!(*mask & online)) rc=-EINVAL;
+    else {
+        target->affinity_mask=*mask & online;
+        thread_apply_affinity_locked(target,target->affinity_mask,SMP_MAX_CPUS);
+        migrate=target==self && !(target->affinity_mask & (1ULL<<smp_current_cpu_id()));
+    }
+    spinlock_unlock_irqrestore(&g_sched_lock,fl);
+    if(migrate) {
+        /* Return from self-affinity only after leaving a now-disallowed CPU. */
+        do { sched_yield(); }
+        while(!(__atomic_load_n(&self->affinity_mask,__ATOMIC_RELAXED) & (1ULL<<smp_current_cpu_id())));
+    }
+    return rc;
 }
 
 int sched_set_thread_affinity(thread_t *t, u64 mask)

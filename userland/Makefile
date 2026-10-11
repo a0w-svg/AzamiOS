@@ -587,10 +587,102 @@ $(OBJ_DIR)/thread_tls_test.o: examples/thread_tls_test.c | skeleton
 $(BIN_DIR)/thread_tls_test.elf: $(OBJ_DIR)/thread_tls_test.o libc/libc.a libgame/libgame.a libc/crt0.o | skeleton
 	$(LD) $(LDFLAGS) libc/crt0.o $(OBJ_DIR)/thread_tls_test.o libc/libc.a libgame/libgame.a -o $@
 
+# ── Comprehensive dynamic loader test fixtures ────────────────────────────
+examples/dltest_event.o: examples/dltest_event.c
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/lib/libdltest_event.so: examples/dltest_event.o toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=libdltest_event.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_event.o -o $@
+
+examples/dltest_dep.o: examples/dltest_dep.c
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/lib/dltest_dep.so: examples/dltest_dep.o $(BUILD_DIR)/lib/libdltest_event.so toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=dltest_dep.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_dep.o $(BUILD_DIR)/lib/libdltest_event.so -o $@
+
+examples/dltest_top.o: examples/dltest_top.c
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/lib/dltest_top.so: examples/dltest_top.o $(BUILD_DIR)/lib/dltest_dep.so $(BUILD_DIR)/lib/libdltest_event.so toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=dltest_top.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_top.o $(BUILD_DIR)/lib/dltest_dep.so $(BUILD_DIR)/lib/libdltest_event.so -o $@
+
+examples/dltest_dtor_order.o: examples/dltest_dtor_order.c
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/lib/dltest_dtor_order.so: examples/dltest_dtor_order.o $(BUILD_DIR)/lib/libdltest_event.so toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=dltest_dtor_order.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_dtor_order.o $(BUILD_DIR)/lib/libdltest_event.so -o $@
+
+examples/dltest_reentrant.o: examples/dltest_reentrant.c
+	$(CC) $(DYNLINK_CFLAGS) -Ilibc/include -c $< -o $@
+
+$(BUILD_DIR)/lib/dltest_reentrant.so: examples/dltest_reentrant.o $(BUILD_DIR)/lib/libdltest_event.so $(BUILD_DIR)/lib/libc.so toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=dltest_reentrant.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_reentrant.o $(BUILD_DIR)/lib/libdltest_event.so $(BUILD_DIR)/lib/libc.so -o $@
+
+examples/dltest_chain_c.o: examples/dltest_chain_c.c
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/lib/dltest_chain_c.so: examples/dltest_chain_c.o toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=dltest_chain_c.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_chain_c.o -o $@
+
+examples/dltest_chain_b.o: examples/dltest_chain_b.c
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/lib/dltest_chain_b.so: examples/dltest_chain_b.o $(BUILD_DIR)/lib/dltest_chain_c.so toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=dltest_chain_b.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_chain_b.o $(BUILD_DIR)/lib/dltest_chain_c.so -o $@
+
+examples/dltest_chain_a.o: examples/dltest_chain_a.c
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/lib/dltest_chain_a.so: examples/dltest_chain_a.o $(BUILD_DIR)/lib/dltest_chain_b.so toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=dltest_chain_a.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_chain_a.o $(BUILD_DIR)/lib/dltest_chain_b.so -o $@
+
+examples/dltest_unresolved.o: examples/dltest_unresolved.c
+	$(CC) $(DYNLINK_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/lib/dltest_unresolved.so: examples/dltest_unresolved.o toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=dltest_unresolved.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_unresolved.o -o $@
+
+examples/dltest_tls_reject.o: examples/dltest_tls_reject.c
+	$(CC) $(DYNLINK_CFLAGS) -ftls-model=initial-exec -c $< -o $@
+
+$(BUILD_DIR)/lib/dltest_tls_reject.so: examples/dltest_tls_reject.o toolchain
+	@mkdir -p $(BUILD_DIR)/lib
+	$(LD) -shared --soname=dltest_tls_reject.so -T ../scripts/user-pic.ld -nostdlib \
+	    -z max-page-size=0x1000 examples/dltest_tls_reject.o -o $@
+
+examples/dltest_runtime.o: examples/dltest_runtime.c
+	$(CC) $(DYNAPP_CFLAGS) -c $< -o $@
+
+$(BIN_DIR)/dltest_runtime.elf: libc/crt0_dyn.o examples/dltest_runtime.o $(BUILD_DIR)/lib/libc.so \
+    $(BUILD_DIR)/lib/libdltest_event.so $(BUILD_DIR)/lib/dltest_top.so $(BUILD_DIR)/lib/dltest_dep.so \
+    $(BUILD_DIR)/lib/dltest_dtor_order.so $(BUILD_DIR)/lib/dltest_reentrant.so $(BUILD_DIR)/lib/dltest_chain_a.so \
+    $(BUILD_DIR)/lib/dltest_chain_b.so $(BUILD_DIR)/lib/dltest_chain_c.so $(BUILD_DIR)/lib/dltest_unresolved.so \
+    $(BUILD_DIR)/lib/dltest_tls_reject.so $(BUILD_DIR)/lib/dltest_lib.so
+	@mkdir -p $(BIN_DIR)
+	$(LD) $(DYNAPP_LDFLAGS) libc/crt0_dyn.o examples/dltest_runtime.o $(BUILD_DIR)/lib/libc.so -o $@
+
 .PHONY: dynlink
 dynlink: toolchain $(BUILD_DIR)/lib/ld-azami.so $(BUILD_DIR)/lib/libc.so $(BIN_DIR)/dltest_app.elf \
     $(BIN_DIR)/dlopen_demo.elf $(BIN_DIR)/fetch_dyn.elf $(BIN_DIR)/thread_tls_test_dyn.elf \
-    $(BIN_DIR)/thread_tls_test.elf
+    $(BIN_DIR)/thread_tls_test.elf $(BIN_DIR)/dltest_runtime.elf
 
 
 

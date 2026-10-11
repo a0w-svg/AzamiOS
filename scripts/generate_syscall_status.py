@@ -74,6 +74,21 @@ def extract_functions():
 def classify_status(entry, fn_info):
     if not fn_info:
         return "Missing", "No entry point found in source files"
+    namespace_limits = {
+        "sys_clone_impl": "UTS creation supported; other namespace types return EOPNOTSUPP (or EPERM without privilege)",
+        "sys_clone3_impl": "UTS creation supported; other namespace types return EOPNOTSUPP (or EPERM without privilege)",
+        "sys_unshare_impl": "Process-wide UTS only; live siblings and other resource isolation return EOPNOTSUPP",
+        "sys_setns_impl": "Validates descriptors; namespace descriptors and joining are unsupported",
+        "sys_openat2_impl": "Component-based BENEATH/IN_ROOT/NO_SYMLINKS/NO_MAGICLINKS; NO_XDEV/CACHED and unsupported open modes return EOPNOTSUPP",
+        "sys_execve_impl": "Exact interpreter path and staged image commit; bounded arguments/paths and incomplete executable permission semantics",
+        "sys_execveat_impl": "Staged image commit; pathname-backed AT_EMPTY_PATH and incomplete AT_SYMLINK_NOFOLLOW semantics",
+        "sys_epoll_ctl_impl": "64 fd-number registrations; edge/oneshot modes, nested epoll, and open-file-description identity remain incomplete",
+        "sys_epoll_wait_impl": "Pinned readiness scans and monotonic deadlines; periodic polling and incomplete registration identity/modes",
+        "sys_epoll_pwait_impl": "Linux argument order and interrupted-mask restoration; process-wide signal masks and polling remain limitations",
+        "sys_epoll_pwait2_impl": "Nanosecond deadlines, overflow saturation, and interrupted-mask restoration; process-wide masks and polling remain limitations",
+    }
+    if entry in namespace_limits:
+        return "Partial", namespace_limits[entry]
     body = fn_info["body"]
     clean_body = re.sub(r'/\*.*?\*/', '', body, flags=re.DOTALL)
     clean_body = re.sub(r'//.*', '', clean_body)
@@ -92,7 +107,7 @@ def classify_status(entry, fn_info):
     if "TODO" in body or "FIXME" in body or "partial" in body.lower():
         return "Partial", "Functional implementation with noted limitations"
 
-    return "Full", "Complete implementation matching Linux ABI"
+    return "Full", "Function body present; Linux conformance requires runtime tests"
 
 def get_domain(filename, name):
     if "sys_fs" in filename: return "Filesystem & I/O"
@@ -137,6 +152,7 @@ def main():
     out = []
     out.append("# AzamiOS System Call Implementation Status\n")
     out.append(f"Generated automatically from `kernel/syscall/syscalls.tbl` and kernel sources.\n")
+    out.append("Status is a source-presence heuristic, not proof of complete Linux semantics or container compatibility. See [W3.8 namespace results](W3.8_NAMESPACE_RESULTS.md) for tested isolation and limitations.\n")
     out.append("## Summary Statistics\n")
     out.append(f"- **Total Defined System Calls:** {total}\n")
     out.append(f"- **Implemented (Full or Partial):** {implemented_count} ({impl_pct:.1f}%)\n")
@@ -176,4 +192,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

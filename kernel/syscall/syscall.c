@@ -32,7 +32,7 @@ file_t *fget(process_t *proc, int fd)
 /* fput() — drop a reference taken by fget(). Frees the file at zero. */
 void fput(file_t *file)
 {
-    if (file) vfs_close(file);
+    if (file) vfs_put(file);
 }
 
 /* fd_table_release() — see syscall.h. Clear each slot under the per-process fd_lock so a
@@ -230,7 +230,7 @@ int syscall_dispatch(pt_regs_t *regs)
             case SECCOMP_RET_TRAP: {
                 sighandler_t h = sp->sigactions[SIGSYS].sa_handler;
                 if (h != SIG_DFL && h != SIG_IGN)
-                    __atomic_or_fetch(&sp->sig_pending, (1ULL << SIGSYS), __ATOMIC_SEQ_CST);
+                    __atomic_or_fetch(&sp->sig_pending, (SIG_MASK(SIGSYS)), __ATOMIC_SEQ_CST);
                 else
                     sched_kill_process(sp->pid, SIGSYS);
                 regs->rax = (u64)(-(s64)ENOSYS);
@@ -269,6 +269,7 @@ int syscall_dispatch(pt_regs_t *regs)
      * syscall number so an interrupted call can honour SA_RESTART — except for
      * rt_sigreturn, which has already rewritten `regs` with a restored frame. */
     signal_deliver_pending(regs, nr == SYS_rt_sigreturn ? -1 : (s64)nr);
+    signal_restore_wait_mask();
 
     return (nr == SYS_rt_sigreturn) ? 1 : 0;
 }
@@ -478,7 +479,9 @@ file_t *fd_detach(process_t *proc, int fd)
 
 bool sleep_signal_pending(process_t *proc)
 {
-    return proc && (proc->sig_pending & ~proc->sig_blocked);
+    if (!proc) return false;
+    thread_t *thread = sched_current_thread();
+    return thread_has_pending_signal(thread, proc);
 }
 
 /* Returns 0 once CLOCK_MONOTONIC >= @deadline, or -EINTR (with the time

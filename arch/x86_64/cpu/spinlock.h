@@ -58,6 +58,18 @@ static __always_inline void spinlock_unlock(spinlock_t *l)
 }
 
 
+/* Save/restore interrupts without acquiring a lock, for bounded try-lock paths. */
+static __always_inline irqflags_t spinlock_irq_save(void)
+{
+    irqflags_t flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    return flags;
+}
+static __always_inline void spinlock_irq_restore(irqflags_t flags)
+{
+    __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
+}
+
 /**
  * spinlock_lock_irqsave(lock) — Disable interrupts, then acquire the lock.
  * Returns the previous RFLAGS value (use with spinlock_unlock_irqrestore).

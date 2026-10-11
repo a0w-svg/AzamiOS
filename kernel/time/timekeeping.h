@@ -107,6 +107,9 @@ void timekeeping_init(void);
 void timekeeping_tick(void);
 
 /** Nanoseconds on CLOCK_MONOTONIC / MONOTONIC_RAW / REALTIME. */
+/* Nonblocking monotonic snapshot for bounded IRQ/RPC paths. False means a
+ * writer is publishing; retry under the caller's own finite budget. */
+bool ktime_try_get_ns(u64 *ns);
 u64 ktime_get_ns(void);
 u64 ktime_get_raw_ns(void);
 u64 ktime_get_real_ns(void);

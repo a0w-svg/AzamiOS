@@ -292,6 +292,11 @@ typedef struct {
     u64 *dt_init_array;
     u64  dt_init_arraysz;
 
+    u64  dt_fini;
+    u64 *dt_fini_array;
+    u64  dt_fini_arraysz;
+    int  finis_ran;
+
     const char *needed_names[MAX_NEEDED];
     int         nneeded;
     int         dep_idx[MAX_NEEDED];
@@ -314,10 +319,22 @@ static int obj_alloc(void)
     return -1;
 }
 
+static int name_match(const char *a, const char *b)
+{
+    if (ld_strcmp(a, b) == 0) return 1;
+    if (a[0] == '/' && a[1] == 'l' && a[2] == 'i' && a[3] == 'b' && a[4] == '/') {
+        if (ld_strcmp(a + 5, b) == 0) return 1;
+    }
+    if (b[0] == '/' && b[1] == 'l' && b[2] == 'i' && b[3] == 'b' && b[4] == '/') {
+        if (ld_strcmp(a, b + 5) == 0) return 1;
+    }
+    return 0;
+}
+
 static int find_loaded_by_name(const char *name)
 {
     for (int i = 0; i < MAX_OBJS; i++)
-        if (g_objs[i].in_use && g_objs[i].name[0] && ld_strcmp(g_objs[i].name, name) == 0)
+        if (g_objs[i].in_use && g_objs[i].name[0] && name_match(g_objs[i].name, name))
             return i;
     return -1;
 }
@@ -373,6 +390,9 @@ static void parse_dynamic(obj_t *o, elf64_dyn_t *dyn)
         case DT_INIT:           o->dt_init = bias + d->d_un.d_val; break;
         case DT_INIT_ARRAY:     o->dt_init_array = (u64 *)(uintptr_t)(bias + d->d_un.d_ptr); break;
         case DT_INIT_ARRAYSZ:   o->dt_init_arraysz = d->d_un.d_val; break;
+        case DT_FINI:           o->dt_fini = bias + d->d_un.d_val; break;
+        case DT_FINI_ARRAY:     o->dt_fini_array = (u64 *)(uintptr_t)(bias + d->d_un.d_ptr); break;
+        case DT_FINI_ARRAYSZ:   o->dt_fini_arraysz = d->d_un.d_val; break;
         case DT_HASH: {
             /* SysV .hash layout: { nbucket, nchain, ... }. nchain is the
              * dynamic symbol table's entry count — the only thing this
@@ -723,7 +743,73 @@ static void apply_symbolic(obj_t *o, int fatal)
     if (o->jmprel) apply_symbolic_table(o, o->jmprel, o->jmprel_count, fatal);
 }
 
-/* ── Constructors (DT_INIT / DT_INIT_ARRAY) ──────────────────────────────── */
+/* ── Loader concurrency (recursive futex mutex) ────────────────────────── */
+
+#ifndef FUTEX_WAIT_PRIVATE
+#define FUTEX_WAIT_PRIVATE 128
+#endif
+#ifndef FUTEX_WAKE_PRIVATE
+#define FUTEX_WAKE_PRIVATE 129
+#endif
+
+static struct {
+    int  lock;
+    long owner;
+    int  count;
+} g_loader_mutex;
+
+static void loader_lock(void)
+{
+    long me = syscall0(SYS_gettid);
+    if (g_loader_mutex.owner == me) {
+        g_loader_mutex.count++;
+        return;
+    }
+
+    int exp = 0;
+    if (__atomic_compare_exchange_n(&g_loader_mutex.lock, &exp, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        g_loader_mutex.owner = me;
+        g_loader_mutex.count = 1;
+        return;
+    }
+
+    for (int i = 0; i < 100; i++) {
+        __asm__ volatile("pause");
+        exp = 0;
+        if (__atomic_compare_exchange_n(&g_loader_mutex.lock, &exp, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            g_loader_mutex.owner = me;
+            g_loader_mutex.count = 1;
+            return;
+        }
+    }
+
+    while (1) {
+        if (exp == 2 || __atomic_exchange_n(&g_loader_mutex.lock, 2, __ATOMIC_ACQ_REL) != 0) {
+            syscall4(SYS_futex, (long)&g_loader_mutex.lock, FUTEX_WAIT_PRIVATE, 2, 0);
+        }
+        exp = 0;
+        if (__atomic_compare_exchange_n(&g_loader_mutex.lock, &exp, 2, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            g_loader_mutex.owner = me;
+            g_loader_mutex.count = 1;
+            return;
+        }
+    }
+}
+
+static void loader_unlock(void)
+{
+    long me = syscall0(SYS_gettid);
+    if (g_loader_mutex.owner != me) return;
+    g_loader_mutex.count--;
+    if (g_loader_mutex.count == 0) {
+        g_loader_mutex.owner = 0;
+        if (__atomic_exchange_n(&g_loader_mutex.lock, 0, __ATOMIC_RELEASE) == 2) {
+            syscall4(SYS_futex, (long)&g_loader_mutex.lock, FUTEX_WAKE_PRIVATE, 1, 0);
+        }
+    }
+}
+
+/* ── Constructors & Destructors ─────────────────────────────────────────── */
 
 static void run_ctors_once(obj_t *o)
 {
@@ -744,87 +830,235 @@ static void run_ctors_once(obj_t *o)
     }
 }
 
-/* Dependency-first, @top_idx last — @top_idx is main at startup, or the
- * object dlopen() just finished relocating. run_ctors_once()'s ctors_ran
- * flag makes this safe to call again later without re-running anything. */
-static void run_all_ctors(int top_idx)
+static void run_ctors_recursive(int idx)
 {
-    for (int i = 0; i < MAX_OBJS; i++)
-        if (g_objs[i].in_use && i != top_idx) run_ctors_once(&g_objs[i]);
-    if (top_idx >= 0 && g_objs[top_idx].in_use) run_ctors_once(&g_objs[top_idx]);
+    if (idx < 0 || idx >= MAX_OBJS) return;
+    obj_t *o = &g_objs[idx];
+    if (!o->in_use || o->ctors_ran) return;
+
+    for (int i = 0; i < o->ndeps; i++) {
+        run_ctors_recursive(o->dep_idx[i]);
+    }
+    run_ctors_once(o);
 }
 
-/* ── dlerror() state ──────────────────────────────────────────────────────── */
+static void run_all_ctors(int top_idx)
+{
+    for (int i = 0; i < MAX_OBJS; i++) {
+        if (g_objs[i].in_use && !g_objs[i].ctors_ran && i != top_idx) {
+            run_ctors_recursive(i);
+        }
+    }
+    if (top_idx >= 0 && g_objs[top_idx].in_use) {
+        run_ctors_recursive(top_idx);
+    }
+}
 
-static char g_dlerror_buf[160];
-static int  g_dlerror_pending;
+static void run_finis_once(obj_t *o)
+{
+    if (o->finis_ran) return;
+    o->finis_ran = 1;
+
+    if (o->dt_fini_array) {
+        u64 n = o->dt_fini_arraysz / sizeof(u64);
+        for (s64 i = (s64)n - 1; i >= 0; i--) {
+            u64 fnaddr = o->dt_fini_array[i];
+            if (fnaddr == 0 || fnaddr == (u64)-1) continue;
+            ((void (*)(void))(uintptr_t)fnaddr)();
+        }
+    }
+
+    if (o->dt_fini) {
+        ((void (*)(void))(uintptr_t)o->dt_fini)();
+    }
+}
+
+static void run_all_finis(void)
+{
+    for (int i = MAX_OBJS - 1; i >= 0; i--) {
+        if (g_objs[i].in_use && !g_objs[i].finis_ran) {
+            run_finis_once(&g_objs[i]);
+        }
+    }
+}
+
+void __ldso_fini(void)
+{
+    loader_lock();
+    run_all_finis();
+    loader_unlock();
+}
+
+static void obj_unload_recursive(int idx)
+{
+    if (idx < 0 || idx >= MAX_OBJS) return;
+    obj_t *o = &g_objs[idx];
+    if (!o->in_use) return;
+
+    o->refcount--;
+    if (o->refcount > 0 || o->pinned) return;
+
+    /* Run destructors for this object before releasing dependencies or unmapping */
+    run_finis_once(o);
+
+    int ndeps = o->ndeps;
+    int deps[MAX_NEEDED];
+    for (int i = 0; i < ndeps; i++) deps[i] = o->dep_idx[i];
+
+    obj_force_unmap(idx);
+
+    for (int i = 0; i < ndeps; i++) {
+        obj_unload_recursive(deps[i]);
+    }
+}
+
+/* ── Thread-isolated dlerror() state ─────────────────────────────────────── */
+
+#define MAX_DLERROR_THREADS 16
+
+typedef struct {
+    long tid;
+    char msg[160];
+    int  pending;
+} dlerror_entry_t;
+
+static dlerror_entry_t g_dlerrors[MAX_DLERROR_THREADS];
 
 static void set_dlerror(const char *msg)
 {
+    long me = syscall0(SYS_gettid);
+    int slot = -1;
+    for (int i = 0; i < MAX_DLERROR_THREADS; i++) {
+        if (g_dlerrors[i].tid == me) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < MAX_DLERROR_THREADS; i++) {
+            if (g_dlerrors[i].tid == 0) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) slot = 0;
+
+    g_dlerrors[slot].tid = me;
     u64 i = 0;
-    while (msg[i] && i < sizeof(g_dlerror_buf) - 1) { g_dlerror_buf[i] = msg[i]; i++; }
-    g_dlerror_buf[i] = '\0';
-    g_dlerror_pending = 1;
+    while (msg && msg[i] && i < sizeof(g_dlerrors[slot].msg) - 1) {
+        g_dlerrors[slot].msg[i] = msg[i];
+        i++;
+    }
+    g_dlerrors[slot].msg[i] = '\0';
+    g_dlerrors[slot].pending = 1;
 }
 
-/* ── Public runtime ABI for libc's dlopen()/dlsym()/dlclose()/dlerror() ─────
- *
- * These are the only non-static symbols in this file besides ld_main()
- * itself. libc never link-time-depends on ld-azami.so (see
- * userland/libc/ldso_bridge.c): it locates these by hand — reading this
- * process's own AT_BASE, parsing ld-azami.so's own PT_DYNAMIC the same way
- * this file parses any other object's, and looking a name up in its
- * .dynsym — then calls through the resulting function pointer. That keeps
- * this file's "nothing here needs a relocation applied to itself" invariant
- * intact: nothing in this file calls these, so exporting them costs nothing
- * for ld.so's own bootstrap safety. */
+const char *__ldso_dlerror(void)
+{
+    loader_lock();
+    long me = syscall0(SYS_gettid);
+    const char *ret = 0;
+    for (int i = 0; i < MAX_DLERROR_THREADS; i++) {
+        if (g_dlerrors[i].tid == me && g_dlerrors[i].pending) {
+            g_dlerrors[i].pending = 0;
+            ret = g_dlerrors[i].msg;
+            break;
+        }
+    }
+    loader_unlock();
+    return ret;
+}
+
+/* ── Public runtime ABI for libc's dlopen()/dlsym()/dlclose()/dlerror()/dladdr() ───── */
 
 void *__ldso_dlopen(const char *path, int flags)
 {
     (void)flags; /* RTLD_LAZY/NOW/GLOBAL/LOCAL are all treated the same: eager, global scope */
-    if (!path) { set_dlerror("dlopen: NULL path"); return 0; }
+    loader_lock();
+
+    if (!path) {
+        set_dlerror("dlopen: NULL path");
+        loader_unlock();
+        return 0;
+    }
 
     int existing = find_loaded_by_name(path);
-    if (existing >= 0) { g_objs[existing].refcount++; return (void *)&g_objs[existing]; }
+    if (existing >= 0) {
+        g_objs[existing].refcount++;
+        loader_unlock();
+        return (void *)&g_objs[existing];
+    }
+
+    /* Snapshot state for transactional rollback */
+    int old_in_use[MAX_OBJS];
+    int old_refcount[MAX_OBJS];
+    for (int i = 0; i < MAX_OBJS; i++) {
+        old_in_use[i] = g_objs[i].in_use;
+        old_refcount[i] = g_objs[i].refcount;
+    }
 
     char full[128];
     build_lib_path(full, sizeof(full), path);
 
     int idx = obj_load_file(full, path);
-    if (idx < 0) { set_dlerror("dlopen: cannot open or map object"); return 0; }
+    if (idx < 0) {
+        set_dlerror("dlopen: cannot open or map object");
+        goto rollback;
+    }
 
     if (g_objs[idx].has_tls) {
         set_dlerror("dlopen: object has a PT_TLS segment, unsupported for a runtime load");
-        obj_force_unmap(idx);
-        return 0;
+        goto rollback;
     }
+
     if (load_needed_recursive(idx) < 0) {
         set_dlerror("dlopen: a dependency failed to load");
-        obj_force_unmap(idx);
-        return 0;
+        goto rollback;
     }
+
     for (int i = 0; i < g_objs[idx].ndeps; i++) {
-        if (g_objs[g_objs[idx].dep_idx[i]].has_tls) {
+        int dep = g_objs[idx].dep_idx[i];
+        if (!old_in_use[dep] && g_objs[dep].has_tls) {
             set_dlerror("dlopen: a dependency has a PT_TLS segment, unsupported for a runtime load");
-            obj_force_unmap(idx);
-            return 0;
+            goto rollback;
         }
     }
 
     g_dlopen_error = 0;
-    apply_relative(&g_objs[idx]);
-    for (int i = 0; i < g_objs[idx].ndeps; i++) apply_relative(&g_objs[g_objs[idx].dep_idx[i]]);
-    apply_symbolic(&g_objs[idx], 0 /* not fatal: fail the dlopen(), don't kill the process */);
-    for (int i = 0; i < g_objs[idx].ndeps; i++) apply_symbolic(&g_objs[g_objs[idx].dep_idx[i]], 0);
+    /* Relocate only newly loaded objects in this transaction */
+    for (int i = 0; i < MAX_OBJS; i++) {
+        if (!old_in_use[i] && g_objs[i].in_use) {
+            apply_relative(&g_objs[i]);
+        }
+    }
+    for (int i = 0; i < MAX_OBJS; i++) {
+        if (!old_in_use[i] && g_objs[i].in_use) {
+            apply_symbolic(&g_objs[i], 0 /* not fatal */);
+        }
+    }
 
     if (g_dlopen_error) {
         set_dlerror("dlopen: unresolved symbol");
-        obj_force_unmap(idx);
-        return 0;
+        goto rollback;
     }
 
+    /* All dependencies and relocations ready: run constructors */
     run_all_ctors(idx);
+
+    loader_unlock();
     return (void *)&g_objs[idx];
+
+rollback:
+    for (int i = 0; i < MAX_OBJS; i++) {
+        if (!old_in_use[i] && g_objs[i].in_use) {
+            obj_force_unmap(i);
+        } else if (old_in_use[i] && g_objs[i].in_use) {
+            g_objs[i].refcount = old_refcount[i];
+        }
+    }
+    loader_unlock();
+    return 0;
 }
 
 static int handle_valid(void *handle)
@@ -833,57 +1067,161 @@ static int handle_valid(void *handle)
     return o >= g_objs && o < g_objs + MAX_OBJS && o->in_use;
 }
 
+static void *dlsym_transitive(obj_t *root, const char *name)
+{
+    int queue[MAX_OBJS];
+    int head = 0, tail = 0;
+    u64 visited = 0;
+
+    int root_idx = (int)(root - g_objs);
+    queue[tail++] = root_idx;
+    visited |= (1ULL << root_idx);
+
+    while (head < tail) {
+        int idx = queue[head++];
+        obj_t *cur = &g_objs[idx];
+        if (cur->symtab && cur->strtab) {
+            for (u32 s = 0; s < cur->nsyms; s++) {
+                elf64_sym_t *sym = &cur->symtab[s];
+                if (sym->st_name && sym->st_shndx && ld_strcmp(cur->strtab + sym->st_name, name) == 0) {
+                    return (void *)(uintptr_t)(cur->load_bias + sym->st_value);
+                }
+            }
+        }
+        for (int i = 0; i < cur->ndeps; i++) {
+            int dep = cur->dep_idx[i];
+            if (dep >= 0 && dep < MAX_OBJS && g_objs[dep].in_use && !(visited & (1ULL << dep))) {
+                visited |= (1ULL << dep);
+                queue[tail++] = dep;
+            }
+        }
+    }
+    return 0;
+}
+
 void *__ldso_dlsym(void *handle, const char *name)
 {
-    if (!name) { set_dlerror("dlsym: NULL name"); return 0; }
+    loader_lock();
+    if (!name) {
+        set_dlerror("dlsym: NULL name");
+        loader_unlock();
+        return 0;
+    }
 
     if (!handle) {
         /* Simplified RTLD_DEFAULT-like behavior: search every loaded object. */
         obj_t *def_obj = 0;
         elf64_sym_t *sym = resolve_symbol_full(name, &def_obj);
-        if (!sym) { set_dlerror("dlsym: symbol not found"); return 0; }
-        return (void *)(uintptr_t)(def_obj->load_bias + sym->st_value);
+        if (!sym) {
+            set_dlerror("dlsym: symbol not found");
+            loader_unlock();
+            return 0;
+        }
+        void *res = (void *)(uintptr_t)(def_obj->load_bias + sym->st_value);
+        loader_unlock();
+        return res;
     }
 
-    if (!handle_valid(handle)) { set_dlerror("dlsym: invalid handle"); return 0; }
-    obj_t *o = (obj_t *)handle;
+    if (!handle_valid(handle)) {
+        set_dlerror("dlsym: invalid handle");
+        loader_unlock();
+        return 0;
+    }
 
-    if (o->symtab && o->strtab) {
-        for (u32 s = 0; s < o->nsyms; s++) {
-            elf64_sym_t *sym = &o->symtab[s];
-            if (sym->st_name && sym->st_shndx && ld_strcmp(o->strtab + sym->st_name, name) == 0)
-                return (void *)(uintptr_t)(o->load_bias + sym->st_value);
-        }
+    obj_t *root = (obj_t *)handle;
+    void *res = dlsym_transitive(root, name);
+    if (!res) {
+        set_dlerror("dlsym: symbol not found");
+        loader_unlock();
+        return 0;
     }
-    /* One level into its own recorded dependencies — a deliberate
-     * simplification, not a fully transitive search (see top-of-file note). */
-    for (int i = 0; i < o->ndeps; i++) {
-        obj_t *d = &g_objs[o->dep_idx[i]];
-        if (!d->symtab || !d->strtab) continue;
-        for (u32 s = 0; s < d->nsyms; s++) {
-            elf64_sym_t *sym = &d->symtab[s];
-            if (sym->st_name && sym->st_shndx && ld_strcmp(d->strtab + sym->st_name, name) == 0)
-                return (void *)(uintptr_t)(d->load_bias + sym->st_value);
-        }
-    }
-    set_dlerror("dlsym: symbol not found");
-    return 0;
+
+    loader_unlock();
+    return res;
 }
 
 int __ldso_dlclose(void *handle)
 {
-    if (!handle_valid(handle)) { set_dlerror("dlclose: invalid handle"); return -1; }
+    loader_lock();
+    if (!handle_valid(handle)) {
+        set_dlerror("dlclose: invalid handle");
+        loader_unlock();
+        return -1;
+    }
     obj_t *o = (obj_t *)handle;
-    o->refcount--;
-    if (o->refcount <= 0 && !o->pinned) obj_force_unmap((int)(o - g_objs));
+    obj_unload_recursive((int)(o - g_objs));
+    loader_unlock();
     return 0;
 }
 
-const char *__ldso_dlerror(void)
+typedef struct {
+    const char *dli_fname;
+    void       *dli_fbase;
+    const char *dli_sname;
+    void       *dli_saddr;
+} ldso_dl_info_t;
+
+int __ldso_dladdr(const void *addr, ldso_dl_info_t *info)
 {
-    if (!g_dlerror_pending) return 0;
-    g_dlerror_pending = 0;
-    return g_dlerror_buf;
+    if (!info) return 0;
+    info->dli_fname = 0;
+    info->dli_fbase = 0;
+    info->dli_sname = 0;
+    info->dli_saddr = 0;
+
+    loader_lock();
+    obj_t *match_obj = 0;
+    u64 a = (u64)(uintptr_t)addr;
+
+    for (int i = 0; i < MAX_OBJS; i++) {
+        obj_t *o = &g_objs[i];
+        if (!o->in_use) continue;
+
+        for (u32 p = 0; p < o->phnum; p++) {
+            if (o->phdr_storage[p].p_type != PT_LOAD) continue;
+            u64 start = o->load_bias + o->phdr_storage[p].p_vaddr;
+            u64 end   = start + o->phdr_storage[p].p_memsz;
+            if (a >= start && a < end) {
+                match_obj = o;
+                break;
+            }
+        }
+        if (match_obj) break;
+    }
+
+    if (!match_obj) {
+        set_dlerror("dladdr: address not mapped");
+        loader_unlock();
+        return 0;
+    }
+
+    info->dli_fname = match_obj->name[0] ? match_obj->name : "[main]";
+    info->dli_fbase = (void *)(uintptr_t)match_obj->load_bias;
+
+    elf64_sym_t *best_sym = 0;
+    u64 best_val = 0;
+
+    if (match_obj->symtab && match_obj->strtab) {
+        for (u32 s = 0; s < match_obj->nsyms; s++) {
+            elf64_sym_t *sym = &match_obj->symtab[s];
+            if (!sym->st_name || !sym->st_shndx) continue;
+            u64 sym_addr = match_obj->load_bias + sym->st_value;
+            if (sym_addr <= a) {
+                if (!best_sym || sym->st_value >= best_val) {
+                    best_sym = sym;
+                    best_val = sym->st_value;
+                }
+            }
+        }
+    }
+
+    if (best_sym) {
+        info->dli_sname = match_obj->strtab + best_sym->st_name;
+        info->dli_saddr = (void *)(uintptr_t)(match_obj->load_bias + best_sym->st_value);
+    }
+
+    loader_unlock();
+    return 1;
 }
 
 /* Combined static TLS layout query for userland/libc/tls.c's
@@ -949,7 +1287,7 @@ static void jump_to_entry(u64 entry, u64 initial_rsp)
 __attribute__((visibility("hidden")))
 long ld_main(long argc, char **argv, char **envp, u64 initial_rsp)
 {
-    (void)argc; (void)argv;
+    (void)argc;
 
     elf64_auxv_t *av = find_auxv(envp);
     u64 at_phdr  = auxv_get(av, AT_PHDR);
@@ -972,6 +1310,13 @@ long ld_main(long argc, char **argv, char **envp, u64 initial_rsp)
     mo->refcount  = 1;
     mo->load_bias = main_bias;
     mo->map_base  = 0; /* kernel-owned; never munmap the main image */
+    if (argv && argv[0]) {
+        u64 n = 0;
+        while (argv[0][n] && n < sizeof(mo->name) - 1) { mo->name[n] = argv[0][n]; n++; }
+        mo->name[n] = '\0';
+    } else {
+        mo->name[0] = '/'; mo->name[1] = 'm'; mo->name[2] = 'a'; mo->name[3] = 'i'; mo->name[4] = 'n'; mo->name[5] = '\0';
+    }
 
     u32 nphdrs = (u32)at_phnum;
     if (nphdrs > LD_MAX_PHDRS) nphdrs = LD_MAX_PHDRS;
