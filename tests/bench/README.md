@@ -202,3 +202,22 @@ Dropping CPU2 checks a production timeout while CPU1 still returns the seed;
 dropping CPU1 remains a negative setup case. Counter snapshots are approximate
 while the worker runs; they do not prove concurrent frame identity or Normal
 zone behavior above 4 GiB. See [deferred reclaim results](../../docs/W4.3_PMM_RECLAIM_RESULTS.md).
+
+## User-copy fault oracle
+
+This captures 60 return/errno, file-position, data and canary observations using
+one stock-musl binary on Linux and AzamiOS. Full collection is separate from
+compatibility: the runner fails by default on any Linux difference. Explicit
+baseline mode keeps `compatible: false` when differences exist:
+
+```sh
+make -C tools/linux usercopy-observe-probe
+python3 -B tests/bench/usercopy_observe.py --accel kvm tcg --collect-only \
+    --kernel build/kernel.elf --output /tmp/azami-usercopy-baseline
+python3 -B tests/bench/test_usercopy_observe.py \
+    /tmp/azami-usercopy-baseline/linux.txt
+```
+
+Raw outputs remain local. [The measured faults](../../docs/W4.3_USERCOPY_RESULTS.md)
+identify remaining I/O transaction and partial-copy fixes; they do not establish
+copy throughput or full SMAP/COW coverage.

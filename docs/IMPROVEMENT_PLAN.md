@@ -51,6 +51,11 @@ workflow, groups and sampling remain later counter milestones. Gemini review
 confirmed a sysfs pagination
 defect; its fix passes 32/64-CPU enumeration.
 
+The [user-copy fault baseline](W4.3_USERCOPY_RESULTS.md) now compares 60 small
+I/O cases with real Linux. KVM/TCG agree with each other; 39 cases expose remaining
+partial-copy, pipe consumption, vector-import and argument-check differences.
+User-copy fixes, large-copy timing and COW/SMAP stress remain next steps.
+
 ## Baseline and corrections
 
 The latest recorded run passed 121 ABI checks, three BusyBox/dynamic-loader
@@ -279,10 +284,11 @@ failures, mixed orders and exact restoration on one/four-CPU KVM/TCG guests.
 It reproduces one stranded remote cached page and recovery through an owner
 drain. The [deferred reclaim checkpoint](W4.3_PMM_RECLAIM_RESULTS.md) now uses
 that production sweep, with atomic-only failure publication for callers holding
-heap/VMM locks. Scheduled-worker execution and quiescence pass on TCG;
-KVM/TCG exhaustion and hosted ownership/budget checks also pass. The remaining
-KVM worker/fault/UEFI runs, refill/spill measurements, explicit caller retry,
-user-copy faults and COW stress remain scoped follow-up work.
+heap/VMM locks. Scheduled-worker execution, quiescence, exhaustion and
+dropped-receiver checks pass on KVM/TCG, alongside ten BIOS/UEFI boot cases
+and hosted ownership/budget checks. Refill/spill measurements, explicit caller retry,
+the [measured user-copy differences](W4.3_USERCOPY_RESULTS.md) and COW stress
+remain scoped follow-up work.
 
 **Skills:** kernel-concurrency, custom-allocators, virtual memory, hardware-counters.
 

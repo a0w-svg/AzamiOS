@@ -356,6 +356,102 @@
         "quiescent_cycles": 10,
         "quiescent_sweeps": 3
       }
+    },
+    {
+      "accel": "kvm",
+      "cpus": 1,
+      "memory_mb": 512,
+      "passed": 8,
+      "stats": {
+        "worker_started": 1,
+        "pending_zones": 0,
+        "pressure_batches": 2,
+        "sweeps": 2,
+        "worker_cycles": 12,
+        "worker_sweeps": 1,
+        "reclaimed_pages": 1,
+        "callbacks": 2,
+        "lock_busy": 0,
+        "rpc_busy": 0,
+        "rpc_timeouts": 0,
+        "time_unavailable": 0,
+        "offline_cpus": 0,
+        "start_failures": 0,
+        "quiescent_cycles": 10,
+        "quiescent_sweeps": 1
+      }
+    },
+    {
+      "accel": "kvm",
+      "cpus": 1,
+      "memory_mb": 1536,
+      "passed": 8,
+      "stats": {
+        "worker_started": 1,
+        "pending_zones": 0,
+        "pressure_batches": 2,
+        "sweeps": 2,
+        "worker_cycles": 12,
+        "worker_sweeps": 1,
+        "reclaimed_pages": 1,
+        "callbacks": 2,
+        "lock_busy": 0,
+        "rpc_busy": 0,
+        "rpc_timeouts": 0,
+        "time_unavailable": 0,
+        "offline_cpus": 0,
+        "start_failures": 0,
+        "quiescent_cycles": 10,
+        "quiescent_sweeps": 1
+      }
+    },
+    {
+      "accel": "kvm",
+      "cpus": 4,
+      "memory_mb": 512,
+      "passed": 8,
+      "stats": {
+        "worker_started": 1,
+        "pending_zones": 0,
+        "pressure_batches": 2,
+        "sweeps": 5,
+        "worker_cycles": 12,
+        "worker_sweeps": 4,
+        "reclaimed_pages": 179,
+        "callbacks": 20,
+        "lock_busy": 0,
+        "rpc_busy": 0,
+        "rpc_timeouts": 0,
+        "time_unavailable": 0,
+        "offline_cpus": 0,
+        "start_failures": 0,
+        "quiescent_cycles": 10,
+        "quiescent_sweeps": 4
+      }
+    },
+    {
+      "accel": "kvm",
+      "cpus": 4,
+      "memory_mb": 1536,
+      "passed": 8,
+      "stats": {
+        "worker_started": 1,
+        "pending_zones": 0,
+        "pressure_batches": 2,
+        "sweeps": 5,
+        "worker_cycles": 12,
+        "worker_sweeps": 4,
+        "reclaimed_pages": 237,
+        "callbacks": 20,
+        "lock_busy": 0,
+        "rpc_busy": 0,
+        "rpc_timeouts": 0,
+        "time_unavailable": 0,
+        "offline_cpus": 0,
+        "start_failures": 0,
+        "quiescent_cycles": 10,
+        "quiescent_sweeps": 4
+      }
     }
   ],
   "dropped_receiver": [
@@ -404,18 +500,70 @@
         "quiescent_cycles": 10,
         "quiescent_sweeps": 8
       }
+    },
+    {
+      "accel": "kvm",
+      "cpus": 4,
+      "memory_mb": 512,
+      "drop_cpu": 2,
+      "remote": {
+        "phase": "remote",
+        "cpu": 1,
+        "supported": true,
+        "seed": 1744896,
+        "cached_pages": 1,
+        "drained": 1,
+        "recovered": 1744896,
+        "pressure_zones": 3,
+        "dma32_pressure_zones": 1,
+        "irq_disabled_failure": true,
+        "sweeps": 1,
+        "reclaimed_pages": 1,
+        "callbacks": 3,
+        "rpc_timeouts": 1,
+        "busy": 0,
+        "cpu_budget": 8,
+        "page_budget": 256,
+        "callback_budget": 32,
+        "global_oom": true,
+        "passed": true
+      },
+      "worker": {
+        "worker_started": 1,
+        "pending_zones": 0,
+        "pressure_batches": 2,
+        "sweeps": 9,
+        "worker_cycles": 12,
+        "worker_sweeps": 8,
+        "reclaimed_pages": 275,
+        "callbacks": 27,
+        "lock_busy": 0,
+        "rpc_busy": 0,
+        "rpc_timeouts": 9,
+        "time_unavailable": 0,
+        "offline_cpus": 0,
+        "start_failures": 0,
+        "quiescent_cycles": 10,
+        "quiescent_sweeps": 8
+      }
     }
   ],
   "regression": {
     "boot": {
-      "accel": "tcg",
-      "passed": 6,
-      "bios": 5,
-      "uefi": 1,
+      "accel": [
+        "kvm",
+        "tcg"
+      ],
+      "passed": 10,
+      "bios": 8,
+      "uefi": 2,
       "selftest": false
     },
     "allocation_integrity": {
-      "accel": "tcg",
+      "accel": [
+        "kvm",
+        "tcg"
+      ],
       "worker_records": 55,
       "ordered_snapshots": 66,
       "workers": [
@@ -425,7 +573,9 @@
       "measured_rounds": 10,
       "warmups": 1,
       "bytes_per_worker": 16777216,
-      "scope": "Content/count/affinity regression; no before-after throughput claim"
+      "scope": "Content/count/affinity regression; no before-after throughput claim",
+      "kvm_boot_settle_seconds": 8,
+      "rejected_kvm_records_interleaved_with_dhcp": 2
     },
     "perf": {
       "accel": "tcg",
@@ -480,8 +630,6 @@
     "tests/bench/test_pmm_selftest.py": "1e0dfc1673ab1c477fb053b5a83c697025140be20e4349ff19f7b442094bd218"
   },
   "additional_coverage": [
-    "KVM scheduled worker/quiescence (4 configurations)",
-    "KVM dropped receiver and normal boot matrix (4 configurations)",
     "Normal physical zone above4GiB and native hardware",
     "Concurrent high-order coalescing and measured throughput"
   ]
