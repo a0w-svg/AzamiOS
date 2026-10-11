@@ -43,8 +43,10 @@ coverage remains additional work. W4.3 now has a
 user-copy and COW measurement. A [controlled allocator baseline](W4.3_PMM_RESULTS.md)
 now passes on KVM/TCG with 55 worker records and 66 parked snapshots; allocation
 failure and mixed-order evidence is now recorded in the
-[opt-in boot checkpoint](W4.3_PMM_SELFTEST_RESULTS.md). Deferred reclaim and
-refill/spill measurements remain before cache tuning. Inheritance/exec
+[opt-in boot checkpoint](W4.3_PMM_SELFTEST_RESULTS.md). A
+[deferred reclaim checkpoint](W4.3_PMM_RECLAIM_RESULTS.md) now adds atomic
+pressure notification, bounded owner-side sweeps and expiring retry epochs.
+Refill/spill measurements remain before cache tuning. Inheritance/exec
 workflow, groups and sampling remain later counter milestones. Gemini review
 confirmed a sysfs pagination
 defect; its fix passes 32/64-CPU enumeration.
@@ -275,9 +277,12 @@ page integrity and approximate retention on KVM/TCG, with no allocator changes.
 The [opt-in exhaustion checkpoint](W4.3_PMM_SELFTEST_RESULTS.md) now covers real
 failures, mixed orders and exact restoration on one/four-CPU KVM/TCG guests.
 It reproduces one stranded remote cached page and recovery through an owner
-drain. Allocation policy is unchanged; production callers holding heap/VMM
-locks require an audited deferred-reclaim design. Refill/spill performance
-measurement remains before cache tuning.
+drain. The [deferred reclaim checkpoint](W4.3_PMM_RECLAIM_RESULTS.md) now uses
+that production sweep, with atomic-only failure publication for callers holding
+heap/VMM locks. Scheduled-worker execution and quiescence pass on TCG;
+KVM/TCG exhaustion and hosted ownership/budget checks also pass. The remaining
+KVM worker/fault/UEFI runs, refill/spill measurements, explicit caller retry,
+user-copy faults and COW stress remain scoped follow-up work.
 
 **Skills:** kernel-concurrency, custom-allocators, virtual memory, hardware-counters.
 

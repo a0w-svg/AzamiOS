@@ -460,6 +460,30 @@ void lapic_send_ipi(u32 apic_id, u8 vector)
     lapic_icr_send(apic_id, LAPIC_ICR_FIXED | LAPIC_ICR_ASSERT | vector);
 }
 
+bool lapic_send_ipi_bounded(u32 apic_id, u8 vector)
+{
+    u32 command = LAPIC_ICR_FIXED | LAPIC_ICR_ASSERT | vector;
+    if (g_x2apic) {
+        wrmsr(MSR_X2APIC_ICR, ((u64)apic_id << 32) | command);
+        return true;
+    }
+    if (!g_lapic_mmio || apic_id > 0xFFU) return false;
+    u64 flags = lapic_icr_guard_enter();
+    /* No timekeeping here: the sender may have interrupted its publisher.
+     * The legacy send retains its acknowledgement contract unchanged. */
+    for (u32 polls = 0; polls < 4096; polls++) {
+        if (!(lapic_read(LAPIC_ICR_LO) & LAPIC_ICR_BUSY)) {
+            lapic_write(LAPIC_ICR_HI, apic_id << 24);
+            lapic_write(LAPIC_ICR_LO, command);
+            lapic_icr_guard_exit(flags);
+            return true;
+        }
+        cpu_pause();
+    }
+    lapic_icr_guard_exit(flags);
+    return false;
+}
+
 void lapic_send_ipi_allbutself(u8 vector)
 {
     lapic_icr_send(0, LAPIC_ICR_FIXED | LAPIC_ICR_ASSERT |

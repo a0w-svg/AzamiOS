@@ -101,6 +101,11 @@ void smp_send_reschedule(u32 cpu_id);
  *  A no-op for the calling CPU itself and for ids that are not online. */
 void smp_send_ipi(u32 cpu_id, u8 vector);
 
+/** Bounded remote fixed-IPI dispatch for smp_rpc_call(), false on an invalid
+ * target, pre-GS startup, or a busy xAPIC ICR. No-op self calls are rejected.
+ * Caller disables IRQs across self/remote selection to prevent migration. */
+bool smp_send_ipi_bounded(u32 cpu_id, u8 vector);
+
 /** smp_send_ipi_mask(mask, vector) — Send @vector to every online CPU in
  *  @mask except the caller. Uses the all-but-self broadcast shorthand when
  *  @mask covers everyone, which is one ICR write instead of one per CPU. */

@@ -85,6 +85,8 @@
 #include "../../drivers/char/console.h"
 #include "../cmdline.h"
 #include "../time/timekeeping.h"
+#include "../sched/sched.h"
+#include "../../include/azami/uapi/errno.h"
 
 
 /* Limine memory map types (from limine.h — we use the numeric values directly
@@ -501,8 +503,8 @@ static bool zone_free_locked(phys_addr_t phys, u32 order)
  * What makes the lock-free path safe is that a row is only ever mutated by its
  * owning CPU with interrupts off: an interrupt-context allocation on the same
  * core is excluded, and no other core touches the row. Nothing here drains a
- * remote CPU's cache, which is why pmm_drain_local() is documented as local
- * only and why the OOM path drains just the current core.
+ * remote CPU's cache. The failure path drains just the current core, then
+ * publishes pressure for a deferred worker whose callbacks run on the owner.
  *
  * Frames sitting in a cache have left the buddy's free_frames, so
  * pmm_get_free_pages() adds the cached counts back in — otherwise the
@@ -661,6 +663,178 @@ static u64 pcp_cached(u32 zone)
     return n;
 }
 
+/* Allocation failures occur with unrelated locks held and IRQs disabled.
+ * Their only additional operation is an atomic zone-bit publication. The
+ * precreated worker polls instead of waking, allocating or issuing RPC there.
+ * A sweep reserves each issued callback's entire budget even on timeout: a
+ * RUNNING request may still drain pages later, but never caller-owned frames.
+ * Every payload contains values only; PCP rows and callback text are permanent.
+ */
+#define PMM_RECLAIM_CPUS 8U
+#define PMM_RECLAIM_PAGES 256U
+#define PMM_RECLAIM_CALLBACK_PAGES 32U
+#define PMM_RECLAIM_SWEEP_NS 50000000ULL
+#define PMM_RECLAIM_RPC_NS 10000000ULL
+#define PMM_RECLAIM_POLL_TICKS 10U
+#define PMM_RECLAIM_ALL ((1U << PMM_ZONE_COUNT) - 1)
+static u32 g_pmm_pressure, g_pmm_reclaim_started, g_pmm_reclaim_running;
+static u32 g_pmm_reclaim_next_cpu;
+/* Retry state is owned by the serialized sweep, separate from racing new
+ * failure notifications. Only the mask is atomically observed by snapshots. */
+static u32 g_pmm_reclaim_retry_zones;
+static u32 g_pmm_reclaim_remaining[PMM_ZONE_COUNT];
+static pmm_reclaim_stat_t g_pmm_reclaim_stat;
+#define RECLAIM_ADD(field, value) \
+    __atomic_fetch_add(&g_pmm_reclaim_stat.field, (u64)(value), __ATOMIC_RELAXED)
+
+typedef struct { u32 zones, budget, moved, busy; } pmm_reclaim_rpc_t;
+
+static void pmm_reclaim_callback(void *data)
+{
+    pmm_reclaim_rpc_t *request = data;
+    u32 budget = request->budget;
+    if (budget > PMM_RECLAIM_CALLBACK_PAGES) budget = PMM_RECLAIM_CALLBACK_PAGES;
+    u32 zones = request->zones & PMM_RECLAIM_ALL;
+    irqflags_t flags = irq_save();
+    u32 cpu = smp_current_cpu_id();
+    RECLAIM_ADD(callbacks, 1);
+    if (g_pmm_percpu_ready && cpu < SMP_MAX_CPUS && budget && zones) {
+        if (spinlock_try_lock(&g_pmm_lock)) {
+            /* Give each requested zone its own share. Persistent DMA32 churn
+             * must not consume every callback budget and strand Normal PCPs. */
+            u32 zone_count = !!(zones & (1U << PMM_ZONE_DMA32)) +
+                             !!(zones & (1U << PMM_ZONE_NORMAL));
+            u32 quota = budget / zone_count;
+            for (u32 zone = 0; zone < PMM_ZONE_COUNT && request->moved < budget; zone++) {
+                if (!(zones & (1U << zone))) continue;
+                pcp_t *cache = &g_pcp[cpu][zone];
+                u32 moved = 0;
+                while (cache->count && moved < quota) {
+                    phys_addr_t phys = cache->page[--cache->count];
+                    if (!zone_free_locked(phys, 0))
+                        PANIC("PMM reclaim owner-cache invariant cpu=%u zone=%u", cpu, zone);
+                    request->moved++; moved++;
+                }
+            }
+            spinlock_unlock(&g_pmm_lock);
+            RECLAIM_ADD(reclaimed_pages, request->moved);
+        } else {
+            request->busy = 1;
+            RECLAIM_ADD(lock_busy, 1);
+        }
+    }
+    irq_restore(flags);
+}
+
+/* Private: only the lock-free worker and the parked-CPU boot test call this.
+ * The worker may migrate; no cache pointer or CPU identity survives an RPC.
+ * Both time reads and RPC waits are bounded, including unavailable timekeeping.
+ */
+static bool pmm_reclaim_sweep(void)
+{
+    u32 expected = 0;
+    if (!__atomic_compare_exchange_n(&g_pmm_reclaim_running, &expected, 1,
+                                    false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return false;
+    u32 fresh = __atomic_exchange_n(&g_pmm_pressure, 0, __ATOMIC_ACQ_REL);
+    u32 zones = fresh | __atomic_load_n(&g_pmm_reclaim_retry_zones, __ATOMIC_RELAXED);
+    if (!zones) {
+        __atomic_store_n(&g_pmm_reclaim_running, 0, __ATOMIC_RELEASE);
+        return false;
+    }
+    if (fresh) RECLAIM_ADD(pressure_batches, 1);
+    RECLAIM_ADD(sweeps, 1);
+    u64 now;
+    u32 cpus = smp_cpu_count(), budget = PMM_RECLAIM_PAGES;
+    if (cpus > SMP_MAX_CPUS) cpus = SMP_MAX_CPUS;
+    /* At most one full cache worth of attempts per CPU/zone for each new
+     * pressure notification, even if frees keep replenishing the cache. The
+     * minimum fair share is 16 pages; retries include this current sweep.
+     * Busy/offline/timeout attempts spend the allowance too: best effort,
+     * never an indefinitely active epoch. A new failure rearms its zone. */
+    u32 passes = ((cpus + PMM_RECLAIM_CPUS - 1) / PMM_RECLAIM_CPUS) *
+                 (PCP_CAP / (PMM_RECLAIM_CALLBACK_PAGES / PMM_ZONE_COUNT));
+    for (u32 zone = 0; zone < PMM_ZONE_COUNT; zone++) {
+        if (fresh & (1U << zone)) g_pmm_reclaim_remaining[zone] = passes;
+        if ((zones & (1U << zone)) && g_pmm_reclaim_remaining[zone])
+            g_pmm_reclaim_remaining[zone]--;
+    }
+    if (!ktime_try_get_ns(&now)) {
+        RECLAIM_ADD(time_unavailable, 1);
+    } else if (cpus) {
+        u64 deadline = now + PMM_RECLAIM_SWEEP_NS;
+        u32 visits = cpus < PMM_RECLAIM_CPUS ? cpus : PMM_RECLAIM_CPUS;
+        for (u32 visit = 0; visit < visits && budget; visit++) {
+            u32 cpu = g_pmm_reclaim_next_cpu++ % cpus;
+            if (!smp_cpu_online(cpu)) { RECLAIM_ADD(offline_cpus, 1); continue; }
+            if (!ktime_try_get_ns(&now)) { RECLAIM_ADD(time_unavailable, 1); break; }
+            if (now >= deadline) break;
+            u64 rpc_deadline = now + PMM_RECLAIM_RPC_NS;
+            if (rpc_deadline > deadline) rpc_deadline = deadline;
+            u32 allowance = budget < PMM_RECLAIM_CALLBACK_PAGES ? budget : PMM_RECLAIM_CALLBACK_PAGES;
+            budget -= allowance;
+            pmm_reclaim_rpc_t request = {.zones = zones, .budget = allowance};
+            int result = smp_rpc_call(cpu, pmm_reclaim_callback, &request,
+                                      sizeof(request), rpc_deadline);
+            if (result == -ETIMEDOUT) RECLAIM_ADD(rpc_timeouts, 1);
+            else if (result == -EBUSY) RECLAIM_ADD(rpc_busy, 1);
+            else if (result == -EAGAIN) RECLAIM_ADD(time_unavailable, 1);
+            else if (result == -ENODEV) RECLAIM_ADD(offline_cpus, 1);
+        }
+    }
+    /* These counts are estimates, never permission to touch remote rows.
+     * Epoch exhaustion stops retries even when caches remain nonempty. Store
+     * only private retry state: new failures racing the sweep remain set in
+     * g_pmm_pressure and are neither erased nor counted as old retry work. */
+    u32 remaining = 0;
+    for (u32 zone = 0; zone < PMM_ZONE_COUNT; zone++)
+        if ((zones & (1U << zone)) && g_pmm_reclaim_remaining[zone] && pcp_cached(zone))
+            remaining |= 1U << zone;
+    __atomic_store_n(&g_pmm_reclaim_retry_zones, remaining, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pmm_reclaim_running, 0, __ATOMIC_RELEASE);
+    return true;
+}
+
+static void pmm_reclaimer_thread(void *data)
+{
+    (void)data;
+    for (;;) {
+        sched_sleep(PMM_RECLAIM_POLL_TICKS);
+        RECLAIM_ADD(worker_cycles, 1);
+        if (pmm_reclaim_sweep()) RECLAIM_ADD(worker_sweeps, 1);
+    }
+}
+
+bool pmm_start_reclaimer(void)
+{
+    u32 expected = 0;
+    if (!__atomic_compare_exchange_n(&g_pmm_reclaim_started, &expected, 1,
+                                    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return expected == 2;
+    process_t *process = sched_kernel_process();
+    if (!process || !thread_create(process, (uintptr_t)pmm_reclaimer_thread, 0, true)) {
+        RECLAIM_ADD(start_failures, 1);
+        __atomic_store_n(&g_pmm_reclaim_started, 0, __ATOMIC_RELEASE);
+        return false;
+    }
+    __atomic_store_n(&g_pmm_reclaim_started, 2, __ATOMIC_RELEASE);
+    return true;
+}
+
+void pmm_reclaim_stats(pmm_reclaim_stat_t *out)
+{
+    if (!out) return;
+#define RECLAIM_READ(field) out->field = __atomic_load_n(&g_pmm_reclaim_stat.field, __ATOMIC_RELAXED)
+    RECLAIM_READ(pressure_batches); RECLAIM_READ(sweeps);
+    RECLAIM_READ(worker_cycles); RECLAIM_READ(worker_sweeps);
+    RECLAIM_READ(reclaimed_pages); RECLAIM_READ(callbacks);
+    RECLAIM_READ(lock_busy); RECLAIM_READ(rpc_busy); RECLAIM_READ(rpc_timeouts);
+    RECLAIM_READ(time_unavailable); RECLAIM_READ(offline_cpus); RECLAIM_READ(start_failures);
+#undef RECLAIM_READ
+    out->pending_zones = __atomic_load_n(&g_pmm_pressure, __ATOMIC_RELAXED) |
+                         __atomic_load_n(&g_pmm_reclaim_retry_zones, __ATOMIC_RELAXED);
+    out->worker_started = __atomic_load_n(&g_pmm_reclaim_started, __ATOMIC_ACQUIRE) == 2;
+}
+
 /* ── Public API ───────────────────────────────────────────────────────────── */
 
 void pmm_init(void *memmap_raw)
@@ -809,7 +983,7 @@ phys_addr_t pmm_alloc(u32 order)
     }
 
     if (unlikely(!ret)) {
-        pr_debug("[PMM] Out of memory (order=%u requested)\n", order);
+        __atomic_fetch_or(&g_pmm_pressure, PMM_RECLAIM_ALL, __ATOMIC_RELAXED);
     }
     return ret;
 }
@@ -909,7 +1083,7 @@ phys_addr_t pmm_alloc_32(u32 order)
     }
 
     if (unlikely(!ret)) {
-        pr_debug("[PMM] Out of 32-bit low memory (order=%u requested)\n", order);
+        __atomic_fetch_or(&g_pmm_pressure, 1U << PMM_ZONE_DMA32, __ATOMIC_RELAXED);
     }
     return ret;
 }
@@ -1027,8 +1201,8 @@ void pmm_dump_stats(void)
     }
 }
 
-/* Boot-only real allocator stress. No allocation policy or hot-path counters
- * change. APs service IPIs but have not started timers or scheduling. Fixed
+/* Boot-only real allocator stress. The precreated worker remains queued:
+ * APs service IPIs but have not started timers or scheduling. Fixed
  * ownership records bound exhaustion work; hitting the bound is a failure,
  * never evidence of exhaustion. All diagnostics are deferred until cleanup.
  * A remote seed is one individually allocated order-0 frame, so its eventual
@@ -1172,7 +1346,18 @@ void pmm_boot_selftest(void)
         kprintf("PMMTEST {\"phase\":\"skip\",\"reason\":\"requires 1-4 online CPUs and 128MiB-2GiB managed RAM\"}\n");
         return;
     }
-    for (u32 cpu=0;cpu<cpus;cpu++) pmm_test_call(cpu,PT_DRAIN,0);
+    if (__atomic_load_n(&g_pmm_reclaim_started,__ATOMIC_ACQUIRE)!=2)
+        PANIC("PMM selftest requires precreated reclaim worker");
+    long dropped_cpu=cmdline_get_long("smp_rpc_drop_cpu",-1);
+    for (u32 cpu=0;cpu<cpus;cpu++) {
+        /* Fault injection can skip an empty, parked non-seed CPU. Nothing is
+         * transferred to it. CPU1's seed RPC still requires acknowledgement. */
+        if ((long)cpu==dropped_cpu && cpu>1) {
+            if (__atomic_load_n(&g_pcp[cpu][0].count,__ATOMIC_RELAXED) ||
+                __atomic_load_n(&g_pcp[cpu][1].count,__ATOMIC_RELAXED))
+                PANIC("PMM selftest dropped CPU has cached frames cpu=%u",cpu);
+        } else pmm_test_call(cpu,PT_DRAIN,0);
+    }
     pmm_zone_stat_t initial[PMM_ZONE_COUNT], final[PMM_ZONE_COUNT];
     u64 initial_pages=pmm_test_snapshot(initial);
     u32 count=0, mixed_mask=0; u64 zero_bytes=0, mixed_pages=0;
@@ -1232,10 +1417,39 @@ void pmm_boot_selftest(void)
         PANIC("PMM selftest did not establish allocation failure accounting");
     u32 exhaust_allocations=count;
     u64 exhaust_pages=held_pages;
-    u32 drained=0;
+    /* The worker is queued, so isolate the two real failure publications.
+     * IRQ-disabled callers (including heap/VMM locks) must not enter RPC or
+     * timekeeping here. No allocator lock is held by this test itself. */
+    __atomic_store_n(&g_pmm_pressure,0,__ATOMIC_RELAXED);
+    irqflags_t failure_flags=irq_save();
+    phys_addr_t dma32_failure=pmm_alloc_32(0);
+    u32 dma32_pressure=__atomic_load_n(&g_pmm_pressure,__ATOMIC_RELAXED);
+    phys_addr_t general_failure=pmm_alloc(0);
+    irqflags_t observed_flags=irq_save();
+    irq_restore(failure_flags);
+    if (dma32_failure || general_failure || dma32_pressure!=(1U<<PMM_ZONE_DMA32) ||
+        (observed_flags & (1ULL<<9)))
+        PANIC("PMM selftest IRQ-disabled failure publication invariant");
+    pmm_reclaim_stat_t reclaim_before,reclaim_after;
+    pmm_reclaim_stats(&reclaim_before);
+    u32 pressure=__atomic_load_n(&g_pmm_pressure,__ATOMIC_RELAXED);
+    if (pressure!=PMM_RECLAIM_ALL || !pmm_reclaim_sweep())
+        PANIC("PMM selftest allocation failure did not publish reclaim pressure");
+    pmm_reclaim_stats(&reclaim_after);
+    u64 reclaimed=reclaim_after.reclaimed_pages-reclaim_before.reclaimed_pages;
+    u64 sweeps=reclaim_after.sweeps-reclaim_before.sweeps;
+    u64 callbacks=reclaim_after.callbacks-reclaim_before.callbacks;
+    u64 timeouts=reclaim_after.rpc_timeouts-reclaim_before.rpc_timeouts;
+    u64 busy=reclaim_after.lock_busy-reclaim_before.lock_busy+
+             reclaim_after.rpc_busy-reclaim_before.rpc_busy;
+    if (reclaimed!=remote_pages || sweeps!=1 || callbacks<1 ||
+        __atomic_load_n(&g_pmm_pressure,__ATOMIC_RELAXED))
+        PANIC("PMM selftest production reclaim did not drain expected cache");
+    if (dropped_cpu>1 && dropped_cpu<(long)cpus && timeouts!=1)
+        PANIC("PMM selftest dropped reclaim receiver did not time out");
+    u32 drained=(u32)reclaimed;
     phys_addr_t recovered=0;
     if (cpus>1) {
-        drained=pmm_test_call(1,PT_DRAIN,0);
         if (drained!=1) PANIC("PMM selftest remote drain changed unexpected frames");
         recovered=pmm_alloc(0);
         if (recovered!=seed) PANIC("PMM selftest remote seed recovery mismatch");
@@ -1243,6 +1457,8 @@ void pmm_boot_selftest(void)
     }
     if (pmm_alloc(0) || pmm_test_snapshot(final))
         PANIC("PMM selftest global exhaustion not established");
+    /* Keep this last real OOM notification pending through restoration. Once
+     * scheduling starts, the actual worker must consume it and report a pass. */
     for (u32 i=0;i<count;i++) pmm_test_content(g_pmm_test_blocks[i],false,false);
     while (count) {
         pmm_test_block_t block=g_pmm_test_blocks[--count];
@@ -1261,9 +1477,13 @@ void pmm_boot_selftest(void)
     kprintf("PMMTEST {\"phase\":\"exhaust\",\"allocations\":%u,\"orders_mask\":%u,\"pages\":%llu,\"order_failures\":%u,\"buddy_pages\":%llu,\"cached_pages\":%llu,\"passed\":true}\n",
             exhaust_allocations,exhaust_mask,(unsigned long long)exhaust_pages,failures,
             (unsigned long long)buddy_pages,(unsigned long long)cached_pages);
-    kprintf("PMMTEST {\"phase\":\"remote\",\"cpu\":%u,\"supported\":%s,\"seed\":%llu,\"cached_pages\":%u,\"drained\":%u,\"recovered\":%llu,\"global_oom\":true,\"passed\":true}\n",
+    kprintf("PMMTEST {\"phase\":\"remote\",\"cpu\":%u,\"supported\":%s,\"seed\":%llu,\"cached_pages\":%u,\"drained\":%u,\"recovered\":%llu,\"pressure_zones\":%u,\"dma32_pressure_zones\":%u,\"irq_disabled_failure\":true,\"sweeps\":%llu,\"reclaimed_pages\":%llu,\"callbacks\":%llu,\"rpc_timeouts\":%llu,\"busy\":%llu,\"cpu_budget\":%u,\"page_budget\":%u,\"callback_budget\":%u,\"global_oom\":true,\"passed\":true}\n",
             cpus>1 ? 1 : 0,cpus>1 ? "true" : "false",(unsigned long long)seed,
-            remote_pages,drained,(unsigned long long)recovered);
+            remote_pages,drained,(unsigned long long)recovered,pressure,dma32_pressure,
+            (unsigned long long)sweeps,(unsigned long long)reclaimed,
+            (unsigned long long)callbacks,(unsigned long long)timeouts,
+            (unsigned long long)busy,PMM_RECLAIM_CPUS,PMM_RECLAIM_PAGES,
+            PMM_RECLAIM_CALLBACK_PAGES);
     kprintf("PMMTEST {\"phase\":\"restore\",\"initial_pages\":%llu,\"restored_pages\":%llu,\"local_drained\":%u,\"orders_restored\":true,\"cached_pages\":0,\"passed\":true}\n",
             (unsigned long long)initial_pages,(unsigned long long)restored_pages,restored_cache);
     kprintf("PMMTEST {\"phase\":\"PASS\",\"cpus\":%u,\"passed\":true}\n",cpus);

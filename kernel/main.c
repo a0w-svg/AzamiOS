@@ -563,12 +563,16 @@ void kernel_main(void)
     extern void ktrace_init(void);
     pmu_init();
     smp_rpc_init();
-    pmm_boot_selftest();
     perf_init();
     ktrace_init();
 
     /* ── Step 12: CFS Scheduler & Process/Thread Manager ─────────────────── */
     sched_init();
+    /* Allocate the worker before pressure testing; AP scheduling is still
+     * parked here. Allocation failures only publish a flag for this worker. */
+    if (!pmm_start_reclaimer())
+        kprintf("[PMM] Deferred cache reclaim worker unavailable\n");
+    pmm_boot_selftest();
     console_start_async();
 
     /* Heap reaper: hands fully-free slab pages back to the PMM on a timer.

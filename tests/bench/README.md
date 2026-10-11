@@ -175,3 +175,30 @@ python3 -B tests/bench/test_pmm_selftest.py \
 This checks allocation-failure and restoration invariants before scheduling;
 it does not measure concurrent allocator throughput. See
 [the checkpoint results](../../docs/W4.3_PMM_SELFTEST_RESULTS.md).
+
+The production reclaimer now consumes the failure flag through owner-side RPCs.
+The same boot test checks both allocation APIs with interrupts disabled and
+recovers the exact remote page through that production sweep. A separate stock
+musl payload checks read-only `/proc/pmm_reclaim` access, enumeration, worker
+startup, and actual scheduled execution after the boot test leaves a real
+failure notification pending. An eighth assertion observes quiescence and two
+more worker cycles without another sweep:
+
+```sh
+make -C tools/linux pmm-reclaim-probe
+python3 -B tests/bench/pmm_selftest.py --accel kvm --worker-probe \
+    --output /tmp/azami-pmm-worker-kvm
+python3 -B tests/bench/pmm_selftest.py --accel tcg --cpus 4 --memory 512 \
+    --drop-cpu 2 --worker-probe --output /tmp/azami-pmm-drop-tcg
+python3 -B tests/bench/test_pmm_selftest.py \
+    /tmp/azami-pmm-worker-kvm/kvm-4cpu-1536m/serial.log --cpus 4 --worker-probe
+python3 -B tools/tests/smp_rpc_dispatch_test.py
+python3 -B tools/tests/pmm_reclaim_test.py
+```
+
+`--kernel /path/to/kernel.elf` selects an existing immutable image. The runner
+requires at least 256 MiB guest RAM to leave room for the managed-memory guard.
+Dropping CPU2 checks a production timeout while CPU1 still returns the seed;
+dropping CPU1 remains a negative setup case. Counter snapshots are approximate
+while the worker runs; they do not prove concurrent frame identity or Normal
+zone behavior above 4 GiB. See [deferred reclaim results](../../docs/W4.3_PMM_RECLAIM_RESULTS.md).
