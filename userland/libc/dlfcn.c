@@ -20,6 +20,8 @@
  * binary linked purely against libc.a with no PT_INTERP.
  * ============================================================================ */
 #include "include/dlfcn.h"
+#include "include/link.h"
+#include "include/sys/auxv.h"
 #include <stddef.h>
 
 /* userland/libc/ldso_bridge.c */
@@ -142,4 +144,31 @@ int dladdr(const void *addr, Dl_info *info)
         set_local_dlerror(msg ? msg : "dladdr: address not mapped");
     }
     return ret;
+}
+
+int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size, void *data), void *data)
+{
+    if (!callback) return 0;
+    int (*fn)(int (*)(struct dl_phdr_info *, size_t, void *), void *) =
+        (int (*)(int (*)(struct dl_phdr_info *, size_t, void *), void *))
+            __libc_ldso_lookup("__ldso_dl_iterate_phdr");
+    if (fn) {
+        return fn(callback, data);
+    }
+
+    uintptr_t phdr = (uintptr_t)getauxval(3 /* AT_PHDR */);
+    uintptr_t phnum = (uintptr_t)getauxval(5 /* AT_PHNUM */);
+    if (!phdr || !phnum) return 0;
+
+    struct dl_phdr_info info;
+    info.dlpi_addr = 0;
+    info.dlpi_name = "";
+    info.dlpi_phdr = (const void *)phdr;
+    info.dlpi_phnum = (uint16_t)phnum;
+    info.dlpi_adds = 1;
+    info.dlpi_subs = 0;
+    info.dlpi_tls_modid = 0;
+    info.dlpi_tls_data = NULL;
+
+    return callback(&info, sizeof(info), data);
 }

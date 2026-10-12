@@ -1521,6 +1521,50 @@ int __ldso_dladdr(const void *addr, ldso_dl_info_t *info)
     return 1;
 }
 
+typedef struct {
+    u64         dlpi_addr;
+    const char *dlpi_name;
+    const void *dlpi_phdr;
+    u16         dlpi_phnum;
+    u64         dlpi_adds;
+    u64         dlpi_subs;
+    size_t      dlpi_tls_modid;
+    void       *dlpi_tls_data;
+} ldso_dl_phdr_info_t;
+
+int __ldso_dl_iterate_phdr(int (*callback)(ldso_dl_phdr_info_t *info, size_t size, void *data), void *data)
+{
+    if (!callback) return 0;
+    loader_lock();
+
+    u64 total_adds = 0;
+    for (int i = 0; i < MAX_OBJS; i++) {
+        if (g_objs[i].in_use) total_adds++;
+    }
+
+    int res = 0;
+    for (int i = 0; i < MAX_OBJS; i++) {
+        obj_t *o = &g_objs[i];
+        if (!o->in_use) continue;
+
+        ldso_dl_phdr_info_t info;
+        info.dlpi_addr = o->load_bias;
+        info.dlpi_name = (i == 0 || !o->name[0]) ? "" : o->name;
+        info.dlpi_phdr = (const void *)o->phdr_storage;
+        info.dlpi_phnum = (u16)o->phnum;
+        info.dlpi_adds = total_adds;
+        info.dlpi_subs = 0;
+        info.dlpi_tls_modid = o->has_tls ? 1 : 0;
+        info.dlpi_tls_data = 0;
+
+        res = callback(&info, sizeof(info), data);
+        if (res != 0) break;
+    }
+
+    loader_unlock();
+    return res;
+}
+
 /* Combined static TLS layout query for userland/libc/tls.c's
  * __init_thread_tls() — exposed as plain scalars rather than a struct
  * pointer so the two independently-compiled translation units never have

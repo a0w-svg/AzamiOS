@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <link.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,6 +34,22 @@ static void check(int ok, const char *name)
 static int elf_magic(unsigned long address)
 {
     return address && memcmp((const void *)address, "\177ELF", 4) == 0;
+}
+
+struct probe_phdr_state {
+    int count;
+    int seen_phdrs;
+};
+
+static int probe_phdr_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+    (void)size;
+    struct probe_phdr_state *st = (struct probe_phdr_state *)data;
+    st->count++;
+    if (info->dlpi_phdr && info->dlpi_phnum > 0) {
+        st->seen_phdrs = 1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -173,6 +190,19 @@ int main(int argc, char **argv)
         if (call_v2) check(call_v2() == 222, "relocation binding to foo@@VER_2.0 (222)");
         check(dlclose(h_c2) == 0, "dlclose consumer_v2 library");
     }
+
+    /* dladdr probe */
+    Dl_info dlinfo;
+    memset(&dlinfo, 0, sizeof(dlinfo));
+    int dladdr_ok = dladdr((const void *)smoke_start_value, &dlinfo);
+    check(dladdr_ok != 0 && dlinfo.dli_sname != NULL && strcmp(dlinfo.dli_sname, "smoke_start_value") == 0,
+          "dladdr finds smoke_start_value symbol");
+
+    /* dl_iterate_phdr probe */
+    struct probe_phdr_state ph_st = {0, 0};
+    int iter_rc = dl_iterate_phdr(probe_phdr_cb, &ph_st);
+    check(iter_rc == 0 && ph_st.count >= 1 && ph_st.seen_phdrs,
+          "dl_iterate_phdr enumerates loaded objects");
 
     printf("dynamic probe complete: %d failed\n", failures);
     return failures ? 1 : 0;
