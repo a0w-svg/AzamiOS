@@ -313,6 +313,20 @@ $(OUT_DIR)/bin/azami-perf-probe: tests/perf.c $(MUSL_GCC)
 fd-lifetime-probe: $(OUT_DIR)/bin/azami-fd-lifetime-probe
 sysfs-pagination-probe: $(OUT_DIR)/bin/azami-sysfs-pagination-probe
 
+.PHONY: pmm-reclaim-probe
+pmm-reclaim-probe: $(OUT_DIR)/bin/azami-pmm-reclaim-probe
+
+$(OUT_DIR)/bin/azami-pmm-reclaim-probe: tests/pmm-reclaim.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
+
+.PHONY: usercopy-observe-probe
+usercopy-observe-probe: $(OUT_DIR)/bin/azami-usercopy-observe
+
+$(OUT_DIR)/bin/azami-usercopy-observe: tests/usercopy-observe.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
+
 $(OUT_DIR)/bin/azami-fd-lifetime-probe: tests/fd-lifetime.c $(MUSL_GCC)
 	@mkdir -p $(dir $@)
 	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -o $@ $<

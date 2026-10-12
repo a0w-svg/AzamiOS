@@ -70,6 +70,27 @@ void pmm_enable_percpu(void);
  * invariant or unresolved ownership failures panic instead of continuing. */
 void pmm_boot_selftest(void);
 
+/** Precreate the deferred cache-reclaim worker after sched_init(). Failure is
+ * reported to the boot caller; allocations never synchronously wait for it.
+ * Each fresh zone notification permits ceil(CPUs/8)*8 best-effort sweeps,
+ * including the first. Contention/timeouts may exhaust that allowance with
+ * pages still cached; later allocation failures rearm it. */
+bool pmm_start_reclaimer(void);
+
+/** Independent atomic counters: a concurrent snapshot is approximate. Pages
+ * count actual owner-cache returns, including late RPC completions, rather
+ * than successful subsequent allocations or high-order coalescing.
+ * pressure_batches counts consumed fresh notifications, sweeps also includes
+ * their bounded retries, and pending_zones combines both kinds of pending work. */
+typedef struct {
+    u64 pressure_batches, sweeps, worker_cycles, worker_sweeps;
+    u64 reclaimed_pages, callbacks, lock_busy, rpc_busy, rpc_timeouts;
+    u64 time_unavailable, offline_cpus, start_failures;
+    u32 pending_zones;
+    bool worker_started;
+} pmm_reclaim_stat_t;
+void pmm_reclaim_stats(pmm_reclaim_stat_t *out);
+
 /**
  * pmm_drain_local() — Return the calling CPU's cached pages to the buddy.
  *

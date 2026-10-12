@@ -157,6 +157,11 @@ u32  lapic_tsc_khz(void);
 /** lapic_send_ipi(apic_id, vector) — Send a fixed IPI to one APIC. */
 void lapic_send_ipi(u32 apic_id, u8 vector);
 
+/** Fixed IPI for bounded RPC dispatch. Returns false if unavailable or the
+ * xAPIC ICR stays busy for 4096 polls; restores incoming IRQ state on all paths.
+ * x2APIC uses one architectural WRMSR without a software polling loop. */
+bool lapic_send_ipi_bounded(u32 apic_id, u8 vector);
+
 /** lapic_send_ipi_allbutself(vector) — One ICR write reaching every other
  *  CPU in the system. */
 void lapic_send_ipi_allbutself(u8 vector);

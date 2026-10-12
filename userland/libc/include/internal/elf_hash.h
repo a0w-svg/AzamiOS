@@ -31,3 +31,23 @@ static inline uint32_t __elf_gnu_hash_count(const uint32_t *hash, size_t bytes)
     }
     return 0;
 }
+
+static inline uint32_t __elf_gnu_hash(const char *name)
+{
+    uint32_t h = 5381;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++)
+        h = (h << 5) + h + *p;
+    return h;
+}
+
+static inline uint32_t __elf_sysv_hash(const char *name)
+{
+    uint32_t h = 0, g;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h = (h << 4) + *p;
+        if ((g = h & 0xf0000000U))
+            h ^= g >> 24;
+        h &= ~g;
+    }
+    return h;
+}

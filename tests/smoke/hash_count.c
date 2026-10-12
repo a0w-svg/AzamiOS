@@ -28,6 +28,10 @@ int main(void)
     assert(__elf_gnu_hash_count(table, sizeof(table)) == 0);
     table[2] = 0;
     assert(__elf_gnu_hash_count(table, sizeof(table)) == 0);
+    assert(__elf_gnu_hash("") == 5381);
+    assert(__elf_gnu_hash("printf") == 0x156b2bb8U);
+    assert(__elf_sysv_hash("") == 0);
+    assert(__elf_sysv_hash("printf") == 0x077905a6U);
     puts("PASS: GNU hash symbol counts and malformed table bounds");
     return 0;
 }

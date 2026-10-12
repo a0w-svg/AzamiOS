@@ -50,11 +50,14 @@ int smp_rpc_call(u32 cpu, void (*func)(void *), void *value, size_t size, u64 de
     slot->func=func;
     memcpy(slot->payload,value,size);
     __atomic_store_n(&slot->state,tag|RPC_QUEUED,__ATOMIC_RELEASE);
+    bool dispatch_failed=false;
+    /* Keep the self/remote decision and send on one CPU even if kernel
+     * scheduling later permits migration at an interrupt boundary. */
+    irqflags_t dispatch_flags=spinlock_irq_save();
     if(cpu==smp_current_cpu_id()) {
-        irqflags_t fl=spinlock_irq_save();
         smp_rpc_drain();
-        spinlock_irq_restore(fl);
-    } else smp_send_ipi(cpu,SMP_VEC_CALL_FUNC);
+    } else dispatch_failed=!smp_send_ipi_bounded(cpu,SMP_VEC_CALL_FUNC);
+    spinlock_irq_restore(dispatch_flags);
     /* Only bounded callbacks are drained here; legacy callbacks are arbitrary
      * code and could turn a deadline wait into another unbounded wait. */
     for(u32 spins=0;;spins++) {
@@ -64,7 +67,10 @@ int smp_rpc_call(u32 cpu, void (*func)(void *), void *value, size_t size, u64 de
             __atomic_store_n(&slot->state,0,__ATOMIC_RELEASE);
             return 0;
         }
-        if((ktime_try_get_ns(&now) && now>=deadline_ns) || spins>=1000000) {
+        /* A busy ICR must not turn bounded RPC into an IRQ-disabled wait.
+         * Cancellation still arbitrates with a receiver that already entered
+         * through another IPI; DONE wins and its result is consumed above. */
+        if(dispatch_failed || (ktime_try_get_ns(&now) && now>=deadline_ns) || spins>=1000000) {
             if(rpc_cancel(&slot->state,tag)) return -ETIMEDOUT;
             continue; /* completion won cancellation; consume its result */
         }

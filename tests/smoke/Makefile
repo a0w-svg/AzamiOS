@@ -17,7 +17,7 @@ check: $(TASK_BUILD)/hash-count
 $(TASK_BUILD)/hash-count: hash_count.c ../../userland/libc/include/internal/elf_hash.h | $(TASK_BUILD)
 	$(HOST_CC) -O2 -Wall -Wextra -Werror $< -o $@
 
-all: $(TASK_BUILD)/smoke-init $(TASK_BUILD)/native-dynamic-probe \
+all: $(TASK_BUILD)/smoke-init $(TASK_BUILD)/ports-init $(TASK_BUILD)/native-dynamic-probe \
      $(TASK_BUILD)/musl-dynamic-probe $(TASK_BUILD)/native/libsmoke_plugin.so \
      $(TASK_BUILD)/musl/libsmoke_plugin.so $(TASK_BUILD)/ld-azami.so
 
@@ -27,14 +27,17 @@ $(TASK_BUILD) $(TASK_BUILD)/native $(TASK_BUILD)/musl:
 $(TASK_BUILD)/smoke-init: init.c | $(TASK_BUILD)
 	$(MUSL_CC) -static -O2 -Wall -Wextra -Werror $< -o $@
 
+$(TASK_BUILD)/ports-init: ports_init.c | $(TASK_BUILD)
+	$(MUSL_CC) -static -O2 -Wall -Wextra -Werror $< -o $@
+
 $(TASK_BUILD)/native/%.o: %.c | $(TASK_BUILD)/native
 	$(NATIVE_CC) $(NATIVE_FLAGS) -c $< -o $@
 
 $(TASK_BUILD)/native/libsmoke_start.so: $(TASK_BUILD)/native/startup.o Makefile
-	$(NATIVE_LD) -shared $(NATIVE_LINK) --hash-style=sysv --soname=libsmoke_start.so $< -o $@
+	$(NATIVE_LD) -shared $(NATIVE_LINK) --hash-style=gnu --soname=libsmoke_start.so $< -o $@
 
 $(TASK_BUILD)/native/libsmoke_plugin.so: $(TASK_BUILD)/native/plugin.o $(TASK_BUILD)/native/libsmoke_start.so
-	$(NATIVE_LD) -shared $(NATIVE_LINK) --soname=libsmoke_plugin.so $^ -o $@
+	$(NATIVE_LD) -shared $(NATIVE_LINK) --hash-style=gnu --soname=libsmoke_plugin.so $^ -o $@
 
 $(TASK_BUILD)/native-dynamic-probe: $(TASK_BUILD)/native/dynamic_probe.o $(TASK_BUILD)/native/libsmoke_start.so ../../userland/libc/libc.so ../../userland/libc/crt0_dyn.o
 	$(NATIVE_LD) -pie $(NATIVE_LINK) --dynamic-linker=/lib/ld-azami.so \

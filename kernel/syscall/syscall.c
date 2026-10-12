@@ -7,6 +7,93 @@
 
 /* Static dispatch table initialized from syscalls.tbl */
 const syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = __SYSCALL_TABLE_INITIALIZER;
+const char * const g_syscall_names[SYSCALL_TABLE_SIZE] = __SYSCALL_NAMES_INITIALIZER;
+
+/* ── ENOSYS telemetry tracking (/proc/azami/enosys) ────────────────────────── */
+#define ENOSYS_OVERFLOW_MAX 32
+typedef struct {
+    u64  count;
+    char last_comm[16];
+} enosys_stat_t;
+
+typedef struct {
+    u64  nr;
+    u64  count;
+    char last_comm[16];
+} enosys_overflow_t;
+
+static enosys_stat_t g_enosys_stats[SYSCALL_TABLE_SIZE];
+static enosys_overflow_t g_enosys_overflow[ENOSYS_OVERFLOW_MAX];
+static u32 g_enosys_overflow_count = 0;
+static spinlock_t g_enosys_lock = SPINLOCK_INIT;
+
+void syscall_record_enosys(u64 nr, const char *comm)
+{
+    irqflags_t fl = spinlock_lock_irqsave(&g_enosys_lock);
+    if (nr < SYSCALL_TABLE_SIZE) {
+        g_enosys_stats[nr].count++;
+        if (comm && comm[0]) {
+            strncpy(g_enosys_stats[nr].last_comm, comm, sizeof(g_enosys_stats[nr].last_comm) - 1);
+            g_enosys_stats[nr].last_comm[sizeof(g_enosys_stats[nr].last_comm) - 1] = '\0';
+        }
+    } else {
+        bool found = false;
+        for (u32 i = 0; i < g_enosys_overflow_count; i++) {
+            if (g_enosys_overflow[i].nr == nr) {
+                g_enosys_overflow[i].count++;
+                if (comm && comm[0]) {
+                    strncpy(g_enosys_overflow[i].last_comm, comm, sizeof(g_enosys_overflow[i].last_comm) - 1);
+                    g_enosys_overflow[i].last_comm[sizeof(g_enosys_overflow[i].last_comm) - 1] = '\0';
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found && g_enosys_overflow_count < ENOSYS_OVERFLOW_MAX) {
+            u32 idx = g_enosys_overflow_count++;
+            g_enosys_overflow[idx].nr = nr;
+            g_enosys_overflow[idx].count = 1;
+            if (comm && comm[0]) {
+                strncpy(g_enosys_overflow[idx].last_comm, comm, sizeof(g_enosys_overflow[idx].last_comm) - 1);
+                g_enosys_overflow[idx].last_comm[sizeof(g_enosys_overflow[idx].last_comm) - 1] = '\0';
+            } else {
+                g_enosys_overflow[idx].last_comm[0] = '\0';
+            }
+        }
+    }
+    spinlock_unlock_irqrestore(&g_enosys_lock, fl);
+}
+
+size_t syscall_format_enosys_telemetry(char *buf, size_t size)
+{
+    if (!buf || size == 0) return 0;
+    size_t written = 0;
+    written += (size_t)scnprintf(buf + written, size > written ? size - written : 0,
+                                 "# nr name count last_comm\n");
+
+    irqflags_t fl = spinlock_lock_irqsave(&g_enosys_lock);
+    for (u32 i = 0; i < SYSCALL_TABLE_SIZE; i++) {
+        if (g_enosys_stats[i].count > 0) {
+            const char *name = g_syscall_names[i] ? g_syscall_names[i] : "unknown";
+            written += (size_t)scnprintf(buf + written, size > written ? size - written : 0,
+                                         "%u %s %llu %s\n",
+                                         i, name,
+                                         (unsigned long long)g_enosys_stats[i].count,
+                                         g_enosys_stats[i].last_comm[0] ? g_enosys_stats[i].last_comm : "-");
+            if (written >= size) break;
+        }
+    }
+    for (u32 i = 0; i < g_enosys_overflow_count && written < size; i++) {
+        written += (size_t)scnprintf(buf + written, size > written ? size - written : 0,
+                                     "%llu %s %llu %s\n",
+                                     (unsigned long long)g_enosys_overflow[i].nr,
+                                     "unknown",
+                                     (unsigned long long)g_enosys_overflow[i].count,
+                                     g_enosys_overflow[i].last_comm[0] ? g_enosys_overflow[i].last_comm : "-");
+    }
+    spinlock_unlock_irqrestore(&g_enosys_lock, fl);
+    return written;
+}
 
 /* Serialises fd-table slot moves (lookup / allocate / teardown). Held only
  * across pointer assignments — never across a blocking call. */
@@ -193,6 +280,7 @@ int syscall_dispatch(pt_regs_t *regs)
         /* A tracer-cancelled call is not a missing syscall; logging it would
          * make every strace run look like a porting failure. */
         if (!traced) syscall_report_missing(regs->rax, regs);
+        syscall_record_enosys(regs->rax, sp ? sp->name : NULL);
         regs->rax = (u64)(-(s64)ENOSYS);
         if (traced) ptrace_syscall_stop(regs, false);
         signal_deliver_pending(regs, -1);
@@ -258,8 +346,11 @@ int syscall_dispatch(pt_regs_t *regs)
         }
     }
 
-    if (!seccomp_denied)
+    if (!seccomp_denied) {
         regs->rax = (u64)g_syscall_table[nr](regs);
+        if ((s64)regs->rax == -(s64)ENOSYS)
+            syscall_record_enosys(nr, sp ? sp->name : NULL);
+    }
 
     /* Syscall-exit stop. ptrace_syscall_stop() re-tests PT_SYSCALL_TRACE, so a
      * tracer that answered the entry stop with PTRACE_CONT gets no exit stop. */

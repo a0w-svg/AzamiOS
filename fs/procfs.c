@@ -40,6 +40,7 @@
 #include "../kernel/security/security.h"
 #include "../kernel/ptrace.h"
 #include "../kernel/ipc/mqueue.h"
+#include "../kernel/syscall/syscall.h"
 
 #define PROCFS_SUPER_MAGIC 0x9FA0
 
@@ -111,6 +112,9 @@ typedef enum {
     PROCFS_TYPE_MCELOG,
     PROCFS_TYPE_SLABINFO,
     PROCFS_TYPE_BUDDYINFO,
+    PROCFS_TYPE_PMM_RECLAIM,
+    PROCFS_TYPE_AZAMI_DIR,
+    PROCFS_TYPE_AZAMI_ENOSYS,
 
     /* /proc/irq/<n>/ — per-interrupt-line control, the standard place
      * userspace sets interrupt affinity (irqbalance and every hand-rolled
@@ -403,6 +407,33 @@ static size_t format_proc_buddyinfo(char *buf, size_t max)
  * "version: 2.1" layout that the usual field offsets (active_objs, num_objs,
  * objsize, objperslab, pagesperslab) line up; the SLUB tunables/columns this
  * allocator has no equivalent for are reported as zero. */
+/* Azami extension: independently atomic counters, approximate while the
+ * worker runs. This endpoint exposes no writable allocator controls. */
+static size_t format_proc_pmm_reclaim(char *buf, size_t max)
+{
+    pmm_reclaim_stat_t st;
+    pmm_reclaim_stats(&st);
+    size_t off = (size_t)scnprintf(buf, max, "worker_started %u\npending_zones %u\n",
+                                  (unsigned)st.worker_started, st.pending_zones);
+#define RECLAIM_LINE(field) \
+    if (off < max) off += (size_t)scnprintf(buf + off, max - off, \
+        #field " %llu\n", (unsigned long long)st.field)
+    RECLAIM_LINE(pressure_batches);
+    RECLAIM_LINE(sweeps);
+    RECLAIM_LINE(worker_cycles);
+    RECLAIM_LINE(worker_sweeps);
+    RECLAIM_LINE(reclaimed_pages);
+    RECLAIM_LINE(callbacks);
+    RECLAIM_LINE(lock_busy);
+    RECLAIM_LINE(rpc_busy);
+    RECLAIM_LINE(rpc_timeouts);
+    RECLAIM_LINE(time_unavailable);
+    RECLAIM_LINE(offline_cpus);
+    RECLAIM_LINE(start_failures);
+#undef RECLAIM_LINE
+    return off;
+}
+
 static size_t format_proc_slabinfo(char *buf, size_t max)
 {
     kmalloc_slab_stat_t st[16];
@@ -1022,6 +1053,10 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 124, S_IFREG | 0444, PROCFS_TYPE_SLABINFO, 0);
         } else if (strcmp(name, "buddyinfo") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 126, S_IFREG | 0444, PROCFS_TYPE_BUDDYINFO, 0);
+        } else if (strcmp(name, "pmm_reclaim") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 127, S_IFREG | 0444, PROCFS_TYPE_PMM_RECLAIM, 0);
+        } else if (strcmp(name, "azami") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 128, S_IFDIR | 0555, PROCFS_TYPE_AZAMI_DIR, 0);
         } else if (strcmp(name, "self") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 117, S_IFLNK | 0777, PROCFS_TYPE_SELF_SYMLINK, 0);
         } else if (strcmp(name, "thread-self") == 0) {
@@ -1098,6 +1133,10 @@ static struct dentry *procfs_lookup(struct inode *dir, struct dentry *dentry)
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 321, S_IFREG | 0444, PROCFS_TYPE_SYSVIPC_SEM, 0);
         } else if (strcmp(name, "msg") == 0) {
             dentry->d_inode = procfs_alloc_inode(dir->i_sb, 322, S_IFREG | 0444, PROCFS_TYPE_SYSVIPC_MSG, 0);
+        }
+    } else if (dir_priv->type == PROCFS_TYPE_AZAMI_DIR) {
+        if (strcmp(name, "enosys") == 0) {
+            dentry->d_inode = procfs_alloc_inode(dir->i_sb, 12801, S_IFREG | 0444, PROCFS_TYPE_AZAMI_ENOSYS, 0);
         }
     } else if (dir_priv->type == PROCFS_TYPE_SYS_DIR) {
         if (strcmp(name, "kernel") == 0) {
@@ -1314,6 +1353,12 @@ static s64 procfs_file_read(struct file *filp, void *buf, size_t len, u64 *offse
         break;
     case PROCFS_TYPE_BUDDYINFO:
         total_len = format_proc_buddyinfo(tmp, PROCFS_TMP_SIZE);
+        break;
+    case PROCFS_TYPE_PMM_RECLAIM:
+        total_len = format_proc_pmm_reclaim(tmp, PROCFS_TMP_SIZE);
+        break;
+    case PROCFS_TYPE_AZAMI_ENOSYS:
+        total_len = syscall_format_enosys_telemetry(tmp, PROCFS_TMP_SIZE);
         break;
     case PROCFS_TYPE_STAT:
         total_len = format_proc_stat(tmp, PROCFS_TMP_SIZE);
@@ -1694,7 +1739,7 @@ static const char *g_static_root_entries[] = {
     "version", "uptime", "meminfo", "cpuinfo", "stat", "dmesg", "net",
     "loadavg", "mounts", "filesystems", "cmdline",
     "devices", "interrupts", "irq", "partitions", "swaps", "self", "sys", "sysvipc",
-    "mqueues", "vulnerabilities", "security", "mcelog", "slabinfo", "buddyinfo"
+    "mqueues", "vulnerabilities", "security", "mcelog", "slabinfo", "buddyinfo", "pmm_reclaim", "azami"
 };
 #define NUM_ROOT_ENTRIES (sizeof(g_static_root_entries) / sizeof(g_static_root_entries[0]))
 
@@ -1734,7 +1779,8 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
             } else if (idx - 2 < NUM_ROOT_ENTRIES) {
                 name = g_static_root_entries[idx - 2];
                 if (strcmp(name, "sys") == 0 || strcmp(name, "net") == 0 ||
-                    strcmp(name, "irq") == 0 || strcmp(name, "sysvipc") == 0) dtype = DT_DIR;
+                    strcmp(name, "irq") == 0 || strcmp(name, "sysvipc") == 0 ||
+                    strcmp(name, "azami") == 0) dtype = DT_DIR;
                 else if (strcmp(name, "self") == 0) dtype = DT_LNK;
                 else dtype = DT_REG;
             } else {
@@ -1840,6 +1886,27 @@ static s64 procfs_dir_readdir(struct file *filp, void *dirent_buf, size_t len, u
         u64 total_entries = 5;
         while (idx < total_entries) {
             const char *name = sys_entries[idx];
+            u8 dtype = (idx < 2) ? DT_DIR : DT_REG;
+            size_t nlen = strlen(name);
+            size_t reclen = ALIGN_UP(sizeof(struct linux_dirent64) + nlen + 1, 8);
+            if (written + reclen > len) {
+                if (written == 0) return -(s64)EINVAL;
+                break;
+            }
+            struct linux_dirent64 *d = (struct linux_dirent64 *)(out_ptr + written);
+            d->d_ino = idx + 1;
+            d->d_off = idx + 1;
+            d->d_reclen = (unsigned short)reclen;
+            d->d_type = dtype;
+            memcpy(d->d_name, name, nlen + 1);
+            written += reclen;
+            idx++;
+        }
+    } else if (priv->type == PROCFS_TYPE_AZAMI_DIR) {
+        const char *azami_entries[] = { ".", "..", "enosys" };
+        u64 total_entries = 3;
+        while (idx < total_entries) {
+            const char *name = azami_entries[idx];
             u8 dtype = (idx < 2) ? DT_DIR : DT_REG;
             size_t nlen = strlen(name);
             size_t reclen = ALIGN_UP(sizeof(struct linux_dirent64) + nlen + 1, 8);

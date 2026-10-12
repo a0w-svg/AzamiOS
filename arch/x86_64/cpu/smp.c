@@ -584,6 +584,18 @@ void smp_send_ipi(u32 cpu_id, u8 vector)
     lapic_send_ipi(g_cpu_infos[cpu_id].lapic_id, vector);
 }
 
+bool smp_send_ipi_bounded(u32 cpu_id, u8 vector)
+{
+    /* BSP online publication follows GS setup. Reject early calls before
+     * reading the calling CPU's GS-relative identity. */
+    if (!smp_cpu_online(0) || cpu_id >= g_cpu_count || !smp_cpu_online(cpu_id)) return false;
+    if (cpu_id == smp_current_cpu_id()) return false;
+    if (!lapic_send_ipi_bounded(g_cpu_infos[cpu_id].lapic_id, vector)) return false;
+    cpu_info_t *self = smp_get_cpu();
+    if (self) self->ipis_sent++;
+    return true;
+}
+
 void smp_send_ipi_mask(u64 mask, u8 vector)
 {
     u32 me = smp_current_cpu_id();

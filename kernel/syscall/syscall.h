@@ -75,3 +75,10 @@ void         syscall_fput(struct file *file);
  * more than one teardown path racing on the same table.
  */
 void fd_table_release(struct process *proc);
+
+/**
+ * ENOSYS telemetry (/proc/azami/enosys).
+ * Recorded on every -ENOSYS return from missing or stub syscalls.
+ */
+void syscall_record_enosys(u64 nr, const char *comm);
+size_t syscall_format_enosys_telemetry(char *buf, size_t size);

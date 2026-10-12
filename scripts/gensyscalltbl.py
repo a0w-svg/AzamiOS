@@ -87,6 +87,12 @@ def main():
         lines.append(f"    [{nr:<3}] = {fn}, /* {name} ({abi}) */ \\")
     lines.append("}")
     lines.append("")
+    lines.append("/* ── System Call Names Initializer ────────────────────────────────── */")
+    lines.append("#define __SYSCALL_NAMES_INITIALIZER { \\")
+    for nr, abi, name, fn in entries:
+        lines.append(f'    [{nr:<3}] = "{name}", /* {abi} */ \\')
+    lines.append("}")
+    lines.append("")
 
     content = "\n".join(lines) + "\n"
 
