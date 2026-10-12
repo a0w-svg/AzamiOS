@@ -92,6 +92,15 @@ int main(int argc, char **argv, char **envp)
     T(getppid() >= 0, "getppid");
     T(getuid() >= 0, "getuid");
 
+    printf("-- auxv fidelity --\n");
+    T(getauxval(AT_PAGESZ) == 4096, "AT_PAGESZ == 4096");
+    T(getauxval(AT_CLKTCK) == 100, "AT_CLKTCK == 100");
+    T(getauxval(51 /* AT_MINSIGSTKSZ */) >= 1776, "AT_MINSIGSTKSZ >= 1776");
+    const char *bplat = (const char *)getauxval(24 /* AT_BASE_PLATFORM */);
+    T(bplat && strcmp(bplat, "x86_64") == 0, "AT_BASE_PLATFORM is x86_64");
+    T(getauxval(AT_RANDOM) != 0, "AT_RANDOM present");
+    T(getauxval(AT_SECURE) == 0, "AT_SECURE is 0 for unprivileged exec");
+
     printf("-- syscall ABI / register preservation --\n");
     unsigned long canaries[6] = {
         0x1122334455667788ULL,

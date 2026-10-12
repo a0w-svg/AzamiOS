@@ -184,6 +184,7 @@ typedef struct {
 #define PT_LOAD    1
 #define PT_DYNAMIC 2
 #define PT_TLS     7
+#define PT_GNU_RELRO 0x6474e552
 
 #define PF_X 0x1
 #define PF_W 0x2
@@ -319,6 +320,10 @@ typedef struct {
     u64 tls_memsz;
     u64 tls_align;
     s64 tls_tpoff;   /* filled by setup_static_tls(); valid only if has_tls */
+
+    int has_relro;
+    u64 relro_start;
+    u64 relro_memsz;
 } obj_t;
 
 static obj_t g_objs[MAX_OBJS];
@@ -377,6 +382,17 @@ static void find_tls_in(obj_t *o, elf64_phdr_t *phdrs, u32 phnum)
         o->tls_align  = phdrs[i].p_align ? phdrs[i].p_align : 8;
         if (o->tls_align < 8) o->tls_align = 8;
         return; /* ELF permits at most one PT_TLS per object */
+    }
+}
+
+static void find_relro_in(obj_t *o, elf64_phdr_t *phdrs, u32 phnum)
+{
+    for (u32 i = 0; i < phnum; i++) {
+        if (phdrs[i].p_type != PT_GNU_RELRO || phdrs[i].p_memsz == 0) continue;
+        o->has_relro   = 1;
+        o->relro_start = o->load_bias + phdrs[i].p_vaddr;
+        o->relro_memsz = phdrs[i].p_memsz;
+        return; /* ELF permits at most one PT_GNU_RELRO per object */
     }
 }
 
@@ -536,6 +552,7 @@ static int obj_load_file(const char *path, const char *name_for_dedup)
     }
 
     find_tls_in(o, o->phdr_storage, o->phnum);
+    find_relro_in(o, o->phdr_storage, o->phnum);
     elf64_dyn_t *dyn = find_dynamic_in(o->phdr_storage, o->phnum, o->load_bias);
     if (dyn) parse_dynamic(o, dyn);
 
@@ -821,6 +838,18 @@ static void apply_symbolic(obj_t *o, int fatal)
 {
     if (o->rela)   apply_symbolic_table(o, o->rela, o->rela_count, fatal);
     if (o->jmprel) apply_symbolic_table(o, o->jmprel, o->jmprel_count, fatal);
+}
+
+static int apply_relro(obj_t *o)
+{
+    if (!o->has_relro || !o->relro_memsz) return 0;
+    u64 start = align_down(o->relro_start, PAGE_SIZE);
+    u64 end   = align_down(o->relro_start + o->relro_memsz, PAGE_SIZE);
+    if (end > start) {
+        long ret = syscall3(SYS_mprotect, (long)start, (long)(end - start), 0x1 /* PROT_READ */);
+        if (ret < 0) return -1;
+    }
+    return 0;
 }
 
 /* ── Loader concurrency (recursive futex mutex) ────────────────────────── */
@@ -1123,6 +1152,15 @@ void *__ldso_dlopen(const char *path, int flags)
         goto rollback;
     }
 
+    for (int i = 0; i < MAX_OBJS; i++) {
+        if (!old_in_use[i] && g_objs[i].in_use) {
+            if (apply_relro(&g_objs[i]) < 0) {
+                set_dlerror("dlopen: failed to apply RELRO protection");
+                goto rollback;
+            }
+        }
+    }
+
     /* All dependencies and relocations ready: run constructors */
     run_all_ctors(idx);
 
@@ -1405,6 +1443,7 @@ long ld_main(long argc, char **argv, char **envp, u64 initial_rsp)
     mo->phnum = nphdrs;
 
     find_tls_in(mo, mo->phdr_storage, mo->phnum);
+    find_relro_in(mo, mo->phdr_storage, mo->phnum);
 
     elf64_dyn_t *main_dyn = find_dynamic_in(mo->phdr_storage, mo->phnum, main_bias);
     if (!main_dyn) {
@@ -1429,6 +1468,15 @@ long ld_main(long argc, char **argv, char **envp, u64 initial_rsp)
 
     for (int i = 0; i < MAX_OBJS; i++) if (g_objs[i].in_use) apply_relative(&g_objs[i]);
     for (int i = 0; i < MAX_OBJS; i++) if (g_objs[i].in_use) apply_symbolic(&g_objs[i], 1 /* fatal */);
+
+    for (int i = 0; i < MAX_OBJS; i++) {
+        if (g_objs[i].in_use) {
+            if (apply_relro(&g_objs[i]) < 0) {
+                ld_write2("ld-azami.so: fatal: cannot apply RELRO protection\n");
+                syscall1(SYS_exit, 127);
+            }
+        }
+    }
 
     run_all_ctors(main_idx);
 

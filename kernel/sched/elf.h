@@ -95,6 +95,7 @@
 #define AT_HWCAP2       26
 #define AT_EXECFN       31 /* Filename of executable */
 #define AT_SYSINFO_EHDR 33 /* VDSO header */
+#define AT_MINSIGSTKSZ  51 /* Minimum signal stack size */
 
 /* ── 64-bit ELF Header ────────────────────────────────────────────────────── */
 typedef struct {

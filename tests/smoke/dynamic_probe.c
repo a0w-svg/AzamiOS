@@ -44,6 +44,10 @@ int main(int argc, char **argv)
     check(getauxval(AT_PAGESZ) == 4096, "AT_PAGESZ");
     errno = 0;
     check(getauxval(AT_SECURE) == 0 && errno == 0, "AT_SECURE present and zero");
+    unsigned long minsig = getauxval(51); /* AT_MINSIGSTKSZ */
+    check(minsig >= 1776, "AT_MINSIGSTKSZ >= 1776");
+    const char *bplat = (const char *)getauxval(24); /* AT_BASE_PLATFORM */
+    check(bplat && strcmp(bplat, "x86_64") == 0, "AT_BASE_PLATFORM is x86_64");
     unsigned long random = getauxval(AT_RANDOM);
     check(random != 0, "AT_RANDOM present");
     if (random) {
