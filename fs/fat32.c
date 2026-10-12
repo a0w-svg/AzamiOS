@@ -302,6 +302,7 @@ static s64 fat32_dir_readdir(file_t *filp, void *dirent_buf, size_t len, u64 *of
 }
 
 static file_operations_t g_fat32_file_fops = {
+    .regular_io = true,
     .read = fat32_file_read,
     .write = fat32_file_write,
 };

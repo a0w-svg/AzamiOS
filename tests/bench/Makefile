@@ -2,7 +2,7 @@ MUSL_CC ?= ../../tools/linux/musl/bin/musl-gcc
 BENCH_CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Werror
 BENCH_LDFLAGS ?= -static
 TASK_BUILD := ../../build/bench/bin
-PROGRAMS := bench_syscall bench_pipe bench_mmap bench_fork bench_fd bench_pmm supervisor
+PROGRAMS := bench_syscall bench_pipe bench_mmap bench_fork bench_fd bench_pmm bench_usercopy supervisor
 
 .PHONY: all check FORCE
 all: $(addprefix $(TASK_BUILD)/,$(PROGRAMS))

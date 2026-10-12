@@ -321,6 +321,23 @@ $(OUT_DIR)/bin/azami-pmm-reclaim-probe: tests/pmm-reclaim.c $(MUSL_GCC)
 	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
 
 .PHONY: usercopy-observe-probe
+usercopy-compat-probe: $(OUT_DIR)/bin/azami-usercopy-compat
+usercopy-device-probe: $(OUT_DIR)/bin/azami-usercopy-device
+usercopy-shared-probe: $(OUT_DIR)/bin/azami-usercopy-shared
+.PHONY: usercopy-compat-probe usercopy-device-probe usercopy-shared-probe
+
+$(OUT_DIR)/bin/azami-usercopy-shared: tests/usercopy-shared.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
+
+$(OUT_DIR)/bin/azami-usercopy-compat: tests/usercopy-compat.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
+
+$(OUT_DIR)/bin/azami-usercopy-device: tests/usercopy-device.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
+
 usercopy-observe-probe: $(OUT_DIR)/bin/azami-usercopy-observe
 
 $(OUT_DIR)/bin/azami-usercopy-observe: tests/usercopy-observe.c $(MUSL_GCC)

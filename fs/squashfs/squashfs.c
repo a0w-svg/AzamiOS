@@ -123,6 +123,7 @@ static inode_operations_t sqfs_symlink_iops = {
 };
 
 static file_operations_t sqfs_file_fops = {
+    .regular_io = true,
     .read    = sqfs_file_read,
     .write   = NULL,
     .readdir = NULL,

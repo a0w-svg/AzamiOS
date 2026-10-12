@@ -812,7 +812,7 @@ process_t *sched_spawn_user_args(const char *path, const char *const argv[], con
 
     /* Initialize standard I/O file descriptors (0=stdin, 1=stdout, 2=stderr) */
     for (int fd = 0; fd < 3; fd++) {
-        file_t *con = vfs_open("/dev/console", 0, 0);
+        file_t *con = vfs_open("/dev/console", fd == 0 ? O_RDONLY : O_WRONLY, 0);
         if (con) proc->handle_table[fd] = con;
     }
 

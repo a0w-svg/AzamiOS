@@ -5,6 +5,7 @@
 #pragma once
 
 #include "vfs.h"
+#include "io_iter.h"
 #include "../arch/x86_64/cpu/spinlock.h"
 #include "../kernel/sched/sched.h"
 
@@ -16,6 +17,8 @@ typedef struct pipe {
     u32         read_pos;
     u32         write_pos;
     u32         count;
+    /* Advances on every committed read, including kernel-buffer readers. */
+    u64         read_seq;
     u32         readers;
     u32         writers;
     thread_t   *read_wait;
@@ -25,6 +28,11 @@ typedef struct pipe {
 
 /** pipe_create() — Allocate a pipe and return read and write file descriptions. */
 int pipe_create(file_t **read_file, file_t **write_file);
+
+/* User copies run without the pipe spinlock. A failed transaction leaves
+ * ring positions and contents available to later reads unchanged. */
+s64 pipe_read_user(file_t *file, const vfs_iovec_t *iov, u32 count, size_t total);
+s64 pipe_write_user(file_t *file, const vfs_iovec_t *iov, u32 count, size_t total);
 
 /** sockpair_create() — Allocate a bidirectional socket pair (AF_UNIX socketpair). */
 int sockpair_create(file_t **file1, file_t **file2);
