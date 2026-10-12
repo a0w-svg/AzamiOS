@@ -49,6 +49,11 @@ void *realloc(void *ptr, size_t size);
 void  free(void *ptr);
 void *aligned_alloc(size_t alignment, size_t size);
 int   posix_memalign(void **memptr, size_t alignment, size_t size);
+void *reallocarray(void *ptr, size_t nmemb, size_t size);
+void *valloc(size_t size);
+void *pvalloc(size_t size);
+int   malloc_trim(size_t pad);
+size_t malloc_usable_size(void *ptr);
 
 /* Numeric conversion */
 int                atoi(const char *nptr);

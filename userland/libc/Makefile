@@ -34,7 +34,7 @@ CFLAGS = -std=c11 -ffreestanding -fstack-protector-strong -mstack-protector-guar
 # libc.a keeps stale objects compiled against the old declarations.
 CFLAGS += -MMD -MP $(TOOLCHAIN_CFLAGS)
 
-SRCS = mqueue.c semaphore.c linuxext.c syscall.c stdio.c stdlib.c string.c string_simd.c ctype.c dirent.c time.c math.c az_ipc.c signal.c mman.c pthread.c termios.c resource.c getopt.c acl.c x11.c socket.c netdb.c pwd.c grp.c regex.c fnmatch.c glob.c spawn.c syslog.c search.c utmp.c xsi.c tls.c ldso_bridge.c pty.c ftw.c wordexp.c font.c theme.c sha256.c dlfcn.c
+SRCS = mqueue.c semaphore.c linuxext.c syscall.c stdio.c stdlib.c malloc.c string.c string_simd.c ctype.c dirent.c time.c math.c az_ipc.c signal.c mman.c pthread.c termios.c resource.c getopt.c acl.c x11.c socket.c netdb.c pwd.c grp.c regex.c fnmatch.c glob.c spawn.c syslog.c search.c utmp.c xsi.c tls.c ldso_bridge.c pty.c ftw.c wordexp.c font.c theme.c sha256.c dlfcn.c
 OBJS = $(SRCS:.c=.o) setjmp.o
 
 # ── libc.so: a second, PIC build of the exact same SRCS list ────────────────
