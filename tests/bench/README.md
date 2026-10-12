@@ -232,3 +232,17 @@ JSON records. `test_usercopy_compat.py LOG` rejects incomplete/malformed results
 and four pinned shared-file readers; see the execution record for reproduction
 and scope limits. `python3 tools/tests/pipe_transaction_test.py` hosts the actual
 production pipe implementation under scripted scheduler and user-copy faults.
+
+## Small/large user-copy I/O timing
+
+`make all` now builds `bench_usercopy`. Run
+`python3 -B tests/bench/usercopy_run.py --accel kvm tcg --kernel build/kernel.elf --output /tmp/azami-usercopy-timing`
+with a fresh output directory, or add `--linux-only`. The single worker pins to an available CPU
+and measures six sizes from 16 bytes to 1 MiB, with one discarded round and ten
+measured rounds. Each pair includes seek/write/seek/read plus endpoint/canary
+checks; full comparison and checksum follow outside the timer. Results describe
+complete memfd I/O and warm buffers. They do not isolate kernel copy speed or
+establish an equal-hardware speedup. The strict parser requires all 66 records,
+exact work/checksums and the final verdict. `test_usercopy_run.py LOG` checks
+malformed evidence and warmup exclusion. See the
+[timing record](../../docs/W4.3_USERCOPY_TIMING_RESULTS.md) for results and limits.
