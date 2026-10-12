@@ -50,6 +50,7 @@ static inode_operations_t ext2_inode_ops = {
 };
 
 static file_operations_t ext2_file_ops = {
+    .regular_io = true,
     .read = ext2_file_read,
     .write = ext2_file_write,
     .readdir = ext2_file_readdir,

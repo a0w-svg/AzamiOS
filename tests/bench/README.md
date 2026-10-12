@@ -221,3 +221,14 @@ python3 -B tests/bench/test_usercopy_observe.py \
 Raw outputs remain local. [The measured faults](../../docs/W4.3_USERCOPY_RESULTS.md)
 identify remaining I/O transaction and partial-copy fixes; they do not establish
 copy throughput or full SMAP/COW coverage.
+
+The [transaction fix checkpoint](../../docs/W4.3_USERCOPY_FIX_RESULTS.md)
+now matches all 60 baseline observations plus 84 added observations on
+KVM/TCG. Build `usercopy-compat-probe` and run `tests/bench/usercopy_compat.py`
+with the same `--accel`, `--kernel` and fresh `--output` arguments. Set
+`LINUX_TEST_CMDLINE=quiet` for both runners so kernel messages cannot interrupt
+JSON records. `test_usercopy_compat.py LOG` rejects incomplete/malformed results.
+`usercopy-device-probe` and `usercopy-shared-probe` add device/descriptor controls
+and four pinned shared-file readers; see the execution record for reproduction
+and scope limits. `python3 tools/tests/pipe_transaction_test.py` hosts the actual
+production pipe implementation under scripted scheduler and user-copy faults.

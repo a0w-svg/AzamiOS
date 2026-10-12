@@ -4,138 +4,162 @@
  * File: kernel/syscall/sys_fs.c
  * ============================================================================ */
 #include "syscall_internal.h"
+#include "../../fs/io_iter.h"
 
 /* ── Standard I/O Syscalls ───────────────────────────────────────────────── */
 
-s64 sys_read_impl(pt_regs_t *r)
+#define IO_MAX_RW_COUNT 0x7ffff000ULL
+
+static bool io_user_range(const void *base, size_t size)
 {
-    int fd = (int)(s32)r->rdi;
-    char *buf = (char *)r->rsi;
-    s64 count = (s64)r->rdx;
-    /* BUG-01: negative count is EINVAL; zero count returns 0 immediately */
-    if (count < 0) return -(s64)EINVAL;
-    if (count == 0 || !buf) return 0;
-    if ((uintptr_t)buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
-
-    process_t *proc = sched_current_process();
-    file_t *file = fget(proc, fd);
-
-    if (fd == 0 && !file) {
-        int c = console_getc();
-        if (c != -1) {
-            char kchar = (char)c;
-            if (copy_to_user(buf, &kchar, 1) != 0) return -(s64)EFAULT;
-            return 1;
-        }
-        return -(s64)EAGAIN;
-    }
-
-    if (!file) return -(s64)EBADF;
-
-    s64 total_read = 0;
-    char stack_buf[4096];
-    char *kbuf = stack_buf;
-    size_t max_chunk = sizeof(stack_buf);
-    bool allocated = false;
-
-    if (count > (s64)sizeof(stack_buf)) {
-        size_t alloc_sz = (count > 65536) ? 65536 : (size_t)count;
-        char *dyn = (char *)kmalloc(alloc_sz);
-        if (dyn) {
-            kbuf = dyn;
-            max_chunk = alloc_sz;
-            allocated = true;
-        }
-    }
-
-    while (count > 0) {
-        size_t chunk = count > (s64)max_chunk ? max_chunk : (size_t)count;
-        s64 ret = (s64)vfs_read(file, kbuf, chunk);
-        if (ret < 0) {
-            if (total_read == 0) total_read = ret;
-            break;
-        }
-        if (ret == 0) break;
-        if (copy_to_user(buf + total_read, kbuf, (size_t)ret) != 0) {
-            if (total_read == 0) total_read = -(s64)EFAULT;
-            break;
-        }
-        total_read += ret;
-        count -= ret;
-        if (ret < (s64)chunk) break;
-    }
-    if (allocated) kfree(kbuf);
-    fput(file);
-    return total_read;
+    uintptr_t start = (uintptr_t)base;
+    return start < TASK_SIZE_MAX && size <= TASK_SIZE_MAX - start;
 }
 
-s64 sys_write_impl(pt_regs_t *r)
+/* Descriptor/permission checks precede range, length and iovec checks.
+ * Initial standard descriptors are real VFS files; closed slots stay closed. */
+static file_t *io_get_file(int fd, bool writing, s64 *error)
 {
-    int fd = (int)(s32)r->rdi;
-    const char *buf = (const char *)r->rsi;
-    s64 count = (s64)r->rdx;
-    if (count <= 0 || !buf) return 0;
-    if ((uintptr_t)buf >= TASK_SIZE_MAX) return -(s64)EFAULT;
-
-    process_t *proc = sched_current_process();
-    file_t *file = fget(proc, fd);
-
-    if ((fd == 1 || fd == 2) && !file) {
-        char kbuf[1024];
-        s64 total_written = 0;
-        while (count > 0) {
-            size_t chunk = (size_t)count > sizeof(kbuf) ? sizeof(kbuf) : (size_t)count;
-            if (copy_from_user(kbuf, buf + total_written, chunk) != 0) break;
-            extern void uart_write(u16 port, const char *buf, size_t len);
-            uart_write(0x3F8, kbuf, chunk);
-            total_written += chunk;
-            count -= chunk;
-        }
-        /* BUG-02: return EFAULT (not rdx) if nothing was written due to copy failure */
-        return total_written > 0 ? total_written : -(s64)EFAULT;
+    *error = 0;
+    if (fd < 0) { *error = -(s64)EBADF; return NULL; }
+    file_t *file = fget(sched_current_process(), fd);
+    if (!file) {
+        *error = -(s64)EBADF;
+        return NULL;
     }
-
-    if (!file) return -(s64)EBADF;
-
-    s64 total_written = 0;
-    char stack_buf[4096];
-    char *kbuf = stack_buf;
-    size_t max_chunk = sizeof(stack_buf);
-    bool allocated = false;
-
-    if (count > (s64)sizeof(stack_buf)) {
-        size_t alloc_sz = (count > 65536) ? 65536 : (size_t)count;
-        char *dyn = (char *)kmalloc(alloc_sz);
-        if (dyn) {
-            kbuf = dyn;
-            max_chunk = alloc_sz;
-            allocated = true;
-        }
+    u32 access = file->f_flags & 3;
+    if ((file->f_flags & 0x200000U /* O_PATH */) ||
+        (writing ? access == O_RDONLY : access == O_WRONLY)) {
+        fput(file); *error = -(s64)EBADF; return NULL;
     }
+    return file;
+}
 
-    while (count > 0) {
-        size_t chunk = count > (s64)max_chunk ? max_chunk : (size_t)count;
-        if (copy_from_user(kbuf, buf + total_written, chunk) != 0) {
-            if (total_written == 0) total_written = -(s64)EFAULT;
-            break;
-        }
-        s64 ret = (s64)vfs_write(file, kbuf, chunk);
-        if (ret < 0) {
-            if (ret == -(s64)EPIPE && proc) {
-                sched_kill_process(proc->pid, 13 /* SIGPIPE */);
+/* This frame is entered only after optional backend user transactions are
+ * selected, so a pipe callback does not nest two 4KiB scratch buffers. */
+static s64 io_buffered_loop(file_t *file, bool writing, const vfs_iovec_t *iov,
+                           u32 count, size_t total, u8 *scratch, size_t max_chunk)
+{
+    size_t done = 0;
+    bool regular = file && file->f_inode && S_ISREG(file->f_inode->i_mode) &&
+                   file->f_op && file->f_op->regular_io;
+    while (done < total) {
+        size_t chunk = total - done;
+        if (chunk > max_chunk) chunk = max_chunk;
+        if (writing) {
+            size_t copied = io_iter_copy_from_user(iov, count, done, scratch, chunk);
+            if (!copied) return done ? (s64)done : -(s64)EFAULT;
+            if (copied < chunk && file && !regular)
+                return done ? (s64)done : -(s64)EFAULT;
+            s64 n;
+            if (file) n = vfs_write(file, scratch, copied);
+            else { uart_write(0x3F8, (char *)scratch, copied); n = (s64)copied; }
+            if (n < 0) {
+                if (n == -(s64)EPIPE) {
+                    process_t *proc = sched_current_process();
+                    if (proc) sched_kill_process(proc->pid, 13);
+                }
+                return done ? (s64)done : n;
             }
-            if (total_written == 0) total_written = ret;
-            break;
+            if ((size_t)n > copied) return done ? (s64)done : -(s64)EIO;
+            done += (size_t)n;
+            if ((size_t)n < copied || copied < chunk) break;
+        } else {
+            s64 n;
+            u64 start = 0, position = 0;
+            if (regular) {
+                if (!file->f_op || !file->f_op->read) return done ? (s64)done : -(s64)EINVAL;
+                position = start = __atomic_load_n(&file->f_pos, __ATOMIC_RELAXED);
+                n = file->f_op->read(file, scratch, chunk, &position);
+            } else if (file) n = vfs_read(file, scratch, chunk);
+            else {
+                int c = console_getc();
+                if (c < 0) return done ? (s64)done : -(s64)EAGAIN;
+                scratch[0] = (u8)c; n = 1;
+            }
+            if (n < 0) return done ? (s64)done : n;
+            if (!n) break;
+            if ((size_t)n > chunk) return done ? (s64)done : -(s64)EIO;
+            size_t copied = io_iter_copy_to_user(iov, count, done, scratch, (size_t)n);
+            if (copied < (size_t)n && file && !regular)
+                return done ? (s64)done : -(s64)EFAULT;
+            if (regular && copied) {
+                u64 expected = start;
+                /* Retry a conflicting read rather than rolling back a live
+                 * shared position. User copies run without permanent ownership
+                 * that a killed/page-fault-blocked thread could abandon. */
+                if (!__atomic_compare_exchange_n(&file->f_pos, &expected, start + copied,
+                                                false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                    process_t *proc = sched_current_process();
+                    if (proc && (proc->sig_pending & ~proc->sig_blocked))
+                        return done ? (s64)done : -(s64)EINTR;
+                    continue;
+                }
+                vfs_notify_event(file->f_inode, 0x00000001 /* FAN_ACCESS */);
+            }
+            done += copied;
+            if (copied < (size_t)n) return done ? (s64)done : -(s64)EFAULT;
+            if ((size_t)n < chunk) break;
         }
-        if (ret == 0) break;
-        total_written += ret;
-        count -= ret;
-        if (ret < (s64)chunk) break;
     }
-    if (allocated) kfree(kbuf);
-    fput(file);
-    return total_written;
+    return (s64)done;
 }
+
+static __attribute__((noinline)) s64 io_buffered(file_t *file, bool writing,
+                                              const vfs_iovec_t *iov, u32 count, size_t total)
+{
+    u8 small[4096];
+    u8 *scratch = small;
+    size_t capacity = sizeof(small);
+    if (total > capacity) {
+        size_t wanted = total > 65536 ? 65536 : total;
+        u8 *large = kmalloc(wanted);
+        if (large) { scratch = large; capacity = wanted; }
+    }
+    s64 result = io_buffered_loop(file, writing, iov, count, total, scratch, capacity);
+    if (scratch != small) kfree(scratch);
+    return result;
+}
+
+static s64 io_dispatch(file_t *file, bool writing, const vfs_iovec_t *iov, u32 count, size_t total)
+{
+    if (file && file->f_op) {
+        if (writing && file->f_op->write_user) return file->f_op->write_user(file, iov, count, total);
+        if (!writing && file->f_op->read_user) return file->f_op->read_user(file, iov, count, total);
+        /* Structured devices retain their existing per-vector operation
+         * sizes until they supply their own user-aware transaction callback. */
+        if (!file->f_op->regular_io && count > 1) {
+            s64 done = 0;
+            for (u32 i = 0; i < count; i++) {
+                if (!iov[i].iov_len) continue;
+                s64 n = io_buffered(file, writing, &iov[i], 1, iov[i].iov_len);
+                if (n < 0) return done ? done : n;
+                done += n;
+                if ((size_t)n < iov[i].iov_len) break;
+            }
+            return done;
+        }
+    }
+    return io_buffered(file, writing, iov, count, total);
+}
+
+static s64 io_scalar(pt_regs_t *r, bool writing)
+{
+    s64 error;
+    file_t *file = io_get_file((int)(s32)r->rdi, writing, &error);
+    if (error) return error;
+    vfs_iovec_t iov = {.iov_base = (void *)r->rsi, .iov_len = (size_t)r->rdx};
+    if (!io_user_range(iov.iov_base, iov.iov_len)) error = -(s64)EFAULT;
+    else {
+        if (iov.iov_len > IO_MAX_RW_COUNT) iov.iov_len = IO_MAX_RW_COUNT;
+        error = io_dispatch(file, writing, &iov, 1, iov.iov_len);
+    }
+    if (file) fput(file);
+    return error;
+}
+
+s64 sys_read_impl(pt_regs_t *r) { return io_scalar(r, false); }
+s64 sys_write_impl(pt_regs_t *r) { return io_scalar(r, true); }
 
 s64 sys_open_impl(pt_regs_t *r)
 {
@@ -219,73 +243,42 @@ s64 sys_close_range_impl(pt_regs_t *r)
 /* ── Scatter-Gather I/O ──────────────────────────────────────────────────── */
 
 
-s64 sys_readv_impl(pt_regs_t *r)
+static s64 io_vector(pt_regs_t *r, bool writing)
 {
-    int fd = (int)r->rdi;
-    const struct iovec *iov = (const struct iovec *)r->rsi;
-    int iovcnt = (int)r->rdx;
-
-    if (!iov || iovcnt <= 0 || iovcnt > 1024) return -(s64)EINVAL;
-    if ((uintptr_t)iov >= TASK_SIZE_MAX) return -(s64)EFAULT;
-
-    s64 total = 0;
-    for (int i = 0; i < iovcnt; i++) {
-        struct iovec kiov;
-        if (copy_from_user(&kiov, &iov[i], sizeof(struct iovec)) != 0) return -(s64)EFAULT;
-        if (kiov.iov_len == 0) continue;
-        /* B-08: overflow and length sanity check */
-        if (kiov.iov_len > 0x7FFFFFFF || (s64)kiov.iov_len < 0) return -(s64)EINVAL;
-        if (total + (s64)kiov.iov_len < total) return -(s64)EINVAL;
-
-        pt_regs_t sub_r = *r;
-        sub_r.rdi = (u64)fd;
-        sub_r.rsi = (u64)(uintptr_t)kiov.iov_base;
-        sub_r.rdx = (u64)kiov.iov_len;
-
-        s64 n = sys_read_impl(&sub_r);
-        if (n < 0) {
-            if (total > 0) return total;
-            return n;
-        }
-        total += n;
-        if ((size_t)n < kiov.iov_len) break;
+    s64 error;
+    file_t *file = io_get_file((int)(s32)r->rdi, writing, &error);
+    if (error) return error;
+    u64 count = r->rdx;
+    if (count > 1024) { error = -(s64)EINVAL; goto out; }
+    if (!count) { error = 0; goto out; }
+    vfs_iovec_t small[8];
+    vfs_iovec_t *iov = count <= 8 ? small : kmalloc((size_t)count * sizeof(*iov));
+    if (!iov) { error = -(s64)ENOMEM; goto out; }
+    /* Snapshot every descriptor before invoking a backend or touching payload. */
+    if (copy_from_user(iov, (void *)r->rsi, (size_t)count * sizeof(*iov))) {
+        error = -(s64)EFAULT; goto free_iov;
     }
-    return total;
+    size_t total = 0;
+    for (u32 i = 0; i < count; i++) {
+        size_t length = iov[i].iov_len;
+        if (length > 0x7fffffffffffffffULL) { error = -(s64)EINVAL; goto free_iov; }
+        if (length && !io_user_range(iov[i].iov_base, length)) {
+            error = -(s64)EFAULT; goto free_iov;
+        }
+        if (length > IO_MAX_RW_COUNT - total) length = IO_MAX_RW_COUNT - total;
+        iov[i].iov_len = length;
+        total += length;
+    }
+    error = io_dispatch(file, writing, iov, (u32)count, total);
+free_iov:
+    if (iov != small) kfree(iov);
+out:
+    if (file) fput(file);
+    return error;
 }
 
-s64 sys_writev_impl(pt_regs_t *r)
-{
-    int fd = (int)r->rdi;
-    const struct iovec *iov = (const struct iovec *)r->rsi;
-    int iovcnt = (int)r->rdx;
-
-    if (!iov || iovcnt <= 0 || iovcnt > 1024) return -(s64)EINVAL;
-    if ((uintptr_t)iov >= TASK_SIZE_MAX) return -(s64)EFAULT;
-
-    s64 total = 0;
-    for (int i = 0; i < iovcnt; i++) {
-        struct iovec kiov;
-        if (copy_from_user(&kiov, &iov[i], sizeof(struct iovec)) != 0) return -(s64)EFAULT;
-        if (kiov.iov_len == 0) continue;
-        /* B-08: overflow and length sanity check */
-        if (kiov.iov_len > 0x7FFFFFFF || (s64)kiov.iov_len < 0) return -(s64)EINVAL;
-        if (total + (s64)kiov.iov_len < total) return -(s64)EINVAL;
-
-        pt_regs_t sub_r = *r;
-        sub_r.rdi = (u64)fd;
-        sub_r.rsi = (u64)(uintptr_t)kiov.iov_base;
-        sub_r.rdx = (u64)kiov.iov_len;
-
-        s64 n = sys_write_impl(&sub_r);
-        if (n < 0) {
-            if (total > 0) return total;
-            return n;
-        }
-        total += n;
-        if ((size_t)n < kiov.iov_len) break;
-    }
-    return total;
-}
+s64 sys_readv_impl(pt_regs_t *r) { return io_vector(r, false); }
+s64 sys_writev_impl(pt_regs_t *r) { return io_vector(r, true); }
 
 s64 sys_pread64_impl(pt_regs_t *r)
 {
@@ -2835,7 +2828,7 @@ s64 sys_eventfd2_impl(pt_regs_t *r)
 
     f->f_op = &g_eventfd_fops;
     f->private_data = ctx;
-    f->f_flags = (flags & EFD_NONBLOCK) ? O_NONBLOCK : 0;
+    f->f_flags = O_RDWR | ((flags & EFD_NONBLOCK) ? O_NONBLOCK : 0);
     f->f_fd_flags = (flags & EFD_CLOEXEC) ? FD_CLOEXEC : 0;
     f->f_mode = 0600;
     f->f_count = 1;
@@ -3485,7 +3478,7 @@ s64 sys_timerfd_create_impl(pt_regs_t *r)
     }
     f->f_op = &g_timerfd_fops;
     f->private_data = ctx;
-    f->f_flags = (flags & TFD_NONBLOCK) ? O_NONBLOCK : 0;
+    f->f_flags = O_RDWR | ((flags & TFD_NONBLOCK) ? O_NONBLOCK : 0);
     f->f_fd_flags = (flags & TFD_CLOEXEC) ? FD_CLOEXEC : 0;
     f->f_count = 1;
 
@@ -3753,7 +3746,7 @@ s64 sys_signalfd4_impl(pt_regs_t *r)
     }
     f->f_op = &g_signalfd_fops;
     f->private_data = ctx;
-    f->f_flags = (flags & SFD_NONBLOCK) ? O_NONBLOCK : 0;
+    f->f_flags = O_RDWR | ((flags & SFD_NONBLOCK) ? O_NONBLOCK : 0);
     f->f_fd_flags = (flags & SFD_CLOEXEC) ? FD_CLOEXEC : 0;
     f->f_count = 1;
 
@@ -4202,6 +4195,7 @@ s64 sys_fanotify_init_impl(pt_regs_t *r)
     int err = fanotify_create(flags, event_f_flags, &filp);
     if (err < 0) return (s64)err;
 
+    filp->f_flags |= O_RDWR;
     filp->f_fd_flags = (flags & 0x00000001 /* FAN_CLOEXEC */) ? FD_CLOEXEC : 0;
     filp->f_mode = 0600;
 

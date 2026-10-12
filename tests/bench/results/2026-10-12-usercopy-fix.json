@@ -1,0 +1,332 @@
+{
+  "date": "2026-10-12",
+  "scope": "W4.3 scalar/vector user-copy fault transactions",
+  "source_parent": "675dccd164f59293231a15b6c7c9c18645227988",
+  "kernel_sha256": "ef4e89dc1d7c757ba98ae054c1b284420f3863fe1565c5ea7d7dad87456f1004",
+  "kernel_bytes": 6136408,
+  "linux_release": "7.2.8-200.fc44.x86_64",
+  "machine": "q35",
+  "cpus": 4,
+  "memory_mb": 1536,
+  "kernel_cmdline": "quiet",
+  "network": "none",
+  "baseline": {
+    "cases": 60,
+    "matches": 21,
+    "differences": 39,
+    "evidence": "2026-10-11-usercopy-faults.json"
+  },
+  "after": {
+    "baseline_matches": 60,
+    "baseline_differences": 0,
+    "extension_matches": 84,
+    "extension_differences": 0,
+    "device_matches": 14,
+    "accelerators": [
+      "kvm",
+      "tcg"
+    ]
+  },
+  "kernel_sources_sha256": {
+    "fs/io_vec.h": "dacda52765b948907dcff2a869f735a0f53366988d837e8ea1a9bd4f8044d813",
+    "fs/io_iter.h": "bf0a534a7ab48c0f67e850532594f1268f6e52f30a12a4e3d0381484e1369127",
+    "fs/pipe.c": "610800b2a0c4b5aaea20a2b90b9f2121f907f169705ac790ae5fafaa555b4f6b",
+    "fs/pipe.h": "2ca401f1909b812d999a207519b43d72bf1958beba5624bf0c88dc651f021837",
+    "fs/vfs.h": "500efaa75a1e8fd4a8da806a90a4b5ef4dda99b06c69ed30642ac009d9ff9627",
+    "fs/tmpfs.c": "32dd7f1242da52aa049bd58e651757c599b5d243c14bcbe8c940d23b9b7ec627",
+    "fs/ext2/ext2.c": "5d307da13a75517e8c48cbce7d551311ef10f19a125f343580130a5614b6e40b",
+    "fs/fat32.c": "85a5fc165609b1cfd0c6fa3a4e243b0be1e6a7b28334e4e10b9b33b7e95aa999",
+    "fs/squashfs/squashfs.c": "5acd5e5240c717bb6e5a1c82ac2b4e05e029415e0e3465949a0276304c002fa0",
+    "kernel/syscall/sys_fs.c": "e2c683ed058bc3cd39bf421a0b2ca0bb3506d1ab49215a6c9d4deb76802cd62a",
+    "kernel/syscall/sys_mm.c": "2ef2a217d47396d3971cc93f0cd9a1eca746764345e84a7093619aeb072b3538",
+    "kernel/syscall/syscall_internal.h": "d405895044328aede4f879ade7836e59ed879431d6828f8533249cd47a5a859a",
+    "kernel/sched/elf.c": "4f1dc267849ad056878979390a3913f60e6c3dc7531deebed54cc372dc7337fd"
+  },
+  "probes": {
+    "usercopy-observe": {
+      "source_sha256": "edecfa1f3c70eff7ce17f95f1f5e12230348c9db195cbedaa45d9466f96f6dbb",
+      "payload_sha256": "c0c9d6b93c509a4445d31d19ad0e99b830d9cebac46fcbf30cc153f8b4ca7ab8"
+    },
+    "usercopy-compat": {
+      "source_sha256": "ccd42cab72f0a3a03aa37a24776b4b57c818cb1775b7576542a12b2d710b71f9",
+      "payload_sha256": "4892bb5b1fd1eb48757053462318e159a0e5f62313c1835be13039fe4f82297a"
+    },
+    "usercopy-device": {
+      "source_sha256": "07b8e838ca421c896872f3d2c62b0d822184c5717400827211686d5819c4be2c",
+      "payload_sha256": "4f895ea6ee5a56e6bcd5a314cd34c5c4c067ef210cdaad8d1892e12979959604"
+    },
+    "usercopy-shared": {
+      "source_sha256": "84476a5ca7eb47b72fda97a1348a729acc4d863d65ca7e5a4b0ca7e38005ac94",
+      "payload_sha256": "91a783e1ceebc2dc762987ba84ffe9979c8e84fad4a6562df6ab151c969c3c7e"
+    },
+    "fd-lifetime": {
+      "source_sha256": "f5968ac13d061d207a824bd614ad913c08c54b74d93d18a7851f3be323c45dbf",
+      "payload_sha256": "1d2c113308a5253c589fcef09b4a73a4fa4b398120a839da3ea137ecce514f03"
+    },
+    "epoll": {
+      "source_sha256": "9010fec980bdeadbf69ccaf54878b6b7653946e4a01e2d87f6a29643a2f851a0",
+      "payload_sha256": "3f3903ae60874009f8dddaa91893d11e7078551cef67cfb61a8ec07cb1c6d1fe"
+    },
+    "abi-probe": {
+      "source_sha256": "c4c2c387b757afb2b96d72bc619aee2519b39d2730f4250f5144765d41e3be4f",
+      "payload_sha256": "8959b5009b39e5f4c04c7cc1903d3cc7e94dcc61069de9a51bf56e1efb29298b"
+    }
+  },
+  "shared_readers": {
+    "linux": {
+      "records": 4096,
+      "reader_records": [
+        1160,
+        1200,
+        568,
+        1168
+      ],
+      "checks_passed": 3
+    },
+    "kvm": {
+      "records": 4096,
+      "reader_records": [
+        632,
+        936,
+        1232,
+        1296
+      ],
+      "checks_passed": 3
+    },
+    "tcg": {
+      "records": 4096,
+      "reader_records": [
+        1736,
+        1728,
+        248,
+        384
+      ],
+      "checks_passed": 3
+    }
+  },
+  "regression": {
+    "abi_kvm": 121,
+    "boot_kvm": 4,
+    "boot_tcg": 6,
+    "smoke_kvm": 3,
+    "fd_lifetime_each_accelerator": 21,
+    "epoll_each_accelerator": 109,
+    "production_pipe_host_transactions": 16,
+    "syscalls_verified": 385,
+    "parser_corruptions_rejected_per_profile": {
+      "baseline": 17,
+      "extension": 20
+    }
+  },
+  "review": {
+    "tool": "Antigravity CLI",
+    "model": "gemini-3.1-pro-high",
+    "implemented_finding": "duplicate pipe waiter enqueue must preserve following waiters"
+  },
+  "limitations": [
+    "Fault corpus uses memfd and anonymous pipe; pipe read seeds one Linux buffer.",
+    "Shared reader test uses ordinary regular file, 64-byte reads, four pinned CPUs; no whole-call large read serialization claim.",
+    "Optimistic retries can rewrite user destination before eventual commit or failure.",
+    "Shared writes, concurrent lseek/pread/pwrite, mapping/COW races and full SMAP restoration are not validated.",
+    "Structured-device reads retain existing consumption on user-copy failure; no universal device transaction conformance claim.",
+    "No copy throughput, physical hardware or full Linux pipe-buffer provenance claim."
+  ],
+  "profiles": [
+    {
+      "profile": "baseline",
+      "cases": 60,
+      "fields": [
+        "return",
+        "errno",
+        "offset",
+        "remaining_or_size",
+        "data_checksum",
+        "copied_prefix",
+        "canary"
+      ],
+      "comparison": {
+        "kvm": [],
+        "tcg": []
+      }
+    },
+    {
+      "profile": "extension",
+      "cases": 84,
+      "fields": [
+        "return",
+        "errno",
+        "offset",
+        "remaining_or_size",
+        "data_checksum",
+        "copied_prefix",
+        "canary"
+      ],
+      "comparison": {
+        "kvm": [],
+        "tcg": []
+      }
+    }
+  ],
+  "observations": [
+    {"profile":"baseline","name":"memfd.read.none.1","linux":[1,0,1,128,707264,1,true],"kvm":[1,0,1,128,707264,1,true],"tcg":[1,0,1,128,707264,1,true]},
+    {"profile":"baseline","name":"memfd.read.none.16","linux":[16,0,16,128,707264,16,true],"kvm":[16,0,16,128,707264,16,true],"tcg":[16,0,16,128,707264,16,true]},
+    {"profile":"baseline","name":"memfd.read.none.63","linux":[63,0,63,128,707264,63,true],"kvm":[63,0,63,128,707264,63,true],"tcg":[63,0,63,128,707264,63,true]},
+    {"profile":"baseline","name":"memfd.read.readonly.1","linux":[1,0,1,128,707264,1,true],"kvm":[1,0,1,128,707264,1,true],"tcg":[1,0,1,128,707264,1,true]},
+    {"profile":"baseline","name":"memfd.read.readonly.16","linux":[16,0,16,128,707264,16,true],"kvm":[16,0,16,128,707264,16,true],"tcg":[16,0,16,128,707264,16,true]},
+    {"profile":"baseline","name":"memfd.read.readonly.63","linux":[63,0,63,128,707264,63,true],"kvm":[63,0,63,128,707264,63,true],"tcg":[63,0,63,128,707264,63,true]},
+    {"profile":"baseline","name":"memfd.read.unmapped.1","linux":[1,0,1,128,707264,1,true],"kvm":[1,0,1,128,707264,1,true],"tcg":[1,0,1,128,707264,1,true]},
+    {"profile":"baseline","name":"memfd.read.unmapped.16","linux":[16,0,16,128,707264,16,true],"kvm":[16,0,16,128,707264,16,true],"tcg":[16,0,16,128,707264,16,true]},
+    {"profile":"baseline","name":"memfd.read.unmapped.63","linux":[63,0,63,128,707264,63,true],"kvm":[63,0,63,128,707264,63,true],"tcg":[63,0,63,128,707264,63,true]},
+    {"profile":"baseline","name":"memfd.read.vector-data.0","linux":[8,0,8,128,707264,8,true],"kvm":[8,0,8,128,707264,8,true],"tcg":[8,0,8,128,707264,8,true]},
+    {"profile":"baseline","name":"memfd.read.vector-desc.0","linux":[-1,14,0,128,707264,0,true],"kvm":[-1,14,0,128,707264,0,true],"tcg":[-1,14,0,128,707264,0,true]},
+    {"profile":"baseline","name":"memfd.read.zero-scalar.0","linux":[0,0,0,128,707264,0,true],"kvm":[0,0,0,128,707264,0,true],"tcg":[0,0,0,128,707264,0,true]},
+    {"profile":"baseline","name":"memfd.read.zero-vector.0","linux":[0,0,0,128,707264,0,true],"kvm":[0,0,0,128,707264,0,true],"tcg":[0,0,0,128,707264,0,true]},
+    {"profile":"baseline","name":"memfd.read.null-data.0","linux":[-1,14,0,128,707264,0,true],"kvm":[-1,14,0,128,707264,0,true],"tcg":[-1,14,0,128,707264,0,true]},
+    {"profile":"baseline","name":"memfd.read.valid.0","linux":[32,0,32,128,707264,32,true],"kvm":[32,0,32,128,707264,32,true],"tcg":[32,0,32,128,707264,32,true]},
+    {"profile":"baseline","name":"memfd.write.none.1","linux":[1,0,1,1,1,0,true],"kvm":[1,0,1,1,1,0,true],"tcg":[1,0,1,1,1,0,true]},
+    {"profile":"baseline","name":"memfd.write.none.16","linux":[16,0,16,16,1496,0,true],"kvm":[16,0,16,16,1496,0,true],"tcg":[16,0,16,16,1496,0,true]},
+    {"profile":"baseline","name":"memfd.write.none.63","linux":[63,0,63,63,85344,0,true],"kvm":[63,0,63,63,85344,0,true],"tcg":[63,0,63,63,85344,0,true]},
+    {"profile":"baseline","name":"memfd.write.readonly.1","linux":[2,0,2,2,5,0,true],"kvm":[2,0,2,2,5,0,true],"tcg":[2,0,2,2,5,0,true]},
+    {"profile":"baseline","name":"memfd.write.readonly.16","linux":[32,0,32,32,11440,0,true],"kvm":[32,0,32,32,11440,0,true],"tcg":[32,0,32,32,11440,0,true]},
+    {"profile":"baseline","name":"memfd.write.readonly.63","linux":[126,0,126,126,674751,0,true],"kvm":[126,0,126,126,674751,0,true],"tcg":[126,0,126,126,674751,0,true]},
+    {"profile":"baseline","name":"memfd.write.unmapped.1","linux":[1,0,1,1,1,0,true],"kvm":[1,0,1,1,1,0,true],"tcg":[1,0,1,1,1,0,true]},
+    {"profile":"baseline","name":"memfd.write.unmapped.16","linux":[16,0,16,16,1496,0,true],"kvm":[16,0,16,16,1496,0,true],"tcg":[16,0,16,16,1496,0,true]},
+    {"profile":"baseline","name":"memfd.write.unmapped.63","linux":[63,0,63,63,85344,0,true],"kvm":[63,0,63,63,85344,0,true],"tcg":[63,0,63,63,85344,0,true]},
+    {"profile":"baseline","name":"memfd.write.vector-data.0","linux":[8,0,8,8,204,0,true],"kvm":[8,0,8,8,204,0,true],"tcg":[8,0,8,8,204,0,true]},
+    {"profile":"baseline","name":"memfd.write.vector-desc.0","linux":[-1,14,0,0,0,0,true],"kvm":[-1,14,0,0,0,0,true],"tcg":[-1,14,0,0,0,0,true]},
+    {"profile":"baseline","name":"memfd.write.zero-scalar.0","linux":[0,0,0,0,0,0,true],"kvm":[0,0,0,0,0,0,true],"tcg":[0,0,0,0,0,0,true]},
+    {"profile":"baseline","name":"memfd.write.zero-vector.0","linux":[0,0,0,0,0,0,true],"kvm":[0,0,0,0,0,0,true],"tcg":[0,0,0,0,0,0,true]},
+    {"profile":"baseline","name":"memfd.write.null-data.0","linux":[-1,14,0,0,0,0,true],"kvm":[-1,14,0,0,0,0,true],"tcg":[-1,14,0,0,0,0,true]},
+    {"profile":"baseline","name":"memfd.write.valid.0","linux":[32,0,32,32,11440,0,true],"kvm":[32,0,32,32,11440,0,true],"tcg":[32,0,32,32,11440,0,true]},
+    {"profile":"baseline","name":"pipe.read.none.1","linux":[-1,14,-1,128,707264,1,true],"kvm":[-1,14,-1,128,707264,1,true],"tcg":[-1,14,-1,128,707264,1,true]},
+    {"profile":"baseline","name":"pipe.read.none.16","linux":[-1,14,-1,128,707264,16,true],"kvm":[-1,14,-1,128,707264,16,true],"tcg":[-1,14,-1,128,707264,16,true]},
+    {"profile":"baseline","name":"pipe.read.none.63","linux":[-1,14,-1,128,707264,63,true],"kvm":[-1,14,-1,128,707264,63,true],"tcg":[-1,14,-1,128,707264,63,true]},
+    {"profile":"baseline","name":"pipe.read.readonly.1","linux":[-1,14,-1,128,707264,1,true],"kvm":[-1,14,-1,128,707264,1,true],"tcg":[-1,14,-1,128,707264,1,true]},
+    {"profile":"baseline","name":"pipe.read.readonly.16","linux":[-1,14,-1,128,707264,16,true],"kvm":[-1,14,-1,128,707264,16,true],"tcg":[-1,14,-1,128,707264,16,true]},
+    {"profile":"baseline","name":"pipe.read.readonly.63","linux":[-1,14,-1,128,707264,63,true],"kvm":[-1,14,-1,128,707264,63,true],"tcg":[-1,14,-1,128,707264,63,true]},
+    {"profile":"baseline","name":"pipe.read.unmapped.1","linux":[-1,14,-1,128,707264,1,true],"kvm":[-1,14,-1,128,707264,1,true],"tcg":[-1,14,-1,128,707264,1,true]},
+    {"profile":"baseline","name":"pipe.read.unmapped.16","linux":[-1,14,-1,128,707264,16,true],"kvm":[-1,14,-1,128,707264,16,true],"tcg":[-1,14,-1,128,707264,16,true]},
+    {"profile":"baseline","name":"pipe.read.unmapped.63","linux":[-1,14,-1,128,707264,63,true],"kvm":[-1,14,-1,128,707264,63,true],"tcg":[-1,14,-1,128,707264,63,true]},
+    {"profile":"baseline","name":"pipe.read.vector-data.0","linux":[-1,14,-1,128,707264,8,true],"kvm":[-1,14,-1,128,707264,8,true],"tcg":[-1,14,-1,128,707264,8,true]},
+    {"profile":"baseline","name":"pipe.read.vector-desc.0","linux":[-1,14,-1,128,707264,0,true],"kvm":[-1,14,-1,128,707264,0,true],"tcg":[-1,14,-1,128,707264,0,true]},
+    {"profile":"baseline","name":"pipe.read.zero-scalar.0","linux":[0,0,-1,128,707264,0,true],"kvm":[0,0,-1,128,707264,0,true],"tcg":[0,0,-1,128,707264,0,true]},
+    {"profile":"baseline","name":"pipe.read.zero-vector.0","linux":[0,0,-1,128,707264,0,true],"kvm":[0,0,-1,128,707264,0,true],"tcg":[0,0,-1,128,707264,0,true]},
+    {"profile":"baseline","name":"pipe.read.null-data.0","linux":[-1,14,-1,128,707264,0,true],"kvm":[-1,14,-1,128,707264,0,true],"tcg":[-1,14,-1,128,707264,0,true]},
+    {"profile":"baseline","name":"pipe.read.valid.0","linux":[32,0,-1,96,448528,32,true],"kvm":[32,0,-1,96,448528,32,true],"tcg":[32,0,-1,96,448528,32,true]},
+    {"profile":"baseline","name":"pipe.write.none.1","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.none.16","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.none.63","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.readonly.1","linux":[2,0,-1,2,5,0,true],"kvm":[2,0,-1,2,5,0,true],"tcg":[2,0,-1,2,5,0,true]},
+    {"profile":"baseline","name":"pipe.write.readonly.16","linux":[32,0,-1,32,11440,0,true],"kvm":[32,0,-1,32,11440,0,true],"tcg":[32,0,-1,32,11440,0,true]},
+    {"profile":"baseline","name":"pipe.write.readonly.63","linux":[126,0,-1,126,674751,0,true],"kvm":[126,0,-1,126,674751,0,true],"tcg":[126,0,-1,126,674751,0,true]},
+    {"profile":"baseline","name":"pipe.write.unmapped.1","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.unmapped.16","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.unmapped.63","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.vector-data.0","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.vector-desc.0","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.zero-scalar.0","linux":[0,0,-1,0,0,0,true],"kvm":[0,0,-1,0,0,0,true],"tcg":[0,0,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.zero-vector.0","linux":[0,0,-1,0,0,0,true],"kvm":[0,0,-1,0,0,0,true],"tcg":[0,0,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.null-data.0","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"baseline","name":"pipe.write.valid.0","linux":[32,0,-1,32,11440,0,true],"kvm":[32,0,-1,32,11440,0,true],"tcg":[32,0,-1,32,11440,0,true]},
+    {"profile":"extension","name":"memfd.read.args.invalid-zero","linux":[-1,9,0,8192,4211824848,0,true],"kvm":[-1,9,0,8192,4211824848,0,true],"tcg":[-1,9,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.invalid-null","linux":[-1,9,0,8192,4211824848,0,true],"kvm":[-1,9,0,8192,4211824848,0,true],"tcg":[-1,9,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.invalid-huge","linux":[-1,9,0,8192,4211824848,0,true],"kvm":[-1,9,0,8192,4211824848,0,true],"tcg":[-1,9,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.zero","linux":[0,0,0,8192,4211824848,0,true],"kvm":[0,0,0,8192,4211824848,0,true],"tcg":[0,0,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.null","linux":[-1,14,0,8192,4211824848,0,true],"kvm":[-1,14,0,8192,4211824848,0,true],"tcg":[-1,14,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.bad","linux":[-1,14,0,8192,4211824848,0,true],"kvm":[-1,14,0,8192,4211824848,0,true],"tcg":[-1,14,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.huge","linux":[-1,14,0,8192,4211824848,0,true],"kvm":[-1,14,0,8192,4211824848,0,true],"tcg":[-1,14,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.above-user","linux":[-1,14,0,8192,4211824848,0,true],"kvm":[-1,14,0,8192,4211824848,0,true],"tcg":[-1,14,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-invalid-zero","linux":[-1,9,0,8192,4211824848,0,true],"kvm":[-1,9,0,8192,4211824848,0,true],"tcg":[-1,9,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-invalid-negative","linux":[-1,9,0,8192,4211824848,0,true],"kvm":[-1,9,0,8192,4211824848,0,true],"tcg":[-1,9,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-invalid-too-many","linux":[-1,9,0,8192,4211824848,0,true],"kvm":[-1,9,0,8192,4211824848,0,true],"tcg":[-1,9,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-zero","linux":[0,0,0,8192,4211824848,0,true],"kvm":[0,0,0,8192,4211824848,0,true],"tcg":[0,0,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-negative","linux":[-1,22,0,8192,4211824848,0,true],"kvm":[-1,22,0,8192,4211824848,0,true],"tcg":[-1,22,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-too-many","linux":[-1,22,0,8192,4211824848,0,true],"kvm":[-1,22,0,8192,4211824848,0,true],"tcg":[-1,22,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-null","linux":[-1,14,0,8192,4211824848,0,true],"kvm":[-1,14,0,8192,4211824848,0,true],"tcg":[-1,14,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-bad","linux":[-1,14,0,8192,4211824848,0,true],"kvm":[-1,14,0,8192,4211824848,0,true],"tcg":[-1,14,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-zero-payload","linux":[0,0,0,8192,4211824848,0,true],"kvm":[0,0,0,8192,4211824848,0,true],"tcg":[0,0,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-overflow","linux":[-1,22,0,8192,4211824848,0,true],"kvm":[-1,22,0,8192,4211824848,0,true],"tcg":[-1,22,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"memfd.read.args.v-max-zero","linux":[0,0,0,8192,4211824848,0,true],"kvm":[0,0,0,8192,4211824848,0,true],"tcg":[0,0,0,8192,4211824848,0,true]},
+    {"profile":"extension","name":"pipe.read.args.wrong-end-zero","linux":[-1,9,-1,4096,1050602856,0,true],"kvm":[-1,9,-1,4096,1050602856,0,true],"tcg":[-1,9,-1,4096,1050602856,0,true]},
+    {"profile":"extension","name":"memfd.write.args.invalid-zero","linux":[-1,9,0,0,0,0,true],"kvm":[-1,9,0,0,0,0,true],"tcg":[-1,9,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.invalid-null","linux":[-1,9,0,0,0,0,true],"kvm":[-1,9,0,0,0,0,true],"tcg":[-1,9,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.invalid-huge","linux":[-1,9,0,0,0,0,true],"kvm":[-1,9,0,0,0,0,true],"tcg":[-1,9,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.zero","linux":[0,0,0,0,0,0,true],"kvm":[0,0,0,0,0,0,true],"tcg":[0,0,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.null","linux":[-1,14,0,0,0,0,true],"kvm":[-1,14,0,0,0,0,true],"tcg":[-1,14,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.bad","linux":[-1,14,0,0,0,0,true],"kvm":[-1,14,0,0,0,0,true],"tcg":[-1,14,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.huge","linux":[-1,14,0,0,0,0,true],"kvm":[-1,14,0,0,0,0,true],"tcg":[-1,14,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.above-user","linux":[-1,14,0,0,0,0,true],"kvm":[-1,14,0,0,0,0,true],"tcg":[-1,14,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-invalid-zero","linux":[-1,9,0,0,0,0,true],"kvm":[-1,9,0,0,0,0,true],"tcg":[-1,9,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-invalid-negative","linux":[-1,9,0,0,0,0,true],"kvm":[-1,9,0,0,0,0,true],"tcg":[-1,9,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-invalid-too-many","linux":[-1,9,0,0,0,0,true],"kvm":[-1,9,0,0,0,0,true],"tcg":[-1,9,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-zero","linux":[0,0,0,0,0,0,true],"kvm":[0,0,0,0,0,0,true],"tcg":[0,0,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-negative","linux":[-1,22,0,0,0,0,true],"kvm":[-1,22,0,0,0,0,true],"tcg":[-1,22,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-too-many","linux":[-1,22,0,0,0,0,true],"kvm":[-1,22,0,0,0,0,true],"tcg":[-1,22,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-null","linux":[-1,14,0,0,0,0,true],"kvm":[-1,14,0,0,0,0,true],"tcg":[-1,14,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-bad","linux":[-1,14,0,0,0,0,true],"kvm":[-1,14,0,0,0,0,true],"tcg":[-1,14,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-zero-payload","linux":[0,0,0,0,0,0,true],"kvm":[0,0,0,0,0,0,true],"tcg":[0,0,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-overflow","linux":[-1,22,0,0,0,0,true],"kvm":[-1,22,0,0,0,0,true],"tcg":[-1,22,0,0,0,0,true]},
+    {"profile":"extension","name":"memfd.write.args.v-max-zero","linux":[0,0,0,0,0,0,true],"kvm":[0,0,0,0,0,0,true],"tcg":[0,0,0,0,0,0,true]},
+    {"profile":"extension","name":"pipe.write.args.wrong-end-zero","linux":[-1,9,-1,0,0,0,true],"kvm":[-1,9,-1,0,0,0,true],"tcg":[-1,9,-1,0,0,0,true]},
+    {"profile":"extension","name":"memfd.read.page.none.1","linux":[1,0,1,8192,4211824848,1,true],"kvm":[1,0,1,8192,4211824848,1,true],"tcg":[1,0,1,8192,4211824848,1,true]},
+    {"profile":"extension","name":"memfd.read.page.none.2048","linux":[2048,0,2048,8192,4211824848,2048,true],"kvm":[2048,0,2048,8192,4211824848,2048,true],"tcg":[2048,0,2048,8192,4211824848,2048,true]},
+    {"profile":"extension","name":"memfd.read.page.none.4095","linux":[4095,0,4095,8192,4211824848,4095,true],"kvm":[4095,0,4095,8192,4211824848,4095,true],"tcg":[4095,0,4095,8192,4211824848,4095,true]},
+    {"profile":"extension","name":"memfd.read.page.readonly.1","linux":[1,0,1,8192,4211824848,1,true],"kvm":[1,0,1,8192,4211824848,1,true],"tcg":[1,0,1,8192,4211824848,1,true]},
+    {"profile":"extension","name":"memfd.read.page.readonly.2048","linux":[2048,0,2048,8192,4211824848,2048,true],"kvm":[2048,0,2048,8192,4211824848,2048,true],"tcg":[2048,0,2048,8192,4211824848,2048,true]},
+    {"profile":"extension","name":"memfd.read.page.readonly.4095","linux":[4095,0,4095,8192,4211824848,4095,true],"kvm":[4095,0,4095,8192,4211824848,4095,true],"tcg":[4095,0,4095,8192,4211824848,4095,true]},
+    {"profile":"extension","name":"memfd.read.page.unmapped.1","linux":[1,0,1,8192,4211824848,1,true],"kvm":[1,0,1,8192,4211824848,1,true],"tcg":[1,0,1,8192,4211824848,1,true]},
+    {"profile":"extension","name":"memfd.read.page.unmapped.2048","linux":[2048,0,2048,8192,4211824848,2048,true],"kvm":[2048,0,2048,8192,4211824848,2048,true],"tcg":[2048,0,2048,8192,4211824848,2048,true]},
+    {"profile":"extension","name":"memfd.read.page.unmapped.4095","linux":[4095,0,4095,8192,4211824848,4095,true],"kvm":[4095,0,4095,8192,4211824848,4095,true],"tcg":[4095,0,4095,8192,4211824848,4095,true]},
+    {"profile":"extension","name":"memfd.read.page.valid.4096","linux":[4096,0,4096,8192,4211824848,4096,true],"kvm":[4096,0,4096,8192,4211824848,4096,true],"tcg":[4096,0,4096,8192,4211824848,4096,true]},
+    {"profile":"extension","name":"memfd.write.page.none.1","linux":[1,0,1,1,1,0,true],"kvm":[1,0,1,1,1,0,true],"tcg":[1,0,1,1,1,0,true]},
+    {"profile":"extension","name":"memfd.write.page.none.2048","linux":[2048,0,2048,2048,266357236,0,true],"kvm":[2048,0,2048,2048,266357236,0,true],"tcg":[2048,0,2048,2048,266357236,0,true]},
+    {"profile":"extension","name":"memfd.write.page.none.4095","linux":[4095,0,4095,4095,1050275176,0,true],"kvm":[4095,0,4095,4095,1050275176,0,true],"tcg":[4095,0,4095,4095,1050275176,0,true]},
+    {"profile":"extension","name":"memfd.write.page.readonly.1","linux":[4096,0,4096,4096,1050602856,0,true],"kvm":[4096,0,4096,4096,1050602856,0,true],"tcg":[4096,0,4096,4096,1050602856,0,true]},
+    {"profile":"extension","name":"memfd.write.page.readonly.2048","linux":[4096,0,4096,4096,1050602856,0,true],"kvm":[4096,0,4096,4096,1050602856,0,true],"tcg":[4096,0,4096,4096,1050602856,0,true]},
+    {"profile":"extension","name":"memfd.write.page.readonly.4095","linux":[4096,0,4096,4096,1050602856,0,true],"kvm":[4096,0,4096,4096,1050602856,0,true],"tcg":[4096,0,4096,4096,1050602856,0,true]},
+    {"profile":"extension","name":"memfd.write.page.unmapped.1","linux":[1,0,1,1,1,0,true],"kvm":[1,0,1,1,1,0,true],"tcg":[1,0,1,1,1,0,true]},
+    {"profile":"extension","name":"memfd.write.page.unmapped.2048","linux":[2048,0,2048,2048,266357236,0,true],"kvm":[2048,0,2048,2048,266357236,0,true],"tcg":[2048,0,2048,2048,266357236,0,true]},
+    {"profile":"extension","name":"memfd.write.page.unmapped.4095","linux":[4095,0,4095,4095,1050275176,0,true],"kvm":[4095,0,4095,4095,1050275176,0,true],"tcg":[4095,0,4095,4095,1050275176,0,true]},
+    {"profile":"extension","name":"memfd.write.page.valid.4096","linux":[4096,0,4096,4096,1050602856,0,true],"kvm":[4096,0,4096,4096,1050602856,0,true],"tcg":[4096,0,4096,4096,1050602856,0,true]},
+    {"profile":"extension","name":"pipe.read.page.none.1","linux":[-1,14,-1,4096,1050602856,1,true],"kvm":[-1,14,-1,4096,1050602856,1,true],"tcg":[-1,14,-1,4096,1050602856,1,true]},
+    {"profile":"extension","name":"pipe.read.page.none.2048","linux":[-1,14,-1,4096,1050602856,2048,true],"kvm":[-1,14,-1,4096,1050602856,2048,true],"tcg":[-1,14,-1,4096,1050602856,2048,true]},
+    {"profile":"extension","name":"pipe.read.page.none.4095","linux":[-1,14,-1,4096,1050602856,4095,true],"kvm":[-1,14,-1,4096,1050602856,4095,true],"tcg":[-1,14,-1,4096,1050602856,4095,true]},
+    {"profile":"extension","name":"pipe.read.page.readonly.1","linux":[-1,14,-1,4096,1050602856,1,true],"kvm":[-1,14,-1,4096,1050602856,1,true],"tcg":[-1,14,-1,4096,1050602856,1,true]},
+    {"profile":"extension","name":"pipe.read.page.readonly.2048","linux":[-1,14,-1,4096,1050602856,2048,true],"kvm":[-1,14,-1,4096,1050602856,2048,true],"tcg":[-1,14,-1,4096,1050602856,2048,true]},
+    {"profile":"extension","name":"pipe.read.page.readonly.4095","linux":[-1,14,-1,4096,1050602856,4095,true],"kvm":[-1,14,-1,4096,1050602856,4095,true],"tcg":[-1,14,-1,4096,1050602856,4095,true]},
+    {"profile":"extension","name":"pipe.read.page.unmapped.1","linux":[-1,14,-1,4096,1050602856,1,true],"kvm":[-1,14,-1,4096,1050602856,1,true],"tcg":[-1,14,-1,4096,1050602856,1,true]},
+    {"profile":"extension","name":"pipe.read.page.unmapped.2048","linux":[-1,14,-1,4096,1050602856,2048,true],"kvm":[-1,14,-1,4096,1050602856,2048,true],"tcg":[-1,14,-1,4096,1050602856,2048,true]},
+    {"profile":"extension","name":"pipe.read.page.unmapped.4095","linux":[-1,14,-1,4096,1050602856,4095,true],"kvm":[-1,14,-1,4096,1050602856,4095,true],"tcg":[-1,14,-1,4096,1050602856,4095,true]},
+    {"profile":"extension","name":"pipe.read.page.valid.4096","linux":[4096,0,-1,0,0,4096,true],"kvm":[4096,0,-1,0,0,4096,true],"tcg":[4096,0,-1,0,0,4096,true]},
+    {"profile":"extension","name":"pipe.write.page.none.1","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"extension","name":"pipe.write.page.none.2048","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"extension","name":"pipe.write.page.none.4095","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"extension","name":"pipe.write.page.readonly.1","linux":[4096,0,-1,4096,1050602856,0,true],"kvm":[4096,0,-1,4096,1050602856,0,true],"tcg":[4096,0,-1,4096,1050602856,0,true]},
+    {"profile":"extension","name":"pipe.write.page.readonly.2048","linux":[4096,0,-1,4096,1050602856,0,true],"kvm":[4096,0,-1,4096,1050602856,0,true],"tcg":[4096,0,-1,4096,1050602856,0,true]},
+    {"profile":"extension","name":"pipe.write.page.readonly.4095","linux":[4096,0,-1,4096,1050602856,0,true],"kvm":[4096,0,-1,4096,1050602856,0,true],"tcg":[4096,0,-1,4096,1050602856,0,true]},
+    {"profile":"extension","name":"pipe.write.page.unmapped.1","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"extension","name":"pipe.write.page.unmapped.2048","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"extension","name":"pipe.write.page.unmapped.4095","linux":[-1,14,-1,0,0,0,true],"kvm":[-1,14,-1,0,0,0,true],"tcg":[-1,14,-1,0,0,0,true]},
+    {"profile":"extension","name":"pipe.write.page.valid.4096","linux":[4096,0,-1,4096,1050602856,0,true],"kvm":[4096,0,-1,4096,1050602856,0,true],"tcg":[4096,0,-1,4096,1050602856,0,true]},
+    {"profile":"extension","name":"memfd.read.page.none.4096","linux":[4096,0,4096,8192,4211824848,4096,true],"kvm":[4096,0,4096,8192,4211824848,4096,true],"tcg":[4096,0,4096,8192,4211824848,4096,true]},
+    {"profile":"extension","name":"memfd.read.page.vector-page.4096","linux":[4096,0,4096,8192,4211824848,4096,true],"kvm":[4096,0,4096,8192,4211824848,4096,true],"tcg":[4096,0,4096,8192,4211824848,4096,true]},
+    {"profile":"extension","name":"memfd.write.page.none.4096","linux":[4096,0,4096,4096,1050602856,0,true],"kvm":[4096,0,4096,4096,1050602856,0,true],"tcg":[4096,0,4096,4096,1050602856,0,true]},
+    {"profile":"extension","name":"memfd.write.page.vector-page.4096","linux":[4096,0,4096,4096,1050602856,0,true],"kvm":[4096,0,4096,4096,1050602856,0,true],"tcg":[4096,0,4096,4096,1050602856,0,true]}
+  ],
+  "device_observations": [
+    {"name":"eventfd.access","mode":2,"return":8,"errno":0},
+    {"name":"timerfd.access","mode":2,"return":-1,"errno":22},
+    {"name":"signalfd.access","mode":2,"return":-1,"errno":22},
+    {"name":"closed.0","read_errno":9,"write_errno":9},
+    {"name":"closed.1","read_errno":9,"write_errno":9},
+    {"name":"closed.2","read_errno":9,"write_errno":9},
+    {"name":"eventfd.write.none.1","return":-1,"errno":14,"counter":7,"canary":true},
+    {"name":"eventfd.write.none.4","return":-1,"errno":14,"counter":7,"canary":true},
+    {"name":"eventfd.write.none.7","return":-1,"errno":14,"counter":7,"canary":true},
+    {"name":"eventfd.write.none.8","return":8,"errno":0,"counter":10,"canary":true},
+    {"name":"eventfd.write.unmapped.1","return":-1,"errno":14,"counter":7,"canary":true},
+    {"name":"eventfd.write.unmapped.4","return":-1,"errno":14,"counter":7,"canary":true},
+    {"name":"eventfd.write.unmapped.7","return":-1,"errno":14,"counter":7,"canary":true},
+    {"name":"eventfd.write.unmapped.8","return":8,"errno":0,"counter":10,"canary":true}
+  ]
+}

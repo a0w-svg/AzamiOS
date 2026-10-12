@@ -22,7 +22,7 @@ for stream in ("memfd", "pipe"):
         NAMES += [f"{stream}.{direction}.{mode}.0" for mode in MODES]
 
 
-def observe(path):
+def observe(path, *, names=NAMES, mode="observation", max_size=128, max_prefix=63):
     text = Path(path).read_text(errors="replace")
     if re.search(r"PANIC|Triple fault|Kernel panic|UCOPYFAIL|divergence", text):
         raise ValueError("fatal diagnostic or incomplete observation")
@@ -36,17 +36,18 @@ def observe(path):
             sequence.append("complete")
         elif line.startswith("== probe complete:"):
             sequence.append("verdict")
-    if environments != [dict(mode="observation", page_bytes=4096, cases=60)]:
+    cases = len(names)
+    if environments != [dict(mode=mode, page_bytes=4096, cases=cases)]:
         raise ValueError("unexpected observation environment")
     if any(type(environments[0][key]) is not int for key in ("page_bytes", "cases")):
         raise ValueError("invalid environment counter types")
-    if sequence != ["environment"] + ["case"] * 60 + ["complete", "verdict"]:
+    if sequence != ["environment"] + ["case"] * cases + ["complete", "verdict"]:
         raise ValueError("missing, repeated or reordered observations/verdict")
     if (re.findall(r"== usercopy observations complete: .* ==", text) !=
-            ["== usercopy observations complete: 60 collected =="] or
-            re.findall(r"== probe complete: .* ==", text) != ["== probe complete: 60 passed, 0 failed =="]):
+            [f"== usercopy observations complete: {cases} collected =="] or
+            re.findall(r"== probe complete: .* ==", text) != [f"== probe complete: {cases} passed, 0 failed =="]):
         raise ValueError("incomplete collection verdict")
-    if [r.get("name") if isinstance(r, dict) else None for r in records] != NAMES:
+    if [r.get("name") if isinstance(r, dict) else None for r in records] != names:
         raise ValueError("missing or inconsistent case identity")
     for record in records:
         if set(record) != {"name", *FIELDS} or type(record["canary"]) is not bool:
@@ -57,8 +58,8 @@ def observe(path):
         if ((record["return"] == -1 and not 0 < record["errno"] < 4096) or
                 (record["return"] >= 0 and record["errno"] != 0)):
             raise ValueError("inconsistent errno observation")
-        if (not 0 <= record["remaining_or_size"] <= 128 or record["data_checksum"] < 0 or
-                not 0 <= record["copied_prefix"] <= 63):
+        if (not 0 <= record["remaining_or_size"] <= max_size or record["data_checksum"] < 0 or
+                not 0 <= record["copied_prefix"] <= max_prefix):
             raise ValueError("out-of-range data observation")
         if record["name"].startswith("pipe.") and record["offset"] != -1:
             raise ValueError("unexpected pipe offset representation")
@@ -67,9 +68,9 @@ def observe(path):
     return records
 
 
-def comparison(linux, guest):
-    if (len(linux) != len(NAMES) or len(guest) != len(NAMES) or
-            [r["name"] for r in linux] != NAMES or [r["name"] for r in guest] != NAMES):
+def comparison(linux, guest, *, names=NAMES):
+    if (len(linux) != len(names) or len(guest) != len(names) or
+            [r["name"] for r in linux] != names or [r["name"] for r in guest] != names):
         raise ValueError("incomplete or reordered oracle comparison")
     return [dict(name=reference["name"], fields=[f for f in FIELDS if reference[f] != actual[f]])
             for reference, actual in zip(linux, guest) if reference != actual]

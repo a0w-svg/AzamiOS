@@ -54,7 +54,10 @@ defect; its fix passes 32/64-CPU enumeration.
 The [user-copy fault baseline](W4.3_USERCOPY_RESULTS.md) now compares 60 small
 I/O cases with real Linux. KVM/TCG agree with each other; 39 cases expose remaining
 partial-copy, pipe consumption, vector-import and argument-check differences.
-User-copy fixes, large-copy timing and COW/SMAP stress remain next steps.
+The [user-copy transaction checkpoint](W4.3_USERCOPY_FIX_RESULTS.md) now fixes
+all 39 measured differences: 60 original and 84 added observations match Linux
+on KVM/TCG, with structured-device controls and four pinned shared readers.
+Large-copy timing, positional I/O and COW/SMAP stress remain next steps.
 
 ## Baseline and corrections
 
@@ -111,7 +114,7 @@ milestone starts.
 | 1 | W4.1: Reproducible benchmarks — complete on Linux/TCG | W3.7 | [Four benchmarks, supervisor, tests, and saved baseline](W4.1_BENCHMARK_RESULTS.md); KVM skipped. |
 | 2 | W3.8: Path, exec, and isolation fidelity — complete | Current ABI/smoke harnesses | [Namespaces](W3.8_NAMESPACE_RESULTS.md), [openat2](W3.8_OPENAT2_RESULTS.md), [exec](W3.8_EXEC_RESULTS.md), [epoll](W3.8_EPOLL_RESULTS.md), [rename](W3.8_RENAME_RESULTS.md), [signals](W3.8_SIGNALS_RESULTS.md), [loader](W3.8_LOADER_RESULTS.md). |
 | 3 | W4.2: Accurate counting checkpoints complete on AMD KVM/TCG | W4.1 | [Wrap, filters and stock attached perf](W4.2_HARDWARE_RESULTS.md); native/vendor runtime coverage remains additional work. |
-| 4 | W4.3: FD checkpoint complete; allocator/copy/COW measurement next | W4.1, W3.8; W4.2 when PMU is needed | Before/after measurements and SMP lifetime/fault stress. |
+| 4 | W4.3: FD, deferred reclaim and user-copy transaction checkpoints complete; copy timing/COW next | W4.1, W3.8; W4.2 when PMU is needed | Before/after measurements and SMP lifetime/fault stress. |
 | 5 | W6.0: Driver test infrastructure | Existing boot harness | Disposable disks, request tracing, failure injection, DMA/IRQ tests. |
 | 6 | W6.1: NVMe concurrency and recovery | W6.0 | Multiple outstanding requests, safe reset, MSI-X, multiple queues. |
 | 7 | W6.2: Virtio-net offload and queues | W6.0 | Feature negotiation, packet verification, SMP throughput and recovery tests. |
@@ -287,8 +290,12 @@ that production sweep, with atomic-only failure publication for callers holding
 heap/VMM locks. Scheduled-worker execution, quiescence, exhaustion and
 dropped-receiver checks pass on KVM/TCG, alongside ten BIOS/UEFI boot cases
 and hosted ownership/budget checks. Refill/spill measurements, explicit caller retry,
-the [measured user-copy differences](W4.3_USERCOPY_RESULTS.md) and COW stress
-remain scoped follow-up work.
+large-copy timing and COW stress remain scoped follow-up work. The
+[user-copy transaction fixes](W4.3_USERCOPY_FIX_RESULTS.md) now pass 144 matching
+Linux observations on KVM/TCG, device controls and shared-reader checks, with
+121 ABI checks, three smoke groups and all ten boot cases. Positional I/O,
+whole-call shared-offset serialization and other device transactions remain
+explicit limits.
 
 **Skills:** kernel-concurrency, custom-allocators, virtual memory, hardware-counters.
 
