@@ -177,6 +177,7 @@ static inode_operations_t s_tmpfs_link_iops = {
 };
 
 static file_operations_t s_tmpfs_file_fops = {
+    .regular_io = true,
     .read      = tmpfs_file_read,
     .write     = tmpfs_file_write,
     .readdir   = NULL,

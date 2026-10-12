@@ -5,6 +5,7 @@
 #pragma once
 
 #include "../include/azami/types.h"
+#include "io_vec.h"
 
 #define VFS_NAME_MAX  255
 
@@ -300,6 +301,13 @@ typedef struct file_operations {
     s64 (*fadvise)(struct file *filp, u64 offset, u64 len, int advice);
     /* fallocate(2): reserve backing blocks for [offset, offset+len). */
     s64 (*fallocate)(struct file *filp, int mode, u64 offset, u64 len);
+    /* Optional user-aware transactions. Descriptors are fully imported before
+     * dispatch; user copies must run outside backend spinlocks. */
+    s64 (*read_user)(struct file *filp, const vfs_iovec_t *iov, u32 count, size_t total);
+    s64 (*write_user)(struct file *filp, const vfs_iovec_t *iov, u32 count, size_t total);
+    /* Ordinary file data: read uses only the supplied offset and write accepts
+     * a copied prefix. Structured device/proc writes keep whole-buffer staging. */
+    bool regular_io;
 } file_operations_t;
 
 /* --------------------------------------------------------------------------

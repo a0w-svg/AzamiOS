@@ -361,6 +361,7 @@ static s64 memfd_release_op(inode_t *inode, file_t *filp)
 }
 
 static file_operations_t g_memfd_fops = {
+    .regular_io = true,
     .read    = memfd_read_op,
     .write   = memfd_write_op,
     .ioctl   = memfd_ioctl_op,

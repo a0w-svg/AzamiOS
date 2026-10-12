@@ -4,6 +4,7 @@
  * ============================================================================ */
 
 #include "pipe.h"
+#include "io_iter.h"
 #include "../kernel/mm/kmalloc.h"
 #include "../kernel/lib/string.h"
 #include "../include/azami/defs.h"
@@ -74,18 +75,17 @@ static s64 pipe_read(file_t *filp, void *buf, size_t len, u64 *offset)
 
             pipe->read_pos = (pipe->read_pos + to_read) % PIPE_BUFFER_SIZE;
             pipe->count -= to_read;
+            pipe->read_seq++;
             bytes_read += to_read;
 
-            thread_t *writer = pipe_wait_pop(&pipe->write_wait);
+            while (pipe->write_wait)
+                sched_unblock(pipe_wait_pop(&pipe->write_wait));
             thread_t *next_reader = NULL;
             if (pipe->count > 0 && pipe->read_wait) {
                 next_reader = pipe_wait_pop(&pipe->read_wait);
             }
             spinlock_unlock(&pipe->lock);
 
-            if (writer) {
-                sched_unblock(writer);
-            }
             if (next_reader) {
                 sched_unblock(next_reader);
             }
@@ -146,7 +146,8 @@ static s64 pipe_write(file_t *filp, const void *buf, size_t len, u64 *offset)
             return -(s64)EPIPE;
         }
 
-        if (pipe->count < PIPE_BUFFER_SIZE) {
+        if (pipe->count < PIPE_BUFFER_SIZE &&
+            (len > PIPE_BUFFER_SIZE || PIPE_BUFFER_SIZE - pipe->count >= len)) {
             size_t avail = PIPE_BUFFER_SIZE - pipe->count;
             size_t to_write = len - bytes_written;
             if (to_write > avail) to_write = avail;
@@ -209,6 +210,187 @@ static s64 pipe_write(file_t *filp, const void *buf, size_t len, u64 *offset)
             return (bytes_written > 0) ? (s64)bytes_written : -(s64)EINTR;
         }
     }
+}
+
+/* Wake all contenders: an atomic writer's required space can differ from
+ * the writer at the head of the queue. Caller holds the pipe lock. */
+static void pipe_wake_all(thread_t **queue)
+{
+    while (*queue) sched_unblock(pipe_wait_pop(queue));
+}
+
+/* Enqueue before dropping the condition lock. sched_unblock() remembers a
+ * wake racing sched_block(), and every return rechecks the ring condition. */
+static s64 pipe_sleep_locked(pipe_t *pipe, thread_t **queue)
+{
+    thread_t *current = sched_current_thread();
+    if (!current) {
+        spinlock_unlock(&pipe->lock);
+        return -(s64)EAGAIN;
+    }
+    process_t *proc = current->proc;
+    if (proc && (proc->sig_pending & ~proc->sig_blocked)) {
+        spinlock_unlock(&pipe->lock);
+        return -(s64)EINTR;
+    }
+    pipe_wait_push(queue, current);
+    spinlock_unlock(&pipe->lock);
+    sched_block(THREAD_BLOCKED_PENDING);
+    spinlock_lock(&pipe->lock);
+    pipe_wait_remove(queue, current);
+    bool interrupted = proc && (proc->sig_pending & ~proc->sig_blocked);
+    spinlock_unlock(&pipe->lock);
+    return interrupted ? -(s64)EINTR : 0;
+}
+
+static bool pipe_signal_pending(void)
+{
+    process_t *proc = sched_current_process();
+    return proc && (proc->sig_pending & ~proc->sig_blocked);
+}
+
+static void pipe_broken_signal(void)
+{
+    process_t *proc = sched_current_process();
+    if (proc) sched_kill_process(proc->pid, 13 /* SIGPIPE */);
+}
+
+/* Snapshot the readable prefix, then copy it with no lock held. A competing
+ * reader invalidates read_seq; a competing writer only appends and cannot
+ * overwrite occupied bytes. Retry on a stale snapshot before committing.
+ * There is no reservation that a killed faulting thread can leave behind.
+ * The caller keeps its file description alive across this operation. */
+s64 pipe_read_user(file_t *filp, const vfs_iovec_t *iov, u32 iov_count, size_t total)
+{
+    pipe_t *pipe = (pipe_t *)filp->private_data;
+    if (!pipe) return -(s64)EINVAL;
+    if (!total) return 0;
+    bool nonblock = !!(filp->f_flags & O_NONBLOCK);
+    u8 snapshot[PIPE_BUFFER_SIZE];
+
+    for (;;) {
+        spinlock_lock(&pipe->lock);
+        if (!pipe->count) {
+            if (!pipe->writers) {
+                spinlock_unlock(&pipe->lock);
+                return 0;
+            }
+            if (nonblock) {
+                spinlock_unlock(&pipe->lock);
+                return -(s64)EAGAIN;
+            }
+            s64 rc = pipe_sleep_locked(pipe, &pipe->read_wait);
+            if (rc) return rc;
+            continue;
+        }
+        size_t length = total < pipe->count ? total : pipe->count;
+        u64 sequence = pipe->read_seq;
+        size_t first = PIPE_BUFFER_SIZE - pipe->read_pos;
+        if (first > length) first = length;
+        memcpy(snapshot, pipe->buffer + pipe->read_pos, first);
+        memcpy(snapshot + first, pipe->buffer, length - first);
+        spinlock_unlock(&pipe->lock);
+
+        if (io_iter_copy_to_user(iov, iov_count, 0, snapshot, length) != length) {
+            /* The reader woken by a kernel writer may have been the only
+             * wake recipient. Leave another reader able to use retained data. */
+            spinlock_lock(&pipe->lock);
+            if (pipe->count) pipe_wake_all(&pipe->read_wait);
+            spinlock_unlock(&pipe->lock);
+            return -(s64)EFAULT;
+        }
+
+        spinlock_lock(&pipe->lock);
+        if (pipe->read_seq != sequence) {
+            spinlock_unlock(&pipe->lock);
+            if (pipe_signal_pending()) return -(s64)EINTR;
+            continue;
+        }
+        pipe->read_pos = (pipe->read_pos + length) % PIPE_BUFFER_SIZE;
+        pipe->count -= length;
+        pipe->read_seq++;
+        pipe_wake_all(&pipe->write_wait);
+        if (pipe->count) pipe_wake_all(&pipe->read_wait);
+        spinlock_unlock(&pipe->lock);
+        return (s64)length;
+    }
+}
+
+/* Each staged chunk is copied in full before any of it becomes readable.
+ * Requests <= PIPE_BUFFER_SIZE wait for space for the entire request, which
+ * preserves PIPE_BUF atomicity across iovecs, wrap, and partial user faults.
+ * Larger requests may retain previously committed chunks on a later fault. */
+s64 pipe_write_user(file_t *filp, const vfs_iovec_t *iov, u32 iov_count, size_t total)
+{
+    pipe_t *pipe = (pipe_t *)filp->private_data;
+    if (!pipe) return -(s64)EINVAL;
+    if (!total) return 0;
+    bool nonblock = !!(filp->f_flags & O_NONBLOCK);
+    bool atomic_write = total <= PIPE_BUFFER_SIZE;
+    u8 staged[PIPE_BUFFER_SIZE];
+    size_t written = 0;
+
+    while (written < total) {
+        spinlock_lock(&pipe->lock);
+        if (!pipe->readers) {
+            spinlock_unlock(&pipe->lock);
+            pipe_broken_signal();
+            return written ? (s64)written : -(s64)EPIPE;
+        }
+        size_t available = PIPE_BUFFER_SIZE - pipe->count;
+        if (!available || (atomic_write && available < total)) {
+            if (nonblock) {
+                spinlock_unlock(&pipe->lock);
+                return written ? (s64)written : -(s64)EAGAIN;
+            }
+            s64 rc = pipe_sleep_locked(pipe, &pipe->write_wait);
+            if (rc) return written ? (s64)written : rc;
+            continue;
+        }
+        size_t length = total - written;
+        if (length > available) length = available;
+        spinlock_unlock(&pipe->lock);
+
+        if (io_iter_copy_from_user(iov, iov_count, written, staged, length) != length) {
+            spinlock_lock(&pipe->lock);
+            if (pipe->count < PIPE_BUFFER_SIZE) pipe_wake_all(&pipe->write_wait);
+            spinlock_unlock(&pipe->lock);
+            return written ? (s64)written : -(s64)EFAULT;
+        }
+
+        /* A competing writer can claim room during the user copy. Preserve
+         * the staged transaction and wait/recheck before committing it. */
+        for (;;) {
+            spinlock_lock(&pipe->lock);
+            if (!pipe->readers) {
+                spinlock_unlock(&pipe->lock);
+                pipe_broken_signal();
+                return written ? (s64)written : -(s64)EPIPE;
+            }
+            available = PIPE_BUFFER_SIZE - pipe->count;
+            if (available && (!atomic_write || available >= length)) break;
+            if (nonblock) {
+                spinlock_unlock(&pipe->lock);
+                return written ? (s64)written : -(s64)EAGAIN;
+            }
+            s64 rc = pipe_sleep_locked(pipe, &pipe->write_wait);
+            if (rc) return written ? (s64)written : rc;
+        }
+        if (length > available) length = available;
+        size_t first = PIPE_BUFFER_SIZE - pipe->write_pos;
+        if (first > length) first = length;
+        memcpy(pipe->buffer + pipe->write_pos, staged, first);
+        memcpy(pipe->buffer, staged + first, length - first);
+        pipe->write_pos = (pipe->write_pos + length) % PIPE_BUFFER_SIZE;
+        pipe->count += length;
+        written += length;
+        pipe_wake_all(&pipe->read_wait);
+        if (pipe->count < PIPE_BUFFER_SIZE) pipe_wake_all(&pipe->write_wait);
+        spinlock_unlock(&pipe->lock);
+        if (nonblock) return (s64)written;
+        if (written < total && pipe_signal_pending()) return (s64)written;
+    }
+    return (s64)written;
 }
 
 static s64 pipe_read_release(struct inode *inode, file_t *filp)
@@ -375,6 +557,7 @@ static s64 pipe_ioctl(file_t *filp, u32 cmd, u64 arg)
 
 static file_operations_t pipe_read_fops = {
     .read = pipe_read,
+    .read_user = pipe_read_user,
     .write = NULL,
     .ioctl = pipe_ioctl,
     .release = pipe_read_release,
@@ -384,6 +567,7 @@ static file_operations_t pipe_read_fops = {
 static file_operations_t pipe_write_fops = {
     .read = NULL,
     .write = pipe_write,
+    .write_user = pipe_write_user,
     .ioctl = pipe_ioctl,
     .release = pipe_write_release,
     .poll = pipe_write_poll,

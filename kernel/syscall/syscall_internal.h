@@ -98,10 +98,7 @@ struct k_itimerval {
 };
 
 /* Scatter-gather I/O vector */
-struct iovec {
-    void  *iov_base;
-    size_t iov_len;
-};
+/* struct iovec is shared with the user-aware VFS callbacks in fs/io_iter.h. */
 
 /* PIDFD internal context & operations */
 typedef struct {
