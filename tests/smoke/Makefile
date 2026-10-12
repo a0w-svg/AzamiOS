@@ -11,13 +11,17 @@ NATIVE_FLAGS := -std=c11 -ffreestanding -fno-stack-protector -fpic -fno-plt \
 NATIVE_LINK := -T ../../scripts/user-pic.ld -nostdlib -z max-page-size=0x1000
 
 .PHONY: all check
-check: $(TASK_BUILD)/hash-count
+check: $(TASK_BUILD)/hash-count $(TASK_BUILD)/check-layouts
 	$(TASK_BUILD)/hash-count
+	$(TASK_BUILD)/check-layouts
 
 $(TASK_BUILD)/hash-count: hash_count.c ../../userland/libc/include/internal/elf_hash.h | $(TASK_BUILD)
 	$(HOST_CC) -O2 -Wall -Wextra -Werror $< -o $@
 
-all: $(TASK_BUILD)/smoke-init $(TASK_BUILD)/ports-init $(TASK_BUILD)/diff-init $(TASK_BUILD)/native-dynamic-probe \
+$(TASK_BUILD)/check-layouts: ../compat/check_layouts.c ../compat/layouts.h | $(TASK_BUILD)
+	$(HOST_CC) -O2 -Wall -Wextra -Werror -I../compat $< -o $@
+
+all: $(TASK_BUILD)/smoke-init $(TASK_BUILD)/ports-init $(TASK_BUILD)/diff-init $(TASK_BUILD)/check-layouts $(TASK_BUILD)/native-dynamic-probe \
      $(TASK_BUILD)/musl-dynamic-probe $(TASK_BUILD)/native/libsmoke_plugin.so \
      $(TASK_BUILD)/musl/libsmoke_plugin.so $(TASK_BUILD)/ld-azami.so \
      $(TASK_BUILD)/native/libsmoke_versioned.so $(TASK_BUILD)/native/libsmoke_consumer_v1.so \
