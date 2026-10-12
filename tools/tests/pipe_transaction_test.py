@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Host the production pipe implementation with scheduler and uaccess stubs."""
 """Host production pipe transactions with scheduler/uaccess stubs."""
 from pathlib import Path
 import re, subprocess, tempfile
@@ -144,6 +145,7 @@ int main(void) {
  /* Read generation conflict plus signal leaves only the competing read committed. */
  reset(&r,&w);assert(pipe_write_pipe(observed,bytes,32,true)==32);iov[0]=(vfs_iovec_t){output,16};copy_hook=consume_signal;
  assert(pipe_read_user(r,iov,1,16)==-EINTR&&observed->count==24&&observed->read_seq==1);cleanup(r,w);tests++;
+ printf("production pipe transaction tests: %d passed\\n",tests);
  /* Duplicate wait insertion must not truncate subsequent waiters. */
  thread_t first={0}, second={0};thread_t *queue=&first;first.next=&second;
  pipe_wait_push(&queue,&first);assert(queue==&first&&first.next==&second);tests++;

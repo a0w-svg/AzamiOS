@@ -344,6 +344,20 @@ $(OUT_DIR)/bin/azami-usercopy-observe: tests/usercopy-observe.c $(MUSL_GCC)
 	@mkdir -p $(dir $@)
 	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
 
+.PHONY: usercopy-compat-probe
+usercopy-compat-probe: $(OUT_DIR)/bin/azami-usercopy-compat
+
+$(OUT_DIR)/bin/azami-usercopy-compat: tests/usercopy-compat.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
+
+.PHONY: usercopy-device-probe
+usercopy-device-probe: $(OUT_DIR)/bin/azami-usercopy-device
+
+$(OUT_DIR)/bin/azami-usercopy-device: tests/usercopy-device.c $(MUSL_GCC)
+	@mkdir -p $(dir $@)
+	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
+
 $(OUT_DIR)/bin/azami-fd-lifetime-probe: tests/fd-lifetime.c $(MUSL_GCC)
 	@mkdir -p $(dir $@)
 	$(BB_CC) -static -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -o $@ $<

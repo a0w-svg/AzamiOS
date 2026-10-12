@@ -16,15 +16,16 @@ static bool io_user_range(const void *base, size_t size)
     return start < TASK_SIZE_MAX && size <= TASK_SIZE_MAX - start;
 }
 
-/* Descriptor/permission checks precede range, length and iovec checks.
- * Initial standard descriptors are real VFS files; closed slots stay closed. */
-static file_t *io_get_file(int fd, bool writing, s64 *error)
+/* Descriptor/permission checks precede range, length and iovec checks. Keep the
+ * console bootstrap fallback until all initial standard FDs have VFS files. */
+static file_t *io_get_file(int fd, bool writing, bool *console, s64 *error)
 {
-    *error = 0;
+    *console = false; *error = 0;
     if (fd < 0) { *error = -(s64)EBADF; return NULL; }
     file_t *file = fget(sched_current_process(), fd);
     if (!file) {
-        *error = -(s64)EBADF;
+        if ((!writing && fd == 0) || (writing && (fd == 1 || fd == 2))) *console = true;
+        else *error = -(s64)EBADF;
         return NULL;
     }
     u32 access = file->f_flags & 3;
@@ -145,6 +146,9 @@ static s64 io_dispatch(file_t *file, bool writing, const vfs_iovec_t *iov, u32 c
 
 static s64 io_scalar(pt_regs_t *r, bool writing)
 {
+    bool console;
+    s64 error;
+    file_t *file = io_get_file((int)(s32)r->rdi, writing, &console, &error);
     s64 error;
     file_t *file = io_get_file((int)(s32)r->rdi, writing, &error);
     if (error) return error;
@@ -245,6 +249,9 @@ s64 sys_close_range_impl(pt_regs_t *r)
 
 static s64 io_vector(pt_regs_t *r, bool writing)
 {
+    bool console;
+    s64 error;
+    file_t *file = io_get_file((int)(s32)r->rdi, writing, &console, &error);
     s64 error;
     file_t *file = io_get_file((int)(s32)r->rdi, writing, &error);
     if (error) return error;

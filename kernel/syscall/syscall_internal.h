@@ -97,7 +97,8 @@ struct k_itimerval {
     struct linux_timeval it_value;
 };
 
-/* struct iovec is shared with the user-aware VFS callbacks in fs/io_vec.h. */
+/* Scatter-gather I/O vector */
+/* struct iovec is shared with the user-aware VFS callbacks in fs/io_iter.h. */
 
 /* PIDFD internal context & operations */
 typedef struct {
