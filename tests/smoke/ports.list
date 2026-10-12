@@ -1,0 +1,15 @@
+# ==============================================================================
+# AzamiOS — Port Smoke Test Matrix Specification
+# File: tests/smoke/ports.list
+#
+# Defines the ported stock Linux CLI tools verified by tests/smoke/ports_matrix.sh
+# Format: <binary_name>:<type>:<description>
+# ==============================================================================
+
+sqlite3:static-sql:SQLite3 in-memory table creation and count aggregation
+lua:static-script:Lua 5.4 standalone arithmetic evaluation
+micropython:static-script:MicroPython interpreter arithmetic evaluation
+dash:static-sh:POSIX Almquist shell command loops
+toybox:static-coreutils:Toybox multicall binary utilities
+zstd:static-compress:Zstandard stream compression and decompression pipeline
+
