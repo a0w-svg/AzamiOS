@@ -8,7 +8,7 @@ HOST_CC ?= cc
 NATIVE_FLAGS := -std=c11 -ffreestanding -fno-stack-protector -fpic -fno-plt \
     -ftls-model=initial-exec -O2 -Wall -Wextra -Werror -MMD -MP \
     -I../../userland/libc/include $(TOOLCHAIN_CFLAGS)
-NATIVE_LINK := -T ../../scripts/user-pic.ld -nostdlib -z max-page-size=0x1000
+NATIVE_LINK := -T ../../scripts/user-pic.ld -nostdlib -z max-page-size=0x1000 -z relro -z now
 
 .PHONY: all check
 check: $(TASK_BUILD)/hash-count $(TASK_BUILD)/check-layouts $(TASK_BUILD)/extensible-structs $(TASK_BUILD)/sigframe-test

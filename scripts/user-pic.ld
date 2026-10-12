@@ -51,7 +51,14 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
-    .dynamic : ALIGN(0x1000) {
+    /* RELRO region: everything from .dynamic through the init/fini arrays is
+     * written only while ld-azami.so relocates the object, then locked
+     * read-only via PT_GNU_RELRO (userland/ldso/ldso.c apply_relro()).
+     * DATA_SEGMENT_ALIGN/RELRO_END are what make ld emit that program header
+     * (requires linking with -z relro; full RELRO with -z now). */
+    . = DATA_SEGMENT_ALIGN(CONSTANT(MAXPAGESIZE), CONSTANT(COMMONPAGESIZE));
+
+    .dynamic : {
         *(.dynamic)
     }
 
@@ -60,9 +67,9 @@ SECTIONS
 
     /* GCC-emitted global/static constructor pointers, run by
      * userland/ldso/ldso.c's run_ctors_once() after relocation — see that
-     * file. Writable: RELATIVE relocations fix each entry's absolute
-     * address up in place before it's ever called, and this loader doesn't
-     * implement PT_GNU_RELRO to re-lock the page afterward. */
+     * file. RELATIVE relocations fix each entry's absolute address up in
+     * place before it's ever called; the page is re-locked afterward by
+     * the RELRO protection above. */
     .init_array : ALIGN(8) {
         PROVIDE_HIDDEN(__init_array_start = .);
         KEEP(*(.init_array .init_array.*))
@@ -73,6 +80,8 @@ SECTIONS
         KEEP(*(.fini_array .fini_array.*))
         PROVIDE_HIDDEN(__fini_array_end = .);
     }
+
+    . = DATA_SEGMENT_RELRO_END(0, .);
 
     /* Thread-local storage template: userland/libc/tls.c's __init_tls() (a
      * statically linked binary) or userland/ldso/ldso.c's
@@ -93,6 +102,8 @@ SECTIONS
         *(COMMON)
         *(.bss .bss.*)
     }
+
+    . = DATA_SEGMENT_END(.);
 
     /DISCARD/ : {
         *(.eh_frame)

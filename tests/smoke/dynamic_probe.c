@@ -52,6 +52,57 @@ static int probe_phdr_cb(struct dl_phdr_info *info, size_t size, void *data)
     return 0;
 }
 
+#define PT_GNU_RELRO_TYPE 0x6474e552u
+
+struct relro_state {
+    int objects_with_relro;
+    int writable_pages;     /* RELRO pages still mapped writable */
+    int unmapped_ranges;    /* RELRO ranges /proc/self/maps does not cover */
+};
+
+/* True when every page in [lo, hi) sits in a /proc/self/maps line whose
+ * permission string has no 'w'. *covered is cleared if some page is unmapped. */
+static int relro_range_state(uintptr_t lo, uintptr_t hi, int *writable, int *covered)
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return -1;
+    char line[512];
+    uintptr_t next = lo;
+    *writable = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *end = NULL;
+        uintptr_t s = (uintptr_t)strtoul(line, &end, 16);
+        if (!end || *end != '-') continue;
+        uintptr_t e = (uintptr_t)strtoul(end + 1, &end, 16);
+        while (*end == ' ') end++;
+        if (e <= lo || s >= hi) continue;
+        if (end[1] == 'w') *writable = 1;
+        if (s <= next && e > next) next = e;
+    }
+    fclose(f);
+    *covered = next >= hi;
+    return 0;
+}
+
+static int relro_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+    (void)size;
+    struct relro_state *st = (struct relro_state *)data;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const struct program_header *ph = (const struct program_header *)info->dlpi_phdr + i;
+        if (ph->type != PT_GNU_RELRO_TYPE || ph->memsz == 0) continue;
+        uintptr_t lo = (info->dlpi_addr + ph->vaddr) & ~(uintptr_t)4095;
+        uintptr_t hi = (info->dlpi_addr + ph->vaddr + ph->memsz) & ~(uintptr_t)4095;
+        if (hi <= lo) continue; /* RELRO smaller than a page: nothing protectable */
+        int writable = 0, covered = 0;
+        if (relro_range_state(lo, hi, &writable, &covered) < 0) { st->unmapped_ranges++; continue; }
+        st->objects_with_relro++;
+        if (writable) st->writable_pages++;
+        if (!covered) st->unmapped_ranges++;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -203,6 +254,13 @@ int main(int argc, char **argv)
     int iter_rc = dl_iterate_phdr(probe_phdr_cb, &ph_st);
     check(iter_rc == 0 && ph_st.count >= 1 && ph_st.seen_phdrs,
           "dl_iterate_phdr enumerates loaded objects");
+
+    /* U1.4: every PT_GNU_RELRO range must be read-only once relocation is done. */
+    struct relro_state rs = {0, 0, 0};
+    check(dl_iterate_phdr(relro_cb, &rs) == 0 && rs.objects_with_relro >= 1,
+          "PT_GNU_RELRO present in a loaded object");
+    check(rs.writable_pages == 0 && rs.unmapped_ranges == 0,
+          "PT_GNU_RELRO ranges are read-only in /proc/self/maps");
 
     printf("dynamic probe complete: %d failed\n", failures);
     return failures ? 1 : 0;
