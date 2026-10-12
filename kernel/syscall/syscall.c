@@ -353,8 +353,10 @@ int syscall_dispatch(pt_regs_t *regs)
     }
 
     /* Syscall-exit stop. ptrace_syscall_stop() re-tests PT_SYSCALL_TRACE, so a
-     * tracer that answered the entry stop with PTRACE_CONT gets no exit stop. */
-    if (traced) ptrace_syscall_stop(regs, false);
+     * tracer that answered the entry stop with PTRACE_CONT gets no exit stop.
+     * Fired only if PT_IN_SYSCALL is set (cleared by legacy execve stop). */
+    if (traced && (sp->ptrace_flags & PT_IN_SYSCALL))
+        ptrace_syscall_stop(regs, false);
 
     /* On the way back to ring 3, run any pending user signal handler. Pass the
      * syscall number so an interrupted call can honour SA_RESTART — except for

@@ -160,6 +160,9 @@ bool ptrace_report_trap(pt_regs_t *r, int sig);
 /** ptrace_report_event(r, event, msg) — PTRACE_EVENT_* stop (exec, exit, ...). */
 void ptrace_report_event(pt_regs_t *r, u32 event, u64 msg);
 
+/** ptrace_report_exec(r) — exec stop (PTRACE_EVENT_EXEC or SIGTRAP). */
+void ptrace_report_exec(pt_regs_t *r);
+
 /**
  * ptrace_release(p) — drop every tracing relationship @p is part of.
  *

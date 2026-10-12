@@ -3521,9 +3521,11 @@ s64 sched_kill_process(u32 pid, int sig)
      * fatal path and killed its target — which is why signal.c used to say
      * there was no stopped process state to enter. */
     if (sig == SIGCONT) {
-        bool was_stopped = (target->stop_state != PROC_STOP_NONE);
-        __atomic_store_n(&target->stop_state, PROC_STOP_NONE, __ATOMIC_RELEASE);
-        target->stop_notified = false;
+        bool was_stopped = (target->stop_state == PROC_STOP_JOB);
+        if (was_stopped) {
+            __atomic_store_n(&target->stop_state, PROC_STOP_NONE, __ATOMIC_RELEASE);
+            target->stop_notified = false;
+        }
         /* POSIX: continuing discards every stop signal still pending. */
         __atomic_and_fetch(&target->sig_pending,
                            ~((SIG_MASK(SIGSTOP)) | (SIG_MASK(SIGTSTP)) |

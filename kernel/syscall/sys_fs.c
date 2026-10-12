@@ -149,8 +149,6 @@ static s64 io_scalar(pt_regs_t *r, bool writing)
     bool console;
     s64 error;
     file_t *file = io_get_file((int)(s32)r->rdi, writing, &console, &error);
-    s64 error;
-    file_t *file = io_get_file((int)(s32)r->rdi, writing, &error);
     if (error) return error;
     vfs_iovec_t iov = {.iov_base = (void *)r->rsi, .iov_len = (size_t)r->rdx};
     if (!io_user_range(iov.iov_base, iov.iov_len)) error = -(s64)EFAULT;
@@ -252,8 +250,6 @@ static s64 io_vector(pt_regs_t *r, bool writing)
     bool console;
     s64 error;
     file_t *file = io_get_file((int)(s32)r->rdi, writing, &console, &error);
-    s64 error;
-    file_t *file = io_get_file((int)(s32)r->rdi, writing, &error);
     if (error) return error;
     u64 count = r->rdx;
     if (count > 1024) { error = -(s64)EINVAL; goto out; }
@@ -1342,7 +1338,7 @@ static s64 sys_getcwd_locked(pt_regs_t *r)
 
     if (size < len) return -(s64)ERANGE;
     if (copy_to_user(user_buf, cwd, len) != 0) return -(s64)EFAULT;
-    return (s64)(uintptr_t)user_buf;
+    return (s64)len;
 }
 
 static s64 sys_chdir_locked(pt_regs_t *r)

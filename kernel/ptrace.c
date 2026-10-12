@@ -335,6 +335,20 @@ void ptrace_report_event(pt_regs_t *r, u32 event, u64 msg)
     ptrace_stop(r, SIGTRAP, event);
 }
 
+void ptrace_report_exec(pt_regs_t *r)
+{
+    process_t *p = sched_current_process();
+    if (!ptrace_traced(p)) return;
+
+    if (p->ptrace_opts & PTRACE_O_TRACEEXEC) {
+        p->ptrace_msg = (u64)p->pid;
+        ptrace_stop(r, SIGTRAP, PTRACE_EVENT_EXEC);
+    } else {
+        p->ptrace_flags &= ~PT_IN_SYSCALL;
+        ptrace_stop(r, SIGTRAP, 0);
+    }
+}
+
 void ptrace_release(process_t *p)
 {
     if (!p) return;

@@ -578,12 +578,12 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
     strncpy(proc->name, bname, sizeof(proc->name) - 1);
     proc->name[sizeof(proc->name) - 1] = '\0';
 
-    /* The tracee survives exec (PT_TRACED is not reset above), so a tracer that
-     * asked for PTRACE_O_TRACEEXEC gets its stop here — with `r` already
-     * describing the new image's entry point, which is the whole point: it is
-     * where a debugger plants its first breakpoints. */
+    /* The tracee survives exec (PT_TRACED is not reset above). Linux ptrace(2)
+     * delivers PTRACE_EVENT_EXEC if PTRACE_O_TRACEEXEC is set, or a plain SIGTRAP
+     * if not. In either case, the tracee is at the new image entry point and
+     * no syscall-exit stop will follow. */
     if (ptrace_traced(proc))
-        ptrace_report_event(r, PTRACE_EVENT_EXEC, (u64)proc->pid);
+        ptrace_report_exec(r);
 
     return 0;
 }

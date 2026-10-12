@@ -17,7 +17,7 @@ check: $(TASK_BUILD)/hash-count
 $(TASK_BUILD)/hash-count: hash_count.c ../../userland/libc/include/internal/elf_hash.h | $(TASK_BUILD)
 	$(HOST_CC) -O2 -Wall -Wextra -Werror $< -o $@
 
-all: $(TASK_BUILD)/smoke-init $(TASK_BUILD)/ports-init $(TASK_BUILD)/native-dynamic-probe \
+all: $(TASK_BUILD)/smoke-init $(TASK_BUILD)/ports-init $(TASK_BUILD)/diff-init $(TASK_BUILD)/native-dynamic-probe \
      $(TASK_BUILD)/musl-dynamic-probe $(TASK_BUILD)/native/libsmoke_plugin.so \
      $(TASK_BUILD)/musl/libsmoke_plugin.so $(TASK_BUILD)/ld-azami.so \
      $(TASK_BUILD)/native/libsmoke_versioned.so $(TASK_BUILD)/native/libsmoke_consumer_v1.so \
@@ -31,6 +31,9 @@ $(TASK_BUILD)/smoke-init: init.c | $(TASK_BUILD)
 	$(MUSL_CC) -static -O2 -Wall -Wextra -Werror $< -o $@
 
 $(TASK_BUILD)/ports-init: ports_init.c | $(TASK_BUILD)
+	$(MUSL_CC) -static -O2 -Wall -Wextra -Werror $< -o $@
+
+$(TASK_BUILD)/diff-init: diff_init.c | $(TASK_BUILD)
 	$(MUSL_CC) -static -O2 -Wall -Wextra -Werror $< -o $@
 
 $(TASK_BUILD)/native/%.o: %.c | $(TASK_BUILD)/native
