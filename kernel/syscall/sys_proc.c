@@ -1228,16 +1228,19 @@ struct kernel_clone_args {
     u64 cgroup;
 };
 
+#define CLONE_ARGS_SIZE_VER0 64
+#define CLONE_ARGS_SIZE_VER1 80
+#define CLONE_ARGS_SIZE_VER2 88
+
 s64 sys_clone3_impl(pt_regs_t *r)
 {
-    const struct kernel_clone_args *uargs = (const struct kernel_clone_args *)r->rdi;
+    const void *uargs = (const void *)r->rdi;
     size_t size = (size_t)r->rsi;
 
-    if (!uargs || size < sizeof(u64)) return -(s64)EINVAL;
+    if (size < CLONE_ARGS_SIZE_VER0) return -(s64)EINVAL;
     struct kernel_clone_args kargs;
-    memset(&kargs, 0, sizeof(kargs));
-    size_t to_copy = size < sizeof(kargs) ? size : sizeof(kargs);
-    if (copy_from_user(&kargs, uargs, to_copy) != 0) return -(s64)EFAULT;
+    int err = copy_struct_from_user(&kargs, sizeof(kargs), uargs, size);
+    if (err) return (s64)err;
 
     /* clone3 has a separate exit_signal field; bit 7 in flags really is a
      * time namespace request here. Do not fold it into the legacy signal byte. */
@@ -1297,6 +1300,9 @@ s64 sys_getcpu_impl(pt_regs_t *r)
 
 struct sched_param { int sched_priority; };
 
+#define SCHED_ATTR_SIZE_VER0 48
+#define SCHED_ATTR_SIZE_VER1 56
+
 struct sched_attr {
     u32 size;
     u32 sched_policy;
@@ -1306,6 +1312,8 @@ struct sched_attr {
     u64 sched_runtime;
     u64 sched_deadline;
     u64 sched_period;
+    u32 sched_util_min;
+    u32 sched_util_max;
 };
 
 /* Resolve a pid argument (0 = caller) and check the caller may reschedule the
@@ -1340,19 +1348,21 @@ static bool sched_policy_valid(int p)
 s64 sys_sched_setattr_impl(pt_regs_t *r)
 {
     u32 pid = (u32)(s32)r->rdi;
-    struct sched_attr *uattr = (struct sched_attr *)r->rsi;
+    const void *uattr = (const void *)r->rsi;
+    u32 flags = (u32)r->rdx;
     if (!uattr || (uintptr_t)uattr >= TASK_SIZE_MAX) return -(s64)EINVAL;
+    if (flags != 0) return -(s64)EINVAL;
 
-    /* size-versioned struct: read the leading u32, then the smaller of what
-     * the caller offered and what we understand. */
+    /* size-versioned struct: read the leading u32, then validate and copy
+     * via extensible struct protocol. */
     u32 size = 0;
     if (copy_from_user(&size, uattr, sizeof(u32)) != 0) return -(s64)EFAULT;
-    if (size < sizeof(u32)) return -(s64)EINVAL;
+    if (size == 0) size = SCHED_ATTR_SIZE_VER0;
+    if (size < SCHED_ATTR_SIZE_VER0 || size > 4096) return -(s64)E2BIG;
 
     struct sched_attr a;
-    memset(&a, 0, sizeof(a));
-    u32 copy = size < sizeof(a) ? size : (u32)sizeof(a);
-    if (copy_from_user(&a, uattr, copy) != 0) return -(s64)EFAULT;
+    int err_copy = copy_struct_from_user(&a, sizeof(a), uattr, size);
+    if (err_copy) return (s64)err_copy;
 
     int policy = (int)a.sched_policy;
     if (!sched_policy_valid(policy)) return -(s64)EINVAL;
@@ -1388,10 +1398,12 @@ s64 sys_sched_setattr_impl(pt_regs_t *r)
 s64 sys_sched_getattr_impl(pt_regs_t *r)
 {
     u32 pid = (u32)(s32)r->rdi;
-    struct sched_attr *uattr = (struct sched_attr *)r->rsi;
+    void *uattr = (void *)r->rsi;
     u32 size = (u32)r->rdx;
+    u32 flags = (u32)r->r10;
     if (!uattr || (uintptr_t)uattr >= TASK_SIZE_MAX) return -(s64)EINVAL;
-    if (size < sizeof(struct sched_attr)) return -(s64)EINVAL;
+    if (flags != 0) return -(s64)EINVAL;
+    if (size < SCHED_ATTR_SIZE_VER0 || size > 4096) return -(s64)EINVAL;
 
     bool put; s64 err;
     process_t *tgt = sched_target(pid, &put, &err);
@@ -1406,9 +1418,23 @@ s64 sys_sched_getattr_impl(pt_regs_t *r)
 
     if (put) proc_put(tgt);
 
-    if (copy_to_user(uattr, &a, sizeof(a)) != 0) return -(s64)EFAULT;
+    size_t copy_len = sizeof(a) < size ? sizeof(a) : size;
+    if (copy_to_user(uattr, &a, copy_len) != 0) return -(s64)EFAULT;
+    if (size > sizeof(a)) {
+        u8 zero[64];
+        memset(zero, 0, sizeof(zero));
+        size_t off = sizeof(a);
+        while (off < size) {
+            size_t chunk = size - off;
+            if (chunk > sizeof(zero)) chunk = sizeof(zero);
+            if (copy_to_user((char *)uattr + off, zero, chunk) != 0)
+                return -(s64)EFAULT;
+            off += chunk;
+        }
+    }
     return 0;
 }
+
 
 
 static s64 pidfd_release_op(inode_t *inode, file_t *filp)

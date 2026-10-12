@@ -66,3 +66,36 @@ size_t copy_to_user(void *dst, const void *src, size_t size);
  */
 u64 search_extable(u64 ip);
 
+/**
+ * check_zeroed_user(addr, size) — Check whether a user memory range contains only zeros.
+ * @addr  User source buffer.
+ * @size  Number of bytes to verify.
+ *
+ * Returns:
+ *   1 if non-zero bytes are found,
+ *   0 if all bytes are zero,
+ *   -EFAULT if an invalid address was encountered.
+ */
+int check_zeroed_user(const void *addr, size_t size);
+
+/**
+ * copy_struct_from_user(dst, ksize, src, usize) — Extensible-struct protocol copy.
+ * @dst   Kernel destination buffer.
+ * @ksize Kernel struct size (sizeof(*dst)).
+ * @src   User source buffer.
+ * @usize Size passed by user space.
+ *
+ * Implements Linux extensible-struct copy semantics:
+ * - If usize == 0: returns -EINVAL.
+ * - If usize > 4096 (PAGE_SIZE): returns -E2BIG.
+ * - If src is NULL or not in user space: returns -EFAULT.
+ * - If usize > ksize: ensures trailing (usize - ksize) bytes in src are zero.
+ *   If non-zero bytes found: returns -E2BIG. If fault: returns -EFAULT.
+ * - If usize < ksize: zeroes the tail (ksize - usize) in dst.
+ * - Copies min(ksize, usize) bytes from src to dst. Returns -EFAULT on failure.
+ *
+ * Returns 0 on success, or negative errno (-EINVAL, -E2BIG, -EFAULT).
+ */
+int copy_struct_from_user(void *dst, size_t ksize, const void *src, size_t usize);
+
+

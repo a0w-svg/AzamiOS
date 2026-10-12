@@ -125,6 +125,10 @@ STRUCTS_CONFIG = [
     ("struct open_how", "OPEN_HOW", [
         "flags", "mode", "resolve"
     ]),
+    ("struct sched_attr", "SCHED_ATTR", [
+        "size", "sched_policy", "sched_flags", "sched_nice", "sched_priority",
+        "sched_runtime", "sched_deadline", "sched_period"
+    ]),
     ("struct rseq", "RSEQ", [
         "cpu_id_start", "cpu_id", "rseq_cs", "flags"
     ]),
@@ -199,6 +203,7 @@ PROBE_C_TEMPLATE = """#define _GNU_SOURCE
 #include <linux/rseq.h>
 #include <linux/openat2.h>
 #include <linux/sched.h>
+#include <linux/sched/types.h>
 #include <linux/io_uring.h>
 #include <asm/sembuf.h>
 #include <asm/shmbuf.h>
@@ -294,3 +299,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

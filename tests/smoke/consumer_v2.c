@@ -4,3 +4,4 @@ int smoke_call_v2(void)
 {
     return smoke_versioned_foo();
 }
+

@@ -10,3 +10,4 @@ int smoke_versioned_foo_v2(void)
 {
     return 222;
 }
+

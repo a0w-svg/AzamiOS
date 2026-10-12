@@ -402,6 +402,59 @@ s64 copy_str_from_user(char *dst, const char *user_src, size_t max_len)
     return (s64)(max_len - 1);
 }
 
+int check_zeroed_user(const void *addr, size_t size)
+{
+    if (size == 0) return 0;
+    if (!addr || (uintptr_t)addr >= TASK_SIZE_MAX) return -(int)EFAULT;
+    if ((uintptr_t)addr + size < (uintptr_t)addr || (uintptr_t)addr + size > TASK_SIZE_MAX)
+        return -(int)EFAULT;
+
+    size_t offset = 0;
+    while (offset < size) {
+        u8 buf[64];
+        size_t chunk = size - offset;
+        if (chunk > sizeof(buf)) chunk = sizeof(buf);
+        if (copy_from_user(buf, (const char *)addr + offset, chunk) != 0)
+            return -(int)EFAULT;
+        for (size_t i = 0; i < chunk; i++) {
+            if (buf[i] != 0) return 1;
+        }
+        offset += chunk;
+    }
+    return 0;
+}
+
+int copy_struct_from_user(void *dst, size_t ksize, const void *src, size_t usize)
+{
+    if (usize == 0)
+        return -(int)EINVAL;
+    if (usize > 4096)
+        return -(int)E2BIG;
+    if (!dst)
+        return -(int)EFAULT;
+    if (!src || (uintptr_t)src >= TASK_SIZE_MAX)
+        return -(int)EFAULT;
+    if ((uintptr_t)src + usize < (uintptr_t)src || (uintptr_t)src + usize > TASK_SIZE_MAX)
+        return -(int)EFAULT;
+
+    size_t copy_size = ksize < usize ? ksize : usize;
+
+    if (usize > ksize) {
+        int zeroed = check_zeroed_user((const char *)src + ksize, usize - ksize);
+        if (zeroed < 0)
+            return zeroed; /* -EFAULT */
+        if (zeroed > 0)
+            return -(int)E2BIG;
+    } else if (usize < ksize) {
+        memset((char *)dst + usize, 0, ksize - usize);
+    }
+
+    if (copy_from_user(dst, src, copy_size) != 0)
+        return -(int)EFAULT;
+
+    return 0;
+}
+
 /* proc_root(proc) — the process's filesystem root, defaulting to "/" for any
  * process created before chroot(2) existed or whose field is somehow blank. */
 static inline const char *proc_root(const process_t *proc)

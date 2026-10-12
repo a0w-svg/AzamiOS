@@ -1961,29 +1961,18 @@ struct kernel_open_how {
     u64 resolve;
 };
 
+#define OPEN_HOW_SIZE_VER0 24
+
 s64 sys_openat2_impl(pt_regs_t *r)
 {
     int dirfd = (int)(s32)r->rdi;
     const char *user_path = (const char *)r->rsi;
     const void *user_how = (const void *)r->rdx;
     size_t size = (size_t)r->r10;
-    if (size < sizeof(struct kernel_open_how)) return -(s64)EINVAL;
-    if (size > 4096) return -(s64)E2BIG;
+    if (size < OPEN_HOW_SIZE_VER0) return -(s64)EINVAL;
     struct kernel_open_how how;
-    if (copy_from_user(&how, user_how, sizeof(how))) return -(s64)EFAULT;
-    /* Unknown extensions are accepted only when all extension bytes are zero. */
-    for (size_t offset = sizeof(how); offset < size;) {
-        u8 extra[64];
-        size_t bytes = size - offset;
-        if (bytes > sizeof(extra)) bytes = sizeof(extra);
-        uintptr_t address = (uintptr_t)user_how;
-        if (address >= TASK_SIZE_MAX || offset > TASK_SIZE_MAX - address)
-            return -(s64)EFAULT;
-        if (copy_from_user(extra, (const void *)(address + offset), bytes))
-            return -(s64)EFAULT;
-        for (size_t i = 0; i < bytes; i++) if (extra[i]) return -(s64)E2BIG;
-        offset += bytes;
-    }
+    int copy_err = copy_struct_from_user(&how, sizeof(how), user_how, size);
+    if (copy_err) return (s64)copy_err;
     const u64 known_resolve = RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS |
         RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_CACHED;
     /* Linux's known flags; unsupported file-description modes are explicit. */

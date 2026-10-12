@@ -32,6 +32,17 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <ucontext.h>
+#if defined(__has_include)
+# if __has_include(<linux/openat2.h>)
+#  include <linux/openat2.h>
+# endif
+# if __has_include(<linux/sched.h>)
+#  include <linux/sched.h>
+# endif
+# if __has_include(<linux/sched/types.h>)
+#  include <linux/sched/types.h>
+# endif
+#endif
 
 #include "layouts.h"
 
@@ -141,6 +152,37 @@ ASSERT_LAYOUT_OFFSET(struct user_regs_struct, orig_rax, LINUX_OFFSETOF_USER_REGS
 ASSERT_LAYOUT_OFFSET(struct user_regs_struct, rip, LINUX_OFFSETOF_USER_REGS_STRUCT_RIP);
 ASSERT_LAYOUT_OFFSET(struct user_regs_struct, rsp, LINUX_OFFSETOF_USER_REGS_STRUCT_RSP);
 
+#ifdef LINUX_SIZEOF_OPEN_HOW
+ASSERT_LAYOUT_SIZE(struct open_how, LINUX_SIZEOF_OPEN_HOW);
+ASSERT_LAYOUT_OFFSET(struct open_how, flags, LINUX_OFFSETOF_OPEN_HOW_FLAGS);
+ASSERT_LAYOUT_OFFSET(struct open_how, mode, LINUX_OFFSETOF_OPEN_HOW_MODE);
+ASSERT_LAYOUT_OFFSET(struct open_how, resolve, LINUX_OFFSETOF_OPEN_HOW_RESOLVE);
+#endif
+
+#ifdef LINUX_SIZEOF_CLONE_ARGS
+ASSERT_LAYOUT_SIZE(struct clone_args, LINUX_SIZEOF_CLONE_ARGS);
+ASSERT_LAYOUT_OFFSET(struct clone_args, flags, LINUX_OFFSETOF_CLONE_ARGS_FLAGS);
+ASSERT_LAYOUT_OFFSET(struct clone_args, pidfd, LINUX_OFFSETOF_CLONE_ARGS_PIDFD);
+ASSERT_LAYOUT_OFFSET(struct clone_args, child_tid, LINUX_OFFSETOF_CLONE_ARGS_CHILD_TID);
+ASSERT_LAYOUT_OFFSET(struct clone_args, parent_tid, LINUX_OFFSETOF_CLONE_ARGS_PARENT_TID);
+ASSERT_LAYOUT_OFFSET(struct clone_args, exit_signal, LINUX_OFFSETOF_CLONE_ARGS_EXIT_SIGNAL);
+ASSERT_LAYOUT_OFFSET(struct clone_args, stack, LINUX_OFFSETOF_CLONE_ARGS_STACK);
+ASSERT_LAYOUT_OFFSET(struct clone_args, stack_size, LINUX_OFFSETOF_CLONE_ARGS_STACK_SIZE);
+ASSERT_LAYOUT_OFFSET(struct clone_args, tls, LINUX_OFFSETOF_CLONE_ARGS_TLS);
+#endif
+
+#ifdef LINUX_SIZEOF_SCHED_ATTR
+ASSERT_LAYOUT_SIZE(struct sched_attr, LINUX_SIZEOF_SCHED_ATTR);
+ASSERT_LAYOUT_OFFSET(struct sched_attr, size, LINUX_OFFSETOF_SCHED_ATTR_SIZE);
+ASSERT_LAYOUT_OFFSET(struct sched_attr, sched_policy, LINUX_OFFSETOF_SCHED_ATTR_SCHED_POLICY);
+ASSERT_LAYOUT_OFFSET(struct sched_attr, sched_flags, LINUX_OFFSETOF_SCHED_ATTR_SCHED_FLAGS);
+ASSERT_LAYOUT_OFFSET(struct sched_attr, sched_nice, LINUX_OFFSETOF_SCHED_ATTR_SCHED_NICE);
+ASSERT_LAYOUT_OFFSET(struct sched_attr, sched_priority, LINUX_OFFSETOF_SCHED_ATTR_SCHED_PRIORITY);
+ASSERT_LAYOUT_OFFSET(struct sched_attr, sched_runtime, LINUX_OFFSETOF_SCHED_ATTR_SCHED_RUNTIME);
+ASSERT_LAYOUT_OFFSET(struct sched_attr, sched_deadline, LINUX_OFFSETOF_SCHED_ATTR_SCHED_DEADLINE);
+ASSERT_LAYOUT_OFFSET(struct sched_attr, sched_period, LINUX_OFFSETOF_SCHED_ATTR_SCHED_PERIOD);
+#endif
+
 int main(void)
 {
     printf("== AzamiOS UAPI Layout Verification (Workstream B3.1) ==\n");
@@ -154,6 +196,15 @@ int main(void)
     printf("  ✓ struct sockaddr_in: %zu B (expected %d)\n", sizeof(struct sockaddr_in), LINUX_SIZEOF_SOCKADDR_IN);
     printf("  ✓ struct sockaddr_in6: %zu B (expected %d)\n", sizeof(struct sockaddr_in6), LINUX_SIZEOF_SOCKADDR_IN6);
     printf("  ✓ struct sockaddr_un: %zu B (expected %d)\n", sizeof(struct sockaddr_un), LINUX_SIZEOF_SOCKADDR_UN);
+#ifdef LINUX_SIZEOF_OPEN_HOW
+    printf("  ✓ struct open_how: %zu B (expected %d)\n", sizeof(struct open_how), LINUX_SIZEOF_OPEN_HOW);
+#endif
+#ifdef LINUX_SIZEOF_CLONE_ARGS
+    printf("  ✓ struct clone_args: %zu B (expected %d)\n", sizeof(struct clone_args), LINUX_SIZEOF_CLONE_ARGS);
+#endif
+#ifdef LINUX_SIZEOF_SCHED_ATTR
+    printf("  ✓ struct sched_attr: %zu B (expected %d)\n", sizeof(struct sched_attr), LINUX_SIZEOF_SCHED_ATTR);
+#endif
     printf("== All static assertions verified: PASS ==\n");
     return 0;
 }

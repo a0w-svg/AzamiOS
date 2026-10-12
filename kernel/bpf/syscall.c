@@ -2,9 +2,8 @@
 #include "../mm/kmalloc.h"
 #include "../mm/kmodmem.h"
 #include "../sched/sched.h"
+#include "../uaccess.h"
 
-extern int copy_from_user(void *dst, const void *src, size_t size);
-extern int copy_to_user(void *dst, const void *src, size_t size);
 extern s64 syscall_fd_install(process_t *proc, file_t *file, u8 fd_flags);
 
 static s64 bpf_prog_release(inode_t *inode, file_t *filp)
@@ -103,10 +102,9 @@ static int bpf_prog_test_run(union bpf_attr *attr)
 
 s64 bpf_syscall_entry(int cmd, union bpf_attr *uattr, unsigned int size)
 {
-    if (size < sizeof(union bpf_attr)) return -(s64)EINVAL;
-    
     union bpf_attr attr;
-    if (copy_from_user(&attr, uattr, sizeof(attr)) != 0) return -(s64)EFAULT;
+    int copy_err = copy_struct_from_user(&attr, sizeof(attr), uattr, size);
+    if (copy_err) return (s64)copy_err;
     
     file_t *new_file = NULL;
     int err = 0;

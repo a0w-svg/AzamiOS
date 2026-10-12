@@ -24,3 +24,4 @@ check env env
 check env-inheritance sh -c 'test "$(env | grep "^AZAMI_SMOKE_TOKEN=")" = "AZAMI_SMOKE_TOKEN=loader-environment"'
 check enosys cat /proc/azami/enosys
 printf 'BusyBox smoke complete: 0 failed\n'
+
