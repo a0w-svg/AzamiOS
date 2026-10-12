@@ -9,6 +9,10 @@
 #include "include/stdlib.h"
 #include "include/string.h"
 #include "include/signal.h"
+#include "include/errno.h"
+#include "include/sched.h"
+#include "include/sys/mman.h"
+#include "include/sys/wait.h"
 
 int posix_spawn_file_actions_init(posix_spawn_file_actions_t *file_actions)
 {
@@ -127,18 +131,18 @@ int posix_spawnattr_setsigdefault(posix_spawnattr_t *attr, const sigset_t *sigde
     return 0;
 }
 
-static void apply_spawn_attr(const posix_spawnattr_t *attrp)
+static int apply_spawn_attr(const posix_spawnattr_t *attrp)
 {
-    if (!attrp) return;
+    if (!attrp) return 0;
     if (attrp->flags & POSIX_SPAWN_SETPGROUP) {
-        setpgid(0, attrp->pgroup);
+        if (setpgid(0, attrp->pgroup) < 0) return errno;
     }
     if (attrp->flags & POSIX_SPAWN_RESETIDS) {
-        seteuid(getuid());
-        setegid(getgid());
+        if (seteuid(getuid()) < 0) return errno;
+        if (setegid(getgid()) < 0) return errno;
     }
     if (attrp->flags & POSIX_SPAWN_SETSIGMASK) {
-        sigprocmask(SIG_SETMASK, &attrp->sigmask, NULL);
+        if (sigprocmask(SIG_SETMASK, &attrp->sigmask, NULL) < 0) return errno;
     }
     if (attrp->flags & POSIX_SPAWN_SETSIGDEF) {
         struct sigaction sa;
@@ -146,28 +150,85 @@ static void apply_spawn_attr(const posix_spawnattr_t *attrp)
         sa.sa_handler = SIG_DFL;
         for (int sig = 1; sig < 32; sig++) {
             if (attrp->sigdefault & (1UL << (sig - 1))) {
-                sigaction(sig, &sa, NULL);
+                if (sigaction(sig, &sa, NULL) < 0) return errno;
             }
         }
     }
+    return 0;
 }
 
-static void apply_file_actions(const posix_spawn_file_actions_t *fa)
+static int apply_file_actions(const posix_spawn_file_actions_t *fa)
 {
-    if (!fa) return;
+    if (!fa) return 0;
     for (int i = 0; i < fa->action_count; i++) {
         if (fa->actions[i].type == 0) { /* open */
             int fd = open(fa->actions[i].path, fa->actions[i].oflag, fa->actions[i].mode);
-            if (fd >= 0 && fd != fa->actions[i].fd) {
-                dup2(fd, fa->actions[i].fd);
+            if (fd < 0) return errno;
+            if (fd != fa->actions[i].fd) {
+                if (dup2(fd, fa->actions[i].fd) < 0) { int e = errno; close(fd); return e; }
                 close(fd);
             }
         } else if (fa->actions[i].type == 1) { /* close */
-            close(fa->actions[i].fd);
+            if (close(fa->actions[i].fd) < 0) return errno;
         } else if (fa->actions[i].type == 2) { /* dup2 */
-            dup2(fa->actions[i].fd, fa->actions[i].newfd);
+            if (dup2(fa->actions[i].fd, fa->actions[i].newfd) < 0) return errno;
         }
     }
+    return 0;
+}
+
+/* Everything the vfork-style child needs. It lives in the parent's frame,
+ * which is safe because the parent stays blocked inside clone() until the
+ * child execs or exits; `err` is how the child reports a failure back. */
+struct spawn_ctx {
+    const char *path;
+    int use_path;
+    const posix_spawn_file_actions_t *fa;
+    const posix_spawnattr_t *attr;
+    char *const *argv;
+    char *const *envp;
+    volatile int err;
+};
+
+#define SPAWN_STACK_SIZE (64 * 1024)
+
+static int spawn_child(void *p)
+{
+    struct spawn_ctx *c = (struct spawn_ctx *)p;
+    int e = apply_spawn_attr(c->attr);
+    if (!e) e = apply_file_actions(c->fa);
+    if (!e) {
+        if (c->use_path) execvpe(c->path, c->argv, c->envp);
+        else             execve(c->path, c->argv, c->envp);
+        e = errno ? errno : 8; /* ENOEXEC */
+    }
+    c->err = e;
+    _exit(127);
+}
+
+static int do_spawn(pid_t *pid, const char *path, int use_path,
+                    const posix_spawn_file_actions_t *fa,
+                    const posix_spawnattr_t *attrp,
+                    char *const argv[], char *const envp[])
+{
+    void *stack = mmap(NULL, SPAWN_STACK_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack == MAP_FAILED) return errno ? errno : 12;
+
+    struct spawn_ctx ctx = { path, use_path, fa, attrp, argv, envp, 0 };
+    int cpid = clone(spawn_child, (char *)stack + SPAWN_STACK_SIZE,
+                     CLONE_VM | CLONE_VFORK | 17 /* SIGCHLD */, &ctx);
+    int clone_errno = errno;
+    munmap(stack, SPAWN_STACK_SIZE);
+    if (cpid < 0) return clone_errno ? clone_errno : 12;
+
+    if (ctx.err) {
+        int status;
+        waitpid(cpid, &status, 0);
+        return ctx.err;
+    }
+    if (pid) *pid = cpid;
+    return 0;
 }
 
 int posix_spawn(pid_t *pid, const char *path,
@@ -176,19 +237,7 @@ int posix_spawn(pid_t *pid, const char *path,
                 char *const argv[], char *const envp[])
 {
     if (!path) return 22;
-
-    pid_t cpid = fork();
-    if (cpid < 0) return 12; /* ENOMEM / EAGAIN */
-
-    if (cpid == 0) {
-        apply_spawn_attr(attrp);
-        apply_file_actions(file_actions);
-        execve(path, argv, envp);
-        _exit(127);
-    }
-
-    if (pid) *pid = cpid;
-    return 0;
+    return do_spawn(pid, path, 0, file_actions, attrp, argv, envp);
 }
 
 int posix_spawnp(pid_t *pid, const char *file,
@@ -197,17 +246,5 @@ int posix_spawnp(pid_t *pid, const char *file,
                  char *const argv[], char *const envp[])
 {
     if (!file) return 22;
-
-    pid_t cpid = fork();
-    if (cpid < 0) return 12;
-
-    if (cpid == 0) {
-        apply_spawn_attr(attrp);
-        apply_file_actions(file_actions);
-        execvpe(file, argv, envp);
-        _exit(127);
-    }
-
-    if (pid) *pid = cpid;
-    return 0;
+    return do_spawn(pid, file, 1, file_actions, attrp, argv, envp);
 }

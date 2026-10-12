@@ -35,7 +35,7 @@ CFLAGS = -std=c11 -ffreestanding -fstack-protector-strong -mstack-protector-guar
 CFLAGS += -MMD -MP $(TOOLCHAIN_CFLAGS)
 
 SRCS = mqueue.c semaphore.c linuxext.c syscall.c stdio.c stdlib.c malloc.c string.c string_simd.c ctype.c dirent.c time.c math.c az_ipc.c signal.c mman.c pthread.c termios.c resource.c getopt.c acl.c x11.c socket.c netdb.c pwd.c grp.c regex.c fnmatch.c glob.c spawn.c syslog.c search.c utmp.c xsi.c tls.c ldso_bridge.c pty.c ftw.c wordexp.c font.c theme.c sha256.c dlfcn.c
-OBJS = $(SRCS:.c=.o) setjmp.o
+OBJS = $(SRCS:.c=.o) setjmp.o clone.o
 
 # ── libc.so: a second, PIC build of the exact same SRCS list ────────────────
 # Reuses SRCS (never a second, independently-maintained file list — see
@@ -55,7 +55,7 @@ PIC_CFLAGS = -std=c11 -ffreestanding -fno-stack-protector -fpic -fno-plt \
              $(OPT_FLAGS) -pipe -ffunction-sections -fdata-sections \
              -ftls-model=initial-exec -I. -Iinclude -MMD -MP $(TOOLCHAIN_CFLAGS)
 
-PIC_OBJS = $(SRCS:.c=.pic.o) setjmp.pic.o
+PIC_OBJS = $(SRCS:.c=.pic.o) setjmp.pic.o clone.pic.o
 
 .PHONY: all clean
 
@@ -71,6 +71,12 @@ setjmp.o: setjmp.asm
 	$(NASM) -f elf64 $< -o $@
 
 setjmp.pic.o: setjmp.asm
+	$(NASM) -f elf64 $< -o $@
+
+clone.o: clone.asm
+	$(NASM) -f elf64 $< -o $@
+
+clone.pic.o: clone.asm
 	$(NASM) -f elf64 $< -o $@
 
 # The dynamic-aware crt0 (userland/libc/crt0_dyn.asm) — see that file's own
@@ -94,7 +100,7 @@ libc.so: $(PIC_OBJS)
 	$(CC) $(PIC_CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(PIC_OBJS) libc.a libc.so crt0.o crt0_dyn.o setjmp.o setjmp.pic.o
+	rm -f $(OBJS) $(PIC_OBJS) libc.a libc.so crt0.o crt0_dyn.o setjmp.o setjmp.pic.o clone.o clone.pic.o
 	rm -f *.d
 
 -include $(OBJS:.o=.d)

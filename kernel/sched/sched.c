@@ -28,6 +28,7 @@
 #include "../../fs/vfs.h"
 #include "../../arch/x86_64/cpu/hwaccel.h"
 #include "../time/timekeeping.h"
+#include "../completion.h"
 #include "../lib/string.h"
 
 
@@ -332,6 +333,10 @@ void sched_post_switch(void)
                 }
                 if (all_dead) {
                     prev->proc->is_zombie = true;
+                    if (prev->proc->vfork_done) {
+                        complete(prev->proc->vfork_done);
+                        prev->proc->vfork_done = NULL;
+                    }
                     notify_waiter_locked(prev->proc->parent, SIGCHLD);
                     if (prev->proc->tracer_pid && (!prev->proc->parent || prev->proc->parent->pid != prev->proc->tracer_pid)) {
                         for (process_t *tr = g_process_list; tr; tr = tr->next) {
@@ -1144,6 +1149,12 @@ process_t *proc_create(const char *name, phys_addr_t pml4_phys)
     proc->uts_ns = uts_ns_get(&init_uts_ns);
 
     proc->pml4_phys = pml4_phys ? pml4_phys : vmm_kernel_space();
+    if (proc->pml4_phys && proc->pml4_phys != vmm_kernel_space()) {
+        proc->vm_users = (u32 *)kmalloc(sizeof(u32));
+        if (proc->vm_users) {
+            *proc->vm_users = 1;
+        }
+    }
     proc->vma_lock = (spinlock_t)SPINLOCK_INIT;
     proc->fd_lock = (spinlock_t)SPINLOCK_INIT;
 
@@ -1389,9 +1400,28 @@ void proc_destroy(process_t *proc)
     extern void seccomp_filters_put(process_t *proc);
     seccomp_filters_put(proc);
 
-    if (proc->pml4_phys && proc->pml4_phys != vmm_kernel_space()) {
-        vmm_destroy_space(proc->pml4_phys);
-        proc->pml4_phys = 0;
+    if (proc->vfork_done) {
+        complete(proc->vfork_done);
+        proc->vfork_done = NULL;
+    }
+
+    if (proc->vm_users) {
+        if (__atomic_sub_fetch(proc->vm_users, 1, __ATOMIC_SEQ_CST) == 0) {
+            kfree(proc->vm_users);
+            proc->vm_users = NULL;
+            if (proc->pml4_phys && proc->pml4_phys != vmm_kernel_space()) {
+                vmm_destroy_space(proc->pml4_phys);
+                proc->pml4_phys = 0;
+            }
+        } else {
+            proc->vm_users = NULL;
+            proc->pml4_phys = 0;
+        }
+    } else {
+        if (proc->pml4_phys && proc->pml4_phys != vmm_kernel_space()) {
+            vmm_destroy_space(proc->pml4_phys);
+            proc->pml4_phys = 0;
+        }
     }
     if (proc->io_bitmap) {
         kfree(proc->io_bitmap);

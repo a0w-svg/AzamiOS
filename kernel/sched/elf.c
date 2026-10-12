@@ -809,6 +809,10 @@ process_t *sched_spawn_user_args(const char *path, const char *const argv[], con
     }
     
     proc->pml4_phys = new_space;
+    if (!proc->vm_users) {
+        proc->vm_users = (u32 *)kmalloc(sizeof(u32));
+        if (proc->vm_users) *proc->vm_users = 1;
+    }
 
     /* Initialize standard I/O file descriptors (0=stdin, 1=stdout, 2=stderr) */
     for (int fd = 0; fd < 3; fd++) {

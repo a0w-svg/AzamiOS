@@ -6,6 +6,7 @@
 
 #include "sys/types.h"
 #include "time.h"
+#include "linux/sched.h"
 #include <string.h>
 
 struct sched_param {
@@ -36,3 +37,5 @@ int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param);
 int sched_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *mask);
 int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask);
 int sched_rr_get_interval(pid_t pid, struct timespec *tp);
+
+int clone(int (*fn)(void *), void *child_stack, int flags, void *arg, ...);

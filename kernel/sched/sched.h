@@ -221,6 +221,8 @@ void uts_ns_put(uts_namespace_t *ns);
 uts_namespace_t *uts_ns_clone(uts_namespace_t *source);
 void uts_ns_read(uts_namespace_t *ns, char nodename[65], char domainname[65]);
 
+struct completion;
+
 /**
  * struct process — Microkernel address space and resource container.
  */
@@ -255,6 +257,8 @@ typedef struct process {
     bool            is_zombie;             /* Process terminated, awaiting waitpid */
     bool            child_subreaper;       /* PR_SET_CHILD_SUBREAPER: reaps orphan descendents */
     struct thread  *wait_thread;          /* Parent thread waiting on child exit */
+    struct completion *vfork_done;        /* Parent waiting on vfork / CLONE_VFORK */
+    u32            *vm_users;             /* Refcount for shared address space (CLONE_VM) */
     /* Filesystem namespace.
      *
      * `root` is the process's filesystem root as a REAL kernel path — "/" for

@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
@@ -78,6 +79,47 @@ int main(void)
     } else {
         perror("open /proc/azami/enosys");
         failed++;
+    }
+
+    /* musl's posix_spawn is clone(CLONE_VM|CLONE_VFORK) on a private stack. */
+    {
+        char *sargv[] = { "sh", "-c", "exit 5", NULL };
+        char *senv[] = { "PATH=/bin", NULL };
+        pid_t sp = 0;
+        int rc = posix_spawn(&sp, "/bin/sh", NULL, NULL, sargv, senv);
+        int st = 0;
+        if (rc == 0 && waitpid(sp, &st, 0) == sp && WIFEXITED(st) && WEXITSTATUS(st) == 5) {
+            printf("PASS: posix_spawn CLONE_VM|CLONE_VFORK child exit status\n");
+            passed++;
+        } else {
+            printf("FAIL: posix_spawn rc=%d st=%#x\n", rc, st);
+            failed++;
+        }
+
+        rc = posix_spawn(&sp, "/nonexistent/binary", NULL, NULL, sargv, senv);
+        if (rc == ENOENT) {
+            printf("PASS: posix_spawn reports ENOENT for missing binary\n");
+            passed++;
+        } else {
+            printf("FAIL: posix_spawn missing binary rc=%d\n", rc);
+            failed++;
+        }
+
+        /* Parent stack must be intact and parent must resume only after the
+         * child released it (exec/exit). */
+        volatile int shared = 1;
+        pid_t vp = vfork();
+        if (vp == 0) {
+            shared = 42;
+            _exit(9);
+        }
+        if (vp > 0 && waitpid(vp, &st, 0) == vp && WEXITSTATUS(st) == 9 && shared == 42) {
+            printf("PASS: vfork shares memory and parent resumes after child exit\n");
+            passed++;
+        } else {
+            printf("FAIL: vfork vp=%d shared=%d st=%#x\n", (int)vp, shared, st);
+            failed++;
+        }
     }
 
     printf("== probe complete: %d passed, %d failed ==\n", passed, failed);

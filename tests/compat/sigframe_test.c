@@ -263,3 +263,4 @@ int main(void)
     printf("== Summary: %d / %d tests passed ==\n", g_tests_passed, g_tests_run);
     return (g_tests_passed == g_tests_run) ? 0 : 1;
 }
+

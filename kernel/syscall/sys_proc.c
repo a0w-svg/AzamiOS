@@ -4,7 +4,10 @@
  * File: kernel/syscall/sys_proc.c
  * ============================================================================ */
 #include "syscall_internal.h"
+#include <kernel/completion.h>
 
+#define CLONE_VM           0x00000100ULL
+#define CLONE_VFORK        0x00004000ULL
 #define CLONE_NEWNS        0x00020000ULL
 #define CLONE_NEWCGROUP    0x02000000ULL
 #define CLONE_NEWUTS       0x04000000ULL
@@ -297,13 +300,36 @@ static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int 
         return (s64)t->tid;
     }
 
-    vmm_space_t child_space = vmm_clone_space(parent->pml4_phys);
-    if (!child_space) return -(s64)ENOMEM;
+    bool is_clone_vm = (flags & CLONE_VM) != 0;
+    bool is_vfork    = (flags & CLONE_VFORK) != 0;
+
+    vmm_space_t child_space;
+    if (is_clone_vm) {
+        child_space = parent->pml4_phys;
+    } else {
+        child_space = vmm_clone_space(parent->pml4_phys);
+        if (!child_space) return -(s64)ENOMEM;
+    }
 
     process_t *child = proc_create(parent->name, child_space);
     if (!child) {
-        vmm_destroy_space(child_space);
+        if (!is_clone_vm) vmm_destroy_space(child_space);
         return -(s64)ENOMEM;
+    }
+
+    if (is_clone_vm) {
+        if (child->vm_users) {
+            kfree(child->vm_users);
+            child->vm_users = NULL;
+        }
+        if (!parent->vm_users) {
+            parent->vm_users = (u32 *)kmalloc(sizeof(u32));
+            if (parent->vm_users) *parent->vm_users = 1;
+        }
+        child->vm_users = parent->vm_users;
+        if (child->vm_users) {
+            __atomic_add_fetch(child->vm_users, 1, __ATOMIC_SEQ_CST);
+        }
     }
 
     child->parent       = parent;
@@ -346,9 +372,16 @@ static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int 
     }
     spinlock_unlock_irqrestore(&parent->fd_lock, fd_irqf);
 
+    struct completion vfork_done;
+    if (is_vfork) {
+        init_completion(&vfork_done);
+        child->vfork_done = &vfork_done;
+    }
+
     virt_addr_t user_rsp = child_stack ? child_stack : r->rsp;
     thread_t *t = thread_create_ex(child, r->rip, user_rsp, false, false);
     if (!t) {
+        if (is_vfork) child->vfork_done = NULL;
         proc_destroy(child);
         return -(s64)ENOMEM;
     }
@@ -391,6 +424,11 @@ static s64 do_clone(u64 flags, virt_addr_t child_stack, int *parent_tidptr, int 
     }
 
     sched_enqueue_thread(t);
+
+    if (is_vfork) {
+        wait_for_completion(&vfork_done);
+    }
+
     return (s64)child->pid;
 }
 
@@ -406,7 +444,8 @@ s64 sys_clone_impl(pt_regs_t *r)
 
 s64 sys_vfork_impl(pt_regs_t *r)
 {
-    return sys_fork_impl(r);
+    return do_clone(CLONE_VM | CLONE_VFORK | 17ULL /* SIGCHLD */,
+                    0, NULL, NULL, 0, r);
 }
 
 /* Shared execve core: `kpath` is an already-resolved absolute path; argv/envp
@@ -511,8 +550,23 @@ static s64 execve_core(pt_regs_t *r, const char *kpath,
     proc->pcid_primed = 0;
     vmm_switch_proc(new_space, proc->pcid, smp_current_cpu_id(), &proc->pcid_primed);
 
-    if (old_space && old_space != vmm_kernel_space()) {
+    if (proc->vm_users) {
+        if (__atomic_sub_fetch(proc->vm_users, 1, __ATOMIC_SEQ_CST) == 0) {
+            kfree(proc->vm_users);
+            proc->vm_users = NULL;
+            if (old_space && old_space != vmm_kernel_space()) {
+                vmm_destroy_space(old_space);
+            }
+        }
+        proc->vm_users = (u32 *)kmalloc(sizeof(u32));
+        if (proc->vm_users) *proc->vm_users = 1;
+    } else if (old_space && old_space != vmm_kernel_space()) {
         vmm_destroy_space(old_space);
+    }
+
+    if (proc->vfork_done) {
+        complete(proc->vfork_done);
+        proc->vfork_done = NULL;
     }
 
     proc->fs_base = 0;
@@ -648,6 +702,10 @@ s64 sys_exit_impl(pt_regs_t *r)
     /* exit(2) terminates the calling thread. Shared descriptors, tracing
      * relationships, and the process exit status belong to the last thread. */
     if (proc && !sched_has_live_siblings()) {
+        if (proc->vfork_done) {
+            complete(proc->vfork_done);
+            proc->vfork_done = NULL;
+        }
         /* Don't clobber a termination signal already recorded by the fault
          * handler (segfault etc.) with the trap frame's rdi. */
         if (r && proc->term_signal == 0) proc->exit_code = (int)r->rdi & 0xFF;

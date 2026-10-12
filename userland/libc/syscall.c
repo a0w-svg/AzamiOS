@@ -31,7 +31,7 @@
 
 __thread int errno = 0;
 
-static inline long __syscall_ret(long r)
+long __syscall_ret(long r)
 {
     if (r < 0) {
         errno = (int)-r;
