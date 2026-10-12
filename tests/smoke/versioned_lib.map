@@ -1,0 +1,11 @@
+VER_1.0 {
+    global:
+        smoke_versioned_foo;
+    local:
+        *;
+};
+
+VER_2.0 {
+    global:
+        smoke_versioned_foo;
+} VER_1.0;

@@ -1060,6 +1060,14 @@ s64 sys_az_thread_exit_impl(pt_regs_t *r)
 #define ARCH_GET_FS 0x1003
 #define ARCH_GET_GS 0x1004
 
+#define ARCH_GET_CPUID 0x1011
+#define ARCH_SET_CPUID 0x1012
+#define ARCH_GET_XCOMP_SUPP 0x1021
+#define ARCH_GET_XCOMP_PERM 0x1022
+#define ARCH_REQ_XCOMP_PERM 0x1023
+
+extern u64 g_xcr0_mask;
+
 s64 sys_arch_prctl_impl(pt_regs_t *r)
 {
     int code = (int)(s32)r->rdi;
@@ -1068,6 +1076,7 @@ s64 sys_arch_prctl_impl(pt_regs_t *r)
     if (!proc) return -(s64)EPERM;
 
     if (code == ARCH_SET_FS) {
+        if (addr >= TASK_SIZE_MAX) return -(s64)EPERM;
         /* Per-thread TLS base — explicit even when addr is 0, so a later
          * save/restore (sched_yield, sched_post_switch) knows this thread has
          * its own override rather than silently promoting it into
@@ -1091,12 +1100,30 @@ s64 sys_arch_prctl_impl(pt_regs_t *r)
         u64 cur = (self && self->has_thread_fs_base) ? self->fs_base : proc->fs_base;
         return copy_to_user((void *)addr, &cur, sizeof(u64)) == 0 ? 0 : -(s64)EFAULT;
     } else if (code == ARCH_SET_GS) {
+        if (addr >= TASK_SIZE_MAX) return -(s64)EPERM;
         proc->gs_base = addr;
         wrmsr(MSR_KERNEL_GS_BASE, addr);
         return 0;
     } else if (code == ARCH_GET_GS) {
         if (!addr || addr >= TASK_SIZE_MAX) return -(s64)EFAULT;
         return copy_to_user((void *)addr, &proc->gs_base, sizeof(u64)) == 0 ? 0 : -(s64)EFAULT;
+    } else if (code == ARCH_GET_CPUID) {
+        return proc->cpuid_faulting ? 1 : 0;
+    } else if (code == ARCH_SET_CPUID) {
+        if (addr > 1) return -(s64)EINVAL;
+        proc->cpuid_faulting = (u8)addr;
+        return 0;
+    } else if (code == ARCH_GET_XCOMP_SUPP) {
+        if (!addr || addr >= TASK_SIZE_MAX) return -(s64)EFAULT;
+        u64 supp = g_xcr0_mask;
+        return copy_to_user((void *)addr, &supp, sizeof(u64)) == 0 ? 0 : -(s64)EFAULT;
+    } else if (code == ARCH_GET_XCOMP_PERM) {
+        if (!addr || addr >= TASK_SIZE_MAX) return -(s64)EFAULT;
+        u64 perm = g_xcr0_mask;
+        return copy_to_user((void *)addr, &perm, sizeof(u64)) == 0 ? 0 : -(s64)EFAULT;
+    } else if (code == ARCH_REQ_XCOMP_PERM) {
+        if (addr >= 64 || !(g_xcr0_mask & (1ULL << addr))) return -(s64)EOPNOTSUPP;
+        return 0;
     }
     return -(s64)EINVAL;
 }

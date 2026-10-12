@@ -83,6 +83,24 @@ void *dlsym(void *handle, const char *name)
     return sym;
 }
 
+void *dlvsym(void *handle, const char *name, const char *version)
+{
+    void *(*fn)(void *, const char *, const char *) =
+        (void *(*)(void *, const char *, const char *))__libc_ldso_lookup("__ldso_dlvsym");
+    if (!fn) {
+        set_local_dlerror("dlvsym: no dynamic linker present (statically linked)");
+        return NULL;
+    }
+    void *sym = fn(handle, name, version);
+    if (!sym) {
+        const char *(*ldso_dlerror)(void) =
+            (const char *(*)(void))__libc_ldso_lookup("__ldso_dlerror");
+        const char *msg = ldso_dlerror ? ldso_dlerror() : NULL;
+        set_local_dlerror(msg ? msg : "dlvsym: symbol not found");
+    }
+    return sym;
+}
+
 int dlclose(void *handle)
 {
     int (*fn)(void *) = (int (*)(void *))__libc_ldso_lookup("__ldso_dlclose");

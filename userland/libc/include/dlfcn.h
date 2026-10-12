@@ -19,6 +19,10 @@
  * ============================================================================ */
 #pragma once
 
+#ifndef __AZAMI_LIBC__
+#define __AZAMI_LIBC__ 1
+#endif
+
 #define RTLD_LAZY   0x0001  /* accepted, but ld-azami.so always binds eagerly */
 #define RTLD_NOW    0x0002  /* the actual (only) behavior; both flags do the same thing */
 #define RTLD_GLOBAL 0x0100  /* accepted, but symbol scope is always global */
@@ -39,6 +43,7 @@ typedef struct {
 
 void *dlopen(const char *path, int flags);
 void *dlsym(void *handle, const char *name);
+void *dlvsym(void *handle, const char *name, const char *version);
 int   dlclose(void *handle);
 char *dlerror(void);
 int   dladdr(const void *addr, Dl_info *info);

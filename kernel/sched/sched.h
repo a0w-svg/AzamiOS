@@ -357,6 +357,7 @@ typedef struct process {
      * disables ASLR for the next execve(), which is what `setarch -R` and most
      * debuggers rely on to get reproducible addresses. */
     u32             personality;
+    u8              cpuid_faulting;
 
     /* POSIX process CPU accounting, in scheduler ticks. Charged by
      * sched_tick() to whichever process was running, split by the privilege

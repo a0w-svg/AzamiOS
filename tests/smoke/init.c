@@ -46,8 +46,14 @@ int main(void)
     /* Give each interpreter its matching ABI-compatible test libraries. */
     if (rename("/lib/libsmoke_start.so", "/lib/libsmoke_start-native.so") ||
         rename("/lib/libsmoke_plugin.so", "/lib/libsmoke_plugin-native.so") ||
+        rename("/lib/libsmoke_versioned.so", "/lib/libsmoke_versioned-native.so") ||
+        rename("/lib/libsmoke_consumer_v1.so", "/lib/libsmoke_consumer_v1-native.so") ||
+        rename("/lib/libsmoke_consumer_v2.so", "/lib/libsmoke_consumer_v2-native.so") ||
         rename("/lib/libsmoke_start-musl.so", "/lib/libsmoke_start.so") ||
-        rename("/lib/libsmoke_plugin-musl.so", "/lib/libsmoke_plugin.so")) {
+        rename("/lib/libsmoke_plugin-musl.so", "/lib/libsmoke_plugin.so") ||
+        rename("/lib/libsmoke_versioned-musl.so", "/lib/libsmoke_versioned.so") ||
+        rename("/lib/libsmoke_consumer_v1-musl.so", "/lib/libsmoke_consumer_v1.so") ||
+        rename("/lib/libsmoke_consumer_v2-musl.so", "/lib/libsmoke_consumer_v2.so")) {
         perror("select musl libraries");
         failed++;
     } else {

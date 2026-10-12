@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
 #include <stdint.h>
@@ -111,6 +112,68 @@ int main(int argc, char **argv)
         check(dlerror() != NULL, "dlsym error reported");
         check(dlclose(handle) == 0, "dlclose plugin");
     }
+
+    /* Symbol versioning tests */
+    void *(*probe_dlvsym)(void *, const char *, const char *) = 0;
+#ifdef __AZAMI_LIBC__
+    probe_dlvsym = dlvsym;
+#else
+    probe_dlvsym = (void *(*)(void *, const char *, const char *))dlsym(RTLD_DEFAULT, "dlvsym");
+#endif
+
+    void *h_ver = dlopen("/lib/libsmoke_versioned.so", RTLD_NOW | RTLD_LOCAL);
+    check(h_ver != NULL, "dlopen versioned library");
+    if (h_ver) {
+        dlerror();
+        int (*foo_def)(void) = (int (*)(void))dlsym(h_ver, "smoke_versioned_foo");
+        const char *err = dlerror();
+        check(foo_def != NULL && err == NULL, "dlsym unversioned finds default version");
+        if (foo_def) check(foo_def() == 222, "dlsym unversioned calls default @@VER_2.0 (222)");
+
+        if (probe_dlvsym) {
+            dlerror();
+            int (*foo_v1)(void) = (int (*)(void))probe_dlvsym(h_ver, "smoke_versioned_foo", "VER_1.0");
+            err = dlerror();
+            check(foo_v1 != NULL && err == NULL, "dlvsym VER_1.0 finds hidden version");
+            if (foo_v1) check(foo_v1() == 111, "dlvsym VER_1.0 calls foo@VER_1.0 (111)");
+
+            dlerror();
+            int (*foo_v2)(void) = (int (*)(void))probe_dlvsym(h_ver, "smoke_versioned_foo", "VER_2.0");
+            err = dlerror();
+            check(foo_v2 != NULL && err == NULL, "dlvsym VER_2.0 finds default version");
+            if (foo_v2) check(foo_v2() == 222, "dlvsym VER_2.0 calls foo@@VER_2.0 (222)");
+
+            dlerror();
+            check(probe_dlvsym(h_ver, "smoke_versioned_foo", "VER_NONEXISTENT") == NULL,
+                  "dlvsym nonexistent version fails");
+            check(dlerror() != NULL, "dlvsym error reported for nonexistent version");
+        }
+        check(dlclose(h_ver) == 0, "dlclose versioned library");
+    }
+
+    void *h_c1 = dlopen("/lib/libsmoke_consumer_v1.so", RTLD_NOW | RTLD_LOCAL);
+    check(h_c1 != NULL, "dlopen consumer_v1 library");
+    if (h_c1) {
+        int (*call_v1)(void) = (int (*)(void))dlsym(h_c1, "smoke_call_v1");
+        if (call_v1) {
+#ifdef __AZAMI_LIBC__
+            check(call_v1() == 111, "relocation binding to foo@VER_1.0 (111)");
+#else
+            check(call_v1() == 111 || call_v1() == 222, "relocation binding to foo (musl fallback)");
+#endif
+        }
+        check(dlclose(h_c1) == 0, "dlclose consumer_v1 library");
+    }
+
+    void *h_c2 = dlopen("/lib/libsmoke_consumer_v2.so", RTLD_NOW | RTLD_LOCAL);
+    check(h_c2 != NULL, "dlopen consumer_v2 library");
+    if (h_c2) {
+        int (*call_v2)(void) = (int (*)(void))dlsym(h_c2, "smoke_call_v2");
+        check(call_v2 != NULL, "dlsym smoke_call_v2");
+        if (call_v2) check(call_v2() == 222, "relocation binding to foo@@VER_2.0 (222)");
+        check(dlclose(h_c2) == 0, "dlclose consumer_v2 library");
+    }
+
     printf("dynamic probe complete: %d failed\n", failures);
     return failures ? 1 : 0;
 }

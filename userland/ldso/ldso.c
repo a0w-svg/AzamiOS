@@ -149,6 +149,37 @@ typedef struct {
     s64 r_addend;
 } __attribute__((packed)) elf64_rela_t;
 
+typedef struct {
+    u16 vd_version;
+    u16 vd_flags;
+    u16 vd_ndx;
+    u16 vd_cnt;
+    u32 vd_hash;
+    u32 vd_aux;
+    u32 vd_next;
+} __attribute__((packed)) elf64_verdef_t;
+
+typedef struct {
+    u32 vda_name;
+    u32 vda_next;
+} __attribute__((packed)) elf64_verdaux_t;
+
+typedef struct {
+    u16 vn_version;
+    u16 vn_cnt;
+    u32 vn_file;
+    u32 vn_aux;
+    u32 vn_next;
+} __attribute__((packed)) elf64_verneed_t;
+
+typedef struct {
+    u32 vna_hash;
+    u16 vna_flags;
+    u16 vna_other;
+    u32 vna_name;
+    u32 vna_next;
+} __attribute__((packed)) elf64_vernaux_t;
+
 #define ELF64_R_SYM(i)  ((u32)((i) >> 32))
 #define ELF64_R_TYPE(i) ((u32)(i))
 #define ELF64_ST_BIND(i) ((i) >> 4)
@@ -179,6 +210,18 @@ typedef struct {
 #define DT_FINI_ARRAY    26
 #define DT_INIT_ARRAYSZ  27
 #define DT_FINI_ARRAYSZ  28
+#define DT_VERSYM        0x6ffffff0
+#define DT_VERDEF        0x6ffffffc
+#define DT_VERDEFNUM     0x6ffffffd
+#define DT_VERNEED       0x6ffffffe
+#define DT_VERNEEDNUM    0x6fffffff
+
+#define VER_FLG_BASE     0x1
+#define VER_FLG_WEAK     0x2
+#define VER_NDX_LOCAL    0
+#define VER_NDX_GLOBAL   1
+#define VERSYM_HIDDEN    0x8000
+#define VERSYM_VERSION   0x7fff
 
 #define PT_NULL    0
 #define PT_LOAD    1
@@ -294,6 +337,13 @@ typedef struct {
     u32        gnu_symoffset;
     u32        gnu_bloom_size;
     u32        gnu_bloom_shift;
+
+    /* Symbol versioning tables */
+    const u16             *versym;
+    const elf64_verdef_t  *verdef;
+    u32                    verdefnum;
+    const elf64_verneed_t *verneed;
+    u32                    verneednum;
 
     elf64_rela_t *rela;
     u64           rela_count;
@@ -437,6 +487,11 @@ static void parse_dynamic(obj_t *o, elf64_dyn_t *dyn)
             o->gnu_chains = o->gnu_buckets + o->gnu_nbuckets;
             break;
         }
+        case DT_VERSYM:       o->versym = (const u16 *)(uintptr_t)(bias + d->d_un.d_ptr); break;
+        case DT_VERDEF:       o->verdef = (const elf64_verdef_t *)(uintptr_t)(bias + d->d_un.d_ptr); break;
+        case DT_VERDEFNUM:    o->verdefnum = (u32)d->d_un.d_val; break;
+        case DT_VERNEED:      o->verneed = (const elf64_verneed_t *)(uintptr_t)(bias + d->d_un.d_ptr); break;
+        case DT_VERNEEDNUM:   o->verneednum = (u32)d->d_un.d_val; break;
         case DT_NEEDED:
             if (o->nneeded < MAX_NEEDED && strtab)
                 o->needed_names[o->nneeded++] = strtab + d->d_un.d_val;
@@ -673,7 +728,107 @@ static void setup_static_tls(void)
 
 /* ── Symbol resolution ───────────────────────────────────────────────────── */
 
-static elf64_sym_t *obj_lookup_symbol(obj_t *o, const char *name, u32 gnu_h, u32 sysv_h)
+static int get_symbol_version_req(obj_t *ref_obj, u32 symidx, const char **out_name, u32 *out_hash)
+{
+    *out_name = 0;
+    *out_hash = 0;
+    if (!ref_obj || !ref_obj->versym) return 0;
+
+    u16 ver = ref_obj->versym[symidx];
+    u16 ndx = ver & VERSYM_VERSION;
+    if (ndx <= VER_NDX_GLOBAL) return 0;
+
+    if (ref_obj->verneed && ref_obj->strtab) {
+        const u8 *p = (const u8 *)ref_obj->verneed;
+        u32 cnt = ref_obj->verneednum ? ref_obj->verneednum : 256;
+        for (u32 i = 0; i < cnt && p; i++) {
+            const elf64_verneed_t *vn = (const elf64_verneed_t *)p;
+            if (vn->vn_aux) {
+                const u8 *ap = p + vn->vn_aux;
+                for (u16 a = 0; a < vn->vn_cnt; a++) {
+                    const elf64_vernaux_t *vna = (const elf64_vernaux_t *)ap;
+                    if ((vna->vna_other & VERSYM_VERSION) == ndx) {
+                        *out_name = ref_obj->strtab + vna->vna_name;
+                        *out_hash = vna->vna_hash;
+                        return 1;
+                    }
+                    if (vna->vna_next == 0) break;
+                    ap += vna->vna_next;
+                }
+            }
+            if (vn->vn_next == 0) break;
+            p += vn->vn_next;
+        }
+    }
+
+    if (ref_obj->verdef && ref_obj->strtab) {
+        const u8 *p = (const u8 *)ref_obj->verdef;
+        u32 cnt = ref_obj->verdefnum ? ref_obj->verdefnum : 256;
+        for (u32 i = 0; i < cnt && p; i++) {
+            const elf64_verdef_t *vd = (const elf64_verdef_t *)p;
+            if ((vd->vd_ndx & VERSYM_VERSION) == ndx) {
+                if (vd->vd_cnt > 0 && vd->vd_aux) {
+                    const elf64_verdaux_t *vda = (const elf64_verdaux_t *)(p + vd->vd_aux);
+                    *out_name = ref_obj->strtab + vda->vda_name;
+                    *out_hash = vd->vd_hash;
+                    return 1;
+                }
+            }
+            if (vd->vd_next == 0) break;
+            p += vd->vd_next;
+        }
+    }
+
+    return 0;
+}
+
+static int sym_version_matches(obj_t *def_obj, u32 def_sym_idx, const char *req_name, u32 req_hash)
+{
+    /* Defining object has no symbol versioning: unversioned fallback matches */
+    if (!def_obj->versym) return 1;
+
+    u16 ver = def_obj->versym[def_sym_idx];
+    int is_hidden = (ver & VERSYM_HIDDEN) != 0;
+    u16 ndx = ver & VERSYM_VERSION;
+
+    if (ndx == VER_NDX_LOCAL) return 0;
+
+    if (!req_name) {
+        /* Unversioned lookup (e.g. dlsym or unversioned reference):
+         * matches default version only, rejects hidden (non-default) versions. */
+        return !is_hidden;
+    }
+
+    /* Versioned lookup: unversioned global symbol does not satisfy a specific version */
+    if (ndx == VER_NDX_GLOBAL) return 0;
+
+    if (!req_hash) req_hash = __elf_sysv_hash(req_name);
+
+    if (def_obj->verdef && def_obj->strtab) {
+        const u8 *p = (const u8 *)def_obj->verdef;
+        u32 cnt = def_obj->verdefnum ? def_obj->verdefnum : 256;
+        for (u32 i = 0; i < cnt && p; i++) {
+            const elf64_verdef_t *vd = (const elf64_verdef_t *)p;
+            if ((vd->vd_ndx & VERSYM_VERSION) == ndx) {
+                if (vd->vd_cnt > 0 && vd->vd_aux) {
+                    const elf64_verdaux_t *vda = (const elf64_verdaux_t *)(p + vd->vd_aux);
+                    const char *def_name = def_obj->strtab + vda->vda_name;
+                    if (vd->vd_hash == req_hash && ld_strcmp(def_name, req_name) == 0) {
+                        return 1;
+                    }
+                }
+                return 0;
+            }
+            if (vd->vd_next == 0) break;
+            p += vd->vd_next;
+        }
+    }
+
+    return 0;
+}
+
+static elf64_sym_t *obj_lookup_symbol(obj_t *o, const char *name, u32 gnu_h, u32 sysv_h,
+                                      const char *req_vname, u32 req_vhash)
 {
     if (!o->symtab || !o->strtab) return 0;
 
@@ -698,7 +853,9 @@ static elf64_sym_t *obj_lookup_symbol(obj_t *o, const char *name, u32 gnu_h, u32
             if ((gnu_h | 1) == (chain_val | 1)) {
                 elf64_sym_t *sym = &o->symtab[sym_idx];
                 if (sym->st_shndx != 0 && ld_strcmp(o->strtab + sym->st_name, name) == 0) {
-                    return sym;
+                    if (sym_version_matches(o, sym_idx, req_vname, req_vhash)) {
+                        return sym;
+                    }
                 }
             }
             if (chain_val & 1) break;
@@ -720,7 +877,9 @@ static elf64_sym_t *obj_lookup_symbol(obj_t *o, const char *name, u32 gnu_h, u32
                 if (sym_idx >= nchain) break;
                 elf64_sym_t *sym = &o->symtab[sym_idx];
                 if (sym->st_shndx != 0 && ld_strcmp(o->strtab + sym->st_name, name) == 0) {
-                    return sym;
+                    if (sym_version_matches(o, sym_idx, req_vname, req_vhash)) {
+                        return sym;
+                    }
                 }
             }
         }
@@ -732,20 +891,22 @@ static elf64_sym_t *obj_lookup_symbol(obj_t *o, const char *name, u32 gnu_h, u32
         elf64_sym_t *sym = &o->symtab[s];
         if (sym->st_name == 0 || sym->st_shndx == 0) continue;
         if (ld_strcmp(o->strtab + sym->st_name, name) == 0) {
-            return sym;
+            if (sym_version_matches(o, s, req_vname, req_vhash)) {
+                return sym;
+            }
         }
     }
     return 0;
 }
 
-static elf64_sym_t *resolve_symbol_full(const char *name, obj_t **out_obj)
+static elf64_sym_t *resolve_symbol_versioned(const char *name, const char *req_vname, u32 req_vhash, obj_t **out_obj)
 {
     u32 gnu_h = __elf_gnu_hash(name);
     u32 sysv_h = __elf_sysv_hash(name);
     for (int i = 0; i < MAX_OBJS; i++) {
         obj_t *o = &g_objs[i];
         if (!o->in_use || !o->symtab || !o->strtab) continue;
-        elf64_sym_t *sym = obj_lookup_symbol(o, name, gnu_h, sysv_h);
+        elf64_sym_t *sym = obj_lookup_symbol(o, name, gnu_h, sysv_h, req_vname, req_vhash);
         if (sym) {
             *out_obj = o;
             return sym;
@@ -797,8 +958,12 @@ static void apply_symbolic_table(obj_t *o, elf64_rela_t *tbl, u64 count, int fat
         elf64_sym_t *local_sym = &o->symtab[symidx];
         const char *name = o->strtab + local_sym->st_name;
 
+        const char *req_vname = 0;
+        u32 req_vhash = 0;
+        get_symbol_version_req(o, symidx, &req_vname, &req_vhash);
+
         obj_t *def_obj = 0;
-        elf64_sym_t *def_sym = resolve_symbol_full(name, &def_obj);
+        elf64_sym_t *def_sym = resolve_symbol_versioned(name, req_vname, req_vhash, &def_obj);
 
         if (!def_sym) {
             if (ELF64_ST_BIND(local_sym->st_info) == STB_WEAK) continue; /* weak: leave the slot as 0 */
@@ -1185,7 +1350,7 @@ static int handle_valid(void *handle)
     return o >= g_objs && o < g_objs + MAX_OBJS && o->in_use;
 }
 
-static void *dlsym_transitive(obj_t *root, const char *name)
+static void *dlvsym_transitive(obj_t *root, const char *name, const char *ver_name)
 {
     int queue[MAX_OBJS];
     int head = 0, tail = 0;
@@ -1197,12 +1362,13 @@ static void *dlsym_transitive(obj_t *root, const char *name)
 
     u32 gnu_h = __elf_gnu_hash(name);
     u32 sysv_h = __elf_sysv_hash(name);
+    u32 ver_hash = ver_name ? __elf_sysv_hash(ver_name) : 0;
 
     while (head < tail) {
         int idx = queue[head++];
         obj_t *cur = &g_objs[idx];
         if (cur->symtab && cur->strtab) {
-            elf64_sym_t *sym = obj_lookup_symbol(cur, name, gnu_h, sysv_h);
+            elf64_sym_t *sym = obj_lookup_symbol(cur, name, gnu_h, sysv_h, ver_name, ver_hash);
             if (sym) {
                 return (void *)(uintptr_t)(cur->load_bias + sym->st_value);
             }
@@ -1218,21 +1384,23 @@ static void *dlsym_transitive(obj_t *root, const char *name)
     return 0;
 }
 
-void *__ldso_dlsym(void *handle, const char *name)
+static void *do_dlvsym(void *handle, const char *name, const char *version)
 {
     loader_lock();
     if (!name) {
-        set_dlerror("dlsym: NULL name");
+        set_dlerror("dlvsym: NULL name");
         loader_unlock();
         return 0;
     }
 
+    u32 ver_hash = version ? __elf_sysv_hash(version) : 0;
+
     if (!handle) {
         /* Simplified RTLD_DEFAULT-like behavior: search every loaded object. */
         obj_t *def_obj = 0;
-        elf64_sym_t *sym = resolve_symbol_full(name, &def_obj);
+        elf64_sym_t *sym = resolve_symbol_versioned(name, version, ver_hash, &def_obj);
         if (!sym) {
-            set_dlerror("dlsym: symbol not found");
+            set_dlerror("dlvsym: symbol not found");
             loader_unlock();
             return 0;
         }
@@ -1242,21 +1410,31 @@ void *__ldso_dlsym(void *handle, const char *name)
     }
 
     if (!handle_valid(handle)) {
-        set_dlerror("dlsym: invalid handle");
+        set_dlerror("dlvsym: invalid handle");
         loader_unlock();
         return 0;
     }
 
     obj_t *root = (obj_t *)handle;
-    void *res = dlsym_transitive(root, name);
+    void *res = dlvsym_transitive(root, name, version);
     if (!res) {
-        set_dlerror("dlsym: symbol not found");
+        set_dlerror("dlvsym: symbol not found");
         loader_unlock();
         return 0;
     }
 
     loader_unlock();
     return res;
+}
+
+void *__ldso_dlvsym(void *handle, const char *name, const char *version)
+{
+    return do_dlvsym(handle, name, version);
+}
+
+void *__ldso_dlsym(void *handle, const char *name)
+{
+    return do_dlvsym(handle, name, 0);
 }
 
 int __ldso_dlclose(void *handle)
