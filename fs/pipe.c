@@ -11,8 +11,8 @@
 
 static void pipe_wait_push(thread_t **queue, thread_t *t)
 {
-    t->next = NULL;
     if (!*queue) {
+        t->next = NULL;
         *queue = t;
         return;
     }
@@ -22,6 +22,7 @@ static void pipe_wait_push(thread_t **queue, thread_t *t)
         curr = curr->next;
     }
     if (curr == t) return;
+    t->next = NULL;
     curr->next = t;
 }
 

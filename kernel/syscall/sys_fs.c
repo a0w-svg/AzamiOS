@@ -149,6 +149,8 @@ static s64 io_scalar(pt_regs_t *r, bool writing)
     bool console;
     s64 error;
     file_t *file = io_get_file((int)(s32)r->rdi, writing, &console, &error);
+    s64 error;
+    file_t *file = io_get_file((int)(s32)r->rdi, writing, &error);
     if (error) return error;
     vfs_iovec_t iov = {.iov_base = (void *)r->rsi, .iov_len = (size_t)r->rdx};
     if (!io_user_range(iov.iov_base, iov.iov_len)) error = -(s64)EFAULT;
@@ -250,6 +252,8 @@ static s64 io_vector(pt_regs_t *r, bool writing)
     bool console;
     s64 error;
     file_t *file = io_get_file((int)(s32)r->rdi, writing, &console, &error);
+    s64 error;
+    file_t *file = io_get_file((int)(s32)r->rdi, writing, &error);
     if (error) return error;
     u64 count = r->rdx;
     if (count > 1024) { error = -(s64)EINVAL; goto out; }
@@ -2831,7 +2835,7 @@ s64 sys_eventfd2_impl(pt_regs_t *r)
 
     f->f_op = &g_eventfd_fops;
     f->private_data = ctx;
-    f->f_flags = (flags & EFD_NONBLOCK) ? O_NONBLOCK : 0;
+    f->f_flags = O_RDWR | ((flags & EFD_NONBLOCK) ? O_NONBLOCK : 0);
     f->f_fd_flags = (flags & EFD_CLOEXEC) ? FD_CLOEXEC : 0;
     f->f_mode = 0600;
     f->f_count = 1;
@@ -3481,7 +3485,7 @@ s64 sys_timerfd_create_impl(pt_regs_t *r)
     }
     f->f_op = &g_timerfd_fops;
     f->private_data = ctx;
-    f->f_flags = (flags & TFD_NONBLOCK) ? O_NONBLOCK : 0;
+    f->f_flags = O_RDWR | ((flags & TFD_NONBLOCK) ? O_NONBLOCK : 0);
     f->f_fd_flags = (flags & TFD_CLOEXEC) ? FD_CLOEXEC : 0;
     f->f_count = 1;
 
@@ -3749,7 +3753,7 @@ s64 sys_signalfd4_impl(pt_regs_t *r)
     }
     f->f_op = &g_signalfd_fops;
     f->private_data = ctx;
-    f->f_flags = (flags & SFD_NONBLOCK) ? O_NONBLOCK : 0;
+    f->f_flags = O_RDWR | ((flags & SFD_NONBLOCK) ? O_NONBLOCK : 0);
     f->f_fd_flags = (flags & SFD_CLOEXEC) ? FD_CLOEXEC : 0;
     f->f_count = 1;
 
@@ -4198,6 +4202,7 @@ s64 sys_fanotify_init_impl(pt_regs_t *r)
     int err = fanotify_create(flags, event_f_flags, &filp);
     if (err < 0) return (s64)err;
 
+    filp->f_flags |= O_RDWR;
     filp->f_fd_flags = (flags & 0x00000001 /* FAN_CLOEXEC */) ? FD_CLOEXEC : 0;
     filp->f_mode = 0600;
 

@@ -18,9 +18,12 @@ ln -s busybox "$TASK_ROOT/bin/sh"
 cp build/smoke/{native-dynamic-probe,musl-dynamic-probe} "$TASK_ROOT/bin/"
 cp build/smoke/ld-azami.so userland/libc/libc.so "$TASK_ROOT/lib/"
 cp tools/linux/musl/lib/libc.so "$TASK_ROOT/lib/ld-musl-x86_64.so.1"
-cp build/smoke/native/libsmoke_{start,plugin}.so "$TASK_ROOT/lib/"
+cp build/smoke/native/libsmoke_{start,plugin,versioned,consumer_v1,consumer_v2}.so "$TASK_ROOT/lib/"
 cp build/smoke/musl/libsmoke_start.so "$TASK_ROOT/lib/libsmoke_start-musl.so"
 cp build/smoke/musl/libsmoke_plugin.so "$TASK_ROOT/lib/libsmoke_plugin-musl.so"
+cp build/smoke/musl/libsmoke_versioned.so "$TASK_ROOT/lib/libsmoke_versioned-musl.so"
+cp build/smoke/musl/libsmoke_consumer_v1.so "$TASK_ROOT/lib/libsmoke_consumer_v1-musl.so"
+cp build/smoke/musl/libsmoke_consumer_v2.so "$TASK_ROOT/lib/libsmoke_consumer_v2-musl.so"
 
 LINUX_TEST_ROOT="$TASK_ROOT" LINUX_TEST_WORK=build/smoke/vm \
     LINUX_TEST_TIMEOUT="${SMOKE_TIMEOUT:-90}" \

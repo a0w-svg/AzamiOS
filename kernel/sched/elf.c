@@ -27,6 +27,7 @@
  * hard-code. */
 #define USER_STACK_MAX_BYTES 0x800000ULL
 extern u8 g_fsgsbase_enabled;
+extern u32 g_xsave_area_size;
 
 #define DYN_LOAD_BASE       0x0000555555554000ULL
 #define INTERP_LOAD_BASE    0x00007ffff7dd5000ULL
@@ -88,7 +89,7 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
                              *(u64 *)(kstack + top_offset) = (u64)(v); } while (0)
 
     /* Number of auxv (key,value) pairs written below — keep in sync. */
-    #define AUX_PAIRS 20
+    #define AUX_PAIRS 22
 
     /* Determine argc / envc up front so the string loops can reserve the exact
      * space the fixed structure (argc + pointer arrays + auxv) will need. */
@@ -160,12 +161,16 @@ static int setup_user_stack(process_t *proc, vmm_space_t user_space, phys_addr_t
 
     /* ── Auxiliary Vector Table (Standard Linux AMD64 auxv, written high→low) ─ */
     PUSHQ(0);                               PUSHQ(AT_NULL);
+    PUSHQ(u_platform_ptr);                  PUSHQ(AT_BASE_PLATFORM);
+    u64 minsigstksz = g_xsave_area_size ? ((u64)g_xsave_area_size + 936ULL) : 1776ULL;
+    PUSHQ(minsigstksz);                     PUSHQ(AT_MINSIGSTKSZ);
     /* Without a vDSO the pair is AT_IGNORE, keeping AUX_PAIRS exact. */
     PUSHQ(vdso_base);                       PUSHQ(vdso_base ? AT_SYSINFO_EHDR : AT_IGNORE);
     PUSHQ(u_platform_ptr);                  PUSHQ(AT_PLATFORM);
     PUSHQ(u_execfn_ptr);                    PUSHQ(AT_EXECFN);
     PUSHQ(u_random_ptr);                    PUSHQ(AT_RANDOM);
-    PUSHQ(0);                               PUSHQ(AT_SECURE);
+    int is_secure = (proc && (proc->uid != proc->euid || proc->gid != proc->egid)) ? 1 : 0;
+    PUSHQ(is_secure);                       PUSHQ(AT_SECURE);
     PUSHQ(100);                             PUSHQ(AT_CLKTCK);
     /* Populate AT_HWCAP from CPUID(1).EDX and AT_HWCAP2 from CPUID(7).EBX */
     u32 cpuid_eax, cpuid_ebx, cpuid_ecx, cpuid_edx;

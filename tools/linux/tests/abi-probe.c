@@ -92,6 +92,15 @@ int main(int argc, char **argv, char **envp)
     T(getppid() >= 0, "getppid");
     T(getuid() >= 0, "getuid");
 
+    printf("-- auxv fidelity --\n");
+    T(getauxval(AT_PAGESZ) == 4096, "AT_PAGESZ == 4096");
+    T(getauxval(AT_CLKTCK) == 100, "AT_CLKTCK == 100");
+    T(getauxval(51 /* AT_MINSIGSTKSZ */) >= 1776, "AT_MINSIGSTKSZ >= 1776");
+    const char *bplat = (const char *)getauxval(24 /* AT_BASE_PLATFORM */);
+    T(bplat && strcmp(bplat, "x86_64") == 0, "AT_BASE_PLATFORM is x86_64");
+    T(getauxval(AT_RANDOM) != 0, "AT_RANDOM present");
+    T(getauxval(AT_SECURE) == 0, "AT_SECURE is 0 for unprivileged exec");
+
     printf("-- syscall ABI / register preservation --\n");
     unsigned long canaries[6] = {
         0x1122334455667788ULL,
@@ -166,6 +175,21 @@ int main(int argc, char **argv, char **envp)
         : "rcx", "r11", "memory"
     );
     T(bad_res == -ENOSYS, "invalid syscall nr returns -ENOSYS");
+
+    printf("-- arch_prctl --\n");
+    unsigned long fs_val = 0;
+    T(syscall(SYS_arch_prctl, 0x1003 /* ARCH_GET_FS */, &fs_val) == 0, "ARCH_GET_FS succeeds");
+    unsigned long supp_xfeatures = 0;
+    T(syscall(SYS_arch_prctl, 0x1021 /* ARCH_GET_XCOMP_SUPP */, &supp_xfeatures) == 0, "ARCH_GET_XCOMP_SUPP succeeds");
+    T((supp_xfeatures & 1) != 0, "xfeatures bit 0 (x87) supported");
+    unsigned long perm_xfeatures = 0;
+    T(syscall(SYS_arch_prctl, 0x1022 /* ARCH_GET_XCOMP_PERM */, &perm_xfeatures) == 0, "ARCH_GET_XCOMP_PERM succeeds");
+    T(syscall(SYS_arch_prctl, 0x1011 /* ARCH_GET_CPUID */, 0) == 0, "ARCH_GET_CPUID returns 0 (disabled)");
+    T(syscall(SYS_arch_prctl, 0x1012 /* ARCH_SET_CPUID */, 1) == 0, "ARCH_SET_CPUID 1 succeeds");
+    T(syscall(SYS_arch_prctl, 0x1011 /* ARCH_GET_CPUID */, 0) == 1, "ARCH_GET_CPUID returns 1 (enabled)");
+    T(syscall(SYS_arch_prctl, 0x1012 /* ARCH_SET_CPUID */, 0) == 0, "ARCH_SET_CPUID 0 restores state");
+    T(syscall(SYS_arch_prctl, 0x1002 /* ARCH_SET_FS */, 0xffff800000000000ULL) == -1 && errno == EPERM,
+      "ARCH_SET_FS with kernel address fails with EPERM");
 
     printf("-- uname --\n");
     struct utsname u;
