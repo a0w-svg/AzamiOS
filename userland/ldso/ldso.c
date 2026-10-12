@@ -283,6 +283,17 @@ typedef struct {
     const char  *strtab;
     u32          nsyms;
 
+    /* Symbol hash tables */
+    const u32 *sysv_hash;
+    const u32 *gnu_hash;
+    const u64 *gnu_bloom;
+    const u32 *gnu_buckets;
+    const u32 *gnu_chains;
+    u32        gnu_nbuckets;
+    u32        gnu_symoffset;
+    u32        gnu_bloom_size;
+    u32        gnu_bloom_shift;
+
     elf64_rela_t *rela;
     u64           rela_count;
     elf64_rela_t *jmprel;
@@ -394,17 +405,22 @@ static void parse_dynamic(obj_t *o, elf64_dyn_t *dyn)
         case DT_FINI_ARRAY:     o->dt_fini_array = (u64 *)(uintptr_t)(bias + d->d_un.d_ptr); break;
         case DT_FINI_ARRAYSZ:   o->dt_fini_arraysz = d->d_un.d_val; break;
         case DT_HASH: {
-            /* SysV .hash layout: { nbucket, nchain, ... }. nchain is the
-             * dynamic symbol table's entry count — the only thing this
-             * loader needs .hash for (see the top-of-file note on why a
-             * real hash walk isn't implemented). */
-            u32 *hash = (u32 *)(uintptr_t)(bias + d->d_un.d_ptr);
-            o->nsyms = hash[1];
+            o->sysv_hash = (const u32 *)(uintptr_t)(bias + d->d_un.d_ptr);
+            o->nsyms = o->sysv_hash[1];
             break;
         }
-        case DT_GNU_HASH:
+        case DT_GNU_HASH: {
             gnu_hash = (const u32 *)(uintptr_t)(bias + d->d_un.d_ptr);
+            o->gnu_hash = gnu_hash;
+            o->gnu_nbuckets = gnu_hash[0];
+            o->gnu_symoffset = gnu_hash[1];
+            o->gnu_bloom_size = gnu_hash[2];
+            o->gnu_bloom_shift = gnu_hash[3];
+            o->gnu_bloom = (const u64 *)(gnu_hash + 4);
+            o->gnu_buckets = (const u32 *)(o->gnu_bloom + o->gnu_bloom_size);
+            o->gnu_chains = o->gnu_buckets + o->gnu_nbuckets;
             break;
+        }
         case DT_NEEDED:
             if (o->nneeded < MAX_NEEDED && strtab)
                 o->needed_names[o->nneeded++] = strtab + d->d_un.d_val;
@@ -640,18 +656,82 @@ static void setup_static_tls(void)
 
 /* ── Symbol resolution ───────────────────────────────────────────────────── */
 
+static elf64_sym_t *obj_lookup_symbol(obj_t *o, const char *name, u32 gnu_h, u32 sysv_h)
+{
+    if (!o->symtab || !o->strtab) return 0;
+
+    /* 1. GNU Hash walk (preferred if present) */
+    if (o->gnu_hash && o->gnu_bloom && o->gnu_buckets && o->gnu_chains &&
+        o->gnu_bloom_size && o->gnu_nbuckets) {
+        u64 word_idx = (gnu_h / 64) % o->gnu_bloom_size;
+        u64 bit1 = 1ULL << (gnu_h % 64);
+        u64 bit2 = 1ULL << ((gnu_h >> o->gnu_bloom_shift) % 64);
+        u64 mask = bit1 | bit2;
+        if ((o->gnu_bloom[word_idx] & mask) != mask) {
+            return 0; /* Bloom filter confirms symbol is not in this object */
+        }
+        u32 bucket_idx = gnu_h % o->gnu_nbuckets;
+        u32 sym_idx = o->gnu_buckets[bucket_idx];
+        if (sym_idx < o->gnu_symoffset) {
+            return 0;
+        }
+        while (1) {
+            u32 chain_idx = sym_idx - o->gnu_symoffset;
+            u32 chain_val = o->gnu_chains[chain_idx];
+            if ((gnu_h | 1) == (chain_val | 1)) {
+                elf64_sym_t *sym = &o->symtab[sym_idx];
+                if (sym->st_shndx != 0 && ld_strcmp(o->strtab + sym->st_name, name) == 0) {
+                    return sym;
+                }
+            }
+            if (chain_val & 1) break;
+            sym_idx++;
+            if (o->nsyms && sym_idx >= o->nsyms) break;
+        }
+        return 0;
+    }
+
+    /* 2. SysV Hash walk */
+    if (o->sysv_hash) {
+        u32 nbucket = o->sysv_hash[0];
+        u32 nchain = o->sysv_hash[1];
+        if (nbucket > 0) {
+            const u32 *buckets = o->sysv_hash + 2;
+            const u32 *chains = buckets + nbucket;
+            u32 bucket_idx = sysv_h % nbucket;
+            for (u32 sym_idx = buckets[bucket_idx]; sym_idx != 0; sym_idx = chains[sym_idx]) {
+                if (sym_idx >= nchain) break;
+                elf64_sym_t *sym = &o->symtab[sym_idx];
+                if (sym->st_shndx != 0 && ld_strcmp(o->strtab + sym->st_name, name) == 0) {
+                    return sym;
+                }
+            }
+        }
+        return 0;
+    }
+
+    /* 3. Fallback: linear scan over dynsym */
+    for (u32 s = 0; s < o->nsyms; s++) {
+        elf64_sym_t *sym = &o->symtab[s];
+        if (sym->st_name == 0 || sym->st_shndx == 0) continue;
+        if (ld_strcmp(o->strtab + sym->st_name, name) == 0) {
+            return sym;
+        }
+    }
+    return 0;
+}
+
 static elf64_sym_t *resolve_symbol_full(const char *name, obj_t **out_obj)
 {
+    u32 gnu_h = __elf_gnu_hash(name);
+    u32 sysv_h = __elf_sysv_hash(name);
     for (int i = 0; i < MAX_OBJS; i++) {
         obj_t *o = &g_objs[i];
         if (!o->in_use || !o->symtab || !o->strtab) continue;
-        for (u32 s = 0; s < o->nsyms; s++) {
-            elf64_sym_t *sym = &o->symtab[s];
-            if (sym->st_name == 0 || sym->st_shndx == 0) continue; /* null entry / undefined ref */
-            if (ld_strcmp(o->strtab + sym->st_name, name) == 0) {
-                *out_obj = o;
-                return sym;
-            }
+        elf64_sym_t *sym = obj_lookup_symbol(o, name, gnu_h, sysv_h);
+        if (sym) {
+            *out_obj = o;
+            return sym;
         }
     }
     return 0;
@@ -1077,15 +1157,16 @@ static void *dlsym_transitive(obj_t *root, const char *name)
     queue[tail++] = root_idx;
     visited |= (1ULL << root_idx);
 
+    u32 gnu_h = __elf_gnu_hash(name);
+    u32 sysv_h = __elf_sysv_hash(name);
+
     while (head < tail) {
         int idx = queue[head++];
         obj_t *cur = &g_objs[idx];
         if (cur->symtab && cur->strtab) {
-            for (u32 s = 0; s < cur->nsyms; s++) {
-                elf64_sym_t *sym = &cur->symtab[s];
-                if (sym->st_name && sym->st_shndx && ld_strcmp(cur->strtab + sym->st_name, name) == 0) {
-                    return (void *)(uintptr_t)(cur->load_bias + sym->st_value);
-                }
+            elf64_sym_t *sym = obj_lookup_symbol(cur, name, gnu_h, sysv_h);
+            if (sym) {
+                return (void *)(uintptr_t)(cur->load_bias + sym->st_value);
             }
         }
         for (int i = 0; i < cur->ndeps; i++) {
