@@ -13,6 +13,15 @@ import sys
 
 STRUCTS_CONFIG = [
     # (Type in C probe, Type name in macro, [members to check])
+    ("struct sigcontext", "SIGCONTEXT", [
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        "rdi", "rsi", "rbp", "rbx", "rdx", "rax", "rcx", "rsp", "rip",
+        "eflags", "cs", "gs", "fs", "err", "trapno", "oldmask", "cr2",
+        "fpstate"
+    ]),
+    ("ucontext_t", "UCONTEXT", [
+        "uc_flags", "uc_link", "uc_stack", "uc_mcontext", "uc_sigmask"
+    ]),
     ("struct stat", "STAT", [
         "st_dev", "st_ino", "st_nlink", "st_mode", "st_uid", "st_gid",
         "st_rdev", "st_size", "st_blksize", "st_blocks",

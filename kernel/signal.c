@@ -13,6 +13,7 @@
  * ============================================================================ */
 
 #include "signal.h"
+#include "../arch/x86_64/cpu/cpu.h"
 #include "ptrace.h"
 #include "uaccess.h"
 #include "sched/sched.h"
@@ -117,7 +118,16 @@ static void crash_report(process_t *proc, int sig, pt_regs_t *r)
 #define sdbg(...) do {} while (0)
 #endif
 
-#define SIGFRAME_MAGIC   0x5349474652414d45ULL   /* "SIGFRAME" */
+#define FP_XSTATE_MAGIC1 0x46505853U
+#define FP_XSTATE_MAGIC2 0x46505845U
+
+struct _fpx_sw_bytes {
+    u32 magic1;
+    u32 extended_size;
+    u64 xfeatures;
+    u32 xstate_size;
+    u32 padding[7];
+};
 
 /* RFLAGS bits the CPU/Linux convention says a signal handler must not inherit. */
 #define RFL_TF   (1ULL << 8)    /* trap flag — don't single-step the handler   */
@@ -136,9 +146,7 @@ extern void xsave_restore_asm(const void *area, u64 mask);
 extern u8   g_osxsave_enabled;
 extern u64  g_xcr0_mask;
 
-/* Full XSAVE area reserved in the signal frame. Same budget as fpu_state_t, so
- * whatever XCR0 the boot settled on always fits (see FPU_STATE_MAX_SIZE). */
-#define SIG_FPSTATE_SIZE FPU_STATE_MAX_SIZE
+#define SIG_FPSTATE_BUF_SIZE 4096
 
 /* RFLAGS bits a signal handler / sigreturn frame may set. Everything else the
  * CPU consumes on the return (IOPL 12-13, NT 14, RF 16, VM 17, VIF/VIP, and the
@@ -148,18 +156,32 @@ extern u64  g_xcr0_mask;
 #define SIG_RFLAGS_USER_MASK  0x00240CD5ULL   /* CF PF AF ZF SF DF OF AC ID */
 
 /* Snapshot the live user FP/SIMD state into a signal frame.
- *
- * @dst points straight at sigframe_t::fpstate, which the struct declares
- * 64-byte aligned so XSAVE64 can write it in place. Bouncing through a second
- * stack buffer would cost another FPU_STATE_MAX_SIZE bytes of the 16 KB ring-0
- * stack on a path that already carries the whole frame. We always use plain
- * XSAVE (never XSAVEC) here: the restore below rebuilds the header assuming
- * the standard, non-compacted layout. */
-static void sig_fpstate_save(u8 *dst)
+ * @dst must be 64-byte aligned. */
+static void sig_fpstate_save(u8 *dst, u32 dst_size)
 {
-    __builtin_memset(dst, 0, SIG_FPSTATE_SIZE);
-    if (g_osxsave_enabled) xsave_save_asm(dst, g_xcr0_mask);
-    else                   fpu_save_asm(dst);
+    __builtin_memset(dst, 0, dst_size);
+    if (g_osxsave_enabled) {
+        xsave_save_asm(dst, g_xcr0_mask);
+        u32 xstate_size = g_xsave_area_size ? g_xsave_area_size : 832;
+        u32 ext_size = xstate_size + 4;
+        struct _fpx_sw_bytes *sw = (struct _fpx_sw_bytes *)(dst + 464);
+        sw->magic1 = FP_XSTATE_MAGIC1;
+        sw->extended_size = ext_size;
+        sw->xfeatures = g_xcr0_mask;
+        sw->xstate_size = xstate_size;
+        for (int i = 0; i < 7; i++) sw->padding[i] = 0;
+        if (ext_size <= dst_size) {
+            *(u32 *)(dst + ext_size - 4) = FP_XSTATE_MAGIC2;
+        }
+    } else {
+        fpu_save_asm(dst);
+        struct _fpx_sw_bytes *sw = (struct _fpx_sw_bytes *)(dst + 464);
+        sw->magic1 = 0;
+        sw->extended_size = 512;
+        sw->xfeatures = 0;
+        sw->xstate_size = 0;
+        for (int i = 0; i < 7; i++) sw->padding[i] = 0;
+    }
 }
 
 /* Restore FP/SIMD state from a sigreturn frame. @buf is the kernel's own copy
@@ -169,44 +191,66 @@ static void sig_fpstate_save(u8 *dst)
 static void sig_fpstate_restore(u8 *buf)
 {
     *(u32 *)(buf + 24) &= 0x0000FFBFu;          /* MXCSR: keep only writable bits */
-    if (g_osxsave_enabled) {
+    struct _fpx_sw_bytes *sw = (struct _fpx_sw_bytes *)(buf + 464);
+    if (g_osxsave_enabled && sw->magic1 == FP_XSTATE_MAGIC1) {
         u64 *xhdr = (u64 *)(buf + 512);
-        xhdr[0] = g_xcr0_mask;                  /* XSTATE_BV: restore what we manage */
+        xhdr[0] = g_xcr0_mask & sw->xfeatures;  /* XSTATE_BV: restore valid managed features */
         for (int i = 1; i < 8; i++) xhdr[i] = 0;/* XCOMP_BV=0 (standard) + reserved */
+        xsave_restore_asm(buf, g_xcr0_mask);
+    } else if (g_osxsave_enabled) {
+        u64 *xhdr = (u64 *)(buf + 512);
+        xhdr[0] = g_xcr0_mask;
+        for (int i = 1; i < 8; i++) xhdr[i] = 0;
         xsave_restore_asm(buf, g_xcr0_mask);
     } else {
         fpu_restore_asm(buf);
     }
 }
 
-/* Linux mcontext greg indices we populate (enough for backtracing handlers). */
-enum {
-    MREG_R8 = 0, MREG_R9, MREG_R10, MREG_R11, MREG_R12, MREG_R13, MREG_R14,
-    MREG_R15, MREG_RDI, MREG_RSI, MREG_RBP, MREG_RBX, MREG_RDX, MREG_RAX,
-    MREG_RCX, MREG_RSP, MREG_RIP, MREG_EFL, MREG_CSGSFS, MREG_ERR,
-    MREG_TRAPNO, MREG_OLDMASK, MREG_CR2, MREG_COUNT
-};
+typedef struct {
+    u64 ss_sp;
+    s32 ss_flags;
+    s32 __pad;
+    u64 ss_size;
+} stack_uapi_t;
+
+typedef union {
+    struct {
+        u64 r8, r9, r10, r11, r12, r13, r14, r15;
+        u64 rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip;
+        u64 eflags;
+        u16 cs, gs, fs, ss;
+        u64 err, trapno, oldmask, cr2;
+        u64 fpstate;
+        u64 reserved1[8];
+    };
+    struct {
+        u64 gregs[23];
+        u64 fpregs;
+        u64 __reserved1[8];
+    };
+} sigcontext_uapi_t;
 
 typedef struct {
-    u64       restorer;                 /* [rsp] at handler entry            */
-    u64       magic;
-    u64       saved_mask;               /* sig_blocked to restore           */
-    pt_regs_t regs;                     /* full interrupted context         */
+    u64               uc_flags;
+    u64               uc_link;
+    stack_uapi_t      uc_stack;
+    sigcontext_uapi_t uc_mcontext;
+    u64               uc_sigmask;
+} ucontext_uapi_t;
 
-    /* Blocks pointed at by RSI / RDX for SA_SIGINFO handlers. Plain
-     * void(int) handlers never look at them, but keeping them valid and
-     * populated means a 3-arg handler won't fault either. */
-    u8        siginfo[128];             /* {si_signo, si_errno, si_code, ...} */
-    u64       uc_flags;
-    u64       uc_link;
-    u64       uc_stack[3];              /* ss_sp, ss_flags, ss_size          */
-    u64       uc_gregs[MREG_COUNT];
-    u64       uc_fpregs;               /* not exposed to the handler        */
-    u64       uc_sigmask;
-    u64       _reserved[6];
-    /* 64-byte aligned so XSAVE64/XRSTOR64 can work on it in place, both here on
-     * the kernel stack and in the copy the frame leaves on the user stack. */
-    u8        fpstate[SIG_FPSTATE_SIZE] __attribute__((aligned(64)));
+/* Linux x86-64 struct rt_sigframe layout:
+ * - pretcode: 8 bytes at (%rsp)
+ * - uc: struct ucontext (304 bytes, 64-byte aligned when (rsp+8)%64 == 0)
+ * - siginfo: struct siginfo (128 bytes)
+ * - __pad: 16 bytes (padding so that (rsp + 456) % 64 == 0)
+ * fpstate (XSAVE/FXSAVE) follows immediately on the user stack at (rsp + 456).
+ */
+typedef struct {
+    u64             pretcode;
+    ucontext_uapi_t uc;
+    u8              siginfo[128];
+    u8              __pad[16];
 } sigframe_t;
 
 static inline u32 lowest_signal(sigset_t s)
@@ -359,7 +403,10 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
      * frame is not small — it carries a full XSAVE image. A stack too small for
      * it is the same error as a stack that cannot be written at all, so it
      * takes the same exit: a fatal SIGSEGV, never a corrupted process. */
-    const u64 frame_need = sizeof(sigframe_t) + 24;   /* + alignment slack */
+    u32 fp_size = g_osxsave_enabled ? (g_xsave_area_size ? g_xsave_area_size + 4 : 836) : 512;
+    if (fp_size > SIG_FPSTATE_BUF_SIZE) fp_size = SIG_FPSTATE_BUF_SIZE;
+
+    const u64 frame_need = sizeof(sigframe_t) + fp_size + 128;   /* + alignment and red zone slack */
 
     if ((act.sa_flags & SA_ONSTACK) && ss_sp &&
         !(ss_flags & 2 /* SS_DISABLE */) && !on_altstack) {
@@ -380,7 +427,7 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
         sp -= 128;
     }
 
-    if (sp < frame_need) {
+    if (sp < frame_need || sp >= TASK_SIZE_MAX) {
         if (is_thread_sig && thread) {
             __atomic_and_fetch(&thread->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
         } else {
@@ -390,43 +437,80 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
         return 0;
     }
 
-    sp -= sizeof(sigframe_t);
-    sp &= ~15ULL;
-    sp -= 8;
+    sp -= (sizeof(sigframe_t) + fp_size);
+    sp = (sp & ~63ULL) - 8;
+
+    if (sp < g_mmap_min_addr || sp >= TASK_SIZE_MAX) {
+        if (is_thread_sig && thread) {
+            __atomic_and_fetch(&thread->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        } else {
+            __atomic_and_fetch(&proc->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
+        }
+        sched_kill_process(proc->pid, SIGSEGV);
+        return 0;
+    }
+
+    /* 64-byte aligned kernel buffer for XSAVE/FXSAVE */
+    u8 fp_buf[SIG_FPSTATE_BUF_SIZE] __attribute__((aligned(64)));
+    sig_fpstate_save(fp_buf, sizeof(fp_buf));
 
     sigframe_t f;
     memset(&f, 0, sizeof(f));
-    f.restorer   = (u64)(uintptr_t)act.sa_restorer;
-    f.magic      = SIGFRAME_MAGIC;
-    f.saved_mask = thread && thread->restore_signal_mask
-                 ? thread->saved_signal_mask : (thread ? thread->sig_blocked : proc->sig_blocked);
-    f.regs       = *r;
+    f.pretcode = (u64)(uintptr_t)act.sa_restorer;
 
-    /* Snapshot the interrupted FPU/SSE/AVX state so a handler that uses floating
-     * point, XMM or YMM registers doesn't corrupt the code it interrupted. */
-    sig_fpstate_save(f.fpstate);
+    u64 saved_mask = thread && thread->restore_signal_mask
+                 ? thread->saved_signal_mask : (thread ? thread->sig_blocked : proc->sig_blocked);
+
+    f.uc.uc_flags = 0;
+    f.uc.uc_link  = 0;
+    f.uc.uc_stack.ss_sp = (u64)(uintptr_t)ss_sp;
+    f.uc.uc_stack.ss_flags = on_altstack ? 1 /* SS_ONSTACK */ : ((ss_flags & 2) ? 2 /* SS_DISABLE */ : 0);
+    f.uc.uc_stack.ss_size = ss_size;
+    f.uc.uc_sigmask = saved_mask;
+
+    f.uc.uc_mcontext.r8  = r->r8;
+    f.uc.uc_mcontext.r9  = r->r9;
+    f.uc.uc_mcontext.r10 = r->r10;
+    f.uc.uc_mcontext.r11 = r->r11;
+    f.uc.uc_mcontext.r12 = r->r12;
+    f.uc.uc_mcontext.r13 = r->r13;
+    f.uc.uc_mcontext.r14 = r->r14;
+    f.uc.uc_mcontext.r15 = r->r15;
+    f.uc.uc_mcontext.rdi = r->rdi;
+    f.uc.uc_mcontext.rsi = r->rsi;
+    f.uc.uc_mcontext.rbp = r->rbp;
+    f.uc.uc_mcontext.rbx = r->rbx;
+    f.uc.uc_mcontext.rdx = r->rdx;
+    f.uc.uc_mcontext.rax = r->rax;
+    f.uc.uc_mcontext.rcx = r->rcx;
+    f.uc.uc_mcontext.rsp = r->rsp;
+    f.uc.uc_mcontext.rip = r->rip;
+    f.uc.uc_mcontext.eflags = r->rflags;
+    f.uc.uc_mcontext.cs  = r->cs;
+    f.uc.uc_mcontext.gs  = 0;
+    f.uc.uc_mcontext.fs  = 0;
+    f.uc.uc_mcontext.ss  = r->ss;
+    f.uc.uc_mcontext.err = 0;
+    f.uc.uc_mcontext.trapno = 0;
+    f.uc.uc_mcontext.oldmask = 0;
+    f.uc.uc_mcontext.cr2 = 0;
+    f.uc.uc_mcontext.fpstate = sp + sizeof(sigframe_t);
 
     /* Minimal Linux-compatible siginfo: si_signo, si_errno, si_code. */
     ((s32 *)f.siginfo)[0] = (s32)sig;
-    ((s32 *)f.siginfo)[2] = 0;                       /* SI_USER */
+    ((s32 *)f.siginfo)[1] = 0;                       /* si_errno */
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        u64 cr2 = 0;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        f.uc.uc_mcontext.cr2 = cr2;
+        *(u64 *)(f.siginfo + 16) = cr2;             /* si_addr */
+        ((s32 *)f.siginfo)[2] = 1;                   /* SEGV_MAPERR / BUS_ADRERR */
+    } else {
+        ((s32 *)f.siginfo)[2] = 0;                   /* SI_USER */
+    }
 
-    f.uc_flags         = 0;
-    f.uc_link          = 0;
-    f.uc_stack[0]      = (u64)(uintptr_t)ss_sp;
-    f.uc_stack[1]      = on_altstack ? 1 /* SS_ONSTACK */ : ((ss_flags & 2) ? 2 : 0);
-    f.uc_stack[2]      = ss_size;
-    f.uc_sigmask       = f.saved_mask;
-    f.uc_gregs[MREG_R8]  = r->r8;   f.uc_gregs[MREG_R9]  = r->r9;
-    f.uc_gregs[MREG_R10] = r->r10;  f.uc_gregs[MREG_R11] = r->r11;
-    f.uc_gregs[MREG_R12] = r->r12;  f.uc_gregs[MREG_R13] = r->r13;
-    f.uc_gregs[MREG_R14] = r->r14;  f.uc_gregs[MREG_R15] = r->r15;
-    f.uc_gregs[MREG_RDI] = r->rdi;  f.uc_gregs[MREG_RSI] = r->rsi;
-    f.uc_gregs[MREG_RBP] = r->rbp;  f.uc_gregs[MREG_RBX] = r->rbx;
-    f.uc_gregs[MREG_RDX] = r->rdx;  f.uc_gregs[MREG_RAX] = r->rax;
-    f.uc_gregs[MREG_RCX] = r->rcx;  f.uc_gregs[MREG_RSP] = r->rsp;
-    f.uc_gregs[MREG_RIP] = r->rip;  f.uc_gregs[MREG_EFL] = r->rflags;
-
-    if (copy_to_user((void *)(uintptr_t)sp, &f, sizeof(f)) != 0) {
+    if (copy_to_user((void *)(uintptr_t)sp, &f, sizeof(f)) != 0 ||
+        copy_to_user((void *)(uintptr_t)(sp + sizeof(sigframe_t)), fp_buf, fp_size) != 0) {
         /* Bad user stack — turn this into a fatal SIGSEGV. */
         if (is_thread_sig && thread) {
             __atomic_and_fetch(&thread->sig_pending, ~(SIG_MASK(sig)), __ATOMIC_SEQ_CST);
@@ -442,7 +526,7 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
     if (thread) thread->restore_signal_mask = false;
 
     /* Enter the handler. */
-    u64 uctx = sp + __builtin_offsetof(sigframe_t, uc_flags);
+    u64 uctx = sp + __builtin_offsetof(sigframe_t, uc);
     u64 sinfo = sp + __builtin_offsetof(sigframe_t, siginfo);
 
     r->rip = (u64)(uintptr_t)act.sa_handler;
@@ -479,7 +563,7 @@ int signal_deliver_pending(pt_regs_t *r, s64 syscall_nr)
                          (sighandler_t)SIG_DFL, __ATOMIC_RELEASE);
 
     sdbg("[SIG]  -> handler=%llx restorer=%llx newrsp=%llx\n",
-         (unsigned long long)r->rip, (unsigned long long)f.restorer,
+         (unsigned long long)r->rip, (unsigned long long)f.pretcode,
          (unsigned long long)r->rsp);
     return 1;
 }
@@ -496,33 +580,52 @@ s64 sys_rt_sigreturn_impl(pt_regs_t *r)
     sdbg("[SIG] sigreturn pid=%u base=%llx\n", proc->pid, (unsigned long long)base);
 
     sigframe_t f;
-    if (copy_from_user(&f, (const void *)(uintptr_t)base, sizeof(f)) != 0)
-        return -(s64)EFAULT;
-    if (f.magic != SIGFRAME_MAGIC) {
-        sdbg("[SIG] sigreturn BAD MAGIC %llx\n", (unsigned long long)f.magic);
+    if (copy_from_user(&f, (const void *)(uintptr_t)base, sizeof(f)) != 0) {
+        sched_kill_process(proc->pid, SIGSEGV);
         return -(s64)EFAULT;
     }
 
-    /* f.regs is entirely user-controlled. Sanitise every field the CPU consumes
+    /* f.uc.uc_mcontext is entirely user-controlled. Sanitise every field the CPU consumes
      * on the return path (this syscall returns via IRETQ — see syscall_dispatch):
      *  - a forged RFLAGS with IOPL=3 would give the process ring-3 port I/O, and
      *    IRETQ from CPL0 loads IOPL straight from the stack image;
      *  - a bad CS/SS/DS selector or a non-canonical RIP/RSP faults in ring 0.
      * Force the flat user selectors, clamp RFLAGS to the benign set (+ IF), and
      * range-check RIP/RSP; a corrupt frame kills the process, never the kernel. */
-    pt_regs_t nr = f.regs;
-    if (nr.rip >= TASK_SIZE_MAX || nr.rsp >= TASK_SIZE_MAX ||
-        nr.rip < g_mmap_min_addr || nr.rsp < g_mmap_min_addr) {
+    u64 rip = f.uc.uc_mcontext.rip;
+    u64 rsp = f.uc.uc_mcontext.rsp;
+    u64 rflags = f.uc.uc_mcontext.eflags;
+
+    if (rip >= TASK_SIZE_MAX || rip < g_mmap_min_addr ||
+        rsp >= TASK_SIZE_MAX || rsp < g_mmap_min_addr) {
         sched_kill_process(proc->pid, SIGSEGV);
         return -(s64)EFAULT;
     }
-    nr.cs = 0x23;
-    nr.ss = 0x1B;
-    nr.ds = 0x1B;
-    nr.rflags = (nr.rflags & SIG_RFLAGS_USER_MASK) | 0x202ULL;   /* + IF, bit1 */
 
-    *r = nr;
-    u64 new_mask = f.saved_mask & ~((SIG_MASK(SIGKILL)) | (SIG_MASK(SIGSTOP)));
+    r->r8  = f.uc.uc_mcontext.r8;
+    r->r9  = f.uc.uc_mcontext.r9;
+    r->r10 = f.uc.uc_mcontext.r10;
+    r->r11 = f.uc.uc_mcontext.r11;
+    r->r12 = f.uc.uc_mcontext.r12;
+    r->r13 = f.uc.uc_mcontext.r13;
+    r->r14 = f.uc.uc_mcontext.r14;
+    r->r15 = f.uc.uc_mcontext.r15;
+    r->rdi = f.uc.uc_mcontext.rdi;
+    r->rsi = f.uc.uc_mcontext.rsi;
+    r->rbp = f.uc.uc_mcontext.rbp;
+    r->rbx = f.uc.uc_mcontext.rbx;
+    r->rdx = f.uc.uc_mcontext.rdx;
+    r->rax = f.uc.uc_mcontext.rax;
+    r->rcx = f.uc.uc_mcontext.rcx;
+    r->rsp = rsp;
+    r->rip = rip;
+
+    r->cs = 0x23;
+    r->ss = 0x1B;
+    r->ds = 0x1B;
+    r->rflags = (rflags & SIG_RFLAGS_USER_MASK) | 0x202ULL;   /* + IF, bit1 */
+
+    u64 new_mask = f.uc.uc_sigmask & ~((SIG_MASK(SIGKILL)) | (SIG_MASK(SIGSTOP)));
     thread_t *thread = sched_current_thread();
     if (thread) {
         __atomic_store_n(&thread->sig_blocked, new_mask, __ATOMIC_RELEASE);
@@ -530,7 +633,23 @@ s64 sys_rt_sigreturn_impl(pt_regs_t *r)
     __atomic_store_n(&proc->sig_blocked, new_mask, __ATOMIC_RELEASE);
 
     /* Restore the FPU/SSE/AVX state the handler ran on top of (sanitised). */
-    sig_fpstate_restore(f.fpstate);
+    if (f.uc.uc_mcontext.fpstate) {
+        u64 fp_ptr = f.uc.uc_mcontext.fpstate;
+        u32 fp_size = g_osxsave_enabled ? (g_xsave_area_size ? g_xsave_area_size + 4 : 836) : 512;
+        if (fp_size > SIG_FPSTATE_BUF_SIZE) fp_size = SIG_FPSTATE_BUF_SIZE;
+
+        if (fp_ptr >= TASK_SIZE_MAX || fp_ptr < g_mmap_min_addr || (fp_ptr & 63) != 0) {
+            sched_kill_process(proc->pid, SIGSEGV);
+            return -(s64)EFAULT;
+        }
+
+        u8 fp_buf[SIG_FPSTATE_BUF_SIZE] __attribute__((aligned(64)));
+        if (copy_from_user(fp_buf, (const void *)(uintptr_t)fp_ptr, fp_size) != 0) {
+            sched_kill_process(proc->pid, SIGSEGV);
+            return -(s64)EFAULT;
+        }
+        sig_fpstate_restore(fp_buf);
+    }
 
     /* Return the value the interrupted context had in RAX so the dispatcher's
      * `regs->rax = <ret>` is a no-op on the restored frame. */

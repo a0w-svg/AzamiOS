@@ -10,6 +10,39 @@
 #include <stdint.h>
 
 /* ── Golden Sizes and Offsets (Linux 6.6 x86-64) ────────────────────────── */
+#define LINUX_SIZEOF_SIGCONTEXT                       256
+#define LINUX_OFFSETOF_SIGCONTEXT_R8                  0
+#define LINUX_OFFSETOF_SIGCONTEXT_R9                  8
+#define LINUX_OFFSETOF_SIGCONTEXT_R10                 16
+#define LINUX_OFFSETOF_SIGCONTEXT_R11                 24
+#define LINUX_OFFSETOF_SIGCONTEXT_R12                 32
+#define LINUX_OFFSETOF_SIGCONTEXT_R13                 40
+#define LINUX_OFFSETOF_SIGCONTEXT_R14                 48
+#define LINUX_OFFSETOF_SIGCONTEXT_R15                 56
+#define LINUX_OFFSETOF_SIGCONTEXT_RDI                 64
+#define LINUX_OFFSETOF_SIGCONTEXT_RSI                 72
+#define LINUX_OFFSETOF_SIGCONTEXT_RBP                 80
+#define LINUX_OFFSETOF_SIGCONTEXT_RBX                 88
+#define LINUX_OFFSETOF_SIGCONTEXT_RDX                 96
+#define LINUX_OFFSETOF_SIGCONTEXT_RAX                 104
+#define LINUX_OFFSETOF_SIGCONTEXT_RCX                 112
+#define LINUX_OFFSETOF_SIGCONTEXT_RSP                 120
+#define LINUX_OFFSETOF_SIGCONTEXT_RIP                 128
+#define LINUX_OFFSETOF_SIGCONTEXT_EFLAGS              136
+#define LINUX_OFFSETOF_SIGCONTEXT_CS                  144
+#define LINUX_OFFSETOF_SIGCONTEXT_GS                  146
+#define LINUX_OFFSETOF_SIGCONTEXT_FS                  148
+#define LINUX_OFFSETOF_SIGCONTEXT_ERR                 152
+#define LINUX_OFFSETOF_SIGCONTEXT_TRAPNO              160
+#define LINUX_OFFSETOF_SIGCONTEXT_OLDMASK             168
+#define LINUX_OFFSETOF_SIGCONTEXT_CR2                 176
+#define LINUX_OFFSETOF_SIGCONTEXT_FPSTATE             184
+#define LINUX_SIZEOF_UCONTEXT                         968
+#define LINUX_OFFSETOF_UCONTEXT_UC_FLAGS              0
+#define LINUX_OFFSETOF_UCONTEXT_UC_LINK               8
+#define LINUX_OFFSETOF_UCONTEXT_UC_STACK              16
+#define LINUX_OFFSETOF_UCONTEXT_UC_MCONTEXT           40
+#define LINUX_OFFSETOF_UCONTEXT_UC_SIGMASK            296
 #define LINUX_SIZEOF_STAT                             144
 #define LINUX_OFFSETOF_STAT_ST_DEV                    0
 #define LINUX_OFFSETOF_STAT_ST_INO                    8
